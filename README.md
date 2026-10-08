@@ -1,18 +1,23 @@
 # CRBugBench
 
-995 code-review tasks for [Harbor](https://github.com/harbor-framework/harbor),
-mined from 98 open-source GitHub repositories: 500 on the
-fix track and 495 on the comment track. An agent reviews a real pull
-request; an LLM judge panel inside the container then decides whether the
-review caught a known defect the agent never sees.
+We rebuilt CRBugBench from descriptions in the paper: (When) Should a Software Factory be Lights-off?
+Benchmarking Code Review Agents on Bug Detection.
+
+This contains 995 [Harbor](https://github.com/harbor-framework/harbor)-format code-review tasks,
+mined from 98 open-source GitHub repositories: 500 on the fix track and 495 on the comment track. 
+
+An agent reviews a real pull request; an LLM judge panel inside the container then decides whether the review caught a known defect the agent never sees.
 
 ## Requirements
 
-Docker, [Harbor](https://github.com/harbor-framework/harbor) (`uv tool install harbor`),
-and Python 3. Each task builds its own environment from `environment/Dockerfile`:
+* Docker
+* uv
+* [Harbor](https://github.com/harbor-framework/harbor) (`uv tool install harbor`)
+* An agent harness for Harbor runs (e.g., Copilot and Codex CLIs)
+
+Each task builds its own environment from `environment/Dockerfile`:
 a published repository image (`docker.io/malusamayo/swe-review-repo-<repository>:v1`, the
-repository's git history) plus the Copilot and Codex CLIs. Nothing else needs to
-be set up.
+repository's git history). Nothing else needs to be set up.
 
 ## Run
 
@@ -25,7 +30,7 @@ python scripts/summarize.py jobs/*
 `scripts/run.py` selects tasks with `--track fix|comments`, `--repo <name>`,
 `--task <id>` (each repeatable) and `--sample N` (balanced across repositories,
 `--seed` to vary), then calls `harbor run`; arguments after `--` go to Harbor.
-Without a selection it runs every task. Harbor works directly too:
+Without a selection, it runs every task. Harbor works directly too:
 
 ```bash
 harbor run --path tasks --agent codex --model gpt-6-luna --include-task-name axios_fix581_induce160
