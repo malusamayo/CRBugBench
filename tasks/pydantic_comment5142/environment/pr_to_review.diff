@@ -1,0 +1,133 @@
+diff --git a/pydantic/_internal/_generate_schema.py b/pydantic/_internal/_generate_schema.py
+index 60c5b74cfa9..ab5c0bd63f6 100644
+--- a/pydantic/_internal/_generate_schema.py
++++ b/pydantic/_internal/_generate_schema.py
+@@ -292,16 +292,24 @@ def _typed_dict_schema(self, typed_dict_cls: Any) -> core_schema.TypedDictSchema
+         """
+         Generate schema for a TypedDict.
+         """
++        type_hints = _typing_extra.get_type_hints(typed_dict_cls, include_extras=True)
++        required_keys: typing.FrozenSet[str]
+         try:
+-            required_keys: typing.FrozenSet[str] = typed_dict_cls.__required_keys__
++            required_keys = typed_dict_cls.__required_keys__
+         except AttributeError:
+-            raise TypeError('Please use `typing_extensions.TypedDict` instead of `typing.TypedDict`.')
++            # __required_keys__ is only available on Python >= 3.11
++            # if it is not present then _all_ keys are either jointly required (total=True)
++            # or optional (total=False)
++            if typed_dict_cls.__total__ is True:
++                required_keys = frozenset(type_hints.keys())
++            else:
++                required_keys = frozenset()
+ 
+         fields: typing.Dict[str, core_schema.TypedDictField] = {}
+         validation_functions = ValidationFunctions(())
+         serialization_functions = SerializationFunctions(())
+ 
+-        for field_name, annotation in _typing_extra.get_type_hints(typed_dict_cls, include_extras=True).items():
++        for field_name, annotation in type_hints.items():
+             required = field_name in required_keys
+ 
+             if get_origin(annotation) == _typing_extra.Required:
+diff --git a/tests/test_typing.py b/tests/test_typing.py
+index 99db4b2090f..ddd15b1de19 100644
+--- a/tests/test_typing.py
++++ b/tests/test_typing.py
+@@ -1,11 +1,13 @@
+ import typing
+ from collections import namedtuple
+-from typing import Callable, NamedTuple
++from dataclasses import dataclass
++from typing import Callable, List, NamedTuple
+ 
+ import pytest
+-from typing_extensions import Literal, get_origin
++from pydantic_core import core_schema
++from typing_extensions import Literal, NotRequired, Required, get_origin
+ 
+-from pydantic import Field  # noqa: F401
++from pydantic import BaseModel, Field  # noqa: F401
+ from pydantic._internal._typing_extra import is_namedtuple, is_none_type, origin_is_union
+ 
+ try:
+@@ -64,3 +66,79 @@ def test_is_union(union_gen):
+     else:
+         origin = get_origin(union)
+         assert origin_is_union(origin)
++
++
++@dataclass
++class TypedDictTestcase:
++    impl: str
++    cls: type
++    expected_schema: core_schema.CoreSchema
++    total: bool
++
++
++TYPEDDICT_TESTCASES: List[TypedDictTestcase] = []
++
++
++for origin, base in (('typing', typing_TypedDict), ('typing_extensions', typing_extensions_TypedDict)):
++
++    class Total(base, total=True):
++        default: str
++        not_req: NotRequired[str]
++        req: Required[str]
++
++    total_schema = core_schema.typed_dict_schema(
++        fields={
++            'default': core_schema.typed_dict_field(schema=core_schema.str_schema(), required=True),
++            'not_req': core_schema.typed_dict_field(
++                schema=core_schema.str_schema(),
++                required=False,
++            ),
++            'req': core_schema.typed_dict_field(
++                schema=core_schema.str_schema(),
++                required=True,
++            ),
++        },
++        extra_behavior='forbid',
++    )
++
++    TYPEDDICT_TESTCASES.append(
++        TypedDictTestcase(origin, Total, total_schema, total=True),
++    )
++
++    class NotTotal(base, total=False):
++        default: str
++        not_req: NotRequired[str]
++        req: Required[str]
++
++    not_total_schema = core_schema.typed_dict_schema(
++        fields={
++            'default': core_schema.typed_dict_field(schema=core_schema.str_schema(), required=False),
++            'not_req': core_schema.typed_dict_field(
++                schema=core_schema.str_schema(),
++                required=False,
++            ),
++            'req': core_schema.typed_dict_field(
++                schema=core_schema.str_schema(),
++                required=True,
++            ),
++        },
++        extra_behavior='allow',
++    )
++    TYPEDDICT_TESTCASES.append(
++        TypedDictTestcase(origin, NotTotal, not_total_schema, total=False),
++    )
++
++
++@pytest.mark.parametrize('testcase', TYPEDDICT_TESTCASES, ids=lambda x: f'{x.impl}(total={x.total})')
++def test_typeddict_required_totality(testcase: TypedDictTestcase):
++    class MyModel(BaseModel):
++        x: testcase.cls
++
++    schema = MyModel.__pydantic_core_schema__['schema']['fields']['x']['schema']
++
++    fields_required = {(field, meta['required']) for field, meta in schema['fields'].items() if meta['required']}
++    expected_fields_required = {
++        (field, meta['required']) for field, meta in testcase.expected_schema['fields'].items() if meta['required']
++    }
++
++    assert fields_required == expected_fields_required

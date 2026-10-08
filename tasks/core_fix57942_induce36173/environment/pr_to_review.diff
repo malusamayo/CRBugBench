@@ -1,0 +1,725 @@
+commit 7a3c2e1f6c87da6447bd80d741aac16927bab6a2
+Author: Aaron Bach <bachya1208@gmail.com>
+Date:   Thu Jun 4 10:07:27 2020 -0600
+
+    Add config flow for Tile (#36173)
+    
+    * Overhaul Tile
+    
+    * Adjust coverage
+    
+    * Fix tests
+    
+    * Code review
+    
+    * Code review
+    
+    * Remove unused config flow step
+    
+    * Revert "Remove unused config flow step"
+    
+    This reverts commit cb206e044672deb7f681d2a3ae0be03762854fc0.
+    
+    * Fix tests
+
+diff --git a/.coveragerc b/.coveragerc
+index de92c1c23e8..169d865ef39 100644
+--- a/.coveragerc
++++ b/.coveragerc
+@@ -797,6 +797,7 @@ omit =
+     homeassistant/components/thomson/device_tracker.py
+     homeassistant/components/tibber/*
+     homeassistant/components/tikteck/light.py
++    homeassistant/components/tile/__init__.py
+     homeassistant/components/tile/device_tracker.py
+     homeassistant/components/time_date/sensor.py
+     homeassistant/components/tmb/sensor.py
+diff --git a/homeassistant/components/tile/__init__.py b/homeassistant/components/tile/__init__.py
+index f0192d0ed32..ec9e6bb0f45 100644
+--- a/homeassistant/components/tile/__init__.py
++++ b/homeassistant/components/tile/__init__.py
+@@ -1 +1,143 @@
+-"""The tile component."""
++"""The Tile component."""
++import asyncio
++from datetime import timedelta
++
++from pytile import async_login
++from pytile.errors import TileError
++
++from homeassistant.const import ATTR_ATTRIBUTION, CONF_PASSWORD, CONF_USERNAME
++from homeassistant.core import callback
++from homeassistant.helpers import aiohttp_client
++from homeassistant.helpers.entity import Entity
++from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
++
++from .const import DATA_COORDINATOR, DOMAIN, LOGGER
++
++PLATFORMS = ["device_tracker"]
++DEVICE_TYPES = ["PHONE", "TILE"]
++
++DEFAULT_ATTRIBUTION = "Data provided by Tile"
++DEFAULT_ICON = "mdi:view-grid"
++DEFAULT_UPDATE_INTERVAL = timedelta(minutes=2)
++
++CONF_SHOW_INACTIVE = "show_inactive"
++
++
++async def async_setup(hass, config):
++    """Set up the Tile component."""
++    hass.data[DOMAIN] = {DATA_COORDINATOR: {}}
++
++    return True
++
++
++async def async_setup_entry(hass, config_entry):
++    """Set up Tile as config entry."""
++    websession = aiohttp_client.async_get_clientsession(hass)
++
++    client = await async_login(
++        config_entry.data[CONF_USERNAME],
++        config_entry.data[CONF_PASSWORD],
++        session=websession,
++    )
++
++    async def async_update_data():
++        """Get new data from the API."""
++        try:
++            return await client.tiles.all()
++        except TileError as err:
++            raise UpdateFailed(f"Error while retrieving data: {err}")
++
++    coordinator = DataUpdateCoordinator(
++        hass,
++        LOGGER,
++        name=config_entry.title,
++        update_interval=DEFAULT_UPDATE_INTERVAL,
++        update_method=async_update_data,
++    )
++
++    await coordinator.async_refresh()
++    hass.data[DOMAIN][DATA_COORDINATOR][config_entry.entry_id] = coordinator
++
++    for component in PLATFORMS:
++        hass.async_create_task(
++            hass.config_entries.async_forward_entry_setup(config_entry, component)
++        )
++
++    return True
++
++
++async def async_unload_entry(hass, config_entry):
++    """Unload a Tile config entry."""
++    unload_ok = all(
++        await asyncio.gather(
++            *[
++                hass.config_entries.async_forward_entry_unload(config_entry, component)
++                for component in PLATFORMS
++            ]
++        )
++    )
++    if unload_ok:
++        hass.data[DOMAIN][DATA_COORDINATOR].pop(config_entry.entry_id)
++
++    return unload_ok
++
++
++class TileEntity(Entity):
++    """Define a generic Tile entity."""
++
++    def __init__(self, coordinator):
++        """Initialize."""
++        self._attrs = {ATTR_ATTRIBUTION: DEFAULT_ATTRIBUTION}
++        self._name = None
++        self._unique_id = None
++        self.coordinator = coordinator
++
++    @property
++    def device_state_attributes(self):
++        """Return the device state attributes."""
++        return self._attrs
++
++    @property
++    def icon(self):
++        """Return the icon."""
++        return DEFAULT_ICON
++
++    @property
++    def name(self):
++        """Return the name."""
++        return self._name
++
++    @property
++    def should_poll(self):
++        """Disable polling."""
++        return False
++
++    @property
++    def unique_id(self):
++        """Return the unique ID of the entity."""
++        return self._unique_id
++
++    @callback
++    def _update_from_latest_data(self):
++        """Update the entity from the latest data."""
++        raise NotImplementedError
++
++    async def async_added_to_hass(self):
++        """Register callbacks."""
++
++        @callback
++        def update():
++            """Update the state."""
++            self._update_from_latest_data()
++            self.async_write_ha_state()
++
++        self.async_on_remove(self.coordinator.async_add_listener(update))
++
++        self._update_from_latest_data()
++
++    async def async_update(self):
++        """Update the entity.
++
++        Only used by the generic entity update service.
++        """
++        await self.coordinator.async_request_refresh()
+diff --git a/homeassistant/components/tile/config_flow.py b/homeassistant/components/tile/config_flow.py
+new file mode 100644
+index 00000000000..15ac70eeb2c
+--- /dev/null
++++ b/homeassistant/components/tile/config_flow.py
+@@ -0,0 +1,52 @@
++"""Config flow to configure the Tile integration."""
++from pytile import async_login
++from pytile.errors import TileError
++import voluptuous as vol
++
++from homeassistant import config_entries
++from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
++from homeassistant.helpers import aiohttp_client
++
++from .const import DOMAIN  # pylint: disable=unused-import
++
++
++class TileFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
++    """Handle a Tile config flow."""
++
++    VERSION = 1
++    CONNECTION_CLASS = config_entries.CONN_CLASS_CLOUD_POLL
++
++    def __init__(self):
++        """Initialize the config flow."""
++        self.data_schema = vol.Schema(
++            {vol.Required(CONF_USERNAME): str, vol.Required(CONF_PASSWORD): str}
++        )
++
++    async def _show_form(self, errors=None):
++        """Show the form to the user."""
++        return self.async_show_form(
++            step_id="user", data_schema=self.data_schema, errors=errors or {}
++        )
++
++    async def async_step_import(self, import_config):
++        """Import a config entry from configuration.yaml."""
++        return await self.async_step_user(import_config)
++
++    async def async_step_user(self, user_input=None):
++        """Handle the start of the config flow."""
++        if not user_input:
++            return await self._show_form()
++
++        await self.async_set_unique_id(user_input[CONF_USERNAME])
++        self._abort_if_unique_id_configured()
++
++        session = aiohttp_client.async_get_clientsession(self.hass)
++
++        try:
++            await async_login(
++                user_input[CONF_USERNAME], user_input[CONF_PASSWORD], session=session
++            )
++        except TileError:
++            return await self._show_form({"base": "invalid_credentials"})
++
++        return self.async_create_entry(title=user_input[CONF_USERNAME], data=user_input)
+diff --git a/homeassistant/components/tile/const.py b/homeassistant/components/tile/const.py
+new file mode 100644
+index 00000000000..91f5b838642
+--- /dev/null
++++ b/homeassistant/components/tile/const.py
+@@ -0,0 +1,8 @@
++"""Define Tile constants."""
++import logging
++
++DOMAIN = "tile"
++
++DATA_COORDINATOR = "coordinator"
++
++LOGGER = logging.getLogger(__package__)
+diff --git a/homeassistant/components/tile/device_tracker.py b/homeassistant/components/tile/device_tracker.py
+index 6cfe6121ccb..3907f2bf7bf 100644
+--- a/homeassistant/components/tile/device_tracker.py
++++ b/homeassistant/components/tile/device_tracker.py
+@@ -1,21 +1,15 @@
+-"""Support for Tile® Bluetooth trackers."""
+-from datetime import timedelta
++"""Support for Tile device trackers."""
+ import logging
+ 
+-from pytile import async_login
+-from pytile.errors import SessionExpiredError, TileError
+-import voluptuous as vol
++from homeassistant.components.device_tracker.config_entry import TrackerEntity
++from homeassistant.components.device_tracker.const import SOURCE_TYPE_GPS
++from homeassistant.config_entries import SOURCE_IMPORT
++from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
++from homeassistant.core import callback
+ 
+-from homeassistant.components.device_tracker import PLATFORM_SCHEMA
+-from homeassistant.const import CONF_MONITORED_VARIABLES, CONF_PASSWORD, CONF_USERNAME
+-from homeassistant.helpers import aiohttp_client, config_validation as cv
+-from homeassistant.helpers.event import async_track_time_interval
+-from homeassistant.util import slugify
+-from homeassistant.util.json import load_json, save_json
++from . import DATA_COORDINATOR, DOMAIN, TileEntity
+ 
+ _LOGGER = logging.getLogger(__name__)
+-CLIENT_UUID_CONFIG_FILE = ".tile.conf"
+-DEVICE_TYPES = ["PHONE", "TILE"]
+ 
+ ATTR_ALTITUDE = "altitude"
+ ATTR_CONNECTION_STATE = "connection_state"
+@@ -23,118 +17,113 @@ ATTR_IS_DEAD = "is_dead"
+ ATTR_IS_LOST = "is_lost"
+ ATTR_RING_STATE = "ring_state"
+ ATTR_VOIP_STATE = "voip_state"
+-ATTR_TILE_ID = "tile_identifier"
+ ATTR_TILE_NAME = "tile_name"
+ 
+-CONF_SHOW_INACTIVE = "show_inactive"
+ 
+-DEFAULT_ICON = "mdi:view-grid"
+-DEFAULT_SCAN_INTERVAL = timedelta(minutes=2)
++async def async_setup_entry(hass, config_entry, async_add_entities):
++    """Set up Tile device trackers."""
++    coordinator = hass.data[DOMAIN][DATA_COORDINATOR][config_entry.entry_id]
+ 
+-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+-    {
+-        vol.Required(CONF_USERNAME): cv.string,
+-        vol.Required(CONF_PASSWORD): cv.string,
+-        vol.Optional(CONF_SHOW_INACTIVE, default=False): cv.boolean,
+-        vol.Optional(CONF_MONITORED_VARIABLES, default=DEVICE_TYPES): vol.All(
+-            cv.ensure_list, [vol.In(DEVICE_TYPES)]
+-        ),
+-    }
+-)
++    async_add_entities(
++        [
++            TileDeviceTracker(coordinator, tile_uuid, tile)
++            for tile_uuid, tile in coordinator.data.items()
++        ],
++        True,
++    )
+ 
+ 
+ async def async_setup_scanner(hass, config, async_see, discovery_info=None):
+-    """Validate the configuration and return a Tile scanner."""
+-    websession = aiohttp_client.async_get_clientsession(hass)
+-
+-    config_file = hass.config.path(
+-        ".{}{}".format(slugify(config[CONF_USERNAME]), CLIENT_UUID_CONFIG_FILE)
+-    )
+-    config_data = await hass.async_add_job(load_json, config_file)
+-    if config_data:
+-        client = await async_login(
+-            config[CONF_USERNAME],
+-            config[CONF_PASSWORD],
+-            websession,
+-            client_uuid=config_data["client_uuid"],
+-        )
+-    else:
+-        client = await async_login(
+-            config[CONF_USERNAME], config[CONF_PASSWORD], websession
++    """Detect a legacy configuration and import it."""
++    hass.async_create_task(
++        hass.config_entries.flow.async_init(
++            DOMAIN,
++            context={"source": SOURCE_IMPORT},
++            data={
++                CONF_USERNAME: config[CONF_USERNAME],
++                CONF_PASSWORD: config[CONF_PASSWORD],
++            },
+         )
++    )
+ 
+-        config_data = {"client_uuid": client.client_uuid}
+-        await hass.async_add_job(save_json, config_file, config_data)
+-
+-    scanner = TileScanner(
+-        client,
+-        hass,
+-        async_see,
+-        config[CONF_MONITORED_VARIABLES],
+-        config[CONF_SHOW_INACTIVE],
++    _LOGGER.info(
++        "Your Tile configuration has been imported into the UI; "
++        "please remove it from configuration.yaml"
+     )
+-    return await scanner.async_init()
++
++    return True
+ 
+ 
+-class TileScanner:
+-    """Define an object to retrieve Tile data."""
++class TileDeviceTracker(TileEntity, TrackerEntity):
++    """Representation of a network infrastructure device."""
+ 
+-    def __init__(self, client, hass, async_see, types, show_inactive):
++    def __init__(self, coordinator, tile_uuid, tile):
+         """Initialize."""
+-        self._async_see = async_see
+-        self._client = client
+-        self._hass = hass
+-        self._show_inactive = show_inactive
+-        self._types = types
+-
+-    async def async_init(self):
+-        """Further initialize connection to the Tile servers."""
+-        try:
+-            await self._client.async_init()
+-        except TileError as err:
+-            _LOGGER.error("Unable to set up Tile scanner: %s", err)
+-            return False
+-
+-        await self._async_update()
+-
+-        async_track_time_interval(self._hass, self._async_update, DEFAULT_SCAN_INTERVAL)
+-
+-        return True
+-
+-    async def _async_update(self, now=None):
+-        """Update info from Tile."""
+-        try:
+-            await self._client.async_init()
+-            tiles = await self._client.tiles.all(
+-                whitelist=self._types, show_inactive=self._show_inactive
+-            )
+-        except SessionExpiredError:
+-            _LOGGER.info("Session expired; trying again shortly")
+-            return
+-        except TileError as err:
+-            _LOGGER.error("There was an error while updating: %s", err)
+-            return
+-
+-        if not tiles:
+-            _LOGGER.warning("No Tiles found")
+-            return
+-
+-        for tile in tiles:
+-            await self._async_see(
+-                dev_id="tile_{}".format(slugify(tile["tile_uuid"])),
+-                gps=(
+-                    tile["last_tile_state"]["latitude"],
+-                    tile["last_tile_state"]["longitude"],
+-                ),
+-                attributes={
+-                    ATTR_ALTITUDE: tile["last_tile_state"]["altitude"],
+-                    ATTR_CONNECTION_STATE: tile["last_tile_state"]["connection_state"],
+-                    ATTR_IS_DEAD: tile["is_dead"],
+-                    ATTR_IS_LOST: tile["last_tile_state"]["is_lost"],
+-                    ATTR_RING_STATE: tile["last_tile_state"]["ring_state"],
+-                    ATTR_VOIP_STATE: tile["last_tile_state"]["voip_state"],
+-                    ATTR_TILE_ID: tile["tile_uuid"],
+-                    ATTR_TILE_NAME: tile["name"],
+-                },
+-                icon=DEFAULT_ICON,
++        super().__init__(coordinator)
++        self._name = tile["name"]
++        self._tile = tile
++        self._tile_uuid = tile_uuid
++        self._unique_id = f"tile_{tile_uuid}"
++
++    @property
++    def available(self):
++        """Return if entity is available."""
++        return self.coordinator.last_update_success and not self._tile["is_dead"]
++
++    @property
++    def battery_level(self):
++        """Return the battery level of the device.
++
++        Percentage from 0-100.
++        """
++        return None
++
++    @property
++    def location_accuracy(self):
++        """Return the location accuracy of the device.
++
++        Value in meters.
++        """
++        return round(
++            (
++                self._tile["last_tile_state"]["h_accuracy"]
++                + self._tile["last_tile_state"]["v_accuracy"]
+             )
++            / 2
++        )
++
++    @property
++    def latitude(self) -> float:
++        """Return latitude value of the device."""
++        return self._tile["last_tile_state"]["latitude"]
++
++    @property
++    def longitude(self) -> float:
++        """Return longitude value of the device."""
++        return self._tile["last_tile_state"]["longitude"]
++
++    @property
++    def source_type(self):
++        """Return the source type, eg gps or router, of the device."""
++        return SOURCE_TYPE_GPS
++
++    @property
++    def state_attributes(self):
++        """Return the device state attributes."""
++        attr = {}
++        attr.update(
++            super().state_attributes,
++            **{
++                ATTR_ALTITUDE: self._tile["last_tile_state"]["altitude"],
++                ATTR_IS_LOST: self._tile["last_tile_state"]["is_lost"],
++                ATTR_RING_STATE: self._tile["last_tile_state"]["ring_state"],
++                ATTR_VOIP_STATE: self._tile["last_tile_state"]["voip_state"],
++            },
++        )
++
++        return attr
++
++    @callback
++    def _update_from_latest_data(self):
++        """Update the entity from the latest data."""
++        self._tile = self.coordinator.data[self._tile_uuid]
+diff --git a/homeassistant/components/tile/manifest.json b/homeassistant/components/tile/manifest.json
+index 553c1e50823..a43a0e229c2 100644
+--- a/homeassistant/components/tile/manifest.json
++++ b/homeassistant/components/tile/manifest.json
+@@ -1,7 +1,8 @@
+ {
+   "domain": "tile",
+   "name": "Tile",
++  "config_flow": true,
+   "documentation": "https://www.home-assistant.io/integrations/tile",
+-  "requirements": ["pytile==3.0.1"],
++  "requirements": ["pytile==3.0.6"],
+   "codeowners": ["@bachya"]
+ }
+diff --git a/homeassistant/components/tile/strings.json b/homeassistant/components/tile/strings.json
+new file mode 100644
+index 00000000000..8a1ee9660d9
+--- /dev/null
++++ b/homeassistant/components/tile/strings.json
+@@ -0,0 +1,29 @@
++{
++  "config": {
++    "step": {
++      "user": {
++        "title": "Configure Tile",
++        "data": {
++          "username": "[%key:common::config_flow::data::email%]",
++          "password": "[%key:common::config_flow::data::password%]"
++        }
++      }
++    },
++    "error": {
++      "invalid_credentials": "Invalid Tile credentials provided."
++    },
++    "abort": {
++      "already_configured": "This Tile account is already registered."
++    }
++  },
++  "options": {
++    "step": {
++      "init": {
++        "title": "Configure Tile",
++        "data": {
++          "show_inactive": "Show inactive Tiles"
++        }
++      }
++    }
++  }
++}
+diff --git a/homeassistant/components/tile/translations/en.json b/homeassistant/components/tile/translations/en.json
+new file mode 100644
+index 00000000000..641515b1689
+--- /dev/null
++++ b/homeassistant/components/tile/translations/en.json
+@@ -0,0 +1,29 @@
++{
++    "config": {
++        "abort": {
++            "already_configured": "This Tile account is already registered."
++        },
++        "error": {
++            "invalid_credentials": "Invalid Tile credentials provided."
++        },
++        "step": {
++            "user": {
++                "data": {
++                    "password": "[%key:common::config_flow::data::password%]",
++                    "username": "[%key:common::config_flow::data::email%]"
++                },
++                "title": "Configure Tile"
++            }
++        }
++    },
++    "options": {
++        "step": {
++            "init": {
++                "data": {
++                    "show_inactive": "Show inactive Tiles"
++                },
++                "title": "Configure Tile"
++            }
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/requirements_all.txt b/requirements_all.txt
+index 9a531478c44..dfdabeb35a6 100644
+--- a/requirements_all.txt
++++ b/requirements_all.txt
+@@ -1762,7 +1762,7 @@ python_opendata_transport==0.2.1
+ pythonegardia==1.0.40
+ 
+ # homeassistant.components.tile
+-pytile==3.0.1
++pytile==3.0.6
+ 
+ # homeassistant.components.touchline
+ pytouchline==0.7
+diff --git a/requirements_test_all.txt b/requirements_test_all.txt
+index 580ac14bc83..8789dc34c3b 100644
+--- a/requirements_test_all.txt
++++ b/requirements_test_all.txt
+@@ -737,6 +737,9 @@ python-velbus==2.0.43
+ # homeassistant.components.awair
+ python_awair==0.0.4
+ 
++# homeassistant.components.tile
++pytile==3.0.6
++
+ # homeassistant.components.traccar
+ pytraccar==0.9.0
+ 
+diff --git a/tests/components/tile/__init__.py b/tests/components/tile/__init__.py
+new file mode 100644
+index 00000000000..5f26eb01ce0
+--- /dev/null
++++ b/tests/components/tile/__init__.py
+@@ -0,0 +1 @@
++"""Define tests for the Tile component."""
+diff --git a/tests/components/tile/test_config_flow.py b/tests/components/tile/test_config_flow.py
+new file mode 100644
+index 00000000000..3354537d1c5
+--- /dev/null
++++ b/tests/components/tile/test_config_flow.py
+@@ -0,0 +1,96 @@
++"""Define tests for the Tile config flow."""
++from pytile.errors import TileError
++
++from homeassistant import data_entry_flow
++from homeassistant.components.tile import DOMAIN
++from homeassistant.config_entries import SOURCE_IMPORT, SOURCE_USER
++from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
++
++from tests.async_mock import patch
++from tests.common import MockConfigEntry
++
++
++async def test_duplicate_error(hass):
++    """Test that errors are shown when duplicates are added."""
++    conf = {
++        CONF_USERNAME: "user@host.com",
++        CONF_PASSWORD: "123abc",
++    }
++
++    MockConfigEntry(domain=DOMAIN, unique_id="user@host.com", data=conf).add_to_hass(
++        hass
++    )
++
++    result = await hass.config_entries.flow.async_init(
++        DOMAIN, context={"source": SOURCE_USER}, data=conf
++    )
++
++    assert result["type"] == data_entry_flow.RESULT_TYPE_ABORT
++    assert result["reason"] == "already_configured"
++
++
++async def test_invalid_credentials(hass):
++    """Test that invalid credentials key throws an error."""
++    conf = {
++        CONF_USERNAME: "user@host.com",
++        CONF_PASSWORD: "123abc",
++    }
++
++    with patch(
++        "homeassistant.components.tile.config_flow.async_login", side_effect=TileError,
++    ):
++        result = await hass.config_entries.flow.async_init(
++            DOMAIN, context={"source": SOURCE_USER}, data=conf
++        )
++        assert result["type"] == data_entry_flow.RESULT_TYPE_FORM
++        assert result["errors"] == {"base": "invalid_credentials"}
++
++
++async def test_step_import(hass):
++    """Test that the import step works."""
++    conf = {
++        CONF_USERNAME: "user@host.com",
++        CONF_PASSWORD: "123abc",
++    }
++
++    with patch(
++        "homeassistant.components.tile.async_setup_entry", return_value=True
++    ), patch("homeassistant.components.tile.config_flow.async_login"):
++        result = await hass.config_entries.flow.async_init(
++            DOMAIN, context={"source": SOURCE_IMPORT}, data=conf
++        )
++        print(result)
++        assert result["type"] == data_entry_flow.RESULT_TYPE_CREATE_ENTRY
++        assert result["title"] == "user@host.com"
++        assert result["data"] == {
++            CONF_USERNAME: "user@host.com",
++            CONF_PASSWORD: "123abc",
++        }
++
++
++async def test_step_user(hass):
++    """Test that the user step works."""
++    conf = {
++        CONF_USERNAME: "user@host.com",
++        CONF_PASSWORD: "123abc",
++    }
++
++    with patch(
++        "homeassistant.components.tile.async_setup_entry", return_value=True
++    ), patch("homeassistant.components.tile.config_flow.async_login"):
++        result = await hass.config_entries.flow.async_init(
++            DOMAIN, context={"source": SOURCE_USER}
++        )
++        assert result["type"] == data_entry_flow.RESULT_TYPE_FORM
++        assert result["step_id"] == "user"
++
++        result = await hass.config_entries.flow.async_init(
++            DOMAIN, context={"source": SOURCE_USER}, data=conf
++        )
++        print(result)
++        assert result["type"] == data_entry_flow.RESULT_TYPE_CREATE_ENTRY
++        assert result["title"] == "user@host.com"
++        assert result["data"] == {
++            CONF_USERNAME: "user@host.com",
++            CONF_PASSWORD: "123abc",
++        }

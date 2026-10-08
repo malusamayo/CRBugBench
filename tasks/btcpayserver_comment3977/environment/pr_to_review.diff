@@ -1,0 +1,248 @@
+diff --git a/BTCPayServer.Abstractions/Security/AuthorizationFilterArguments.cs b/BTCPayServer.Abstractions/Security/AuthorizationFilterArguments.cs
+new file mode 100644
+index 00000000000..93fa979e20f
+--- /dev/null
++++ b/BTCPayServer.Abstractions/Security/AuthorizationFilterArguments.cs
+@@ -0,0 +1,21 @@
++using Microsoft.AspNetCore.Authorization;
++using Microsoft.AspNetCore.Http;
++
++namespace BTCPayServer.Security;
++
++public class AuthorizationFilterArguments
++{
++    public AuthorizationHandlerContext Context { get; }
++    public PolicyRequirement Requirement { get; }
++    public HttpContext HttpContext { get; }
++        
++    public AuthorizationFilterArguments(
++        AuthorizationHandlerContext context,
++        PolicyRequirement requirement,
++        HttpContext httpContext)
++    {
++        Context = context;
++        Requirement = requirement;
++        HttpContext = httpContext;
++    }
++}
+diff --git a/BTCPayServer/Security/PolicyRequirement.cs b/BTCPayServer.Abstractions/Security/PolicyRequirement.cs
+similarity index 100%
+rename from BTCPayServer/Security/PolicyRequirement.cs
+rename to BTCPayServer.Abstractions/Security/PolicyRequirement.cs
+diff --git a/BTCPayServer.Client/Permissions.cs b/BTCPayServer.Client/Permissions.cs
+index d98b4d3a412..1f0cc41f382 100644
+--- a/BTCPayServer.Client/Permissions.cs
++++ b/BTCPayServer.Client/Permissions.cs
+@@ -84,6 +84,10 @@ public static bool IsServerPolicy(string policy)
+         {
+             return policy.StartsWith("btcpay.server", StringComparison.OrdinalIgnoreCase);
+         }
++        public static bool IsPluginPolicy(string policy)
++        {
++            return policy.StartsWith("btcpay.plugin", StringComparison.OrdinalIgnoreCase);
++        }
+     }
+     public class Permission
+     {
+diff --git a/BTCPayServer/Controllers/GreenField/LocalBTCPayServerClient.cs b/BTCPayServer/Controllers/GreenField/LocalBTCPayServerClient.cs
+index fc308770adb..d1b8b29bb97 100644
+--- a/BTCPayServer/Controllers/GreenField/LocalBTCPayServerClient.cs
++++ b/BTCPayServer/Controllers/GreenField/LocalBTCPayServerClient.cs
+@@ -341,7 +341,8 @@ public LocalBTCPayServerClient(
+ 
+             var authoverride = new AuthorizationService(new GreenfieldAuthorizationHandler(httpContextAccessor,
+                 serviceProvider.GetService<UserManager<ApplicationUser>>(),
+-                serviceProvider.GetService<StoreRepository>()));
++                serviceProvider.GetService<StoreRepository>(),
++                serviceProvider.GetService<IPluginHookService>()));
+ 
+ 
+             foreach (var controller in controllers)
+diff --git a/BTCPayServer/Security/CookieAuthorizationHandler.cs b/BTCPayServer/Security/CookieAuthorizationHandler.cs
+index efc2ca3f3d2..a881fc8ea34 100644
+--- a/BTCPayServer/Security/CookieAuthorizationHandler.cs
++++ b/BTCPayServer/Security/CookieAuthorizationHandler.cs
+@@ -1,8 +1,8 @@
+ using System;
+ using System.Threading.Tasks;
+ using BTCPayServer.Abstractions.Constants;
++using BTCPayServer.Abstractions.Contracts;
+ using BTCPayServer.Client;
+-using BTCPayServer.Controllers;
+ using BTCPayServer.Data;
+ using BTCPayServer.Services.Apps;
+ using BTCPayServer.Services.Invoices;
+@@ -23,19 +23,22 @@ public class CookieAuthorizationHandler : AuthorizationHandler<PolicyRequirement
+         private readonly AppService _appService;
+         private readonly PaymentRequestRepository _paymentRequestRepository;
+         private readonly InvoiceRepository _invoiceRepository;
++        private readonly IPluginHookService _pluginHookService;
+ 
+         public CookieAuthorizationHandler(IHttpContextAccessor httpContextAccessor,
+                                 UserManager<ApplicationUser> userManager,
+                                 StoreRepository storeRepository,
+                                 AppService appService,
+                                 InvoiceRepository invoiceRepository,
+-                                PaymentRequestRepository paymentRequestRepository)
++                                PaymentRequestRepository paymentRequestRepository,
++                                IPluginHookService pluginHookService)
+         {
+             _httpContext = httpContextAccessor.HttpContext;
+             _userManager = userManager;
+             _appService = appService;
+             _storeRepository = storeRepository;
+             _invoiceRepository = invoiceRepository;
++            _pluginHookService = pluginHookService;
+             _paymentRequestRepository = paymentRequestRepository;
+         }
+ 
+@@ -144,6 +147,13 @@ protected override async Task HandleRequirementAsync(AuthorizationHandlerContext
+                     if (context.User != null)
+                         success = true;
+                     break;
++                default:
++                    if (Policies.IsPluginPolicy(requirement.Policy))
++                    {
++                        var args = new AuthorizationFilterArguments(context, requirement, _httpContext);
++                        success = (bool)await _pluginHookService.ApplyFilter("handle-authorization-requirement", args);
++                    }
++                    break;
+             }
+ 
+             if (success)
+@@ -151,7 +161,6 @@ protected override async Task HandleRequirementAsync(AuthorizationHandlerContext
+                 context.Succeed(requirement);
+                 if (!explicitResource)
+                 {
+-
+                     if (store != null)
+                     {
+                         _httpContext.SetStoreData(store);
+diff --git a/BTCPayServer/Security/GreenField/GreenFieldAuthorizationHandler.cs b/BTCPayServer/Security/GreenField/GreenFieldAuthorizationHandler.cs
+index 335893c0790..26efa2e82e6 100644
+--- a/BTCPayServer/Security/GreenField/GreenFieldAuthorizationHandler.cs
++++ b/BTCPayServer/Security/GreenField/GreenFieldAuthorizationHandler.cs
+@@ -1,17 +1,13 @@
+-using System.Buffers;
+ using System.Collections.Generic;
+-using System.Globalization;
+ using System.Security.Claims;
+-using System.Text;
+ using System.Threading.Tasks;
++using BTCPayServer.Abstractions.Contracts;
+ using BTCPayServer.Client;
+-using BTCPayServer.Client.Models;
+ using BTCPayServer.Data;
+ using BTCPayServer.Services.Stores;
+ using Microsoft.AspNetCore.Authorization;
+ using Microsoft.AspNetCore.Http;
+ using Microsoft.AspNetCore.Identity;
+-using Newtonsoft.Json;
+ using StoreData = BTCPayServer.Data.StoreData;
+ 
+ namespace BTCPayServer.Security.Greenfield
+@@ -21,14 +17,17 @@ public class LocalGreenfieldAuthorizationHandler : AuthorizationHandler<PolicyRe
+         private readonly IHttpContextAccessor _httpContextAccessor;
+         private readonly UserManager<ApplicationUser> _userManager;
+         private readonly StoreRepository _storeRepository;
++        private readonly IPluginHookService _pluginHookService;
+ 
+         public LocalGreenfieldAuthorizationHandler(IHttpContextAccessor httpContextAccessor,
+             UserManager<ApplicationUser> userManager,
+-            StoreRepository storeRepository)
++            StoreRepository storeRepository,
++            IPluginHookService pluginHookService)
+         {
+             _httpContextAccessor = httpContextAccessor;
+             _userManager = userManager;
+             _storeRepository = storeRepository;
++            _pluginHookService = pluginHookService;
+         }
+         protected override Task HandleRequirementAsync(AuthorizationHandlerContext context, PolicyRequirement requirement)
+         {
+@@ -38,7 +37,8 @@ protected override Task HandleRequirementAsync(AuthorizationHandlerContext conte
+                 var newUser = new ClaimsPrincipal(new ClaimsIdentity(context.User.Claims,
+                     $"{GreenfieldConstants.AuthenticationType}"));
+                 var newContext = new AuthorizationHandlerContext(context.Requirements, newUser, null);
+-                return new GreenfieldAuthorizationHandler(_httpContextAccessor, _userManager, _storeRepository).HandleAsync(newContext);
++                return new GreenfieldAuthorizationHandler(
++                    _httpContextAccessor, _userManager, _storeRepository, _pluginHookService).HandleAsync(newContext);
+             }
+             
+             var succeed = context.User.Identity.AuthenticationType == $"Local{GreenfieldConstants.AuthenticationType}";
+@@ -50,21 +50,23 @@ protected override Task HandleRequirementAsync(AuthorizationHandlerContext conte
+             return Task.CompletedTask;
+         }
+     }
+-
++    
+     public class GreenfieldAuthorizationHandler : AuthorizationHandler<PolicyRequirement>
+-
+     {
+-        private readonly HttpContext _HttpContext;
++        private readonly HttpContext _httpContext;
+         private readonly UserManager<ApplicationUser> _userManager;
+         private readonly StoreRepository _storeRepository;
++        private readonly IPluginHookService _pluginHookService;
+ 
+         public GreenfieldAuthorizationHandler(IHttpContextAccessor httpContextAccessor,
+             UserManager<ApplicationUser> userManager,
+-            StoreRepository storeRepository)
++            StoreRepository storeRepository,
++            IPluginHookService pluginHookService)
+         {
+-            _HttpContext = httpContextAccessor.HttpContext;
++            _httpContext = httpContextAccessor.HttpContext;
+             _userManager = userManager;
+             _storeRepository = storeRepository;
++            _pluginHookService = pluginHookService;
+         }
+ 
+         protected override async Task HandleRequirementAsync(AuthorizationHandlerContext context,
+@@ -85,7 +87,7 @@ protected override async Task HandleRequirementAsync(AuthorizationHandlerContext
+             switch (policy)
+             {
+                 case { } when Policies.IsStorePolicy(policy):
+-                    var storeId = _HttpContext.GetImplicitStoreId();
++                    var storeId = _httpContext.GetImplicitStoreId();
+                     // Specific store action
+                     if (storeId != null)
+                     {
+@@ -102,7 +104,7 @@ protected override async Task HandleRequirementAsync(AuthorizationHandlerContext
+                                     break;
+                             }
+                             success = true;
+-                            _HttpContext.SetStoreData(store);
++                            _httpContext.SetStoreData(store);
+                         }
+                     }
+                     else
+@@ -118,7 +120,7 @@ protected override async Task HandleRequirementAsync(AuthorizationHandlerContext
+                         }
+                         if (!requiredUnscoped && permissionedStores.Count is 0)
+                             break;
+-                        _HttpContext.SetStoresData(permissionedStores.ToArray());
++                        _httpContext.SetStoresData(permissionedStores.ToArray());
+                         success = true;
+                     }
+                     break;
+@@ -133,6 +135,10 @@ protected override async Task HandleRequirementAsync(AuthorizationHandlerContext
+                         success = true;
+                     }
+                     break;
++                case { } when Policies.IsPluginPolicy(requirement.Policy):
++                    var args = new AuthorizationFilterArguments(context, requirement, _httpContext);
++                    success = (bool)await _pluginHookService.ApplyFilter("handle-authorization-requirement", args);
++                    break;
+                 case Policies.CanManageNotificationsForUser:
+                 case Policies.CanViewNotificationsForUser:
+                 case Policies.CanModifyProfile:
+@@ -147,7 +153,7 @@ protected override async Task HandleRequirementAsync(AuthorizationHandlerContext
+             {
+                 context.Succeed(requirement);
+             }
+-            _HttpContext.Items[RequestedPermissionKey] = policy;
++            _httpContext.Items[RequestedPermissionKey] = policy;
+         }
+         public const string RequestedPermissionKey = nameof(RequestedPermissionKey);
+     }

@@ -1,0 +1,318 @@
+commit 4bb3f1fee2361d0d99857ff4831be0c49bd42f92
+Author: Luke Steensen <luke.steensen@gmail.com>
+Date:   Thu Sep 9 13:04:45 2021 -0500
+
+    chore(observability): revert internal tracing proof of concept (#9041)
+    
+    This reverts commit 37e06de830377f1ded73d70014f099ae487ad6da (#7929).
+    
+    Signed-off-by: Luke Steensen <luke.steensen@gmail.com>
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 8d1da99ca9..0e255510da 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -123,9 +123,6 @@ tracing-futures = { version = "0.2.5", default-features = false, features = ["fu
+ tracing-log = { version = "0.1.2", default-features = false }
+ tracing-subscriber = { version = "0.2.20", default-features = false }
+ tracing-tower = { git = "https://github.com/tokio-rs/tracing", default-features = false, rev = "f470db1b0354b368f62f9ee4d763595d16373231" }
+-tracing-opentelemetry = { version = "0.15.0", default-features = false }
+-opentelemetry = { version = "0.16.0", default-features = false, features = ["trace", "rt-tokio"] }
+-opentelemetry-datadog = { version = "0.4.0", default-features = false, features = ["reqwest-client"] }
+ 
+ # Metrics
+ metrics = { version = "0.17.0", default-features = false, features = ["std"] }
+diff --git a/benches/metrics_bench_util/mod.rs b/benches/metrics_bench_util/mod.rs
+index f30ffd373e..4f94be3e0d 100644
+--- a/benches/metrics_bench_util/mod.rs
++++ b/benches/metrics_bench_util/mod.rs
+@@ -35,7 +35,7 @@ fn disable_metrics_tracing_integration() {
+ 
+ #[inline]
+ fn boot() {
+-    vector::trace::init(false, false, "warn", false);
++    vector::trace::init(false, false, "warn");
+     vector::metrics::init().expect("metrics initialization failed");
+ }
+ 
+diff --git a/lib/file-source/src/file_server.rs b/lib/file-source/src/file_server.rs
+index ed1f8f585f..6ad9989d60 100644
+--- a/lib/file-source/src/file_server.rs
++++ b/lib/file-source/src/file_server.rs
+@@ -21,7 +21,7 @@ use std::{
+     time::{self, Duration},
+ };
+ use tokio::time::sleep;
+-use tracing::{debug, error, info, trace, trace_span, Instrument};
++use tracing::{debug, error, info, trace};
+ 
+ /// `FileServer` is a Source which cooperatively schedules reads over files,
+ /// converting the lines of said files into `LogLine` structures. As
+@@ -155,7 +155,6 @@ where
+                         Err(error) => emitter.emit_file_checkpoint_write_failed(error),
+                     }
+                 })
+-                .instrument(trace_span!("writing checkpoints file"))
+                 .await
+                 .ok();
+             }
+@@ -172,13 +171,9 @@ where
+         // or write new checkpoints, on every iteration.
+         let mut next_glob_time = time::Instant::now();
+         loop {
+-            let _loop_span = trace_span!("file_server_iteration").entered();
+-
+             // Glob find files to follow, but not too often.
+             let now_time = time::Instant::now();
+             if next_glob_time <= now_time {
+-                let _discovery_span = trace_span!("file_discovery").entered();
+-
+                 // Schedule the next glob time.
+                 next_glob_time = now_time.checked_add(self.glob_minimum_cooldown).unwrap();
+ 
+@@ -195,10 +190,7 @@ where
+                 for (_file_id, watcher) in &mut fp_map {
+                     watcher.set_file_findable(false); // assume not findable until found
+                 }
+-
+-                let paths = trace_span!("paths_provider").in_scope(|| self.paths_provider.paths());
+-
+-                for path in paths.into_iter() {
++                for path in self.paths_provider.paths().into_iter() {
+                     if let Some(file_id) = self.fingerprinter.get_fingerprint_or_log_error(
+                         &path,
+                         &mut fingerprint_buffer,
+@@ -256,12 +248,9 @@ where
+             }
+ 
+             // Collect lines by polling files.
+-            let reading_span = trace_span!("reading").entered();
+             let mut global_bytes_read: usize = 0;
+             let mut maxed_out_reading_single_file = false;
+             for (&file_id, watcher) in &mut fp_map {
+-                let _span = trace_span!("reading", path = ?watcher.path).entered();
+-
+                 if !watcher.should_read() {
+                     continue;
+                 }
+@@ -319,7 +308,6 @@ where
+                     break;
+                 }
+             }
+-            drop(reading_span);
+ 
+             // A FileWatcher is dead when the underlying file has disappeared.
+             // If the FileWatcher is dead we don't retain it; it will be deallocated.
+@@ -337,11 +325,7 @@ where
+             let start = time::Instant::now();
+             let to_send = std::mem::take(&mut lines);
+             let mut stream = stream::once(futures::future::ok(to_send));
+-            let result = self.handle.block_on(
+-                chans
+-                    .send_all(&mut stream)
+-                    .instrument(trace_span!("sending")),
+-            );
++            let result = self.handle.block_on(chans.send_all(&mut stream));
+             match result {
+                 Ok(()) => {}
+                 Err(error) => {
+diff --git a/lib/file-source/src/fingerprinter.rs b/lib/file-source/src/fingerprinter.rs
+index 1b6159740c..ebd791d53c 100644
+--- a/lib/file-source/src/fingerprinter.rs
++++ b/lib/file-source/src/fingerprinter.rs
+@@ -7,7 +7,6 @@ use std::{
+     io::{self, Read, Seek, SeekFrom, Write},
+     path::{Path, PathBuf},
+ };
+-use tracing::trace_span;
+ 
+ const FINGERPRINT_CRC: Crc<u64> = Crc::<u64>::new(&crc::CRC_64_ECMA_182);
+ const LEGACY_FINGERPRINT_CRC: Crc<u64> = Crc::<u64>::new(&crc::CRC_64_XZ);
+@@ -109,7 +108,6 @@ impl Fingerprinter {
+         known_small_files: &mut HashSet<PathBuf>,
+         emitter: &impl FileSourceInternalEvents,
+     ) -> Option<FileFingerprint> {
+-        let _span = trace_span!("fingerprinting", ?path).entered();
+         metadata(path)
+             .and_then(|metadata| {
+                 if metadata.is_dir() {
+diff --git a/src/app.rs b/src/app.rs
+index 241977a43b..7d2261aa44 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -84,15 +84,12 @@ impl Application {
+             LogFormat::Json => true,
+         };
+ 
+-        let enable_datadog_tracing = root_opts.enable_datadog_tracing;
+-
+         metrics::init().expect("metrics initialization failed");
++        trace::init(color, json, &level);
+ 
+         if let Some(threads) = root_opts.threads {
+             if threads < 1 {
+-                // Unforunately we can't `error!` here because we haven't yet called `trace::init`,
+-                // and we can't call that without a runtime available.
+-                println!("Config error: The `threads` argument must be greater or equal to 1.");
++                error!("The `threads` argument must be greater or equal to 1.");
+                 return Err(exitcode::CONFIG);
+             }
+         }
+@@ -105,16 +102,6 @@ impl Application {
+                 .expect("Unable to create async runtime")
+         };
+ 
+-        // We need a runtime to initiate the datadog tracing exporter
+-        rt.block_on(async move {
+-            trace::init(color, json, &level, enable_datadog_tracing);
+-            info!(
+-                message = "Log level is enabled.",
+-                ?level,
+-                ?enable_datadog_tracing
+-            );
+-        });
+-
+         let config = {
+             let config_paths = root_opts.config_paths_with_formats();
+             let pipeline_paths = root_opts.pipeline_paths();
+@@ -147,6 +134,8 @@ impl Application {
+                     return Err(code);
+                 };
+ 
++                info!(message = "Log level is enabled.", level = ?level);
++
+                 let config_paths = config::process_paths(&config_paths).ok_or(exitcode::CONFIG)?;
+ 
+                 if watch_config {
+@@ -368,8 +357,6 @@ impl Application {
+                 }
+                 _ => unreachable!(),
+             }
+-
+-            opentelemetry::global::shutdown_tracer_provider();
+         });
+     }
+ }
+diff --git a/src/cli.rs b/src/cli.rs
+index b479cc3cbc..c687ad077b 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -163,11 +163,6 @@ pub struct RootOpts {
+     /// Watch for changes in configuration file, and reload accordingly.
+     #[structopt(short, long, env = "VECTOR_WATCH_CONFIG")]
+     pub watch_config: bool,
+-
+-    /// Send internal tracing spans to a local APM-enabled Datadog agent with
+-    /// a granularity matching the current log level. This is experimental.
+-    #[structopt(long, env = "VECTOR_ENABLE_DATADOG_TRACING", takes_value(false))]
+-    pub enable_datadog_tracing: bool,
+ }
+ 
+ impl RootOpts {
+diff --git a/src/sources/internal_logs.rs b/src/sources/internal_logs.rs
+index 96d6ff37ca..40e9eeeaad 100644
+--- a/src/sources/internal_logs.rs
++++ b/src/sources/internal_logs.rs
+@@ -100,7 +100,7 @@ mod tests {
+     #[tokio::test]
+     async fn receives_logs() {
+         let start = chrono::Utc::now();
+-        trace::init(false, false, "debug", false);
++        trace::init(false, false, "debug");
+         trace::reset_early_buffer();
+         error!(message = "Before source started.");
+ 
+diff --git a/src/test_util/mod.rs b/src/test_util/mod.rs
+index b8a8206233..e1362ef148 100644
+--- a/src/test_util/mod.rs
++++ b/src/test_util/mod.rs
+@@ -112,7 +112,7 @@ pub fn trace_init() {
+ 
+     let levels = std::env::var("TEST_LOG").unwrap_or_else(|_| "error".to_string());
+ 
+-    trace::init(color, false, &levels, false);
++    trace::init(color, false, &levels);
+ }
+ 
+ pub async fn send_lines(
+diff --git a/src/trace.rs b/src/trace.rs
+index 1b78d7ca16..af7a6e2ad9 100644
+--- a/src/trace.rs
++++ b/src/trace.rs
+@@ -31,26 +31,7 @@ fn metrics_layer_enabled() -> bool {
+     !matches!(std::env::var("DISABLE_INTERNAL_METRICS_TRACING_INTEGRATION"), Ok(x) if x == "true")
+ }
+ 
+-// This is a macro because `$subscriber` can be different, opaque types in different branches
+-macro_rules! send_to_dd {
+-    ($subscriber:ident) => {
+-        let tracer = opentelemetry_datadog::new_pipeline()
+-            .with_service_name("vector")
+-            .with_version(opentelemetry_datadog::ApiVersion::Version05)
+-            .with_trace_config(
+-                opentelemetry::sdk::trace::config()
+-                    .with_sampler(opentelemetry::sdk::trace::Sampler::AlwaysOn),
+-            )
+-            .install_batch(opentelemetry::runtime::Tokio)
+-            .expect("building tracer");
+-
+-        let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
+-
+-        let $subscriber = $subscriber.with(telemetry);
+-    };
+-}
+-
+-pub fn init(color: bool, json: bool, levels: &str, enable_datadog_tracing: bool) {
++pub fn init(color: bool, json: bool, levels: &str) {
+     let _ = BUFFER.set(Mutex::new(Some(Vec::new())));
+ 
+     // An escape hatch to disable injecting a mertics layer into tracing.
+@@ -81,14 +62,6 @@ pub fn init(color: bool, json: bool, levels: &str, enable_datadog_tracing: bool)
+ 
+         if metrics_layer_enabled {
+             let subscriber = subscriber.with(MetricsLayer::new());
+-            if enable_datadog_tracing {
+-                send_to_dd!(subscriber);
+-                Dispatch::new(BroadcastSubscriber { subscriber })
+-            } else {
+-                Dispatch::new(BroadcastSubscriber { subscriber })
+-            }
+-        } else if enable_datadog_tracing {
+-            send_to_dd!(subscriber);
+             Dispatch::new(BroadcastSubscriber { subscriber })
+         } else {
+             Dispatch::new(BroadcastSubscriber { subscriber })
+@@ -106,14 +79,6 @@ pub fn init(color: bool, json: bool, levels: &str, enable_datadog_tracing: bool)
+ 
+         if metrics_layer_enabled {
+             let subscriber = subscriber.with(MetricsLayer::new());
+-            if enable_datadog_tracing {
+-                send_to_dd!(subscriber);
+-                Dispatch::new(BroadcastSubscriber { subscriber })
+-            } else {
+-                Dispatch::new(BroadcastSubscriber { subscriber })
+-            }
+-        } else if enable_datadog_tracing {
+-            send_to_dd!(subscriber);
+             Dispatch::new(BroadcastSubscriber { subscriber })
+         } else {
+             Dispatch::new(BroadcastSubscriber { subscriber })
+diff --git a/website/cue/reference/cli.cue b/website/cue/reference/cli.cue
+index 745ec792dc..f9357c680f 100644
+--- a/website/cue/reference/cli.cue
++++ b/website/cue/reference/cli.cue
+@@ -149,14 +149,6 @@ cli: {
+ 			description: "Watch for changes in the configuration file and reload accordingly"
+ 			env_var:     "VECTOR_WATCH_CONFIG"
+ 		}
+-		"enable-datadog-tracing": {
+-			description: """
+-				Send internal tracing spans to a local APM-enabled
+-				Datadog agent with a granularity matching the current log level.
+-				"""
+-			env_var:      "VECTOR_ENABLE_DATADOG_TRACING"
+-			experimental: true
+-		}
+ 	}
+ 
+ 	options: _config_options & {

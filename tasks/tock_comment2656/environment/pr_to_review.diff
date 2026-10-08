@@ -1,0 +1,168 @@
+diff --git a/kernel/src/grant.rs b/kernel/src/grant.rs
+index 83aeae86a33..a1199718937 100644
+--- a/kernel/src/grant.rs
++++ b/kernel/src/grant.rs
+@@ -215,11 +215,17 @@ impl<'a> GrantUpcallTable<'a> {
+     /// identified by the `subscribe_num`, which must match the subscribe number
+     /// used when the upcall was originally subscribed by a process.
+     /// `subscribe_num`s are indexed starting at zero.
+-    pub fn schedule_upcall(&self, subscribe_num: usize, r0: usize, r1: usize, r2: usize) -> bool {
++    pub fn schedule_upcall(
++        &self,
++        subscribe_num: usize,
++        r0: usize,
++        r1: usize,
++        r2: usize,
++    ) -> Result<(), ErrorCode> {
+         // Implement `self.upcalls[subscribe_num]` without a chance of a panic.
+         self.upcalls
+             .get(subscribe_num)
+-            .map_or(false, |saved_upcall| {
++            .map_or(Err(ErrorCode::INVAL), |saved_upcall| {
+                 // We can create an `Upcall` object based on what is stored in
+                 // the process grant and use that to add the upcall to the
+                 // pending array for the process.
+diff --git a/kernel/src/ipc.rs b/kernel/src/ipc.rs
+index 74f6dcd6b90..289bafabc26 100644
+--- a/kernel/src/ipc.rs
++++ b/kernel/src/ipc.rs
+@@ -225,8 +225,12 @@ impl<const NUM_PROCS: usize, const NUM_UPCALLS: usize> Driver for IPC<NUM_PROCS,
+                             |target| {
+                                 let ret = target.enqueue_task(process::Task::IPC((appid, cb_type)));
+                                 match ret {
+-                                    true => CommandReturn::success(),
+-                                    false => CommandReturn::failure(ErrorCode::FAIL),
++                                    Ok(()) => CommandReturn::success(),
++                                    Err(e) => match e {
++                                        // The other side has a null upcall, choosing to ignore
++                                        ErrorCode::OFF => CommandReturn::success(),
++                                        _ => CommandReturn::failure(e),
++                                    },
+                                 }
+                             },
+                         )
+@@ -248,8 +252,12 @@ impl<const NUM_PROCS: usize, const NUM_UPCALLS: usize> Driver for IPC<NUM_PROCS,
+                             |target| {
+                                 let ret = target.enqueue_task(process::Task::IPC((appid, cb_type)));
+                                 match ret {
+-                                    true => CommandReturn::success(),
+-                                    false => CommandReturn::failure(ErrorCode::FAIL),
++                                    Ok(()) => CommandReturn::success(),
++                                    Err(e) => match e {
++                                        // The other side has a null upcall, choosing to ignore
++                                        ErrorCode::OFF => CommandReturn::success(),
++                                        _ => CommandReturn::failure(e),
++                                    },
+                                 }
+                             },
+                         )
+diff --git a/kernel/src/process.rs b/kernel/src/process.rs
+index 19aef95464d..02f17725e41 100644
+--- a/kernel/src/process.rs
++++ b/kernel/src/process.rs
+@@ -176,7 +176,7 @@ pub trait Process {
+     ///
+     /// This will fail if the process is no longer active, and therefore cannot
+     /// execute any new tasks.
+-    fn enqueue_task(&self, task: Task) -> bool;
++    fn enqueue_task(&self, task: Task) -> Result<(), ErrorCode>;
+ 
+     /// Returns whether this process is ready to execute.
+     fn ready(&self) -> bool;
+diff --git a/kernel/src/process_standard.rs b/kernel/src/process_standard.rs
+index 6e8417533e6..b81078ff5e0 100644
+--- a/kernel/src/process_standard.rs
++++ b/kernel/src/process_standard.rs
+@@ -213,26 +213,27 @@ impl<C: Chip> Process for ProcessStandard<'_, C> {
+         self.process_id.get()
+     }
+ 
+-    fn enqueue_task(&self, task: Task) -> bool {
++    fn enqueue_task(&self, task: Task) -> Result<(), ErrorCode> {
+         // If this app is in a `Fault` state then we shouldn't schedule
+         // any work for it.
+         if !self.is_active() {
+-            return false;
++            return Err(ErrorCode::NODEVICE);
+         }
+ 
+-        let ret = self.tasks.map_or(false, |tasks| tasks.enqueue(task));
+-
+-        // Make a note that we lost this upcall if the enqueue function
+-        // fails.
+-        if ret == false {
+-            self.debug.map(|debug| {
+-                debug.dropped_upcall_count += 1;
+-            });
+-        } else {
+-            self.kernel.increment_work();
+-        }
+-
+-        ret
++        self.tasks.map_or_else(
++            |tasks| {
++                tasks.enqueue(task);
++                self.kernel.increment_work();
++                Ok(())
++            },
++            || {
++                // Make a note that we lost this upcall if the enqueue function fails.
++                self.debug.map(|debug| {
++                    debug.dropped_upcall_count += 1;
++                });
++                Err(ErrorCode::BUSY)
++            },
++        )
+     }
+ 
+     fn ready(&self) -> bool {
+diff --git a/kernel/src/upcall.rs b/kernel/src/upcall.rs
+index 0abe17f00ed..1563c734531 100644
+--- a/kernel/src/upcall.rs
++++ b/kernel/src/upcall.rs
+@@ -78,8 +78,8 @@ impl Upcall {
+         r0: usize,
+         r1: usize,
+         r2: usize,
+-    ) -> bool {
+-        let res = self.fn_ptr.map_or(false, |fp| {
++    ) -> Result<(), ErrorCode> {
++        let res = self.fn_ptr.map_or(Err(ErrorCode::OFF), |fp| {
+             process.enqueue_task(process::Task::FunctionCall(process::FunctionCall {
+                 source: process::FunctionCallSource::Driver(self.upcall_id),
+                 argument0: r0,
+@@ -92,7 +92,7 @@ impl Upcall {
+ 
+         if config::CONFIG.trace_syscalls {
+             debug!(
+-                "[{:?}] schedule[{:#x}:{}] @{:#x}({:#x}, {:#x}, {:#x}, {:#x}) = {}",
++                "[{:?}] schedule[{:#x}:{}] @{:#x}({:#x}, {:#x}, {:#x}, {:#x}) = {:?}",
+                 self.process_id,
+                 self.upcall_id.driver_num,
+                 self.upcall_id.subscribe_num,
+diff --git a/libraries/tock-cells/src/map_cell.rs b/libraries/tock-cells/src/map_cell.rs
+index 85a65dd7eb2..eff0ee648bb 100644
+--- a/libraries/tock-cells/src/map_cell.rs
++++ b/libraries/tock-cells/src/map_cell.rs
+@@ -140,11 +140,19 @@ impl<T> MapCell<T> {
+         }
+     }
+ 
+-    pub fn map_or<F, R>(&self, default: R, closure: F) -> R
++    pub fn map_or<F, R>(&self, default: R, present_closure: F) -> R
+     where
+         F: FnOnce(&mut T) -> R,
+     {
+-        self.map(closure).unwrap_or(default)
++        self.map(present_closure).unwrap_or(default)
++    }
++
++    pub fn map_or_else<D, F, R>(&self, present_closure: F, else_closure: D) -> R
++    where
++        F: FnOnce(&mut T) -> R,
++        D: FnOnce() -> R,
++    {
++        self.map(present_closure).unwrap_or_else(else_closure)
+     }
+ 
+     /// Behaves the same as `map`, except the closure is allowed to return

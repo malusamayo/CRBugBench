@@ -1,0 +1,228 @@
+diff --git a/ingestion/src/metadata/profiler/metrics/hybrid/histogram.py b/ingestion/src/metadata/profiler/metrics/hybrid/histogram.py
+index 6d1718cd3bd4..7a82ccc5ed8c 100644
+--- a/ingestion/src/metadata/profiler/metrics/hybrid/histogram.py
++++ b/ingestion/src/metadata/profiler/metrics/hybrid/histogram.py
+@@ -23,7 +23,8 @@
+ from metadata.profiler.metrics.static.count import Count
+ from metadata.profiler.metrics.static.max import Max
+ from metadata.profiler.metrics.static.min import Min
+-from metadata.profiler.orm.registry import is_quantifiable
++from metadata.profiler.orm.functions.length import LenFn
++from metadata.profiler.orm.registry import is_concatenable, is_quantifiable
+ from metadata.utils.helpers import format_large_string_numbers
+ from metadata.utils.logger import profiler_logger
+ from metadata.utils.sqa_utils import handle_array
+@@ -66,11 +67,11 @@ def _get_res(res: Dict[str, Any]):
+         res_min = res.get(Min.name())
+         res_max = res.get(Max.name())
+ 
+-        if any(var is None for var in [res_iqr, res_row_count, res_min, res_max]):
++        if any(var is None for var in [res_row_count, res_min, res_max]):
+             return None
+ 
+         return (
+-            float(res_iqr),
++            float(res_iqr) if res_iqr is not None else res_iqr,
+             float(res_row_count),
+             float(res_min),
+             float(res_max),
+@@ -110,18 +111,23 @@ def _get_bins(
+             res_min (float): minimum value
+             res_max (float): maximum value
+         """
+-        # freedman-diaconis rule
+-        bin_width = self._get_bin_width(float(res_iqr), res_row_count)  # type: ignore
+-        num_bins = math.ceil((res_max - res_min) / bin_width)  # type: ignore
++        # preinint num_bins over 100.  On the normal path freedman-diaconis will readjust according to the algorithm
++        # when we must fallback to sturges rule due to res_iqr being None, then num_bins will be readjusted.
++        max_bin_count = 100
++        num_bins = max_bin_count + 1
++        if res_iqr:
++            # freedman-diaconis rule
++            bin_width = self._get_bin_width(float(res_iqr), res_row_count)  # type: ignore
++            num_bins = math.ceil((res_max - res_min) / bin_width)  # type: ignore
+ 
+         # sturge's rule
+-        if num_bins > 100:
++        if num_bins > max_bin_count or not res_iqr:
+             num_bins = int(math.ceil(math.log2(res_row_count) + 1))
+             bin_width = (res_max - res_min) / num_bins
+ 
+-        # fallback to 100 bins
+-        if num_bins > 100:
+-            num_bins = 100
++        # fallback to max_bin_count bins
++        if num_bins > max_bin_count:
++            num_bins = max_bin_count
+             bin_width = (res_max - res_min) / num_bins
+ 
+         return num_bins, bin_width
+@@ -141,7 +147,7 @@ def fn(
+                 "We are missing the session attribute to compute the Histogram."
+             )
+ 
+-        if not is_quantifiable(self.col.type):
++        if not (is_quantifiable(self.col.type) or is_concatenable(self.col.type)):
+             return None
+ 
+         # get the metric need for the freedman-diaconis rule
+@@ -159,7 +165,11 @@ def fn(
+         starting_bin_bound = res_min
+         res_min = cast(Union[float, int], res_min)  # satisfy mypy
+         ending_bin_bound = res_min + bin_width
+-        col = column(self.col.name)  # type: ignore
++
++        if is_concatenable(self.col.type):
++            col = LenFn(column(self.col.name))
++        else:
++            col = column(self.col.name)  # type: ignore
+ 
+         case_stmts = []
+         for bin_num in range(num_bins):
+diff --git a/ingestion/src/metadata/profiler/metrics/static/max.py b/ingestion/src/metadata/profiler/metrics/static/max.py
+index 67c39ea7897a..43cecbb61dc5 100644
+--- a/ingestion/src/metadata/profiler/metrics/static/max.py
++++ b/ingestion/src/metadata/profiler/metrics/static/max.py
+@@ -40,12 +40,6 @@ def _(element, compiler, **kw):
+     return f"MAX({col})"
+ 
+ 
+-@compiles(MaxFn, Dialects.Impala)
+-def _(element, compiler, **kw):
+-    col = compiler.process(element.clauses, **kw)
+-    return f"MAX(if(is_nan({col}) or is_inf({col}), null, {col}))"
+-
+-
+ class Max(StaticMetric):
+     """
+     MAX Metric
+diff --git a/ingestion/src/metadata/profiler/metrics/static/mean.py b/ingestion/src/metadata/profiler/metrics/static/mean.py
+index 334430174343..881911eae6eb 100644
+--- a/ingestion/src/metadata/profiler/metrics/static/mean.py
++++ b/ingestion/src/metadata/profiler/metrics/static/mean.py
+@@ -52,15 +52,6 @@ def _(element, compiler, **kw):
+     return f"avg(cast({proc} as decimal))"
+ 
+ 
+-@compiles(avg, Dialects.Impala)
+-def _(element, compiler, **kw):
+-    """
+-    Convert NaN and Inf values to null before computing average.
+-    """
+-    proc = compiler.process(element.clauses, **kw)
+-    return f"avg(if(is_nan({proc}) or is_inf({proc}), null, {proc}))"
+-
+-
+ class Mean(StaticMetric):
+     """
+     AVG Metric
+diff --git a/ingestion/src/metadata/profiler/metrics/static/min.py b/ingestion/src/metadata/profiler/metrics/static/min.py
+index 8971b2ff757b..8d5c24b3bc27 100644
+--- a/ingestion/src/metadata/profiler/metrics/static/min.py
++++ b/ingestion/src/metadata/profiler/metrics/static/min.py
+@@ -40,12 +40,6 @@ def _(element, compiler, **kw):
+     return f"MIN({col})"
+ 
+ 
+-@compiles(MinFn, Dialects.Impala)
+-def _(element, compiler, **kw):
+-    col = compiler.process(element.clauses, **kw)
+-    return f"MIN(if(is_nan({col}) or is_inf({col}), null, {col}))"
+-
+-
+ class Min(StaticMetric):
+     """
+     MIN Metric
+diff --git a/ingestion/src/metadata/profiler/metrics/static/stddev.py b/ingestion/src/metadata/profiler/metrics/static/stddev.py
+index 0bcf16aaf076..465972788ded 100644
+--- a/ingestion/src/metadata/profiler/metrics/static/stddev.py
++++ b/ingestion/src/metadata/profiler/metrics/static/stddev.py
+@@ -44,12 +44,6 @@ def _(element, compiler, **kw):
+     return "STDEVP(%s)" % compiler.process(element.clauses, **kw)
+ 
+ 
+-@compiles(StdDevFn, Dialects.Impala)
+-def _(element, compiler, **kw):
+-    col = compiler.process(element.clauses, **kw)
+-    return f"STDDEV_POP(if(is_nan({col}) or is_inf({col}), null, {col}))"
+-
+-
+ @compiles(StdDevFn, Dialects.SQLite)  # Needed for unit tests
+ def _(element, compiler, **kw):
+     """
+diff --git a/ingestion/src/metadata/profiler/metrics/window/first_quartile.py b/ingestion/src/metadata/profiler/metrics/window/first_quartile.py
+index 13f93218dfb5..0e17ebd02d06 100644
+--- a/ingestion/src/metadata/profiler/metrics/window/first_quartile.py
++++ b/ingestion/src/metadata/profiler/metrics/window/first_quartile.py
+@@ -19,8 +19,9 @@
+ from sqlalchemy import column
+ 
+ from metadata.profiler.metrics.core import StaticMetric, _label
++from metadata.profiler.orm.functions.length import LenFn
+ from metadata.profiler.orm.functions.median import MedianFn
+-from metadata.profiler.orm.registry import is_quantifiable
++from metadata.profiler.orm.registry import is_concatenable, is_quantifiable
+ from metadata.utils.logger import profiler_logger
+ 
+ logger = profiler_logger()
+@@ -53,6 +54,9 @@ def fn(self):
+         if is_quantifiable(self.col.type):
+             return MedianFn(column(self.col.name), self.col.table.fullname, 0.25)
+ 
++        if is_concatenable(self.col.type):
++            return MedianFn(LenFn(column(self.col.name)), self.col.table.fullname, 0.25)
++
+         logger.debug(
+             f"Don't know how to process type {self.col.type} when computing First Quartile"
+         )
+diff --git a/ingestion/src/metadata/profiler/metrics/window/third_quartile.py b/ingestion/src/metadata/profiler/metrics/window/third_quartile.py
+index b40cc41f1091..f0aaad173517 100644
+--- a/ingestion/src/metadata/profiler/metrics/window/third_quartile.py
++++ b/ingestion/src/metadata/profiler/metrics/window/third_quartile.py
+@@ -19,8 +19,9 @@
+ from sqlalchemy import column
+ 
+ from metadata.profiler.metrics.core import StaticMetric, _label
++from metadata.profiler.orm.functions.length import LenFn
+ from metadata.profiler.orm.functions.median import MedianFn
+-from metadata.profiler.orm.registry import is_quantifiable
++from metadata.profiler.orm.registry import is_concatenable, is_quantifiable
+ from metadata.utils.logger import profiler_logger
+ 
+ logger = profiler_logger()
+@@ -53,6 +54,9 @@ def fn(self):
+         if is_quantifiable(self.col.type):
+             return MedianFn(column(self.col.name), self.col.table.fullname, 0.75)
+ 
++        if is_concatenable(self.col.type):
++            return MedianFn(LenFn(column(self.col.name)), self.col.table.fullname, 0.75)
++
+         logger.debug(
+             f"Don't know how to process type {self.col.type} when computing Third Quartile"
+         )
+diff --git a/ingestion/src/metadata/profiler/orm/functions/median.py b/ingestion/src/metadata/profiler/orm/functions/median.py
+index 45d44cb7057b..3015295c23f3 100644
+--- a/ingestion/src/metadata/profiler/orm/functions/median.py
++++ b/ingestion/src/metadata/profiler/orm/functions/median.py
+@@ -111,7 +111,7 @@ def _(elements, compiler, **kwargs):
+     col, _, percentile = [
+         compiler.process(element, **kwargs) for element in elements.clauses
+     ]
+-    return f"if({percentile} = .5, appx_median(if(is_nan({col}) or is_inf({col}), null, {col})), null)"
++    return f"if({percentile} = .5, appx_median({col}), null)"
+ 
+ 
+ @compiles(MedianFn, Dialects.MySQL)
+diff --git a/ingestion/src/metadata/profiler/orm/functions/sum.py b/ingestion/src/metadata/profiler/orm/functions/sum.py
+index 3a1f449661e3..534be4c8aa23 100644
+--- a/ingestion/src/metadata/profiler/orm/functions/sum.py
++++ b/ingestion/src/metadata/profiler/orm/functions/sum.py
+@@ -78,7 +78,7 @@ def _(element, compiler, **kw):
+ def _(element, compiler, **kw):
+     """Impala casting.  Default BIGINT isn't big enough for some sums"""
+     proc = compiler.process(element.clauses, **kw)
+-    return f"SUM(CAST(if(is_nan({proc}) or is_inf({proc}), null, {proc}) AS DOUBLE))"
++    return f"SUM(CAST({proc} AS DOUBLE))"
+ 
+ 
+ @compiles(SumFn, Dialects.IbmDbSa)

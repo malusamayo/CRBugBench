@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "track": "fix",
+  "task": {
+    "pr_number": 6283,
+    "pr_url": "https://github.com/ReactiveX/RxJava/pull/6283",
+    "commit": "3281b027c7e46c1f0ab9ec7719b5029285920e37",
+    "detectability": 5,
+    "szz_confidence": "high",
+    "blamed_line_share": 0.833
+  },
+  "cases": [
+    {
+      "id": "issue:6945",
+      "provenance": "A user reported this defect after the reviewed pull request, and a later fix repaired it.",
+      "summary": "Deadlock",
+      "description": "RXJava 3.0.1.\r\nI randomly got into a weird situation where my code entered a deadlock and I don't know why.\r\nI simplified the code and got to the below part which will enter a deadlock and never return.\r\nThis seems like a bug, but maybe I'm missing something.\r\nThe code:\r\n```java\r\nObservable\r\n    .range(1, 20)\r\n    .flatMap(\r\n            integer -> {\r\n                if (integer % 5 != 0) {\r\n                    return Observable\r\n                            .just(integer);\r\n                }\r\n\r\n                return Observable\r\n                        .just(-integer)\r\n                        .observeOn(Schedulers.io());\r\n            },\r\n            false,\r\n            1\r\n    )\r\n    .ignoreElements()\r\n    .blockingAwait();\r\n```",
+      "location": {
+        "files": [
+          "src/main/java/io/reactivex/rxjava3/internal/operators/observable/ObservableFlatMap.java"
+        ]
+      },
+      "evidence": {
+        "eventual_fix_title": "3.x: Fix Observable.flatMap with maxConcurrency hangs",
+        "eventual_fix_problem_statement": "3.x: Fix Observable.flatMap with maxConcurrency hangs\n\nQueued up scalar values were not counted as completed, thus the subsequent sources where not subscribed to to fill up the allowed concurrency level.\r\n\r\nFixes #6945",
+        "eventual_fix_diff": "commit c4780977c766f301d38b99e304edf492e66c7631\nAuthor: David Karnok <akarnokd@gmail.com>\nDate:   Sat Apr 4 11:29:22 2020 +0200\n\n    3.x: Fix Observable.flatMap with maxConcurrency hangs (#6946)\n    \n    * 3.x: Fix Observable.flatMap with maxConcurrency hangs\n    \n    * Verify Flowable\n\ndiff --git a/src/main/java/io/reactivex/rxjava3/internal/operators/observable/ObservableFlatMap.java b/src/main/java/io/reactivex/rxjava3/internal/operators/observable/ObservableFlatMap.java\nindex d2ca19c31..6265a5d55 100644\n--- a/src/main/java/io/reactivex/rxjava3/internal/operators/observable/ObservableFlatMap.java\n+++ b/src/main/java/io/reactivex/rxjava3/internal/operators/observable/ObservableFlatMap.java\n@@ -318,6 +318,7 @@ public final class ObservableFlatMap<T, U> extends AbstractObservableWithUpstrea\n                 if (checkTerminate()) {\n                     return;\n                 }\n+                int innerCompleted = 0;\n                 SimplePlainQueue<U> svq = queue;\n \n                 if (svq != null) {\n@@ -333,9 +334,18 @@ public final class ObservableFlatMap<T, U> extends AbstractObservableWithUpstrea\n                         }\n \n                         child.onNext(o);\n+                        innerCompleted++;\n                     }\n                 }\n \n+                if (innerCompleted != 0) {\n+                    if (maxConcurrency != Integer.MAX_VALUE) {\n+                        subscribeMore(innerCompleted);\n+                        innerCompleted = 0;\n+                    }\n+                    continue;\n+                }\n+\n                 boolean d = done;\n                 svq = queue;\n                 InnerObserver<?, ?>[] inner = observers.get();\n@@ -353,7 +363,6 @@ public final class ObservableFlatMap<T, U> extends AbstractObservableWithUpstrea\n                     return;\n                 }\n \n-                int innerCompleted = 0;\n                 if (n != 0) {\n                     int j = Math.min(n - 1, lastIndex);\n \n@@ -415,20 +424,12 @@ public final class ObservableFlatMap<T, U> extends AbstractObservableWithUpstrea\n \n                 if (innerCompleted != 0) {\n                     if (maxConcurrency != Integer.MAX_VALUE) {\n-                        while (innerCompleted-- != 0) {\n-                            ObservableSource<? extends U> p;\n-                            synchronized (this) {\n-                                p = sources.poll();\n-                                if (p == null) {\n-                                    wip--;\n-                                    continue;\n-                                }\n-                            }\n-                            subscribeInner(p);\n-                        }\n+                        subscribeMore(innerCompleted);\n+                        innerCompleted = 0;\n                     }\n                     continue;\n                 }\n+\n                 missed = addAndGet(-missed);\n                 if (missed == 0) {\n                     break;\n@@ -436,6 +437,20 @@ public final class ObservableFlatMap<T, U> extends AbstractObservableWithUpstrea\n             }\n         }\n \n+        void subscribeMore(int innerCompleted) {\n+            while (innerCompleted-- != 0) {\n+                ObservableSource<? extends U> p;\n+                synchronized (this) {\n+                    p = sources.poll();\n+                    if (p == null) {\n+                        wip--;\n+                        continue;\n+                    }\n+                }\n+                subscribeInner(p);\n+            }\n+        }\n+\n         boolean checkTerminate() {\n             if (disposed) {\n                 return true;\ndiff --git a/src/test/java/io/reactivex/rxjava3/internal/operators/flowable/FlowableFlatMapTest.java b/src/test/java/io/reactivex/rxjava3/internal/operators/flowable/FlowableFlatMapTest.java\nindex 1687c2dd7..935182fd7 100644\n--- a/src/test/java/io/reactivex/rxjava3/internal/operators/flowable/FlowableFlatMapTest.java\n+++ b/src/test/java/io/reactivex/rxjava3/internal/operators/flowable/FlowableFlatMapTest.java\n@@ -1478,4 +1478,28 @@ public class FlowableFlatMapTest extends RxJavaTest {\n         .requestMore(1)\n         .assertValuesOnly(1);\n     }\n+\n+    @Test(timeout = 5000)\n+    public void mixedScalarAsync() {\n+        for (int i = 0; i < TestHelper.RACE_DEFAULT_LOOPS; i++) {\n+            Flowable\n+            .range(0, 20)\n+            .flatMap(\n+                    integer -> {\n+                        if (integer % 5 != 0) {\n+                            return Flowable\n+                                    .just(integer);\n+                        }\n+\n+                        return Flowable\n+                                .just(-integer)\n+                                .observeOn(Schedulers.computation());\n+                    },\n+                    false,\n+                    1\n+            )\n+            .ignoreElements()\n+            .blockingAwait();\n+        }\n+    }\n }\ndiff --git a/src/test/java/io/reactivex/rxjava3/internal/operators/observable/ObservableFlatMapTest.java b/src/test/java/io/reactivex/rxjava3/internal/operators/observable/ObservableFlatMapTest.java\nindex 165aa9dab..1e083d217 100644\n--- a/src/test/java/io/reactivex/rxjava3/internal/operators/observable/ObservableFlatMapTest.java\n+++ b/src/test/java/io/reactivex/rxjava3/internal/operators/observable/ObservableFlatMapTest.java\n@@ -1240,4 +1240,28 @@ public class ObservableFlatMapTest extends RxJavaTest {\n \n         to.assertFailure(TestException.class, 1, 2);\n     }\n+\n+    @Test(timeout = 5000)\n+    public void mixedScalarAsync() {\n+        for (int i = 0; i < TestHelper.RACE_DEFAULT_LOOPS; i++) {\n+            Observable\n+            .range(0, 20)\n+            .flatMap(\n+                    integer -> {\n+                        if (integer % 5 != 0) {\n+                            return Observable\n+                                    .just(integer);\n+                        }\n+\n+                        return Observable\n+                                .just(-integer)\n+                                .observeOn(Schedulers.computation());\n+                    },\n+                    false,\n+                    1\n+            )\n+            .ignoreElements()\n+            .blockingAwait();\n+        }\n+    }\n }\n"
+      },
+      "metadata": {
+        "oracle_source": "issue",
+        "issue_number": 6945,
+        "issue_url": "https://github.com/ReactiveX/RxJava/issues/6945",
+        "issue_type": "",
+        "issue_priority": null,
+        "issue_severity": null,
+        "issue_tags": [],
+        "issue_area_path": "",
+        "issue_resolved_reason": "",
+        "fix_pr": 6946,
+        "fix_pr_url": "https://github.com/ReactiveX/RxJava/pull/6946",
+        "fix_commit": "c4780977c766f301d38b99e304edf492e66c7631",
+        "verification": {
+          "root_cause_confirmed": "yes",
+          "source": "published task list"
+        }
+      }
+    }
+  ]
+}

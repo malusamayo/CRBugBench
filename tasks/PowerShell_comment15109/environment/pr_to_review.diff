@@ -1,0 +1,434 @@
+diff --git a/.vsts-ci/linux.yml b/.vsts-ci/linux.yml
+index be7de6d8fc5..b5e6db0db71 100644
+--- a/.vsts-ci/linux.yml
++++ b/.vsts-ci/linux.yml
+@@ -89,6 +89,14 @@ stages:
+     parameters:
+       pool: ubuntu-16.04
+ 
++- stage: PackageLinux
++  displayName: Package Linux
++  dependsOn: ["BuildLinux"]
++  jobs:
++  - template: linux/templates/packaging.yml
++    parameters:
++      pool: ubuntu-16.04
++
+ - stage: CodeCovTestPackage
+   displayName: CodeCoverage and Test Packages
+   dependsOn: [] # by specifying an empty array, this stage doesn't depend on the stage before it
+diff --git a/.vsts-ci/linux/templates/packaging.yml b/.vsts-ci/linux/templates/packaging.yml
+new file mode 100644
+index 00000000000..530232cbf67
+--- /dev/null
++++ b/.vsts-ci/linux/templates/packaging.yml
+@@ -0,0 +1,92 @@
++parameters:
++  pool: 'ubuntu-16.04'
++  parentJobs: []
++  name: 'Linux'
++
++jobs:
++- job: ${{ parameters.name }}_packaging
++  dependsOn:
++    ${{ parameters.parentJobs }}
++  pool:
++    vmImage: ${{ parameters.pool }}
++
++  displayName: ${{ parameters.name }} packaging
++
++  steps:
++  - pwsh: |
++      Get-ChildItem -Path env:
++    displayName: Capture Environment
++    condition: succeededOrFailed()
++
++  - task: DownloadBuildArtifacts@0
++    displayName: 'Download build artifacts'
++    inputs:
++      downloadType: specific
++      itemPattern: |
++        build/**/*
++      downloadPath: '$(System.ArtifactsDirectory)'
++
++  - pwsh: |
++      Get-ChildItem "$(System.ArtifactsDirectory)\*" -Recurse
++    displayName: 'Capture Artifacts Directory'
++    continueOnError: true
++
++  - pwsh: |
++      Import-Module .\build.psm1
++      Start-PSBootstrap -Package
++    displayName: Bootstrap
++
++  - pwsh: |
++      Import-Module ./build.psm1
++    displayName: 'Capture Artifacts Directory'
++    continueOnError: true
++
++  - task: ExtractFiles@1
++    displayName: 'Extract Build ZIP'
++    inputs:
++      archiveFilePatterns: '$(System.ArtifactsDirectory)/build/build.zip'
++      destinationFolder: '$(System.ArtifactsDirectory)/bins'
++
++  - bash: |
++      find "$(System.ArtifactsDirectory)/bins" -type d -exec chmod +rwx {} \;
++      find "$(System.ArtifactsDirectory)/bins" -type f -exec chmod +rw {} \;
++    displayName: 'Fix permissions'
++    continueOnError: true
++
++  - pwsh: |
++      Get-ChildItem "$(System.ArtifactsDirectory)\bins\*" -Recurse -ErrorAction SilentlyContinue
++    displayName: 'Capture Extracted Build ZIP'
++    continueOnError: true
++
++  - pwsh: |
++      Import-Module .\tools\ci.psm1
++      Restore-PSOptions -PSOptionsPath '$(System.ArtifactsDirectory)\build\psoptions.json'
++      $options = (Get-PSOptions)
++      $rootPath = '$(System.ArtifactsDirectory)\bins'
++      $originalRootPath = Split-Path -path $options.Output
++      $path = Join-Path -path $rootPath -ChildPath (split-path -leaf -path $originalRootPath)
++      $pwshPath = Join-Path -path $path -ChildPath 'pwsh'
++      chmod a+x $pwshPath
++      $options.Output = $pwshPath
++      Set-PSOptions $options
++      Invoke-CIFinish
++    displayName: Packaging Tests
++    condition: succeeded()
++
++  - pwsh: |
++      Get-ChildItem "${env:BUILD_ARTIFACTSTAGINGDIRECTORY}\*.deb" -Recurse | ForEach-Object {
++        $packagePath = $_.FullName
++        Write-Host "Uploading $packagePath"
++        Write-Host "##vso[artifact.upload containerfolder=deb;artifactname=deb]$packagePath"
++      }
++      Get-ChildItem "${env:BUILD_ARTIFACTSTAGINGDIRECTORY}\*.rpm" -Recurse | ForEach-Object {
++        $packagePath = $_.FullName
++        Write-Host "Uploading $packagePath"
++        Write-Host "##vso[artifact.upload containerfolder=rpm;artifactname=rpm]$packagePath"
++      }
++      Get-ChildItem "${env:BUILD_ARTIFACTSTAGINGDIRECTORY}\*.tar.gz" -Recurse | ForEach-Object {
++        $packagePath = $_.FullName
++        Write-Host "Uploading $packagePath"
++        Write-Host "##vso[artifact.upload containerfolder=rpm;artifactname=rpm]$packagePath"
++      }
++    displayName: Upload packages
+diff --git a/.vsts-ci/templates/ci-build.yml b/.vsts-ci/templates/ci-build.yml
+index 9dc43bc8ebf..b88aa1b7c3d 100644
+--- a/.vsts-ci/templates/ci-build.yml
++++ b/.vsts-ci/templates/ci-build.yml
+@@ -20,7 +20,8 @@ jobs:
+     displayName: Set Build Name for Non-PR
+     condition: ne(variables['Build.Reason'], 'PullRequest')
+ 
+-  - template: /tools/releaseBuild/azureDevOps/templates/insert-nuget-config-azfeed.yml
++  - ${{ if ne(variables['AzDevOpsFeed'], '') }}:
++    - template: /tools/releaseBuild/azureDevOps/templates/insert-nuget-config-azfeed.yml
+ 
+   - pwsh: |
+       if (Test-Path -Path $HOME/.dotnet) {
+diff --git a/tools/ci.psm1 b/tools/ci.psm1
+index 41e972b9bcf..013598a581e 100644
+--- a/tools/ci.psm1
++++ b/tools/ci.psm1
+@@ -713,7 +713,7 @@ function New-LinuxPackage
+ 
+     # Only build packages for PowerShell/PowerShell repository
+     # branches, not pull requests
+-    $packages = @(Start-PSPackage @packageParams -SkipReleaseChecks)
++    $packages = @(Start-PSPackage @packageParams -SkipReleaseChecks -Type deb, rpm, tar)
+     foreach($package in $packages)
+     {
+         if (Test-Path $package)
+@@ -725,21 +725,18 @@ function New-LinuxPackage
+             Write-Error -Message "Package NOT found: $package"
+         }
+ 
+-        if($isFullBuild)
++        if ($package -isnot [System.IO.FileInfo])
+         {
+-            if ($package -isnot [System.IO.FileInfo])
+-            {
+-                $packageObj = Get-Item $package
+-                Write-Error -Message "The PACKAGE is not a FileInfo object"
+-            }
+-            else
+-            {
+-                $packageObj = $package
+-            }
+-
+-            Write-Log -message "Artifacts directory: ${env:BUILD_ARTIFACTSTAGINGDIRECTORY}"
+-            Copy-Item $packageObj.FullName -Destination "${env:BUILD_ARTIFACTSTAGINGDIRECTORY}" -Force
++            $packageObj = Get-Item $package
++            Write-Error -Message "The PACKAGE is not a FileInfo object"
+         }
++        else
++        {
++            $packageObj = $package
++        }
++
++        Write-Log -message "Artifacts directory: ${env:BUILD_ARTIFACTSTAGINGDIRECTORY}"
++        Copy-Item $packageObj.FullName -Destination "${env:BUILD_ARTIFACTSTAGINGDIRECTORY}" -Force
+     }
+ 
+     if ($IsLinux)
+diff --git a/tools/packaging/packaging.psm1 b/tools/packaging/packaging.psm1
+index e9ede940673..e4a5e8ae7e5 100644
+--- a/tools/packaging/packaging.psm1
++++ b/tools/packaging/packaging.psm1
+@@ -6,8 +6,8 @@ $RepoRoot = (Resolve-Path -Path "$PSScriptRoot/../..").Path
+ 
+ $packagingStrings = Import-PowerShellDataFile "$PSScriptRoot\packaging.strings.psd1"
+ Import-Module "$PSScriptRoot\..\Xml" -ErrorAction Stop -Force
+-$DebianDistributions = @("ubuntu.16.04", "ubuntu.18.04", "ubuntu.20.04", "debian.9", "debian.10", "debian.11")
+-$RedhatDistributions = @("rhel.7","centos.8")
++$DebianDistributions = @("deb")
++$RedhatDistributions = @("rh")
+ $script:netCoreRuntime = 'net6.0'
+ $script:iconFileName = "Powershell_black_64.png"
+ $script:iconPath = Join-Path -path $PSScriptRoot -ChildPath "../../assets/$iconFileName" -Resolve
+@@ -577,10 +577,6 @@ function New-TarballPackage {
+     $Staging = "$PSScriptRoot/staging"
+     New-StagingFolder -StagingPath $Staging -PackageSourcePath $PackageSourcePath
+ 
+-    if (-not $ExcludeSymbolicLinks.IsPresent) {
+-        New-PSSymbolicLinks -Distribution 'ubuntu.16.04' -Staging $Staging
+-    }
+-
+     if (Get-Command -Name tar -CommandType Application -ErrorAction Ignore) {
+         if ($Force -or $PSCmdlet.ShouldProcess("Create tarball package")) {
+             $options = "-czf"
+@@ -840,9 +836,6 @@ function New-UnixPackage {
+                 }
+ 
+                 $packageVersion = Get-LinuxPackageSemanticVersion -Version $Version
+-                if (!$Environment.IsRedHatFamily -and !$Environment.IsSUSEFamily) {
+-                    throw ($ErrorMessage -f "Redhat or SUSE Family")
+-                }
+             }
+             "osxpkg" {
+                 $packageVersion = $Version
+@@ -904,8 +897,7 @@ function New-UnixPackage {
+         if ($PSCmdlet.ShouldProcess("Create package file system"))
+         {
+             # Generate After Install and After Remove scripts
+-            $AfterScriptInfo = New-AfterScripts -Link $Link -Distribution $DebDistro
+-            New-PSSymbolicLinks -Distribution $DebDistro -Staging $Staging
++            $AfterScriptInfo = New-AfterScripts -Link $Link -Distribution $DebDistro -Destination $Destination
+ 
+             # there is a weird bug in fpm
+             # if the target of the powershell symlink exists, `fpm` aborts
+@@ -1265,42 +1257,18 @@ function Get-FpmArguments
+     return $Arguments
+ }
+ 
+-function Test-Distribution
+-{
+-    param(
+-        [String]
+-        $Distribution
+-    )
+-
+-    if ( $Environment.IsDebianFamily -and !$Distribution )
+-    {
+-        throw "$Distribution is required for a Debian based distribution."
+-    }
+-
+-    if ( $Environment.IsDebianFamily -and $Script:DebianDistributions -notcontains $Distribution)
+-    {
+-        throw "$Distribution should be one of the following: $Script:DebianDistributions"
+-    }
+-
+-    if ( $Environment.IsRedHatFamily -and $Script:RedHatDistributions -notcontains $Distribution)
+-    {
+-        throw "$Distribution should be one of the following: $Script:RedHatDistributions"
+-    }
+-
+-    return $true
+-}
+ function Get-PackageDependencies
+ {
+     param(
+         [String]
+-        [ValidateScript({Test-Distribution -Distribution $_})]
++        [ValidateSet('rh','deb')]
+         $Distribution
+     )
+ 
+     End {
+         # These should match those in the Dockerfiles, but exclude tools like Git, which, and curl
+         $Dependencies = @()
+-        if ($Environment.IsDebianFamily) {
++        if ($Distribution -eq 'deb') {
+             $Dependencies = @(
+                 "libc6",
+                 "libgcc1",
+@@ -1311,16 +1279,11 @@ function Get-PackageDependencies
+                 "libssl1.1|libssl1.0.2|libssl1.0.0"
+             )
+ 
+-        } elseif ($Environment.IsRedHatFamily) {
++        } elseif ($Distribution -eq 'rh') {
+             $Dependencies = @(
+                 "openssl-libs",
+                 "libicu"
+             )
+-        } elseif ($Environment.IsSUSEFamily) {
+-            $Dependencies = @(
+-                "libopenssl1_0_0",
+-                "libicu"
+-            )
+         }
+ 
+         return $Dependencies
+@@ -1362,7 +1325,11 @@ function New-AfterScripts
+ 
+         [Parameter(Mandatory)]
+         [string]
+-        $Distribution
++        $Distribution,
++
++        [Parameter(Mandatory)]
++        [string]
++        $Destination
+     )
+ 
+     Write-Verbose -Message "AfterScript Distribution: $Distribution" -Verbose
+@@ -1370,14 +1337,14 @@ function New-AfterScripts
+     if ($Environment.IsRedHatFamily) {
+         $AfterInstallScript = [io.path]::GetTempFileName()
+         $AfterRemoveScript = [io.path]::GetTempFileName()
+-        $packagingStrings.RedHatAfterInstallScript -f "$Link" | Out-File -FilePath $AfterInstallScript -Encoding ascii
+-        $packagingStrings.RedHatAfterRemoveScript -f "$Link" | Out-File -FilePath $AfterRemoveScript -Encoding ascii
++        $packagingStrings.RedHatAfterInstallScript -f "$Link", $Destination  | Out-File -FilePath $AfterInstallScript -Encoding ascii
++        $packagingStrings.RedHatAfterRemoveScript -f "$Link", $Destination | Out-File -FilePath $AfterRemoveScript -Encoding ascii
+     }
+     elseif ($Environment.IsDebianFamily -or $Environment.IsSUSEFamily) {
+         $AfterInstallScript = [io.path]::GetTempFileName()
+         $AfterRemoveScript = [io.path]::GetTempFileName()
+-        $packagingStrings.UbuntuAfterInstallScript -f "$Link" | Out-File -FilePath $AfterInstallScript -Encoding ascii
+-        $packagingStrings.UbuntuAfterRemoveScript -f "$Link" | Out-File -FilePath $AfterRemoveScript -Encoding ascii
++        $packagingStrings.UbuntuAfterInstallScript -f "$Link", $Destination | Out-File -FilePath $AfterInstallScript -Encoding ascii
++        $packagingStrings.UbuntuAfterRemoveScript -f "$Link", $Destination | Out-File -FilePath $AfterRemoveScript -Encoding ascii
+     }
+     elseif ($Environment.IsMacOS) {
+         # NOTE: The macos pkgutil doesn't support uninstall actions so we did not implement it.
+@@ -1392,60 +1359,6 @@ function New-AfterScripts
+     }
+ }
+ 
+-function New-PSSymbolicLinks
+-{
+-    param(
+-        [Parameter(Mandatory)]
+-        [string]
+-        $Distribution,
+-
+-        [Parameter(Mandatory)]
+-        [string]
+-        $Staging
+-    )
+-
+-    Write-Verbose -Message "PSSymLinks-Distribution: $Distribution" -Verbose
+-
+-    if ($Environment.IsRedHatFamily) {
+-        switch -regex ($Distribution)
+-        {
+-            # add two symbolic links to system shared libraries that libmi.so is dependent on to handle
+-            # platform specific changes. This is the only set of platforms needed for this currently
+-            # as Ubuntu has these specific library files in the platform and macOS builds for itself
+-            # against the correct versions.
+-            'centos\.8' {
+-                New-Item -Force -ItemType SymbolicLink -Target "/lib64/libssl.so.1.1" -Path "$Staging/libssl.so.1.0.0" > $null
+-                New-Item -Force -ItemType SymbolicLink -Target "/lib64/libcrypto.so.1.1.1" -Path "$Staging/libcrypto.so.1.0.0" > $null
+-            }
+-            default {
+-                New-Item -Force -ItemType SymbolicLink -Target "/lib64/libssl.so.10" -Path "$Staging/libssl.so.1.0.0" > $null
+-                New-Item -Force -ItemType SymbolicLink -Target "/lib64/libcrypto.so.10" -Path "$Staging/libcrypto.so.1.0.0" > $null
+-            }
+-        }
+-    }
+-    elseif ($Environment.IsDebianFamily -or $Environment.IsSUSEFamily) {
+-         switch -regex ($Distribution)
+-        {
+-            # add two symbolic links to system shared libraries that libmi.so is dependent on to handle
+-            # platform specific changes. This appears to be a change in Debian 9; Debian 8 did not need these
+-            # symlinks.
+-            'debian\.9' {
+-                New-Item -Force -ItemType SymbolicLink -Target "/usr/lib/x86_64-linux-gnu/libssl.so.1.0.2" -Path "$Staging/libssl.so.1.0.0" > $null
+-                New-Item -Force -ItemType SymbolicLink -Target "/usr/lib/x86_64-linux-gnu/libcrypto.so.1.0.2" -Path "$Staging/libcrypto.so.1.0.0" > $null
+-            }
+-            'debian\.(10|11)' {
+-                New-Item -Force -ItemType SymbolicLink -Target "/usr/lib/x86_64-linux-gnu/libssl.so.1.1" -Path "$Staging/libssl.so.1.0.0" > $null
+-                New-Item -Force -ItemType SymbolicLink -Target "/usr/lib/x86_64-linux-gnu/libcrypto.so.1.1" -Path "$Staging/libcrypto.so.1.0.0" > $null
+-            }
+-            default {
+-                # Default to old behavior before this change
+-                New-Item -Force -ItemType SymbolicLink -Target "/lib64/libssl.so.10" -Path "$Staging/libssl.so.1.0.0" > $null
+-                New-Item -Force -ItemType SymbolicLink -Target "/lib64/libcrypto.so.10" -Path "$Staging/libcrypto.so.1.0.0" > $null
+-            }
+-        }
+-    }
+-}
+-
+ function New-ManGzip
+ {
+     param(
+diff --git a/tools/packaging/packaging.strings.psd1 b/tools/packaging/packaging.strings.psd1
+index 8fcb4e93fc5..7a06855442d 100644
+--- a/tools/packaging/packaging.strings.psd1
++++ b/tools/packaging/packaging.strings.psd1
+@@ -11,6 +11,14 @@ if [ ! -f /etc/shells ] ; then
+ else
+     grep -q "^{0}$" /etc/shells || echo "{0}" >> /etc/shells
+ fi
++if [ -f /lib64/libssl.so.1.1 ] ; then
++    ln -f -s /lib64/libssl.so.1.1 {1}/libssl.so.1.0.0
++    ln -f -s /lib64/libcrypto.so.1.1.1 {1}/libcrypto.so.1.0.0
++else
++    ln -f -s /lib64/libssl.so.10 {1}/libssl.so.1.0.0
++    ln -f -s /lib64/libcrypto.so.10 {1}/libcrypto.so.1.0.0
++fi
++
+ '@
+ 
+     RedHatAfterRemoveScript = @'
+@@ -20,6 +28,8 @@ if [ "$1" = 0 ] ; then
+         grep -v '^{0}$' /etc/shells > $TmpFile
+         cp -f $TmpFile /etc/shells
+         rm -f $TmpFile
++        rm -f {1}/libssl.so.1.0.0
++        rm -f {1}/libcrypto.so.1.0.0
+     fi
+ fi
+ '@
+@@ -38,6 +48,18 @@ case "$1" in
+         exit 0
+     ;;
+ esac
++
++if [ -f /usr/lib/x86_64-linux-gnu/libssl.so.1.1 ] ; then
++    ln -f -s /usr/lib/x86_64-linux-gnu/libssl.so.1.1 {1}/libssl.so.1.0.0
++    ln -f -s /usr/lib/x86_64-linux-gnu/libcrypto.so.1.1 {1}/libcrypto.so.1.0.0
++elif [ -f /usr/lib/x86_64-linux-gnu/libssl.so.1.0.2 ] ; then
++    ln -f -s /usr/lib/x86_64-linux-gnu/libssl.so.1.0.2 {1}/libssl.so.1.0.0
++    ln -f -s /usr/lib/x86_64-linux-gnu/libcrypto.so.1.0.2 {1}/libcrypto.so.1.0.0
++else
++    ln -f -s /lib64/libssl.so.10 {1}/libssl.so.1.0.0
++    ln -f -s /lib64/libcrypto.so.10 {1}/libcrypto.so.1.0.0
++fi
++
+ '@
+ 
+     UbuntuAfterRemoveScript = @'
+@@ -46,6 +68,8 @@ set -e
+ case "$1" in
+         (remove)
+         remove-shell "{0}"
++        rm -f {1}/libssl.so.1.0.0
++        rm -f {1}/libcrypto.so.1.0.0
+         ;;
+ esac
+ '@

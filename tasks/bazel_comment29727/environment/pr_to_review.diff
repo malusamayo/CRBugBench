@@ -1,0 +1,912 @@
+diff --git a/src/main/java/com/google/devtools/build/lib/analysis/platform/ConstraintSettingInfo.java b/src/main/java/com/google/devtools/build/lib/analysis/platform/ConstraintSettingInfo.java
+index 1b6fbd6afacb55..f5a3bc56fe221f 100644
+--- a/src/main/java/com/google/devtools/build/lib/analysis/platform/ConstraintSettingInfo.java
++++ b/src/main/java/com/google/devtools/build/lib/analysis/platform/ConstraintSettingInfo.java
+@@ -14,13 +14,14 @@
+ 
+ package com.google.devtools.build.lib.analysis.platform;
+ 
+-import com.google.common.base.Objects;
+ import com.google.devtools.build.lib.cmdline.Label;
+ import com.google.devtools.build.lib.concurrent.ThreadSafety.Immutable;
+ import com.google.devtools.build.lib.packages.BuiltinProvider;
+ import com.google.devtools.build.lib.packages.NativeInfo;
+ import com.google.devtools.build.lib.starlarkbuildapi.platform.ConstraintSettingInfoApi;
+ import com.google.devtools.build.lib.util.Fingerprint;
++import java.util.Objects;
++import java.util.stream.Stream;
+ import javax.annotation.Nullable;
+ import net.starlark.java.eval.Printer;
+ 
+@@ -36,10 +37,15 @@ public class ConstraintSettingInfo extends NativeInfo implements ConstraintSetti
+ 
+   private final Label label;
+   @Nullable private final Label defaultConstraintValueLabel;
++  @Nullable private final ConstraintValueInfo refinedConstraintValue;
+ 
+-  private ConstraintSettingInfo(Label label, Label defaultConstraintValueLabel) {
++  private ConstraintSettingInfo(
++      Label label,
++      @Nullable Label defaultConstraintValueLabel,
++      @Nullable ConstraintValueInfo refinedConstraintValue) {
+     this.label = label;
+     this.defaultConstraintValueLabel = defaultConstraintValueLabel;
++    this.refinedConstraintValue = refinedConstraintValue;
+   }
+ 
+   @Override
+@@ -66,6 +72,26 @@ public ConstraintValueInfo defaultConstraintValue() {
+     return ConstraintValueInfo.create(this, defaultConstraintValueLabel);
+   }
+ 
++  /** Returns the refined constraint value, or {@code null} if not set. */
++  @Nullable
++  public ConstraintValueInfo refinedConstraintValue() {
++    return refinedConstraintValue;
++  }
++
++  /**
++   * Iterates the constraint value labels that any {@code constraint_value} for this setting
++   * recursively implies via the {@code refines_constraint_value} chain.
++   */
++  public Iterable<Label> refinementChain() {
++    return () ->
++        Stream.iterate(
++                refinedConstraintValue,
++                Objects::nonNull,
++                cv -> cv.constraint().refinedConstraintValue)
++            .map(ConstraintValueInfo::label)
++            .iterator();
++  }
++
+   /** Add this constraint setting to the given fingerprint. */
+   public void addTo(Fingerprint fp) {
+     fp.addString(label.getCanonicalForm());
+@@ -77,7 +103,7 @@ public boolean equals(Object other) {
+       return false;
+     }
+ 
+-    return Objects.equal(label, otherConstraint.label);
++    return Objects.equals(label, otherConstraint.label);
+   }
+ 
+   @Override
+@@ -91,17 +117,24 @@ public void repr(Printer printer) {
+     if (defaultConstraintValueLabel != null) {
+       printer.append(", default_constraint_value=").append(defaultConstraintValueLabel.toString());
+     }
++    if (refinedConstraintValue != null) {
++      printer.append(", refines_constraint_value=").append(refinedConstraintValue.label());
++    }
+     printer.append(")");
+   }
+ 
+   /** Returns a new {@link ConstraintSettingInfo} with the given data. */
+   public static ConstraintSettingInfo create(Label constraintSetting) {
+-    return create(constraintSetting, null);
++    return create(
++        constraintSetting, /* defaultConstraintValue= */ null, /* refinedConstraintValue= */ null);
+   }
+ 
+   /** Returns a new {@link ConstraintSettingInfo} with the given data. */
+   public static ConstraintSettingInfo create(
+-      Label constraintSetting, Label defaultConstraintValue) {
+-    return new ConstraintSettingInfo(constraintSetting, defaultConstraintValue);
++      Label constraintSetting,
++      @Nullable Label defaultConstraintValue,
++      @Nullable ConstraintValueInfo refinedConstraintValue) {
++    return new ConstraintSettingInfo(
++        constraintSetting, defaultConstraintValue, refinedConstraintValue);
+   }
+ }
+diff --git a/src/main/java/com/google/devtools/build/lib/rules/config/ConfigSetting.java b/src/main/java/com/google/devtools/build/lib/rules/config/ConfigSetting.java
+index 4faeea24ecb58f..632270ebfb9dd8 100644
+--- a/src/main/java/com/google/devtools/build/lib/rules/config/ConfigSetting.java
++++ b/src/main/java/com/google/devtools/build/lib/rules/config/ConfigSetting.java
+@@ -152,7 +152,7 @@ public ConfiguredTarget create(RuleContext ruleContext)
+             ruleContext.getLabel(),
+             settings.nativeFlagSettings,
+             userDefinedFlags.getSpecifiedFlagValues(),
+-            ImmutableSet.copyOf(getSpecifiedConstraintValues(ruleContext)),
++            getSpecifiedConstraintValues(ruleContext),
+             Stream.of(userDefinedFlags.result(), nativeFlagsResult, constraintValuesResult)
+                 .reduce(MatchResult::combine)
+                 .get());
+@@ -838,9 +838,16 @@ private static String maybeCanonicalizeLabel(
+    *
+    * @param ruleContext this rule's RuleContext
+    */
+-  private static List<Label> getSpecifiedConstraintValues(RuleContext ruleContext) {
+-    return ruleContext.getPrerequisites(ConfigSettingRule.CONSTRAINT_VALUES_ATTRIBUTE).stream()
+-        .map(TransitiveInfoCollection::getLabel)
+-        .collect(Collectors.toList());
++  private static ImmutableSet<Label> getSpecifiedConstraintValues(RuleContext ruleContext) {
++    var result = ImmutableSet.<Label>builder();
++    for (TransitiveInfoCollection dep :
++        ruleContext.getPrerequisites(ConfigSettingRule.CONSTRAINT_VALUES_ATTRIBUTE)) {
++      result.add(dep.getLabel());
++      ConstraintValueInfo constraintValue = PlatformProviderUtils.constraintValue(dep);
++      if (constraintValue != null) {
++        result.addAll(constraintValue.constraint().refinementChain());
++      }
++    }
++    return result.build();
+   }
+ }
+diff --git a/src/main/java/com/google/devtools/build/lib/rules/platform/ConstraintSetting.java b/src/main/java/com/google/devtools/build/lib/rules/platform/ConstraintSetting.java
+index 438703b6d2ff00..f88e7c468bd6cb 100644
+--- a/src/main/java/com/google/devtools/build/lib/rules/platform/ConstraintSetting.java
++++ b/src/main/java/com/google/devtools/build/lib/rules/platform/ConstraintSetting.java
+@@ -24,6 +24,8 @@
+ import com.google.devtools.build.lib.analysis.RuleContext;
+ import com.google.devtools.build.lib.analysis.RunfilesProvider;
+ import com.google.devtools.build.lib.analysis.platform.ConstraintSettingInfo;
++import com.google.devtools.build.lib.analysis.platform.ConstraintValueInfo;
++import com.google.devtools.build.lib.analysis.platform.PlatformProviderUtils;
+ import com.google.devtools.build.lib.cmdline.Label;
+ import com.google.devtools.build.lib.packages.BuildType;
+ import com.google.devtools.build.lib.packages.NoSuchTargetException;
+@@ -47,15 +49,37 @@ public ConfiguredTarget create(RuleContext ruleContext)
+         ruleContext
+             .attributes()
+             .get(ConstraintSettingRule.DEFAULT_CONSTRAINT_VALUE_ATTR, BuildType.NODEP_LABEL);
++    Label refinesConstraintValueAttr =
++        ruleContext
++            .attributes()
++            .get(ConstraintSettingRule.REFINES_CONSTRAINT_VALUE_ATTR, BuildType.LABEL);
+ 
+     validateDefaultConstraintValue(ruleContext, constraintSetting, defaultConstraintValue);
+ 
++    // The ConstraintValueInfo of the refined value (resolved through aliases), if any. Its label
++    // is the underlying constraint_value's label, so platform validation and select() refinement
++    // match the value as it appears on platforms.
++    ConstraintValueInfo refinedValue = null;
++    if (refinesConstraintValueAttr != null) {
++      refinedValue =
++          PlatformProviderUtils.constraintValue(
++              ruleContext.getPrerequisite(ConstraintSettingRule.REFINES_CONSTRAINT_VALUE_ATTR));
++      if (refinedValue == null) {
++        // Should not happen since the attribute mandates ConstraintValueInfo.
++        throw ruleContext.throwWithAttributeError(
++            ConstraintSettingRule.REFINES_CONSTRAINT_VALUE_ATTR,
++            "The refined constraint value '"
++                + refinesConstraintValueAttr
++                + "' is not a constraint_value.");
++      }
++    }
++
+     return new RuleConfiguredTargetBuilder(ruleContext)
+         .addProvider(RunfilesProvider.class, RunfilesProvider.EMPTY)
+         .addProvider(FileProvider.class, FileProvider.EMPTY)
+         .addProvider(FilesToRunProvider.class, FilesToRunProvider.EMPTY)
+         .addNativeDeclaredProvider(
+-            ConstraintSettingInfo.create(constraintSetting, defaultConstraintValue))
++            ConstraintSettingInfo.create(constraintSetting, defaultConstraintValue, refinedValue))
+         .build();
+   }
+ 
+diff --git a/src/main/java/com/google/devtools/build/lib/rules/platform/ConstraintSettingRule.java b/src/main/java/com/google/devtools/build/lib/rules/platform/ConstraintSettingRule.java
+index b3e34dd4476263..03e0f8cfc34745 100644
+--- a/src/main/java/com/google/devtools/build/lib/rules/platform/ConstraintSettingRule.java
++++ b/src/main/java/com/google/devtools/build/lib/rules/platform/ConstraintSettingRule.java
+@@ -22,15 +22,18 @@
+ import com.google.devtools.build.lib.analysis.RuleDefinitionEnvironment;
+ import com.google.devtools.build.lib.analysis.config.transitions.NoConfigTransition;
+ import com.google.devtools.build.lib.analysis.platform.ConstraintSettingInfo;
++import com.google.devtools.build.lib.analysis.platform.ConstraintValueInfo;
+ import com.google.devtools.build.lib.packages.BuildType;
+ import com.google.devtools.build.lib.packages.RuleClass;
+ import com.google.devtools.build.lib.packages.RuleClass.ToolchainResolutionMode;
+ import com.google.devtools.build.lib.packages.Types;
++import com.google.devtools.build.lib.util.FileTypeSet;
+ 
+ /** Rule definition for {@link ConstraintSetting}. */
+ public class ConstraintSettingRule implements RuleDefinition {
+   public static final String RULE_NAME = "constraint_setting";
+   public static final String DEFAULT_CONSTRAINT_VALUE_ATTR = "default_constraint_value";
++  public static final String REFINES_CONSTRAINT_VALUE_ATTR = "refines_constraint_value";
+ 
+   @Override
+   public RuleClass build(RuleClass.Builder builder, RuleDefinitionEnvironment env) {
+@@ -61,6 +64,25 @@ constraint list (such as for a <code>config_setting</code>) that requires a part
+         .add(
+             attr(DEFAULT_CONSTRAINT_VALUE_ATTR, BuildType.NODEP_LABEL)
+                 .nonconfigurable("constants must be consistent across configurations"))
++        /* <!-- #BLAZE_RULE(constraint_setting).ATTRIBUTE(refines_constraint_value) -->
++        The label of a <code>constraint_value</code> that this setting refines. If set, any
++        <code>platform</code> that specifies a non-default <code>constraint_value</code> for this
++        setting must also specify the refined <code>constraint_value</code> in its
++        <code>constraint_values</code> attribute. Platforms that resolve to the default
++        <code>constraint_value</code> for this setting (either implicitly via
++        <code>default_constraint_value</code> or explicitly) are exempt from this requirement.
++
++        <p>When both the refined <code>constraint_value</code> and a <code>constraint_value</code>
++        for this setting appear as conditions in the same <code>select</code> and both are
++        satisfied, the condition that includes the refining <code>constraint_value</code> is
++        considered more specific and is chosen unambiguously.
++        <!-- #END_BLAZE_RULE.ATTRIBUTE --> */
++        .add(
++            attr(REFINES_CONSTRAINT_VALUE_ATTR, BuildType.LABEL)
++                .allowedRuleClasses(ConstraintValueRule.RULE_NAME)
++                .allowedFileTypes(FileTypeSet.NO_FILE)
++                .mandatoryProviders(ConstraintValueInfo.PROVIDER.id())
++                .nonconfigurable("constants must be consistent across configurations"))
+         .build();
+   }
+ 
+diff --git a/src/main/java/com/google/devtools/build/lib/rules/platform/Platform.java b/src/main/java/com/google/devtools/build/lib/rules/platform/Platform.java
+index cf2353001b3e87..9a4f057d7753cb 100644
+--- a/src/main/java/com/google/devtools/build/lib/rules/platform/Platform.java
++++ b/src/main/java/com/google/devtools/build/lib/rules/platform/Platform.java
+@@ -29,6 +29,7 @@
+ import com.google.devtools.build.lib.analysis.RunfilesProvider;
+ import com.google.devtools.build.lib.analysis.config.ConfigMatchingProvider;
+ import com.google.devtools.build.lib.analysis.platform.ConstraintCollection;
++import com.google.devtools.build.lib.analysis.platform.ConstraintValueInfo;
+ import com.google.devtools.build.lib.analysis.platform.PlatformInfo;
+ import com.google.devtools.build.lib.analysis.platform.PlatformProviderUtils;
+ import com.google.devtools.build.lib.cmdline.Label;
+@@ -108,6 +109,8 @@ public ConfiguredTarget create(RuleContext ruleContext)
+       throw ruleContext.throwWithAttributeError(PlatformRule.EXEC_PROPS_ATTR, e.getMessage());
+     }
+ 
++    validateRefinedConstraintValues(ruleContext, platformInfo);
++
+     return new RuleConfiguredTargetBuilder(ruleContext)
+         .addProvider(RunfilesProvider.class, RunfilesProvider.EMPTY)
+         .addProvider(FileProvider.class, FileProvider.EMPTY)
+@@ -115,4 +118,67 @@ public ConfiguredTarget create(RuleContext ruleContext)
+         .addNativeDeclaredProvider(platformInfo)
+         .build();
+   }
++
++  /**
++   * Verifies that whenever a platform declares a non-default {@code constraint_value} for a {@code
++   * constraint_setting} that refines another {@code constraint_value}, the refined {@code
++   * constraint_value} is also declared on the platform (directly or via a parent).
++   *
++   * <p>The check is skipped for refining values that equal the {@code default_constraint_value} of
++   * their setting, allowing a "no information" default that does not pull in the refined value.
++   */
++  private static void validateRefinedConstraintValues(
++      RuleContext ruleContext, PlatformInfo platformInfo)
++      throws RuleErrorException, InterruptedException {
++    ConstraintCollection constraints = platformInfo.constraints();
++    ImmutableList<ConstraintValueInfo> directConstraints =
++        PlatformProviderUtils.constraintValues(
++            ruleContext.getPrerequisites(PlatformRule.CONSTRAINT_VALUES_ATTR));
++    boolean hasError = false;
++    for (ConstraintValueInfo constraintValue : directConstraints) {
++      var setting = constraintValue.constraint();
++      if (constraintValue.equals(setting.defaultConstraintValue())) {
++        // Default values don't carry the refinement implication.
++        continue;
++      }
++      ConstraintValueInfo refinedValue = setting.refinedConstraintValue();
++      if (refinedValue == null) {
++        continue;
++      }
++      ConstraintValueInfo actualValue = constraints.get(refinedValue.constraint());
++      if (refinedValue.equals(actualValue)) {
++        continue;
++      }
++
++      hasError = true;
++      var mainRepoMapping = ruleContext.getAnalysisEnvironment().getMainRepoMapping();
++      if (actualValue == null) {
++        ruleContext.attributeError(
++            PlatformRule.CONSTRAINT_VALUES_ATTR,
++            String.format(
++                "constraint_value %s refines %s, but platform %s does not set the latter. "
++                    + "Fix with:\n  buildozer 'add %s %s' %s",
++                constraintValue.label().getShorthandDisplayForm(mainRepoMapping),
++                refinedValue.label().getShorthandDisplayForm(mainRepoMapping),
++                ruleContext.getLabel().getShorthandDisplayForm(mainRepoMapping),
++                PlatformRule.CONSTRAINT_VALUES_ATTR,
++                refinedValue.label().getShorthandDisplayForm(mainRepoMapping),
++                ruleContext.getLabel().getShorthandDisplayForm(mainRepoMapping)));
++      } else {
++        ruleContext.attributeError(
++            PlatformRule.CONSTRAINT_VALUES_ATTR,
++            String.format(
++                "constraint_value %s refines %s, but platform %s sets the conflicting"
++                    + " constraint_value %s for %s",
++                constraintValue.label().getShorthandDisplayForm(mainRepoMapping),
++                refinedValue.label().getShorthandDisplayForm(mainRepoMapping),
++                ruleContext.getLabel().getShorthandDisplayForm(mainRepoMapping),
++                actualValue.label().getShorthandDisplayForm(mainRepoMapping),
++                refinedValue.constraint().label().getShorthandDisplayForm(mainRepoMapping)));
++      }
++    }
++    if (hasError) {
++      throw new RuleErrorException();
++    }
++  }
+ }
+diff --git a/src/test/java/com/google/devtools/build/lib/analysis/ConfigurableAttributesTest.java b/src/test/java/com/google/devtools/build/lib/analysis/ConfigurableAttributesTest.java
+index 297dde864267d6..4b344eac7aae16 100644
+--- a/src/test/java/com/google/devtools/build/lib/analysis/ConfigurableAttributesTest.java
++++ b/src/test/java/com/google/devtools/build/lib/analysis/ConfigurableAttributesTest.java
+@@ -929,6 +929,49 @@ public void multipleMatchesUnambiguous_aliasedConstraintValue() throws Exception
+         /*not expected:*/ ImmutableList.of("src a/a.in"));
+   }
+ 
++  /**
++   * Tests that a condition matching via a refining {@code constraint_value} is treated as more
++   * specific than a condition matching via the refined {@code constraint_value}, so that both can
++   * appear in the same {@code select()} without producing an "ambiguous match" error.
++   */
++  @Test
++  public void multipleMatchesUnambiguous_refinedConstraintValue() throws Exception {
++    scratch.file(
++        "conditions/BUILD",
++        "constraint_setting(name = 'libc')",
++        "constraint_value(name = 'glibc', constraint_setting = ':libc')",
++        "constraint_setting(",
++        "    name = 'glibc_version',",
++        "    refines_constraint_value = ':glibc')",
++        "constraint_value(name = 'glibc_2_42', constraint_setting = ':glibc_version')",
++        "platform(",
++        "    name = 'specialized_platform',",
++        "    constraint_values = [':glibc', ':glibc_2_42'],",
++        ")",
++        "config_setting(",
++        "    name = 'refined',",
++        "    constraint_values = [':glibc'])",
++        "config_setting(",
++        "    name = 'refining',",
++        "    constraint_values = [':glibc_2_42'])");
++    scratch.file(
++        "a/BUILD",
++        "genrule(",
++        "    name = 'gen',",
++        "    cmd = '',",
++        "    outs = ['gen.out'],",
++        "    srcs = select({",
++        "        '//conditions:refined': ['refined.in'],",
++        "        '//conditions:refining': ['refining.in'],",
++        "    }))");
++    checkRule(
++        "//a:gen",
++        "srcs",
++        ImmutableList.of("--platforms=//conditions:specialized_platform"),
++        /*expected:*/ ImmutableList.of("src a/refining.in"),
++        /*not expected:*/ ImmutableList.of("src a/refined.in"));
++  }
++
+   /** Tests that default conditions are only required when no main condition matches. */
+   @Test
+   public void noDefaultCondition() throws Exception {
+diff --git a/src/test/java/com/google/devtools/build/lib/analysis/platform/ConstraintCollectionTest.java b/src/test/java/com/google/devtools/build/lib/analysis/platform/ConstraintCollectionTest.java
+index 625299d5301b89..b2aae8b56be7f3 100644
+--- a/src/test/java/com/google/devtools/build/lib/analysis/platform/ConstraintCollectionTest.java
++++ b/src/test/java/com/google/devtools/build/lib/analysis/platform/ConstraintCollectionTest.java
+@@ -58,7 +58,8 @@ public void testSetArithmetic_withDefaultValues() throws Exception {
+     ConstraintSettingInfo setting =
+         ConstraintSettingInfo.create(
+             Label.parseCanonicalUnchecked("//foo:s"),
+-            Label.parseCanonicalUnchecked("//foo:value1"));
++            Label.parseCanonicalUnchecked("//foo:value1"),
++            /* refinedConstraintValue= */ null);
+     ConstraintValueInfo value1 =
+         ConstraintValueInfo.create(setting, Label.parseCanonicalUnchecked("//foo:value1"));
+     ConstraintValueInfo value2 =
+diff --git a/src/test/java/com/google/devtools/build/lib/rules/config/ConfigSettingTest.java b/src/test/java/com/google/devtools/build/lib/rules/config/ConfigSettingTest.java
+index 48befb3a9120ab..e08f49aab5958a 100644
+--- a/src/test/java/com/google/devtools/build/lib/rules/config/ConfigSettingTest.java
++++ b/src/test/java/com/google/devtools/build/lib/rules/config/ConfigSettingTest.java
+@@ -1812,6 +1812,63 @@ public void refinesSettingWithSubsetConstraintValues() throws Exception {
+         .isTrue();
+   }
+ 
++  @Test
++  public void refinesSettingWithRefinedConstraintValue() throws Exception {
++    scratch.file(
++        "libc/BUILD",
++        """
++        constraint_setting(name = "libc")
++
++        constraint_value(
++            name = "glibc",
++            constraint_setting = ":libc",
++        )
++        """);
++    scratch.file(
++        "libc/glibc/BUILD",
++        """
++        constraint_setting(
++            name = "version",
++            refines_constraint_value = "//libc:glibc",
++        )
++
++        constraint_value(
++            name = "2.42",
++            constraint_setting = ":version",
++        )
++        """);
++    scratch.file(
++        "test/BUILD",
++        """
++        platform(
++            name = "p",
++            constraint_values = [
++                "//libc:glibc",
++                "//libc/glibc:2.42",
++            ],
++        )
++
++        config_setting(
++            name = "refining",
++            constraint_values = ["//libc/glibc:2.42"],
++        )
++
++        config_setting(
++            name = "refined",
++            constraint_values = ["//libc:glibc"],
++        )
++        """);
++    useConfiguration("--platforms=//test:p");
++    assertThat(
++            getConfigMatchingProvider("//test:refining")
++                .refines(getConfigMatchingProvider("//test:refined")))
++        .isTrue();
++    assertThat(
++            getConfigMatchingProvider("//test:refined")
++                .refines(getConfigMatchingProvider("//test:refining")))
++        .isFalse();
++  }
++
+   @Test
+   public void matchesAliasedFlagsInFlagValues() throws Exception {
+     useConfiguration("--enforce_transitive_configs_for_config_feature_flag");
+diff --git a/src/test/java/com/google/devtools/build/lib/rules/platform/ConstraintTest.java b/src/test/java/com/google/devtools/build/lib/rules/platform/ConstraintTest.java
+index 058a2be5fa806f..2e4d1725472929 100644
+--- a/src/test/java/com/google/devtools/build/lib/rules/platform/ConstraintTest.java
++++ b/src/test/java/com/google/devtools/build/lib/rules/platform/ConstraintTest.java
+@@ -222,6 +222,168 @@ def _impl(ctx):
+     assertThat(hasConstraintValue).isTrue();
+   }
+ 
++  @Test
++  public void testConstraint_refinesConstraintValue() throws Exception {
++    scratch.file(
++        "libc/BUILD",
++        """
++        constraint_setting(name = "libc")
++
++        constraint_value(
++            name = "glibc",
++            constraint_setting = ":libc",
++        )
++        """);
++    scratch.file(
++        "libc/glibc/BUILD",
++        """
++        constraint_setting(
++            name = "version",
++            refines_constraint_value = "//libc:glibc",
++        )
++
++        constraint_value(
++            name = "2.42",
++            constraint_setting = ":version",
++        )
++        """);
++
++    ConfiguredTarget setting = getConfiguredTarget("//libc/glibc:version");
++    assertThat(setting).isNotNull();
++    ConstraintSettingInfo settingInfo = PlatformProviderUtils.constraintSetting(setting);
++    assertThat(settingInfo).isNotNull();
++    assertThat(settingInfo.refinedConstraintValue().label())
++        .isEqualTo(Label.parseCanonical("//libc:glibc"));
++    assertThat(settingInfo.refinementChain()).containsExactly(Label.parseCanonical("//libc:glibc"));
++  }
++
++  @Test
++  public void testConstraint_refinesConstraintValue_alias() throws Exception {
++    scratch.file(
++        "libc/BUILD",
++        """
++        constraint_setting(name = "libc")
++
++        constraint_value(
++            name = "glibc",
++            constraint_setting = ":libc",
++        )
++
++        alias(
++            name = "glibc_alias",
++            actual = ":glibc",
++        )
++        """);
++    scratch.file(
++        "libc/glibc/BUILD",
++        """
++        constraint_setting(
++            name = "version",
++            refines_constraint_value = "//libc:glibc_alias",
++        )
++
++        constraint_value(
++            name = "2.42",
++            constraint_setting = ":version",
++        )
++        """);
++
++    ConfiguredTarget setting = getConfiguredTarget("//libc/glibc:version");
++    ConstraintSettingInfo settingInfo = PlatformProviderUtils.constraintSetting(setting);
++    assertThat(settingInfo).isNotNull();
++    // The alias is resolved to the underlying constraint_value.
++    assertThat(settingInfo.refinedConstraintValue().label())
++        .isEqualTo(Label.parseCanonical("//libc:glibc"));
++    assertThat(settingInfo.refinementChain()).containsExactly(Label.parseCanonical("//libc:glibc"));
++  }
++
++  @Test
++  public void testConstraint_refinesConstraintValue_chain() throws Exception {
++    scratch.file(
++        "a/BUILD",
++        """
++        constraint_setting(name = "a")
++
++        constraint_value(
++            name = "a1",
++            constraint_setting = ":a",
++        )
++        """);
++    scratch.file(
++        "b/BUILD",
++        """
++        constraint_setting(
++            name = "b",
++            refines_constraint_value = "//a:a1",
++        )
++
++        constraint_value(
++            name = "b1",
++            constraint_setting = ":b",
++        )
++        """);
++    scratch.file(
++        "c/BUILD",
++        """
++        constraint_setting(
++            name = "c",
++            refines_constraint_value = "//b:b1",
++        )
++
++        constraint_value(
++            name = "c1",
++            constraint_setting = ":c",
++        )
++        """);
++
++    ConfiguredTarget setting = getConfiguredTarget("//c:c");
++    ConstraintSettingInfo settingInfo = PlatformProviderUtils.constraintSetting(setting);
++    assertThat(settingInfo).isNotNull();
++    assertThat(settingInfo.refinementChain())
++        .containsExactly(Label.parseCanonical("//b:b1"), Label.parseCanonical("//a:a1"))
++        .inOrder();
++  }
++
++  @Test
++  public void testConstraint_refinesConstraintValue_withDefault() throws Exception {
++    scratch.file(
++        "libc/BUILD",
++        """
++        constraint_setting(name = "libc")
++
++        constraint_value(
++            name = "glibc",
++            constraint_setting = ":libc",
++        )
++        """);
++    scratch.file(
++        "libc/glibc/BUILD",
++        """
++        constraint_setting(
++            name = "version",
++            default_constraint_value = ":unknown",
++            refines_constraint_value = "//libc:glibc",
++        )
++
++        constraint_value(
++            name = "unknown",
++            constraint_setting = ":version",
++        )
++
++        constraint_value(
++            name = "2.42",
++            constraint_setting = ":version",
++        )
++        """);
++
++    ConfiguredTarget setting = getConfiguredTarget("//libc/glibc:version");
++    ConstraintSettingInfo settingInfo = PlatformProviderUtils.constraintSetting(setting);
++    assertThat(settingInfo).isNotNull();
++    assertThat(settingInfo.hasDefaultConstraintValue()).isTrue();
++    assertThat(settingInfo.refinedConstraintValue().label())
++        .isEqualTo(Label.parseCanonical("//libc:glibc"));
++  }
++
+   @Test
+   public void testConstraint_defaultValue_notSet_starlark() throws Exception {
+     setBuildLanguageOptions("--experimental_platforms_api=true");
+diff --git a/src/test/java/com/google/devtools/build/lib/rules/platform/PlatformInfoApiTest.java b/src/test/java/com/google/devtools/build/lib/rules/platform/PlatformInfoApiTest.java
+index b948aff430756e..04bbeb28a60dec 100644
+--- a/src/test/java/com/google/devtools/build/lib/rules/platform/PlatformInfoApiTest.java
++++ b/src/test/java/com/google/devtools/build/lib/rules/platform/PlatformInfoApiTest.java
+@@ -95,6 +95,273 @@ public void constraints_overlappingError() throws Exception {
+         lines.toArray(new String[] {}));
+   }
+ 
++  @Test
++  public void constraints_refinesConstraintValue_satisfied() throws Exception {
++    scratch.file(
++        "libc/BUILD",
++        """
++        constraint_setting(name = "libc")
++
++        constraint_value(
++            name = "glibc",
++            constraint_setting = ":libc",
++        )
++        """);
++    scratch.file(
++        "libc/glibc/BUILD",
++        """
++        constraint_setting(
++            name = "version",
++            refines_constraint_value = "//libc:glibc",
++        )
++
++        constraint_value(
++            name = "2.42",
++            constraint_setting = ":version",
++        )
++        """);
++    scratch.file(
++        "platforms/BUILD",
++        """
++        platform(
++            name = "glibc242",
++            constraint_values = [
++                "//libc:glibc",
++                "//libc/glibc:2.42",
++            ],
++        )
++        """);
++
++    PlatformInfo platformInfo = fetchPlatformInfo("//platforms:glibc242");
++    assertThat(platformInfo).isNotNull();
++  }
++
++  @Test
++  public void constraints_refinesConstraintValue_alias_satisfied() throws Exception {
++    scratch.file(
++        "libc/BUILD",
++        """
++        constraint_setting(name = "libc")
++
++        constraint_value(
++            name = "glibc",
++            constraint_setting = ":libc",
++        )
++
++        alias(
++            name = "glibc_alias",
++            actual = ":glibc",
++        )
++        """);
++    scratch.file(
++        "libc/glibc/BUILD",
++        """
++        constraint_setting(
++            name = "version",
++            refines_constraint_value = "//libc:glibc_alias",
++        )
++
++        constraint_value(
++            name = "2.42",
++            constraint_setting = ":version",
++        )
++        """);
++    // The refined value is declared by its real label even though refines_constraint_value used
++    // an alias.
++    scratch.file(
++        "platforms/BUILD",
++        """
++        platform(
++            name = "glibc242",
++            constraint_values = [
++                "//libc:glibc",
++                "//libc/glibc:2.42",
++            ],
++        )
++        """);
++
++    PlatformInfo platformInfo = fetchPlatformInfo("//platforms:glibc242");
++    assertThat(platformInfo).isNotNull();
++  }
++
++  @Test
++  public void constraints_refinesConstraintValue_missingRefined_error() throws Exception {
++    scratch.file(
++        "libc/BUILD",
++        """
++        constraint_setting(name = "libc")
++
++        constraint_value(
++            name = "glibc",
++            constraint_setting = ":libc",
++        )
++        """);
++    scratch.file(
++        "libc/glibc/BUILD",
++        """
++        constraint_setting(
++            name = "version",
++            refines_constraint_value = "//libc:glibc",
++        )
++
++        constraint_value(
++            name = "2.42",
++            constraint_setting = ":version",
++        )
++        """);
++    checkError(
++        "platforms",
++        "broken",
++        "constraint_value //libc/glibc:2.42 refines //libc:glibc, but platform //platforms:broken"
++            + " does not set the latter.",
++        """
++        platform(
++            name = "broken",
++            constraint_values = ["//libc/glibc:2.42"],
++        )
++        """);
++    assertContainsEvent("buildozer 'add constraint_values //libc:glibc' //platforms:broken");
++  }
++
++  @Test
++  public void constraints_refinesConstraintValue_wrongValue_error() throws Exception {
++    scratch.file(
++        "libc/BUILD",
++        """
++        constraint_setting(name = "libc")
++
++        constraint_value(
++            name = "glibc",
++            constraint_setting = ":libc",
++        )
++
++        constraint_value(
++            name = "musl",
++            constraint_setting = ":libc",
++        )
++        """);
++    scratch.file(
++        "libc/glibc/BUILD",
++        """
++        constraint_setting(
++            name = "version",
++            refines_constraint_value = "//libc:glibc",
++        )
++
++        constraint_value(
++            name = "2.42",
++            constraint_setting = ":version",
++        )
++        """);
++    // The platform sets a conflicting value (musl) for the refined setting.
++    checkError(
++        "platforms",
++        "wrong",
++        "constraint_value //libc/glibc:2.42 refines //libc:glibc, but platform //platforms:wrong"
++            + " sets the conflicting constraint_value //libc:musl for //libc",
++        """
++        platform(
++            name = "wrong",
++            constraint_values = [
++                "//libc:musl",
++                "//libc/glibc:2.42",
++            ],
++        )
++        """);
++    // A conflicting value is a likely-real contradiction, so no mechanical buildozer fixup is
++    // suggested.
++    assertDoesNotContainEvent("buildozer");
++  }
++
++  @Test
++  public void constraints_refinesConstraintValue_defaultNotEnforced() throws Exception {
++    scratch.file(
++        "libc/BUILD",
++        """
++        constraint_setting(name = "libc")
++
++        constraint_value(
++            name = "glibc",
++            constraint_setting = ":libc",
++        )
++        """);
++    scratch.file(
++        "libc/glibc/BUILD",
++        """
++        constraint_setting(
++            name = "version",
++            default_constraint_value = ":unknown",
++            refines_constraint_value = "//libc:glibc",
++        )
++
++        constraint_value(
++            name = "unknown",
++            constraint_setting = ":version",
++        )
++
++        constraint_value(
++            name = "2.42",
++            constraint_setting = ":version",
++        )
++        """);
++    // Platform may explicitly set the *default* refining value without declaring the refined one.
++    scratch.file(
++        "platforms/BUILD",
++        """
++        platform(
++            name = "default_only",
++            constraint_values = ["//libc/glibc:unknown"],
++        )
++        """);
++
++    PlatformInfo platformInfo = fetchPlatformInfo("//platforms:default_only");
++    assertThat(platformInfo).isNotNull();
++  }
++
++  @Test
++  public void constraints_refinesConstraintValue_inheritedFromParent() throws Exception {
++    scratch.file(
++        "libc/BUILD",
++        """
++        constraint_setting(name = "libc")
++
++        constraint_value(
++            name = "glibc",
++            constraint_setting = ":libc",
++        )
++        """);
++    scratch.file(
++        "libc/glibc/BUILD",
++        """
++        constraint_setting(
++            name = "version",
++            refines_constraint_value = "//libc:glibc",
++        )
++
++        constraint_value(
++            name = "2.42",
++            constraint_setting = ":version",
++        )
++        """);
++    scratch.file(
++        "platforms/BUILD",
++        """
++        platform(
++            name = "parent",
++            constraint_values = ["//libc:glibc"],
++        )
++
++        platform(
++            name = "child",
++            parents = [":parent"],
++            constraint_values = ["//libc/glibc:2.42"],
++        )
++        """);
++
++    PlatformInfo platformInfo = fetchPlatformInfo("//platforms:child");
++    assertThat(platformInfo).isNotNull();
++  }
++
+   @Test
+   public void constraints_invalidTarget_error() throws Exception {
+     checkError(

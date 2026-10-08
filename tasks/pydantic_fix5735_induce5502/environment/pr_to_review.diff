@@ -1,0 +1,1458 @@
+commit 8ee553aae909a88df483d6454ed9af58c494879f
+Author: Samuel Colvin <s@muelcolvin.com>
+Date:   Wed Apr 19 16:02:41 2023 +0100
+
+    Computed Fields (#5502)
+
+diff --git a/docs/usage/computed_fields.md b/docs/usage/computed_fields.md
+new file mode 100644
+index 000000000..08498d06b
+--- /dev/null
++++ b/docs/usage/computed_fields.md
+@@ -0,0 +1,76 @@
++## Field with computed value based on other fields
++
++Computed fields allow `property` and `cached_property` to be included when serializing models or dataclasses.
++
++```py
++from pydantic import BaseModel, computed_field
++
++
++class Rectangle(BaseModel):
++    width: int
++    length: int
++
++    @computed_field
++    @property
++    def area(self) -> int:
++        return self.width * self.length
++
++
++print(Rectangle(width=3, length=2).model_dump())
++#> {'width': 3, 'length': 2, 'area': 6}
++```
++
++If the `computed_field` decorator is applied to a bare function
++(e.g. a function with the `@property` or `@cached_property` decorator)
++it will wrap the function in `property` itself. Although this is more concise, you will lose IntelliSense in your IDE,
++and confuse static type checkers, thus explicit use of `@property` is recommended.
++
++!!! warning "Mypy Warning"
++    Even with the `@property` or `@cached_property` applied to your function before `@computed_field`,
++    mypy won't be happy because of [this issue](https://github.com/python/mypy/issues/1362),
++    you'll need to add `# type: ignore[misc]` to the `@computed_field` line.
++
++In contract, [pyright](https://github.com/microsoft/pyright) works nicely with `@computed_field`.
++
++```py requires="3.8"
++import random
++from functools import cached_property
++
++from pydantic import BaseModel, computed_field
++
++
++class Square(BaseModel):
++    width: float
++
++    @computed_field
++    def area(self) -> float:  # converted to a `property` by `computed_field`
++        return round(self.width**2, 2)
++
++    @area.setter
++    def area(self, new_area: float) -> None:
++        self.width = new_area**0.5
++
++    @computed_field(alias='the magic number', repr=False)
++    @cached_property
++    def random_number(self) -> int:
++        return random.randint(0, 1_000)
++
++
++square = Square(width=1.3)
++
++# `random_number` does not appear in representation
++print(repr(square))
++#> Square(width=1.3, area=1.69)
++
++print(square.random_number)
++#> 3
++
++# same random number as before (cached as expected)
++print(square.model_dump())
++#> {'width': 1.3, 'area': 1.69, 'random_number': 3}
++
++square.area = 4
++
++print(square.model_dump_json(by_alias=True))
++#> {"width":2.0,"area":4.0,"the magic number":3}
++```
+diff --git a/mkdocs.yml b/mkdocs.yml
+index efd6bd1e1..fe606ade2 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -79,6 +79,7 @@ nav:
+   - 'Model Config': usage/model_config.md
+   - usage/schema.md
+   - usage/exporting_models.md
++  - usage/computed_fields.md
+   - usage/dataclasses.md
+   - usage/validation_decorator.md
+   - usage/postponed_annotations.md
+diff --git a/pydantic/__init__.py b/pydantic/__init__.py
+index 1fbefc515..3e2ac5af5 100644
+--- a/pydantic/__init__.py
++++ b/pydantic/__init__.py
+@@ -15,7 +15,7 @@ from .decorators import field_serializer, field_validator, model_serializer, roo
+ from .deprecated.config import BaseConfig
+ from .deprecated.tools import *
+ from .errors import *
+-from .fields import AliasChoices, AliasPath, Field, PrivateAttr
++from .fields import AliasChoices, AliasPath, Field, PrivateAttr, computed_field
+ from .main import *
+ from .networks import *
+ from .types import *
+@@ -57,6 +57,7 @@ __all__ = [
+     'AliasPath',
+     'AliasChoices',
+     'Field',
++    'computed_field',
+     # main
+     'BaseModel',
+     'create_model',
+diff --git a/pydantic/_internal/_decorators.py b/pydantic/_internal/_decorators.py
+index ba534cf7e..d32a4a77c 100644
+--- a/pydantic/_internal/_decorators.py
++++ b/pydantic/_internal/_decorators.py
+@@ -3,21 +3,28 @@ Logic related to validators applied to models etc. via the `@validator` and `@ro
+ """
+ from __future__ import annotations as _annotations
+ 
+-from dataclasses import field
++from dataclasses import dataclass, field
+ from functools import partial, partialmethod
+-from inspect import Parameter, Signature, signature
+-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Generic, TypeVar, Union, cast, overload
++from inspect import Parameter, Signature, isdatadescriptor, ismethoddescriptor, signature
++from typing import TYPE_CHECKING, Any, Callable, ClassVar, Generic, TypeVar, Union, cast
+ 
+ from pydantic_core import core_schema
+ from typing_extensions import Literal, TypeAlias
+ 
+ from ..errors import PydanticUserError
++from ..fields import ComputedFieldInfo
+ from ._core_utils import get_type_ref
+ from ._internal_dataclass import slots_dataclass
+ 
+ if TYPE_CHECKING:
+     from ..decorators import FieldValidatorModes
+ 
++try:
++    from functools import cached_property  # type: ignore
++except ImportError:
++    # python 3.7
++    cached_property = None
++
+ 
+ @slots_dataclass
+ class ValidatorDecoratorInfo:
+@@ -105,18 +112,19 @@ DecoratorInfo = Union[
+     FieldSerializerDecoratorInfo,
+     ModelSerializerDecoratorInfo,
+     ModelValidatorDecoratorInfo,
++    ComputedFieldInfo,
+ ]
+ 
+ ReturnType = TypeVar('ReturnType')
+ DecoratedType: TypeAlias = (
+-    'Union[classmethod[Any, Any, ReturnType], staticmethod[Any, ReturnType], Callable[..., ReturnType]]'
++    'Union[classmethod[Any, Any, ReturnType], staticmethod[Any, ReturnType], Callable[..., ReturnType], property]'
+ )
+ 
+ 
+-@slots_dataclass
+-class PydanticDecoratorMarker(Generic[ReturnType]):
++@dataclass  # can't use slots here since we set attributes on `__post_init__`
++class PydanticDescriptorProxy(Generic[ReturnType]):
+     """
+-    Wrap a classmethod, staticmethod or unbound function
++    Wrap a classmethod, staticmethod, property or unbound function
+     and act as a descriptor that allows us to detect decorated items
+     from the class' attributes.
+ 
+@@ -128,23 +136,31 @@ class PydanticDecoratorMarker(Generic[ReturnType]):
+     decorator_info: DecoratorInfo
+     shim: Callable[[Callable[..., Any]], Callable[..., Any]] | None = None
+ 
+-    @overload
+-    def __get__(self, obj: None, objtype: None) -> PydanticDecoratorMarker[ReturnType]:
+-        ...
++    def __post_init__(self):
++        for attr in 'setter', 'deleter':
++            if hasattr(self.wrapped, attr):
++                f = partial(self._call_wrapped_attr, name=attr)
++                setattr(self, attr, f)
+ 
+-    @overload
+-    def __get__(self, obj: object, objtype: type[object]) -> Callable[..., ReturnType]:
+-        ...
++    def _call_wrapped_attr(self, func: Callable[[Any], None], *, name: str) -> PydanticDescriptorProxy[ReturnType]:
++        self.wrapped = getattr(self.wrapped, name)(func)
++        return self
+ 
+-    def __get__(
+-        self, obj: object | None, objtype: type[object] | None = None
+-    ) -> Callable[..., ReturnType] | PydanticDecoratorMarker[ReturnType]:
++    def __get__(self, obj: object | None, obj_type: type[object] | None = None) -> PydanticDescriptorProxy[ReturnType]:
+         try:
+-            return self.wrapped.__get__(obj, objtype)
++            return self.wrapped.__get__(obj, obj_type)
+         except AttributeError:
+             # not a descriptor, e.g. a partial object
+             return self.wrapped  # type: ignore[return-value]
+ 
++    def __set_name__(self, instance: Any, name: str) -> None:
++        if hasattr(self.wrapped, '__set_name__'):
++            self.wrapped.__set_name__(instance, name)
++
++    def __getattr__(self, __name: str) -> Any:
++        """Forward checks for __isabstractmethod__ and such"""
++        return getattr(self.wrapped, __name)
++
+ 
+ DecoratorInfoType = TypeVar('DecoratorInfoType', bound=DecoratorInfo)
+ 
+@@ -167,6 +183,7 @@ class Decorator(Generic[DecoratorInfoType]):
+     @staticmethod
+     def build(
+         cls_: Any,
++        *,
+         cls_var_name: str,
+         shim: Callable[[Any], Any] | None,
+         info: DecoratorInfoType,
+@@ -196,15 +213,17 @@ class DecoratorInfos:
+     # mapping of name in the class namespace to decorator info
+     # note that the name in the class namespace is the function or attribute name
+     # not the field name!
++    # TODO these all need to be renamed to plural
+     validator: dict[str, Decorator[ValidatorDecoratorInfo]] = field(default_factory=dict)
+     field_validator: dict[str, Decorator[FieldValidatorDecoratorInfo]] = field(default_factory=dict)
+     root_validator: dict[str, Decorator[RootValidatorDecoratorInfo]] = field(default_factory=dict)
+     field_serializer: dict[str, Decorator[FieldSerializerDecoratorInfo]] = field(default_factory=dict)
+     model_serializer: dict[str, Decorator[ModelSerializerDecoratorInfo]] = field(default_factory=dict)
+     model_validator: dict[str, Decorator[ModelValidatorDecoratorInfo]] = field(default_factory=dict)
++    computed_fields: dict[str, Decorator[ComputedFieldInfo]] = field(default_factory=dict)
+ 
+     @staticmethod
+-    def build(model_dc: type[Any]) -> DecoratorInfos:
++    def build(model_dc: type[Any]) -> DecoratorInfos:  # noqa: C901 (ignore complexity)
+         """
+         We want to collect all DecFunc instances that exist as
+         attributes in the namespace of the class (a BaseModel or dataclass)
+@@ -229,9 +248,10 @@ class DecoratorInfos:
+                 res.root_validator.update({k: v.bind_to_cls(model_dc) for k, v in existing.root_validator.items()})
+                 res.field_serializer.update({k: v.bind_to_cls(model_dc) for k, v in existing.field_serializer.items()})
+                 res.model_serializer.update({k: v.bind_to_cls(model_dc) for k, v in existing.model_serializer.items()})
++                res.computed_fields.update({k: v.bind_to_cls(model_dc) for k, v in existing.computed_fields.items()})
+ 
+         for var_name, var_value in vars(model_dc).items():
+-            if isinstance(var_value, PydanticDecoratorMarker):
++            if isinstance(var_value, PydanticDescriptorProxy):
+                 info = var_value.decorator_info
+                 if isinstance(info, ValidatorDecoratorInfo):
+                     res.validator[var_name] = Decorator.build(
+@@ -267,11 +287,15 @@ class DecoratorInfos:
+                     res.model_validator[var_name] = Decorator.build(
+                         model_dc, cls_var_name=var_name, shim=var_value.shim, info=info
+                     )
+-                else:
+-                    assert isinstance(info, ModelSerializerDecoratorInfo)
++                elif isinstance(info, ModelSerializerDecoratorInfo):
+                     res.model_serializer[var_name] = Decorator.build(
+                         model_dc, cls_var_name=var_name, shim=var_value.shim, info=info
+                     )
++                else:
++                    isinstance(var_value, ComputedFieldInfo)
++                    res.computed_fields[var_name] = Decorator.build(
++                        model_dc, cls_var_name=var_name, shim=None, info=info
++                    )
+                 setattr(model_dc, var_name, var_value.wrapped)
+         return res
+ 
+@@ -490,3 +514,20 @@ def count_positional_params(sig: Signature) -> int:
+ 
+ def can_be_positional(param: Parameter) -> bool:
+     return param.kind in (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)
++
++
++def ensure_property(f: Any) -> Any:
++    """
++    Ensure that a function is a `property` or `cached_property`, or is a valid descriptor.
++
++    Args:
++        f: The function to check.
++
++    Returns:
++        The function, or a `property` or `cached_property` instance wrapping the function.
++    """
++
++    if ismethoddescriptor(f) or isdatadescriptor(f):
++        return f
++    else:
++        return property(f)
+diff --git a/pydantic/_internal/_generate_schema.py b/pydantic/_internal/_generate_schema.py
+index b653d81bf..ca4b6255b 100644
+--- a/pydantic/_internal/_generate_schema.py
++++ b/pydantic/_internal/_generate_schema.py
+@@ -34,6 +34,7 @@ from ._core_utils import (
+     remove_unnecessary_invalid_definitions,
+ )
+ from ._decorators import (
++    ComputedFieldInfo,
+     Decorator,
+     DecoratorInfos,
+     FieldSerializerDecoratorInfo,
+@@ -218,6 +219,7 @@ class GenerateSchema:
+         try:
+             fields_schema: core_schema.CoreSchema = core_schema.typed_dict_schema(
+                 {k: self._generate_td_field_schema(k, v, decorators) for k, v in fields.items()},
++                computed_fields=generate_computed_field(decorators.computed_fields),
+                 return_fields_set=True,
+             )
+         finally:
+@@ -968,7 +970,12 @@ class GenerateSchema:
+         decorators = getattr(dataclass, '__pydantic_decorators__', None) or DecoratorInfos()
+         args = [self._generate_dc_field_schema(k, v, decorators) for k, v in fields.items()]
+         has_post_init = hasattr(dataclass, '__post_init__')
+-        args_schema = core_schema.dataclass_args_schema(dataclass.__name__, args, collect_init_only=has_post_init)
++        args_schema = core_schema.dataclass_args_schema(
++            dataclass.__name__,
++            args,
++            computed_fields=generate_computed_field(decorators.computed_fields),
++            collect_init_only=has_post_init,
++        )
+         inner_schema = apply_validators(args_schema, decorators.root_validator.values())
+         dc_schema = core_schema.dataclass_schema(dataclass, inner_schema, post_init=has_post_init, ref=dataclass_ref)
+         schema = apply_model_serializers(dc_schema, decorators.model_serializer.values())
+@@ -1337,3 +1344,15 @@ def _common_field(
+         'frozen': frozen,
+         'metadata': metadata,
+     }
++
++
++def generate_computed_field(d: dict[str, Decorator[ComputedFieldInfo]]) -> list[core_schema.ComputedField] | None:
++    r = [
++        core_schema.computed_field(
++            d.cls_var_name,
++            json_return_type=d.info.json_return_type,
++            alias=d.info.alias,
++        )
++        for d in d.values()
++    ]
++    return r
+diff --git a/pydantic/_internal/_model_construction.py b/pydantic/_internal/_model_construction.py
+index 145f2c210..320f5f47f 100644
+--- a/pydantic/_internal/_model_construction.py
++++ b/pydantic/_internal/_model_construction.py
+@@ -12,7 +12,7 @@ from pydantic_core import SchemaSerializer, SchemaValidator
+ from ..errors import PydanticErrorCodes, PydanticUndefinedAnnotation, PydanticUserError
+ from ..fields import FieldInfo, ModelPrivateAttr, PrivateAttr
+ from ._config import ConfigWrapper
+-from ._decorators import PydanticDecoratorMarker
++from ._decorators import ComputedFieldInfo, PydanticDescriptorProxy
+ from ._fields import Undefined, collect_model_fields
+ from ._generate_schema import GenerateSchema
+ from ._generics import get_model_typevars_map
+@@ -26,7 +26,15 @@ if typing.TYPE_CHECKING:
+     from ..main import BaseModel
+ 
+ 
+-IGNORED_TYPES: tuple[Any, ...] = (FunctionType, property, type, classmethod, staticmethod, PydanticDecoratorMarker)
++IGNORED_TYPES: tuple[Any, ...] = (
++    FunctionType,
++    property,
++    type,
++    classmethod,
++    staticmethod,
++    PydanticDescriptorProxy,
++    ComputedFieldInfo,
++)
+ object_setattr = object.__setattr__
+ 
+ 
+@@ -72,7 +80,7 @@ def inspect_namespace(  # noqa C901
+     for var_name, value in list(namespace.items()):
+         if var_name == 'model_config':
+             continue
+-        elif isinstance(value, all_ignored_types):
++        elif isinstance(value, all_ignored_types) or value.__class__.__module__ == 'functools':
+             ignored_names.add(var_name)
+             continue
+         elif isinstance(value, ModelPrivateAttr):
+@@ -122,6 +130,7 @@ def inspect_namespace(  # noqa C901
+             and ann_name not in ignored_names
+             and not is_classvar(ann_type)
+             and ann_type not in all_ignored_types
++            and ann_type.__module__ != 'functools'
+         ):
+             private_attributes[ann_name] = PrivateAttr()
+ 
+diff --git a/pydantic/decorators.py b/pydantic/decorators.py
+index 69f60d1a5..e92810aa7 100644
+--- a/pydantic/decorators.py
++++ b/pydantic/decorators.py
+@@ -1,9 +1,5 @@
+ """
+-Public methods related to:
+-
+-* `validator` - a decorator to add validation to a field on a model
+-* `root_validator` - a decorator to add validation to a model as a whole
+-* `serializer` - a decorator to add serialization to a field on a model
++Public methods used as decorators within pydantic models and dataclasses
+ """
+ 
+ from __future__ import annotations as _annotations
+@@ -171,7 +167,7 @@ def validator(
+ 
+     mode: Literal['before', 'after'] = 'before' if pre is True else 'after'
+ 
+-    def dec(f: Any) -> _decorators.PydanticDecoratorMarker[Any]:
++    def dec(f: Any) -> _decorators.PydanticDescriptorProxy[Any]:
+         if _decorators.is_instance_method_from_sig(f):
+             raise PydanticUserError(
+                 '`@validator` cannot be applied to instance methods', code='validator-instance-method'
+@@ -186,7 +182,7 @@ def validator(
+             always=always,
+             check_fields=check_fields,
+         )
+-        return _decorators.PydanticDecoratorMarker(f, validator_wrapper_info, shim=wrap)
++        return _decorators.PydanticDescriptorProxy(f, validator_wrapper_info, shim=wrap)
+ 
+     return dec  # type: ignore[return-value]
+ 
+@@ -249,7 +245,7 @@ def field_validator(
+ 
+     def dec(
+         f: Callable[..., Any] | staticmethod[Any, Any] | classmethod[Any, Any, Any]
+-    ) -> _decorators.PydanticDecoratorMarker[Any]:
++    ) -> _decorators.PydanticDescriptorProxy[Any]:
+         if _decorators.is_instance_method_from_sig(f):
+             raise PydanticUserError(
+                 '`@field_validator` cannot be applied to instance methods', code='validator-instance-method'
+@@ -259,7 +255,7 @@ def field_validator(
+         f = _decorators.ensure_classmethod_based_on_signature(f)
+ 
+         dec_info = _decorators.FieldValidatorDecoratorInfo(fields=fields, mode=mode, check_fields=check_fields)
+-        return _decorators.PydanticDecoratorMarker(f, dec_info)
++        return _decorators.PydanticDescriptorProxy(f, dec_info)
+ 
+     return dec
+ 
+@@ -336,7 +332,7 @@ def root_validator(
+         # auto apply the @classmethod decorator and warn users if we had to do so
+         res = _decorators.ensure_classmethod_based_on_signature(f)
+         dec_info = _decorators.RootValidatorDecoratorInfo(mode=mode)
+-        return _decorators.PydanticDecoratorMarker(res, dec_info, shim=wrap)
++        return _decorators.PydanticDescriptorProxy(res, dec_info, shim=wrap)
+ 
+     return dec
+ 
+@@ -415,7 +411,7 @@ def field_serializer(
+ 
+     def dec(
+         f: Callable[..., Any] | staticmethod[Any, Any] | classmethod[Any, Any, Any]
+-    ) -> _decorators.PydanticDecoratorMarker[Any]:
++    ) -> _decorators.PydanticDescriptorProxy[Any]:
+         dec_info = _decorators.FieldSerializerDecoratorInfo(
+             fields=fields,
+             mode=mode,
+@@ -423,7 +419,7 @@ def field_serializer(
+             when_used=when_used,
+             check_fields=check_fields,
+         )
+-        return _decorators.PydanticDecoratorMarker(f, dec_info)
++        return _decorators.PydanticDescriptorProxy(f, dec_info)
+ 
+     return dec
+ 
+@@ -433,7 +429,7 @@ def model_serializer(
+     *,
+     mode: Literal['plain', 'wrap'] = 'plain',
+     json_return_type: _core_schema.JsonReturnTypes | None = None,
+-) -> Callable[[Any], _decorators.PydanticDecoratorMarker[Any]] | _decorators.PydanticDecoratorMarker[Any]:
++) -> Callable[[Any], _decorators.PydanticDescriptorProxy[Any]] | _decorators.PydanticDescriptorProxy[Any]:
+     """
+     Decorator to add a function which will be called to serialize the model.
+ 
+@@ -452,9 +448,9 @@ def model_serializer(
+             The decorated function.
+     """
+ 
+-    def dec(f: Callable[..., Any]) -> _decorators.PydanticDecoratorMarker[Any]:
++    def dec(f: Callable[..., Any]) -> _decorators.PydanticDescriptorProxy[Any]:
+         dec_info = _decorators.ModelSerializerDecoratorInfo(mode=mode, json_return_type=json_return_type)
+-        return _decorators.PydanticDecoratorMarker(f, dec_info)
++        return _decorators.PydanticDescriptorProxy(f, dec_info)
+ 
+     if __f is None:
+         return dec
+@@ -544,7 +540,7 @@ AnyModeAfterValidator = Union[ModelAfterValidator, ModelAfterValidatorWithoutInf
+ def model_validator(
+     *,
+     mode: Literal['wrap'],
+-) -> Callable[[AnyModelWrapValidator], _decorators.PydanticDecoratorMarker[_decorators.ModelValidatorDecoratorInfo]]:
++) -> Callable[[AnyModelWrapValidator], _decorators.PydanticDescriptorProxy[_decorators.ModelValidatorDecoratorInfo]]:
+     ...
+ 
+ 
+@@ -552,7 +548,7 @@ def model_validator(
+ def model_validator(
+     *,
+     mode: Literal['before'],
+-) -> Callable[[AnyModeBeforeValidator], _decorators.PydanticDecoratorMarker[_decorators.ModelValidatorDecoratorInfo]]:
++) -> Callable[[AnyModeBeforeValidator], _decorators.PydanticDescriptorProxy[_decorators.ModelValidatorDecoratorInfo]]:
+     ...
+ 
+ 
+@@ -560,7 +556,7 @@ def model_validator(
+ def model_validator(
+     *,
+     mode: Literal['after'],
+-) -> Callable[[AnyModeAfterValidator], _decorators.PydanticDecoratorMarker[_decorators.ModelValidatorDecoratorInfo]]:
++) -> Callable[[AnyModeAfterValidator], _decorators.PydanticDescriptorProxy[_decorators.ModelValidatorDecoratorInfo]]:
+     ...
+ 
+ 
+@@ -568,8 +564,8 @@ def model_validator(
+     *,
+     mode: Literal['wrap', 'before', 'after'],
+ ) -> Any:
+-    def dec(f: Any) -> _decorators.PydanticDecoratorMarker[Any]:
++    def dec(f: Any) -> _decorators.PydanticDescriptorProxy[Any]:
+         dec_info = _decorators.ModelValidatorDecoratorInfo(mode=mode)
+-        return _decorators.PydanticDecoratorMarker(f, dec_info)
++        return _decorators.PydanticDescriptorProxy(f, dec_info)
+ 
+     return dec
+diff --git a/pydantic/fields.py b/pydantic/fields.py
+index c321e35fd..36a31df3e 100644
+--- a/pydantic/fields.py
++++ b/pydantic/fields.py
+@@ -4,6 +4,7 @@ Defining fields on models.
+ from __future__ import annotations as _annotations
+ 
+ import dataclasses
++import inspect
+ import sys
+ import typing
+ from copy import copy
+@@ -15,13 +16,14 @@ import annotated_types
+ import typing_extensions
+ 
+ from . import types
+-from ._internal import _fields, _forward_ref, _repr, _typing_extra, _utils
++from ._internal import _decorators, _fields, _forward_ref, _internal_dataclass, _repr, _typing_extra, _utils
+ from ._internal._fields import Undefined
+ from ._internal._generics import replace_types
+-from ._internal._internal_dataclass import slots_dataclass
+ from .errors import PydanticUserError
+ 
+ if typing.TYPE_CHECKING:
++    from pydantic_core import core_schema as _core_schema
++
+     from ._internal._repr import ReprArgs
+ 
+ 
+@@ -456,7 +458,7 @@ class FieldInfo(_repr.Representation):
+                     yield s, value
+ 
+ 
+-@slots_dataclass
++@_internal_dataclass.slots_dataclass
+ class AliasPath:
+     path: list[int | str]
+ 
+@@ -467,7 +469,7 @@ class AliasPath:
+         return self.path
+ 
+ 
+-@slots_dataclass
++@_internal_dataclass.slots_dataclass
+ class AliasChoices:
+     choices: list[str | AliasPath]
+ 
+@@ -736,3 +738,86 @@ def PrivateAttr(
+         default,
+         default_factory=default_factory,
+     )
++
++
++@_internal_dataclass.slots_dataclass
++class ComputedFieldInfo:
++    """
++    A container for data from `@computed_field` so that we can access it
++    while building the pydantic-core schema.
++    """
++
++    decorator_repr: typing.ClassVar[str] = '@computed_field'
++    wrapped_property: property
++    json_return_type: _core_schema.JsonReturnTypes | None
++    alias: str | None
++    title: str | None
++    description: str | None
++    repr: bool
++
++
++# this should really be `property[T], cached_proprety[T]` but property is not generic unlike cached_property
++# See https://github.com/python/typing/issues/985 and linked issues
++PropertyT = typing.TypeVar('PropertyT')
++
++
++@typing.overload
++def computed_field(
++    *,
++    json_return_type: _core_schema.JsonReturnTypes | None = None,
++    alias: str | None = None,
++    title: str | None = None,
++    description: str | None = None,
++    repr: bool = True,
++) -> typing.Callable[[PropertyT], PropertyT]:
++    ...
++
++
++@typing.overload
++def computed_field(__func: PropertyT) -> PropertyT:
++    ...
++
++
++def computed_field(
++    __f: PropertyT | None = None,
++    *,
++    alias: str | None = None,
++    title: str | None = None,
++    description: str | None = None,
++    repr: bool = True,
++    json_return_type: _core_schema.JsonReturnTypes | None = None,
++) -> PropertyT | typing.Callable[[PropertyT], PropertyT]:
++    """
++    Decorate to include `property` and `cached_property` when serialising models.
++
++    If applied to functions not yet decorated with `@property` or `@cached_property`, the function is
++    automatically wrapped with `property`.
++
++    Args:
++        __f: the function to wrap.
++        alias: alias to use when serializing this computed field, only used when `by_alias=True`
++        title: Title to used when including this computed field in JSON Schema, currently unused waiting for #4697
++        description: Description to used when including this computed field in JSON Schema, defaults to the functions
++            docstring, currently unused waiting for #4697
++        repr: whether to include this computed field in model repr
++        json_return_type: optional return for serialization logic to expect when serialising to JSON, if included
++            this must be correct, otherwise a `TypeError` is raised
++
++    Returns:
++        A proxy wrapper for the property.
++    """
++
++    def dec(f: Any) -> Any:
++        nonlocal description
++        if description is None and f.__doc__:
++            description = inspect.cleandoc(f.__doc__)
++
++        # if the function isn't already decorated with `@property` (or another descriptor), then we wrap it now
++        f = _decorators.ensure_property(f)
++        dec_info = ComputedFieldInfo(f, json_return_type, alias, title, description, repr)
++        return _decorators.PydanticDescriptorProxy(f, dec_info)
++
++    if __f is None:
++        return dec
++    else:
++        return dec(__f)
+diff --git a/pydantic/main.py b/pydantic/main.py
+index 5b416e284..824b98bef 100644
+--- a/pydantic/main.py
++++ b/pydantic/main.py
+@@ -30,7 +30,7 @@ from .config import ConfigDict
+ from .deprecated import copy_internals as _deprecated_copy_internals
+ from .deprecated import parse as _deprecated_parse
+ from .errors import PydanticUndefinedAnnotation, PydanticUserError
+-from .fields import Field, FieldInfo, ModelPrivateAttr
++from .fields import ComputedFieldInfo, Field, FieldInfo, ModelPrivateAttr
+ from .json_schema import DEFAULT_REF_TEMPLATE, GenerateJsonSchema, JsonSchemaValue, model_json_schema
+ 
+ if typing.TYPE_CHECKING:
+@@ -63,7 +63,7 @@ class _ModelNamespaceDict(dict):  # type: ignore[type-arg]
+ 
+     def __setitem__(self, k: str, v: object) -> None:
+         existing: Any = self.get(k, None)
+-        if existing and v is not existing and isinstance(existing, _decorators.PydanticDecoratorMarker):
++        if existing and v is not existing and isinstance(existing, _decorators.PydanticDescriptorProxy):
+             warnings.warn(f'`{k}` overrides an existing Pydantic `{existing.decorator_info.decorator_repr}` decorator')
+ 
+         return super().__setitem__(k, v)
+@@ -275,6 +275,13 @@ class BaseModel(_repr.Representation, metaclass=ModelMetaclass):
+         """
+         return self.__pydantic_fields_set__
+ 
++    @property
++    def model_computed_fields(self) -> dict[str, ComputedFieldInfo]:
++        """
++        The computed fields of this model instance.
++        """
++        return {k: v.info for k, v in self.__pydantic_decorators__.computed_fields.items()}
++
+     @classmethod
+     def model_validate_json(
+         cls: type[Model],
+@@ -302,10 +309,15 @@ class BaseModel(_repr.Representation, metaclass=ModelMetaclass):
+                 f'"{name}" is a ClassVar of `{self.__class__.__name__}` and cannot be set on an instance. '
+                 f'If you want to set a value on the class, use `{self.__class__.__name__}.{name} = value`.'
+             )
+-        if name.startswith('_'):
++        elif name.startswith('_'):
+             _object_setattr(self, name, value)
++            return
+         elif self.model_config.get('frozen', None):
+             raise TypeError(f'"{self.__class__.__name__}" is frozen and does not support item assignment')
++
++        attr = getattr(self.__class__, name, None)
++        if isinstance(attr, property):
++            attr.__set__(self, value)
+         elif self.model_config.get('validate_assignment', None):
+             self.__pydantic_validator__.validate_assignment(self, name, value)
+         elif self.model_config.get('extra') != 'allow' and name not in self.model_fields:
+@@ -550,11 +562,12 @@ class BaseModel(_repr.Representation, metaclass=ModelMetaclass):
+         return m
+ 
+     def __repr_args__(self) -> _repr.ReprArgs:
+-        return [
++        yield from [
+             (k, v)
+             for k, v in self.__dict__.items()
+             if not k.startswith('_') and (k not in self.model_fields or self.model_fields[k].repr)
+         ]
++        yield from [(k, getattr(self, k)) for k, v in self.model_computed_fields.items() if v.repr]
+ 
+     def __class_getitem__(
+         cls, typevar_values: type[Any] | tuple[type[Any], ...]
+diff --git a/pyproject.toml b/pyproject.toml
+index 45695fdda..253bbec4f 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -57,7 +57,7 @@ classifiers = [
+ requires-python = '>=3.7'
+ dependencies = [
+     'typing-extensions>=4.2.0',
+-    'pydantic-core==0.24.1',
++    'pydantic-core==0.25.0',
+     'annotated-types>=0.4.0',
+ ]
+ optional-dependencies = { email = ['email-validator>=1.3.0'] }
+diff --git a/requirements/all.txt b/requirements/all.txt
+index 42b043d4a..7127af264 100644
+--- a/requirements/all.txt
++++ b/requirements/all.txt
+@@ -115,7 +115,7 @@ pluggy==1.0.0
+     # via pytest
+ pre-commit==2.21.0
+     # via -r requirements/linting.in
+-pydantic-core==0.24.1
++pydantic-core==0.25.0
+     # via
+     #   -r requirements/docs.in
+     #   -r requirements/linting.in
+diff --git a/requirements/docs.txt b/requirements/docs.txt
+index 174227a06..49f7e1881 100644
+--- a/requirements/docs.txt
++++ b/requirements/docs.txt
+@@ -98,7 +98,7 @@ packaging==23.0
+     # via
+     #   -c requirements/all.txt
+     #   mkdocs
+-pydantic-core==0.24.1
++pydantic-core==0.25.0
+     # via
+     #   -c requirements/all.txt
+     #   -r requirements/docs.in
+diff --git a/requirements/linting.txt b/requirements/linting.txt
+index c58dc8295..a2171061b 100644
+--- a/requirements/linting.txt
++++ b/requirements/linting.txt
+@@ -69,7 +69,7 @@ pre-commit==2.21.0
+     # via
+     #   -c requirements/all.txt
+     #   -r requirements/linting.in
+-pydantic-core==0.24.1
++pydantic-core==0.25.0
+     # via
+     #   -c requirements/all.txt
+     #   -r requirements/linting.in
+diff --git a/requirements/pyproject-all.txt b/requirements/pyproject-all.txt
+index 8b5284536..62d8a1eeb 100644
+--- a/requirements/pyproject-all.txt
++++ b/requirements/pyproject-all.txt
+@@ -12,7 +12,7 @@ email-validator==1.3.1
+     # via pydantic (pyproject.toml)
+ idna==3.4
+     # via email-validator
+-pydantic-core==0.24.1
++pydantic-core==0.25.0
+     # via pydantic (pyproject.toml)
+ typing-extensions==4.5.0
+     # via
+diff --git a/requirements/pyproject-min.txt b/requirements/pyproject-min.txt
+index 492040498..07d3833ae 100644
+--- a/requirements/pyproject-min.txt
++++ b/requirements/pyproject-min.txt
+@@ -6,7 +6,7 @@
+ #
+ annotated-types==0.4.0
+     # via pydantic (pyproject.toml)
+-pydantic-core==0.24.1
++pydantic-core==0.25.0
+     # via pydantic (pyproject.toml)
+ typing-extensions==4.5.0
+     # via
+diff --git a/tests/mypy/modules/computed_fields.py b/tests/mypy/modules/computed_fields.py
+new file mode 100644
+index 000000000..695f72c9b
+--- /dev/null
++++ b/tests/mypy/modules/computed_fields.py
+@@ -0,0 +1,37 @@
++from pydantic import BaseModel, computed_field
++
++
++class Square(BaseModel):
++    side: float
++
++    @computed_field
++    @property
++    def area(self) -> float:
++        return self.side**2
++
++    @area.setter
++    def area(self, area: float) -> None:
++        self.side = area**0.5
++
++
++sq = Square(side=10)
++y = 12.4 + sq.area
++z = 'x' + sq.area
++
++try:
++    from functools import cached_property
++except ImportError:
++    pass
++else:
++
++    class Square2(BaseModel):
++        side: float
++
++        @computed_field
++        @cached_property
++        def area(self) -> float:
++            return self.side**2
++
++    sq = Square(side=10)
++    y = 12.4 + sq.area
++    z = 'x' + sq.area
+diff --git a/tests/mypy/outputs/latest/computed_fields.txt b/tests/mypy/outputs/latest/computed_fields.txt
+new file mode 100644
+index 000000000..dcfb1ba01
+--- /dev/null
++++ b/tests/mypy/outputs/latest/computed_fields.txt
+@@ -0,0 +1,4 @@
++7: error: Decorators on top of @property are not supported  [misc]
++19: error: Unsupported operand types for + ("str" and "float")  [operator]
++30: error: Decorators on top of @property are not supported  [misc]
++37: error: Unsupported operand types for + ("str" and "float")  [operator]
+diff --git a/tests/mypy/test_mypy.py b/tests/mypy/test_mypy.py
+index 7f26e5b90..0272e011a 100644
+--- a/tests/mypy/test_mypy.py
++++ b/tests/mypy/test_mypy.py
+@@ -77,6 +77,15 @@ cases = [
+     ('pyproject-plugin.toml', 'plugin_fail_baseConfig.py', 'plugin-fail-baseConfig.txt'),
+     ('pyproject-plugin-strict.toml', 'plugin_success_baseConfig.py', 'plugin-success-strict-baseConfig.txt'),
+     ('pyproject-plugin-strict.toml', 'plugin_fail_baseConfig.py', 'plugin-fail-strict-baseConfig.txt'),
++    pytest.param(
++        'pyproject-default.toml',
++        'computed_fields.py',
++        'computed_fields.txt',
++        marks=pytest.mark.skipif(
++            sys.version_info < (3, 8) or MYPY_VERSION_TUPLE < (0, 982),
++            reason='cached_property is only available in Python 3.8+, errors are different with mypy 0.971',
++        ),
++    ),
+ ]
+ 
+ 
+diff --git a/tests/pyright/pyright_example.py b/tests/pyright/pyright_example.py
+index bd286b984..41f4c2393 100644
+--- a/tests/pyright/pyright_example.py
++++ b/tests/pyright/pyright_example.py
+@@ -2,9 +2,10 @@
+ This file is used to test pyright's ability to check pydantic code.
+ """
+ 
++from functools import cached_property
+ from typing import List
+ 
+-from pydantic import BaseModel, Field
++from pydantic import BaseModel, Field, computed_field
+ 
+ 
+ class MyModel(BaseModel):
+@@ -23,3 +24,35 @@ class Knight(BaseModel):
+ 
+ 
+ k = Knight()  # pyright: ignore
++
++
++class Square(BaseModel):
++    side: float
++
++    @computed_field
++    @property
++    def area(self) -> float:
++        return self.side**2
++
++    @area.setter
++    def area(self, area: float) -> None:
++        self.side = area**0.5
++
++
++sq = Square(side=10)
++y = 12.4 + sq.area
++z = 'x' + sq.area  # type: ignore
++
++
++class Square2(BaseModel):
++    side: float
++
++    @computed_field
++    @cached_property
++    def area(self) -> float:
++        return self.side**2
++
++
++sq = Square(side=10)
++y = 12.4 + sq.area
++z = 'x' + sq.area  # type: ignore
+diff --git a/tests/test_computed_fields.py b/tests/test_computed_fields.py
+new file mode 100644
+index 000000000..9c41ba45e
+--- /dev/null
++++ b/tests/test_computed_fields.py
+@@ -0,0 +1,489 @@
++from __future__ import annotations as _annotations
++
++import random
++import sys
++from abc import ABC, abstractmethod
++from typing import Any, ClassVar
++
++import pytest
++from pydantic_core import PydanticSerializationError, ValidationError
++
++from pydantic import AnalyzedType, BaseModel, Field, PrivateAttr, computed_field, dataclasses, field_validator
++
++try:
++    from functools import cached_property, lru_cache, singledispatchmethod
++except ImportError:
++    cached_property = None
++    lru_cache = None
++    singledispatchmethod = None
++
++
++def test_computed_fields_get():
++    class Rectangle(BaseModel):
++        width: int
++        length: int
++
++        @computed_field
++        def area(self) -> int:
++            """An awesome area"""
++            return self.width * self.length
++
++        @computed_field(title='Pikarea', description='Another area')
++        @property
++        def area2(self) -> int:
++            return self.width * self.length
++
++        @property
++        def double_width(self) -> int:
++            return self.width * 2
++
++    rect = Rectangle(width=10, length=5)
++    assert set(rect.model_fields) == {'width', 'length'}
++    assert set(rect.model_computed_fields) == {'area', 'area2'}
++    assert rect.__dict__ == {'width': 10, 'length': 5}
++
++    assert rect.model_computed_fields['area'].description == 'An awesome area'
++    assert rect.model_computed_fields['area2'].title == 'Pikarea'
++    assert rect.model_computed_fields['area2'].description == 'Another area'
++
++    assert rect.area == 50
++    assert rect.double_width == 20
++    assert rect.model_dump() == {'width': 10, 'length': 5, 'area': 50, 'area2': 50}
++    assert rect.model_dump_json() == '{"width":10,"length":5,"area":50,"area2":50}'
++
++
++@pytest.mark.skip(reason='waiting for https://github.com/pydantic/pydantic/issues/4697')
++def test_computed_fields_json_schema():
++    class Rectangle(BaseModel):
++        width: int
++        length: int
++
++        @computed_field
++        def area(self) -> int:
++            """An awesome area"""
++            return self.width * self.length
++
++        @computed_field(title='Pikarea', description='Another area')
++        @property
++        def area2(self) -> int:
++            return self.width * self.length
++
++        @property
++        def double_width(self) -> int:
++            return self.width * 2
++
++    assert Rectangle.model_json_schema() == {
++        'title': 'Rectangle',
++        'type': 'object',
++        'properties': {
++            'width': {
++                'title': 'Width',
++                'type': 'integer',
++            },
++            'length': {
++                'title': 'Length',
++                'type': 'integer',
++            },
++            'area': {
++                'title': 'Area',
++                'description': 'An awesome area',
++                'type': 'integer',
++                'readOnly': True,
++            },
++            'area2': {
++                'title': 'Pikarea',
++                'description': 'Another area',
++                'type': 'integer',
++                'readOnly': True,
++            },
++        },
++        'required': ['width', 'length'],
++    }
++
++
++def test_computed_fields_set():
++    class Square(BaseModel):
++        side: float
++
++        @computed_field
++        @property
++        def area(self) -> float:
++            return self.side**2
++
++        @area.setter
++        def area(self, new_area: int):
++            self.side = new_area**0.5
++
++    s = Square(side=10)
++    assert s.model_dump() == {'side': 10.0, 'area': 100.0}
++    s.area = 64
++    assert s.model_dump() == {'side': 8.0, 'area': 64.0}
++
++
++def test_computed_fields_del():
++    class User(BaseModel):
++        first: str
++        last: str
++
++        @computed_field
++        def fullname(self) -> str:
++            return f'{self.first} {self.last}'
++
++        @fullname.setter
++        def fullname(self, new_fullname: str) -> None:
++            self.first, self.last = new_fullname.split()
++
++        @fullname.deleter
++        def fullname(self):
++            self.first = ''
++            self.last = ''
++
++    user = User(first='John', last='Smith')
++    assert user.model_dump() == {'first': 'John', 'last': 'Smith', 'fullname': 'John Smith'}
++    user.fullname = 'Pika Chu'
++    assert user.model_dump() == {'first': 'Pika', 'last': 'Chu', 'fullname': 'Pika Chu'}
++    del user.fullname
++    assert user.model_dump() == {'first': '', 'last': '', 'fullname': ' '}
++
++
++@pytest.mark.skipif(cached_property is None, reason='cached_property not available')
++def test_cached_property():
++    class Model(BaseModel):
++        minimum: int = Field(alias='min')
++        maximum: int = Field(alias='max')
++
++        @computed_field(alias='the magic number')
++        @cached_property
++        def random_number(self) -> int:
++            """An awesome area"""
++            return random.randint(self.minimum, self.maximum)
++
++        @cached_property
++        def cached_property_2(self) -> int:
++            return 42
++
++        @cached_property
++        def _cached_property_3(self) -> int:
++            return 43
++
++    rect = Model(min=10, max=10_000)
++    assert rect.__private_attributes__ == {}
++    assert rect.cached_property_2 == 42
++    assert rect._cached_property_3 == 43
++    first_n = rect.random_number
++    second_n = rect.random_number
++    assert first_n == second_n
++    assert rect.model_dump() == {'minimum': 10, 'maximum': 10_000, 'random_number': first_n}
++    assert rect.model_dump(by_alias=True) == {'min': 10, 'max': 10_000, 'the magic number': first_n}
++    assert rect.model_dump(by_alias=True, exclude={'random_number'}) == {'min': 10, 'max': 10000}
++
++
++def test_properties_and_computed_fields():
++    class Model(BaseModel):
++        x: str
++        _private_float: float = PrivateAttr(0)
++
++        @property
++        def public_int(self) -> int:
++            return int(self._private_float)
++
++        @public_int.setter
++        def public_int(self, v: float) -> None:
++            self._private_float = v
++
++        @computed_field
++        @property
++        def public_str(self) -> str:
++            return f'public {self.public_int}'
++
++    m = Model(x='pika')
++    assert m.model_dump() == {'x': 'pika', 'public_str': 'public 0'}
++    m._private_float = 3.1
++    assert m.model_dump() == {'x': 'pika', 'public_str': 'public 3'}
++    m.public_int = 2
++    assert m._private_float == 2.0
++    assert m.model_dump() == {'x': 'pika', 'public_str': 'public 2'}
++
++
++def test_computed_fields_repr():
++    class Model(BaseModel):
++        x: int
++
++        @computed_field(repr=False)
++        @property
++        def double(self) -> int:
++            return self.x * 2
++
++        @computed_field  # repr=True by default
++        @property
++        def triple(self) -> int:
++            return self.x * 3
++
++    assert repr(Model(x=2)) == 'Model(x=2, triple=6)'
++
++
++@pytest.mark.skipif(singledispatchmethod is None, reason='singledispatchmethod not available')
++def test_functools():
++    class Model(BaseModel, frozen=True):
++        x: int
++
++        @lru_cache
++        def x_pow(self, p):
++            return self.x**p
++
++        @singledispatchmethod
++        def neg(self, arg):
++            raise NotImplementedError('Cannot negate a')
++
++        @neg.register
++        def _(self, arg: int):
++            return -arg
++
++        @neg.register
++        def _(self, arg: bool):
++            return not arg
++
++    m = Model(x=2)
++    assert m.x_pow(1) == 2
++    assert m.x_pow(2) == 4
++    assert m.neg(1) == -1
++    assert m.neg(True) is False
++
++
++def test_include_exclude():
++    class Model(BaseModel):
++        x: int
++        y: int
++
++        @computed_field
++        def x_list(self) -> list[int]:
++            return [self.x, self.x + 1]
++
++        @computed_field
++        def y_list(self) -> list[int]:
++            return [self.y, self.y + 1, self.y + 2]
++
++    m = Model(x=1, y=2)
++    assert m.model_dump() == {'x': 1, 'y': 2, 'x_list': [1, 2], 'y_list': [2, 3, 4]}
++    assert m.model_dump(include={'x'}) == {'x': 1}
++    assert m.model_dump(include={'x': None, 'x_list': {0}}) == {'x': 1, 'x_list': [1]}
++    assert m.model_dump(exclude={'x': ..., 'y_list': {2}}) == {'y': 2, 'x_list': [1, 2], 'y_list': [2, 3]}
++
++
++def test_expected_type():
++    class Model(BaseModel):
++        x: int
++        y: int
++
++        @computed_field(json_return_type='list')
++        def x_list(self) -> list[int]:
++            return [self.x, self.x + 1]
++
++        @computed_field(json_return_type='bytes')
++        def y_str(self) -> bytes:
++            s = f'y={self.y}'
++            return s.encode()
++
++    m = Model(x=1, y=2)
++    assert m.model_dump() == {'x': 1, 'y': 2, 'x_list': [1, 2], 'y_str': b'y=2'}
++    assert m.model_dump(mode='json') == {'x': 1, 'y': 2, 'x_list': [1, 2], 'y_str': 'y=2'}
++    assert m.model_dump_json() == '{"x":1,"y":2,"x_list":[1,2],"y_str":"y=2"}'
++
++
++def test_expected_type_wrong():
++    class Model(BaseModel):
++        x: int
++
++        @computed_field(json_return_type='list')
++        def x_list(self) -> list[int]:
++            return 'not a list'
++
++    m = Model(x=1)
++    with pytest.raises(TypeError, match="^'str' object cannot be converted to 'PyList'$"):
++        m.model_dump()
++    with pytest.raises(TypeError, match="^'str' object cannot be converted to 'PyList'$"):
++        m.model_dump(mode='json')
++    with pytest.raises(PydanticSerializationError, match="Error serializing to JSON: 'str' object cannot be converted"):
++        m.model_dump_json()
++
++
++def test_inheritance():
++    class Base(BaseModel):
++        x: int
++
++        @computed_field
++        def double(self) -> int:
++            return self.x * 2
++
++    class Child(Base):
++        y: int
++
++        @computed_field
++        def triple(self) -> int:
++            return self.y * 3
++
++    c = Child(x=2, y=3)
++    assert c.double == 4
++    assert c.triple == 9
++    assert c.model_dump() == {'x': 2, 'y': 3, 'double': 4, 'triple': 9}
++
++
++def test_dataclass():
++    @dataclasses.dataclass
++    class MyDataClass:
++        x: int
++
++        @computed_field
++        def double(self) -> int:
++            return self.x * 2
++
++    m = MyDataClass(x=2)
++    assert m.double == 4
++    assert AnalyzedType(MyDataClass).dump_python(m) == {'x': 2, 'double': 4}
++
++
++def test_free_function():
++    @property
++    def double_func(self) -> int:
++        return self.x * 2
++
++    class MyModel(BaseModel):
++        x: int
++        double = computed_field(double_func)
++
++    m = MyModel(x=2)
++    assert set(m.model_fields) == {'x'}
++    assert m.__private_attributes__ == {}
++    assert m.double == 4
++    assert repr(m) == 'MyModel(x=2, double=4)'
++    assert m.model_dump() == {'x': 2, 'double': 4}
++
++
++def test_private_computed_field():
++    class MyModel(BaseModel):
++        x: int
++
++        @computed_field
++        def _double(self) -> int:
++            return self.x * 2
++
++    m = MyModel(x=2)
++    assert repr(m) == 'MyModel(x=2, _double=4)'
++    assert m.__private_attributes__ == {}
++    assert m._double == 4
++    assert m.model_dump() == {'x': 2, '_double': 4}
++
++
++@pytest.mark.skipif(sys.version_info < (3, 9), reason='fails before 3.9 - Do we want to fix this???')
++def test_classmethod():
++    class MyModel(BaseModel):
++        x: int
++        y: ClassVar[int] = 4
++
++        @computed_field
++        @classmethod
++        @property
++        def two_y(cls) -> int:
++            return cls.y * 2
++
++    m = MyModel(x=1)
++    assert m.two_y == 8
++    assert m.model_dump() == {'x': 1, 'two_y': 8}
++
++
++def test_frozen():
++    class Square(BaseModel, frozen=True):
++        side: float
++
++        @computed_field
++        @property
++        def area(self) -> float:
++            return self.side**2
++
++        @area.setter
++        def area(self, new_area: int):
++            self.side = new_area**0.5
++
++    m = Square(side=4)
++    assert m.area == 16.0
++    assert m.model_dump() == {'side': 4.0, 'area': 16.0}
++
++    with pytest.raises(TypeError, match='"Square" is frozen and does not support item assignment'):
++        m.area = 4
++
++
++def test_validate_assignment():
++    class Square(BaseModel, validate_assignment=True):
++        side: float
++
++        @field_validator('side')
++        def small_side(cls, s):
++            if s < 2:
++                raise ValueError('must be >=2')
++            return float(round(s))
++
++        @computed_field
++        @property
++        def area(self) -> float:
++            return self.side**2
++
++        @area.setter
++        def area(self, new_area: int):
++            self.side = new_area**0.5
++
++    with pytest.raises(ValidationError, match=r'side\s+Value error, must be >=2'):
++        Square(side=1)
++
++    m = Square(side=4.0)
++    assert m.area == 16.0
++    assert m.model_dump() == {'side': 4.0, 'area': 16.0}
++    m.area = 10.0
++    assert m.side == 3.0
++
++    with pytest.raises(ValidationError, match=r'side\s+Value error, must be >=2'):
++        m.area = 3
++
++
++def test_abstractmethod():
++    class AbstractSquare(BaseModel):
++        side: float
++
++        @computed_field
++        @property
++        @abstractmethod
++        def area(self) -> float:
++            raise NotImplementedError()
++
++    class Square(AbstractSquare):
++        @computed_field
++        @property
++        def area(self) -> float:
++            return self.side + 1
++
++    m = Square(side=4.0)
++    assert m.model_dump() == {'side': 4.0, 'area': 5.0}
++
++
++@pytest.mark.parametrize(
++    'bases',
++    [
++        (BaseModel, ABC),
++        (ABC, BaseModel),
++        (BaseModel,),
++    ],
++)
++def test_abstractmethod_missing(bases: tuple[Any, ...]):
++    class AbstractSquare(*bases):
++        side: float
++
++        @computed_field
++        @property
++        @abstractmethod
++        def area(self) -> float:
++            raise NotImplementedError()
++
++    class Square(AbstractSquare):
++        pass
++
++    with pytest.raises(TypeError, match="Can't instantiate abstract class Square with abstract methods? area"):
++        Square(side=4.0)
+diff --git a/tests/test_private_attributes.py b/tests/test_private_attributes.py
+index ce4e8d800..4c5783a0d 100644
+--- a/tests/test_private_attributes.py
++++ b/tests/test_private_attributes.py
+@@ -1,3 +1,4 @@
++import functools
+ import platform
+ from typing import ClassVar, Generic, TypeVar
+ 
+@@ -312,3 +313,14 @@ def test_ignored_types_are_ignored() -> None:
+         _g = 1  # Note: this is completely ignored, in keeping with v1
+ 
+     assert sorted(MyModel.__private_attributes__.keys()) == ['_e', '_f']
++
++
++@pytest.mark.skipif(not hasattr(functools, 'cached_property'), reason='cached_property is not available')
++def test_ignored_types_are_ignored_cached_property():
++    """Demonstrate the members of functools are ignore here as with fields."""
++
++    class MyModel(BaseModel):
++        _a: functools.cached_property
++        _b: int
++
++    assert set(MyModel.__private_attributes__) == {'_b'}

@@ -1,0 +1,2779 @@
+diff --git a/src/uu/sort/Cargo.toml b/src/uu/sort/Cargo.toml
+index 6a99762784f..464207a2cf0 100644
+--- a/src/uu/sort/Cargo.toml
++++ b/src/uu/sort/Cargo.toml
+@@ -22,6 +22,7 @@ fnv = "1.0.7"
+ itertools = "0.10.0"
+ semver = "0.9.0"
+ smallvec = "1.6.1"
++unicode-width = "0.1.8"
+ uucore = { version=">=0.0.8", package="uucore", path="../../uucore", features=["fs"] }
+ uucore_procs = { version=">=0.0.5", package="uucore_procs", path="../../uucore_procs" }
+ 
+diff --git a/src/uu/sort/src/numeric_str_cmp.rs b/src/uu/sort/src/numeric_str_cmp.rs
+index a50734ebd75..314b4c59595 100644
+--- a/src/uu/sort/src/numeric_str_cmp.rs
++++ b/src/uu/sort/src/numeric_str_cmp.rs
+@@ -137,7 +137,15 @@ impl NumInfo {
+                     sign: if had_digit { sign } else { Sign::Positive },
+                     exponent: 0,
+                 },
+-                0..0,
++                if had_digit {
++                    // In this case there were only zeroes.
++                    // For debug output to work properly, we have to claim to match the end of the number.
++                    num.len()..num.len()
++                } else {
++                    // This was no number at all.
++                    // For debug output to work properly, we have to claim to match the start of the number.
++                    0..0
++                },
+             )
+         }
+     }
+diff --git a/src/uu/sort/src/sort.rs b/src/uu/sort/src/sort.rs
+index 07b85292184..d9a639b3cc6 100644
+--- a/src/uu/sort/src/sort.rs
++++ b/src/uu/sort/src/sort.rs
+@@ -26,7 +26,6 @@ use rand::{thread_rng, Rng};
+ use rayon::prelude::*;
+ use semver::Version;
+ use smallvec::SmallVec;
+-use std::borrow::Cow;
+ use std::cmp::Ordering;
+ use std::collections::BinaryHeap;
+ use std::env;
+@@ -34,8 +33,9 @@ use std::fs::File;
+ use std::hash::{Hash, Hasher};
+ use std::io::{stdin, stdout, BufRead, BufReader, BufWriter, Lines, Read, Write};
+ use std::mem::replace;
+-use std::ops::{Range, RangeInclusive};
++use std::ops::Range;
+ use std::path::Path;
++use unicode_width::UnicodeWidthStr;
+ use uucore::fs::is_stdin_interactive; // for Iterator::dedup()
+ 
+ static NAME: &str = "sort";
+@@ -62,6 +62,7 @@ static OPT_DICTIONARY_ORDER: &str = "dictionary-order";
+ static OPT_MERGE: &str = "merge";
+ static OPT_CHECK: &str = "check";
+ static OPT_CHECK_SILENT: &str = "check-silent";
++static OPT_DEBUG: &str = "debug";
+ static OPT_IGNORE_CASE: &str = "ignore-case";
+ static OPT_IGNORE_BLANKS: &str = "ignore-blanks";
+ static OPT_IGNORE_NONPRINTING: &str = "ignore-nonprinting";
+@@ -96,6 +97,7 @@ enum SortMode {
+ 
+ struct GlobalSettings {
+     mode: SortMode,
++    debug: bool,
+     ignore_blanks: bool,
+     ignore_case: bool,
+     dictionary_order: bool,
+@@ -119,6 +121,7 @@ impl Default for GlobalSettings {
+     fn default() -> GlobalSettings {
+         GlobalSettings {
+             mode: SortMode::Default,
++            debug: true,
+             ignore_blanks: false,
+             ignore_case: false,
+             dictionary_order: false,
+@@ -196,13 +199,13 @@ impl SelectionRange {
+ }
+ 
+ enum NumCache {
+-    AsF64(f64),
++    AsF64(GeneralF64ParseResult),
+     WithInfo(NumInfo),
+     None,
+ }
+ 
+ impl NumCache {
+-    fn as_f64(&self) -> f64 {
++    fn as_f64(&self) -> GeneralF64ParseResult {
+         match self {
+             NumCache::AsF64(n) => *n,
+             _ => unreachable!(),
+@@ -253,19 +256,14 @@ impl Line {
+             .selectors
+             .iter()
+             .map(|selector| {
+-                let mut range =
+-                    if let Some(range) = selector.get_selection(&line, fields.as_deref()) {
+-                        if let Some(transformed) =
+-                            transform(&line[range.to_owned()], &selector.settings)
+-                        {
+-                            SelectionRange::String(transformed)
+-                        } else {
+-                            SelectionRange::ByIndex(range.start().to_owned()..range.end() + 1)
+-                        }
+-                    } else {
+-                        // If there is no match, match the empty string.
+-                        SelectionRange::ByIndex(0..0)
+-                    };
++                let range = selector.get_selection(&line, fields.as_deref());
++                let mut range = if let Some(transformed) =
++                    transform(&line[range.to_owned()], &selector.settings)
++                {
++                    SelectionRange::String(transformed)
++                } else {
++                    SelectionRange::ByIndex(range)
++                };
+                 let num_cache = if selector.settings.mode == SortMode::Numeric
+                     || selector.settings.mode == SortMode::HumanNumeric
+                 {
+@@ -280,7 +278,8 @@ impl Line {
+                     range.shorten(num_range);
+                     NumCache::WithInfo(info)
+                 } else if selector.settings.mode == SortMode::GeneralNumeric {
+-                    NumCache::AsF64(permissive_f64_parse(get_leading_gen(range.get_str(&line))))
++                    let str = range.get_str(&line);
++                    NumCache::AsF64(general_f64_parse(&str[get_leading_gen(str)]))
+                 } else {
+                     NumCache::None
+                 };
+@@ -289,6 +288,129 @@ impl Line {
+             .collect();
+         Self { line, selections }
+     }
++
++    /// Writes indicators for the selections this line matched. The original line content is NOT expected
++    /// to be already printed.
++    fn print_debug(
++        &self,
++        settings: &GlobalSettings,
++        writer: &mut dyn Write,
++    ) -> std::io::Result<()> {
++        // We do not consider this function performance critical, as debug output is only useful for small files,
++        // which are not a performance problem in any case. Therefore there aren't any special performance
++        // optimizations here.
++
++        let line = self.line.replace('\t', ">");
++        writeln!(writer, "{}", line)?;
++
++        let fields = tokenize(&self.line, settings.separator);
++        for selector in settings.selectors.iter() {
++            let mut selection = selector.get_selection(&self.line, Some(&fields));
++            match selector.settings.mode {
++                SortMode::Numeric | SortMode::HumanNumeric => {
++                    // find out which range is used for numeric comparisons
++                    let (_, num_range) = NumInfo::parse(
++                        &self.line[selection.clone()],
++                        NumInfoParseSettings {
++                            accept_si_units: selector.settings.mode == SortMode::HumanNumeric,
++                            thousands_separator: Some(THOUSANDS_SEP),
++                            decimal_pt: Some(DECIMAL_PT),
++                        },
++                    );
++                    let initial_selection = selection.clone();
++
++                    // Shorten selection to num_range.
++                    selection.start += num_range.start;
++                    selection.end = selection.start + num_range.len();
++
++                    // include a trailing si unit
++                    if selector.settings.mode == SortMode::HumanNumeric
++                        && self.line[selection.end..initial_selection.end]
++                            .starts_with(&['k', 'K', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y'][..])
++                    {
++                        selection.end += 1;
++                    }
++
++                    // include leading zeroes, a leading minus or a leading decimal point
++                    while self.line[initial_selection.start..selection.start]
++                        .ends_with(&['-', '0', '.'][..])
++                    {
++                        selection.start -= 1;
++                    }
++                }
++                SortMode::GeneralNumeric => {
++                    let initial_selection = &self.line[selection.clone()];
++
++                    let leading = get_leading_gen(initial_selection);
++
++                    // Shorten selection to leading.
++                    selection.start += leading.start;
++                    selection.end = selection.start + leading.len();
++                }
++                SortMode::Month => {
++                    let initial_selection = &self.line[selection.clone()];
++
++                    let month = if month_parse(initial_selection) == Month::Unknown {
++                        // We failed to parse a month, which is equivalent to matching nothing.
++                        0..0
++                    } else {
++                        // We parsed a month. Match the three first non-whitespace characters, which must be the month we parsed.
++                        let mut chars = initial_selection
++                            .char_indices()
++                            .skip_while(|(_, c)| c.is_whitespace());
++                        chars.next().unwrap().0
++                            ..chars.nth(2).map_or(initial_selection.len(), |(idx, _)| idx)
++                    };
++
++                    // Shorten selection to month.
++                    selection.start += month.start;
++                    selection.end = selection.start + month.len();
++                }
++                _ => {}
++            }
++
++            write!(
++                writer,
++                "{}",
++                " ".repeat(UnicodeWidthStr::width(&line[..selection.start]))
++            )?;
++
++            // TODO: Once our minimum supported rust version is at least 1.47, use selection.is_empty() instead.
++            #[allow(clippy::len_zero)]
++            {
++                if selection.len() == 0 {
++                    writeln!(writer, "^ no match for key")?;
++                } else {
++                    writeln!(
++                        writer,
++                        "{}",
++                        "_".repeat(UnicodeWidthStr::width(&line[selection]))
++                    )?;
++                }
++            }
++        }
++        if !(settings.random
++            || settings.stable
++            || settings.unique
++            || !(settings.dictionary_order
++                || settings.ignore_blanks
++                || settings.ignore_case
++                || settings.ignore_non_printing
++                || settings.mode != SortMode::Default))
++        {
++            // A last resort comparator is in use, underline the whole line.
++            if self.line.is_empty() {
++                writeln!(writer, "^ no match for key")?;
++            } else {
++                writeln!(
++                    writer,
++                    "{}",
++                    "_".repeat(UnicodeWidthStr::width(line.as_str()))
++                )?;
++            }
++        }
++        Ok(())
++    }
+ }
+ 
+ /// Transform this line. Returns None if there's no need to transform.
+@@ -449,13 +571,16 @@ impl FieldSelector {
+ 
+     /// Look up the slice that corresponds to this selector for the given line.
+     /// If needs_fields returned false, fields may be None.
+-    fn get_selection<'a>(
+-        &self,
+-        line: &'a str,
+-        tokens: Option<&[Field]>,
+-    ) -> Option<RangeInclusive<usize>> {
+-        enum ResolutionErr {
++    fn get_selection<'a>(&self, line: &'a str, tokens: Option<&[Field]>) -> Range<usize> {
++        enum Resolution {
++            // The start index of the resolved character, inclusive
++            StartOfChar(usize),
++            // The end index of the resolved character, exclusive.
++            // This is only returned if the character index is 0.
++            EndOfChar(usize),
++            // The resolved character would be in front of the first character
+             TooLow,
++            // The resolved character would be after the last character
+             TooHigh,
+         }
+ 
+@@ -464,15 +589,15 @@ impl FieldSelector {
+             line: &str,
+             tokens: Option<&[Field]>,
+             position: &KeyPosition,
+-        ) -> Result<usize, ResolutionErr> {
++        ) -> Resolution {
+             if tokens.map_or(false, |fields| fields.len() < position.field) {
+-                Err(ResolutionErr::TooHigh)
++                Resolution::TooHigh
+             } else if position.char == 0 {
+                 let end = tokens.unwrap()[position.field - 1].end;
+                 if end == 0 {
+-                    Err(ResolutionErr::TooLow)
++                    Resolution::TooLow
+                 } else {
+-                    Ok(end - 1)
++                    Resolution::EndOfChar(end)
+                 }
+             } else {
+                 let mut idx = if position.field == 1 {
+@@ -481,38 +606,52 @@ impl FieldSelector {
+                     0
+                 } else {
+                     tokens.unwrap()[position.field - 1].start
+-                } + position.char
+-                    - 1;
++                };
++                idx += line[idx..]
++                    .char_indices()
++                    .nth(position.char - 1)
++                    .map_or(line.len(), |(idx, _)| idx);
+                 if idx >= line.len() {
+-                    Err(ResolutionErr::TooHigh)
++                    Resolution::TooHigh
+                 } else {
+                     if position.ignore_blanks {
+-                        if let Some(not_whitespace) =
+-                            line[idx..].chars().position(|c| !c.is_whitespace())
++                        if let Some((not_whitespace, _)) =
++                            line[idx..].char_indices().find(|(_, c)| !c.is_whitespace())
+                         {
+                             idx += not_whitespace;
+                         } else {
+-                            return Err(ResolutionErr::TooHigh);
++                            return Resolution::TooHigh;
+                         }
+                     }
+-                    Ok(idx)
++                    Resolution::StartOfChar(idx)
+                 }
+             }
+         }
+ 
+-        if let Ok(from) = resolve_index(line, tokens, &self.from) {
+-            let to = self.to.as_ref().map(|to| resolve_index(line, tokens, &to));
+-            match to {
+-                Some(Ok(to)) => Some(from..=to),
+-                // If `to` was not given or the match would be after the end of the line,
+-                // match everything until the end of the line.
+-                None | Some(Err(ResolutionErr::TooHigh)) => Some(from..=line.len() - 1),
+-                // If `to` is before the start of the line, report no match.
+-                // This can happen if the line starts with a separator.
+-                Some(Err(ResolutionErr::TooLow)) => None,
++        match resolve_index(line, tokens, &self.from) {
++            Resolution::StartOfChar(from) => {
++                let to = self.to.as_ref().map(|to| resolve_index(line, tokens, &to));
++
++                match to {
++                    Some(Resolution::StartOfChar(mut to)) => {
++                        to += line[to..].chars().next().map_or(1, |c| c.len_utf8());
++                        from..to
++                    }
++                    Some(Resolution::EndOfChar(to)) => from..to,
++                    // If `to` was not given or the match would be after the end of the line,
++                    // match everything until the end of the line.
++                    None | Some(Resolution::TooHigh) => from..line.len(),
++                    // If `to` is before the start of the line, report no match.
++                    // This can happen if the line starts with a separator.
++                    Some(Resolution::TooLow) => 0..0,
++                }
+             }
+-        } else {
+-            None
++            Resolution::TooLow | Resolution::EndOfChar(_) => {
++                unreachable!("This should only happen if the field start index is 0, but that should already have caused an error.")
++            }
++            // While for comparisons it's only important that this is an empty slice,
++            // to produce accurate debug output we need to match an empty slice at the end of the line.
++            Resolution::TooHigh => line.len()..line.len(),
+         }
+     }
+ }
+@@ -540,7 +679,7 @@ impl<'a> PartialOrd for MergeableFile<'a> {
+ 
+ impl<'a> PartialEq for MergeableFile<'a> {
+     fn eq(&self, other: &MergeableFile) -> bool {
+-        Ordering::Equal == compare_by(&self.current_line, &other.current_line, self.settings)
++        Ordering::Equal == self.cmp(other)
+     }
+ }
+ 
+@@ -571,8 +710,8 @@ impl<'a> FileMerger<'a> {
+ }
+ 
+ impl<'a> Iterator for FileMerger<'a> {
+-    type Item = String;
+-    fn next(&mut self) -> Option<String> {
++    type Item = Line;
++    fn next(&mut self) -> Option<Line> {
+         match self.heap.pop() {
+             Some(mut current) => {
+                 match current.lines.next() {
+@@ -582,12 +721,12 @@ impl<'a> Iterator for FileMerger<'a> {
+                             Line::new(next_line, &self.settings),
+                         );
+                         self.heap.push(current);
+-                        Some(ret.line)
++                        Some(ret)
+                     }
+                     _ => {
+                         // Don't put it back in the heap (it's empty/erroring)
+                         // but its first line is still valid.
+-                        Some(current.current_line.line)
++                        Some(current.current_line)
+                     }
+                 }
+             }
+@@ -756,9 +895,16 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
+                 .value_name("NUL_FILES")
+                 .multiple(true),
+         )
++        .arg(
++            Arg::with_name(OPT_DEBUG)
++                .long(OPT_DEBUG)
++                .help("underline the parts of the line that are actually used for sorting"),
++        )
+         .arg(Arg::with_name(ARG_FILES).multiple(true).takes_value(true))
+         .get_matches_from(args);
+ 
++    settings.debug = matches.is_present(OPT_DEBUG);
++
+     // check whether user specified a zero terminated list of files for input, otherwise read files from args
+     let mut files: Vec<String> = if matches.is_present(OPT_FILES0_FROM) {
+         let files0_from: Vec<String> = matches
+@@ -862,6 +1008,13 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
+                 1,
+                 &mut key_settings,
+             );
++            if from.char == 0 {
++                crash!(
++                    1,
++                    "invalid character index 0 in `{}` for the start position of a field",
++                    key
++                )
++            }
+             let to = from_to
+                 .next()
+                 .map(|to| KeyPosition::parse(to, 0, &mut key_settings));
+@@ -933,7 +1086,10 @@ fn exec(files: Vec<String>, settings: &GlobalSettings) -> i32 {
+ 
+     if settings.merge {
+         if settings.unique {
+-            print_sorted(file_merger.dedup(), &settings)
++            print_sorted(
++                file_merger.dedup_by(|a, b| compare_by(a, b, settings) == Ordering::Equal),
++                &settings,
++            )
+         } else {
+             print_sorted(file_merger, &settings)
+         }
+@@ -941,12 +1097,11 @@ fn exec(files: Vec<String>, settings: &GlobalSettings) -> i32 {
+         print_sorted(
+             lines
+                 .into_iter()
+-                .dedup_by(|a, b| compare_by(a, b, settings) == Ordering::Equal)
+-                .map(|line| line.line),
++                .dedup_by(|a, b| compare_by(a, b, settings) == Ordering::Equal),
+             &settings,
+         )
+     } else {
+-        print_sorted(lines.into_iter().map(|line| line.line), &settings)
++        print_sorted(lines.into_iter(), &settings)
+     }
+ 
+     0
+@@ -1043,107 +1198,80 @@ fn default_compare(a: &str, b: &str) -> Ordering {
+     a.cmp(b)
+ }
+ 
+-// This function does the initial detection of numeric lines.
+-// Lines starting with a number or positive or negative sign.
+-// It also strips the string of any thing that could never
+-// be a number for the purposes of any type of numeric comparison.
+-#[inline(always)]
+-fn leading_num_common(a: &str) -> &str {
+-    let mut s = "";
+-
+-    // check whether char is numeric, whitespace or decimal point or thousand separator
+-    for (idx, c) in a.char_indices() {
+-        if !c.is_numeric()
+-            && !c.is_whitespace()
+-            && !c.eq(&THOUSANDS_SEP)
+-            && !c.eq(&DECIMAL_PT)
+-            // check for e notation
+-            && !c.eq(&'e')
+-            && !c.eq(&'E')
+-            // check whether first char is + or - 
+-            && !a.chars().next().unwrap_or('\0').eq(&POSITIVE)
+-            && !a.chars().next().unwrap_or('\0').eq(&NEGATIVE)
+-        {
+-            // Strip string of non-numeric trailing chars
+-            s = &a[..idx];
+-            break;
+-        }
+-        // If line is not a number line, return the line as is
+-        s = &a;
+-    }
+-    s
+-}
+-
+ // This function cleans up the initial comparison done by leading_num_common for a general numeric compare.
+ // In contrast to numeric compare, GNU general numeric/FP sort *should* recognize positive signs and
+ // scientific notation, so we strip those lines only after the end of the following numeric string.
+ // For example, 5e10KFD would be 5e10 or 5x10^10 and +10000HFKJFK would become 10000.
+-fn get_leading_gen(a: &str) -> &str {
++fn get_leading_gen(input: &str) -> Range<usize> {
++    let trimmed = input.trim_start();
++    let leading_whitespace_len = input.len() - trimmed.len();
++    for allowed_prefix in &["inf", "-inf", "nan"] {
++        if trimmed.is_char_boundary(allowed_prefix.len())
++            && trimmed[..allowed_prefix.len()].eq_ignore_ascii_case(allowed_prefix)
++        {
++            return leading_whitespace_len..(leading_whitespace_len + allowed_prefix.len());
++        }
++    }
+     // Make this iter peekable to see if next char is numeric
+-    let raw_leading_num = leading_num_common(a);
+-    let mut p_iter = raw_leading_num.chars().peekable();
+-    let mut result = "";
+-    // Cleanup raw stripped strings
+-    for c in p_iter.to_owned() {
+-        let next_char_numeric = p_iter.peek().unwrap_or(&'\0').is_numeric();
+-        // Only general numeric recognizes e notation and, see block below, the '+' sign
+-        // Only GNU (non-general) numeric recognize thousands seperators, takes only leading #
+-        if (c.eq(&'e') || c.eq(&'E')) && !next_char_numeric || c.eq(&THOUSANDS_SEP) {
+-            result = a.split(c).next().unwrap_or("");
+-            break;
+-        // If positive sign and next char is not numeric, split at postive sign at keep trailing numbers
+-        // There is a more elegant way to do this in Rust 1.45, std::str::strip_prefix
+-        } else if c.eq(&POSITIVE) && !next_char_numeric {
+-            result = a.trim().trim_start_matches('+');
+-            break;
++    let mut char_indices = trimmed.char_indices().peekable();
++
++    let first = char_indices.peek();
++
++    if first.map_or(false, |&(_, c)| c == NEGATIVE || c == POSITIVE) {
++        char_indices.next();
++    }
++
++    let mut had_e_notation = false;
++    let mut had_decimal_pt = false;
++    while let Some((idx, c)) = char_indices.next() {
++        if c.is_ascii_digit() {
++            continue;
++        }
++        if c == DECIMAL_PT && !had_decimal_pt {
++            had_decimal_pt = true;
++            continue;
+         }
+-        // If no further processing needed to be done, return the line as-is to be sorted
+-        result = a;
++        let next_char_numeric = char_indices
++            .peek()
++            .map_or(false, |(_, c)| c.is_ascii_digit());
++        if (c == 'e' || c == 'E') && !had_e_notation && next_char_numeric {
++            had_e_notation = true;
++            continue;
++        }
++        return leading_whitespace_len..(leading_whitespace_len + idx);
+     }
+-    result
++    leading_whitespace_len..input.len()
+ }
+ 
+-#[inline(always)]
+-fn remove_trailing_dec<'a, S: Into<Cow<'a, str>>>(input: S) -> Cow<'a, str> {
+-    let input = input.into();
+-    if let Some(s) = input.find(DECIMAL_PT) {
+-        let (leading, trailing) = input.split_at(s);
+-        let output = [leading, ".", trailing.replace(DECIMAL_PT, "").as_str()].concat();
+-        Cow::Owned(output)
+-    } else {
+-        input
+-    }
++#[derive(Copy, Clone, PartialEq, PartialOrd)]
++enum GeneralF64ParseResult {
++    Invalid,
++    NaN,
++    NegInfinity,
++    Number(f64),
++    Infinity,
+ }
+ 
+ /// Parse the beginning string into an f64, returning -inf instead of NaN on errors.
+ #[inline(always)]
+-fn permissive_f64_parse(a: &str) -> f64 {
+-    // GNU sort treats "NaN" as non-number in numeric, so it needs special care.
+-    // *Keep this trim before parse* despite what POSIX may say about -b and -n
+-    // because GNU and BSD both seem to require it to match their behavior
+-    //
+-    // Remove any trailing decimals, ie 4568..890... becomes 4568.890
+-    // Then, we trim whitespace and parse
+-    match remove_trailing_dec(a).trim().parse::<f64>() {
+-        Ok(a) if a.is_nan() => std::f64::NEG_INFINITY,
+-        Ok(a) => a,
+-        Err(_) => std::f64::NEG_INFINITY,
++fn general_f64_parse(a: &str) -> GeneralF64ParseResult {
++    // The actual behavior here relies on Rust's implementation of parsing floating points.
++    // For example "nan", "inf" (ignoring the case) and "infinity" are only parsed to floats starting from 1.53.
++    // TODO: Once our minimum supported Rust version is 1.53 or above, we should add tests for those cases.
++    match a.parse::<f64>() {
++        Ok(a) if a.is_nan() => GeneralF64ParseResult::NaN,
++        Ok(a) if a == std::f64::NEG_INFINITY => GeneralF64ParseResult::NegInfinity,
++        Ok(a) if a == std::f64::INFINITY => GeneralF64ParseResult::Infinity,
++        Ok(a) => GeneralF64ParseResult::Number(a),
++        Err(_) => GeneralF64ParseResult::Invalid,
+     }
+ }
+ 
+ /// Compares two floats, with errors and non-numerics assumed to be -inf.
+ /// Stops coercing at the first non-numeric char.
+ /// We explicitly need to convert to f64 in this case.
+-fn general_numeric_compare(a: f64, b: f64) -> Ordering {
+-    #![allow(clippy::comparison_chain)]
+-    // f64::cmp isn't implemented (due to NaN issues); implement directly instead
+-    if a > b {
+-        Ordering::Greater
+-    } else if a < b {
+-        Ordering::Less
+-    } else {
+-        Ordering::Equal
+-    }
++fn general_numeric_compare(a: GeneralF64ParseResult, b: GeneralF64ParseResult) -> Ordering {
++    a.partial_cmp(&b).unwrap()
+ }
+ 
+ fn get_rand_string() -> String {
+@@ -1170,7 +1298,7 @@ fn random_shuffle(a: &str, b: &str, x: String) -> Ordering {
+     da.cmp(&db)
+ }
+ 
+-#[derive(Eq, Ord, PartialEq, PartialOrd)]
++#[derive(Eq, Ord, PartialEq, PartialOrd, Clone, Copy)]
+ enum Month {
+     Unknown,
+     January,
+@@ -1189,29 +1317,32 @@ enum Month {
+ 
+ /// Parse the beginning string into a Month, returning Month::Unknown on errors.
+ fn month_parse(line: &str) -> Month {
+-    // GNU splits at any 3 letter match "JUNNNN" is JUN
+-    let pattern = if line.trim().len().ge(&3) {
+-        // Split a 3 and get first element of tuple ".0"
+-        line.trim().split_at(3).0
+-    } else {
+-        ""
+-    };
+-
+-    match pattern.to_uppercase().as_ref() {
+-        "JAN" => Month::January,
+-        "FEB" => Month::February,
+-        "MAR" => Month::March,
+-        "APR" => Month::April,
+-        "MAY" => Month::May,
+-        "JUN" => Month::June,
+-        "JUL" => Month::July,
+-        "AUG" => Month::August,
+-        "SEP" => Month::September,
+-        "OCT" => Month::October,
+-        "NOV" => Month::November,
+-        "DEC" => Month::December,
+-        _ => Month::Unknown,
++    let line = line.trim();
++
++    const MONTHS: [(&str, Month); 12] = [
++        ("JAN", Month::January),
++        ("FEB", Month::February),
++        ("MAR", Month::March),
++        ("APR", Month::April),
++        ("MAY", Month::May),
++        ("JUN", Month::June),
++        ("JUL", Month::July),
++        ("AUG", Month::August),
++        ("SEP", Month::September),
++        ("OCT", Month::October),
++        ("NOV", Month::November),
++        ("DEC", Month::December),
++    ];
++
++    for (month_str, month) in &MONTHS {
++        if line.is_char_boundary(month_str.len())
++            && line[..month_str.len()].eq_ignore_ascii_case(month_str)
++        {
++            return *month;
++        }
+     }
++
++    Month::Unknown
+ }
+ 
+ fn month_compare(a: &str, b: &str) -> Ordering {
+@@ -1269,7 +1400,7 @@ fn remove_nonprinting_chars(s: &str) -> String {
+         .collect::<String>()
+ }
+ 
+-fn print_sorted<T: Iterator<Item = String>>(iter: T, settings: &GlobalSettings) {
++fn print_sorted<T: Iterator<Item = Line>>(iter: T, settings: &GlobalSettings) {
+     let mut file: Box<dyn Write> = match settings.outfile {
+         Some(ref filename) => match File::create(Path::new(&filename)) {
+             Ok(f) => Box::new(BufWriter::new(f)) as Box<dyn Write>,
+@@ -1280,15 +1411,19 @@ fn print_sorted<T: Iterator<Item = String>>(iter: T, settings: &GlobalSettings)
+         },
+         None => Box::new(BufWriter::new(stdout())) as Box<dyn Write>,
+     };
+-    if settings.zero_terminated {
++    if settings.zero_terminated && !settings.debug {
+         for line in iter {
+-            crash_if_err!(1, file.write_all(line.as_bytes()));
++            crash_if_err!(1, file.write_all(line.line.as_bytes()));
+             crash_if_err!(1, file.write_all("\0".as_bytes()));
+         }
+     } else {
+         for line in iter {
+-            crash_if_err!(1, file.write_all(line.as_bytes()));
+-            crash_if_err!(1, file.write_all("\n".as_bytes()));
++            if !settings.debug {
++                crash_if_err!(1, file.write_all(line.line.as_bytes()));
++                crash_if_err!(1, file.write_all("\n".as_bytes()));
++            } else {
++                crash_if_err!(1, line.print_debug(settings, &mut file));
++            }
+         }
+     }
+     crash_if_err!(1, file.flush());
+diff --git a/tests/by-util/test_sort.rs b/tests/by-util/test_sort.rs
+index a4a9a383ca8..c68fa3dcf77 100644
+--- a/tests/by-util/test_sort.rs
++++ b/tests/by-util/test_sort.rs
+@@ -2,10 +2,17 @@ use crate::common::util::*;
+ 
+ fn test_helper(file_name: &str, args: &str) {
+     new_ucmd!()
+-        .arg(args)
+         .arg(format!("{}.txt", file_name))
++        .args(&args.split(' ').collect::<Vec<&str>>())
+         .succeeds()
+         .stdout_is_fixture(format!("{}.expected", file_name));
++
++    new_ucmd!()
++        .arg(format!("{}.txt", file_name))
++        .arg("--debug")
++        .args(&args.split(' ').collect::<Vec<&str>>())
++        .succeeds()
++        .stdout_is_fixture(format!("{}.expected.debug", file_name));
+ }
+ 
+ #[test]
+@@ -29,11 +36,7 @@ fn test_human_numeric_whitespace() {
+ 
+ #[test]
+ fn test_multiple_decimals_general() {
+-    new_ucmd!()
+-        .arg("-g")
+-        .arg("multiple_decimals_general.txt")
+-        .succeeds()
+-        .stdout_is("\n\n\n\n\n\n\n\nCARAvan\n-2028789030\n-896689\n-8.90880\n-1\n-.05\n000\n00000001\n1\n1.040000000\n1.444\n1.58590\n8.013\n45\n46.89\n576,446.88800000\n576,446.890\n               4567.\n4567.1\n4567.34\n\t\t\t\t\t\t\t\t\t\t4567..457\n\t\t\t\t37800\n\t\t\t\t\t\t45670.89079.098\n\t\t\t\t\t\t45670.89079.1\n4798908.340000000000\n4798908.45\n4798908.8909800\n");
++    test_helper("multiple_decimals_general", "-g")
+ }
+ 
+ #[test]
+@@ -63,7 +66,7 @@ fn test_check_zero_terminated_success() {
+ #[test]
+ fn test_random_shuffle_len() {
+     // check whether output is the same length as the input
+-    const FILE: &'static str = "default_unsorted_ints.expected";
++    const FILE: &str = "default_unsorted_ints.expected";
+     let (at, _ucmd) = at_and_ucmd!();
+     let result = new_ucmd!().arg("-R").arg(FILE).run().stdout_move_str();
+     let expected = at.read(FILE);
+@@ -75,7 +78,7 @@ fn test_random_shuffle_len() {
+ #[test]
+ fn test_random_shuffle_contains_all_lines() {
+     // check whether lines of input are all in output
+-    const FILE: &'static str = "default_unsorted_ints.expected";
++    const FILE: &str = "default_unsorted_ints.expected";
+     let (at, _ucmd) = at_and_ucmd!();
+     let result = new_ucmd!().arg("-R").arg(FILE).run().stdout_move_str();
+     let expected = at.read(FILE);
+@@ -90,7 +93,7 @@ fn test_random_shuffle_two_runs_not_the_same() {
+     // check to verify that two random shuffles are not equal; this has the
+     // potential to fail in the very unlikely event that the random order is the same
+     // as the starting order, or if both random sorts end up having the same order.
+-    const FILE: &'static str = "default_unsorted_ints.expected";
++    const FILE: &str = "default_unsorted_ints.expected";
+     let (at, _ucmd) = at_and_ucmd!();
+     let result = new_ucmd!().arg("-R").arg(FILE).run().stdout_move_str();
+     let expected = at.read(FILE);
+@@ -105,7 +108,7 @@ fn test_random_shuffle_contains_two_runs_not_the_same() {
+     // check to verify that two random shuffles are not equal; this has the
+     // potential to fail in the unlikely event that random order is the same
+     // as the starting order, or if both random sorts end up having the same order.
+-    const FILE: &'static str = "default_unsorted_ints.expected";
++    const FILE: &str = "default_unsorted_ints.expected";
+     let (at, _ucmd) = at_and_ucmd!();
+     let result = new_ucmd!().arg("-R").arg(FILE).run().stdout_move_str();
+     let expected = at.read(FILE);
+@@ -209,13 +212,7 @@ fn test_non_printing_chars() {
+ 
+ #[test]
+ fn test_exponents_positive_general_fixed() {
+-    for exponents_positive_general_param in vec!["-g"] {
+-        new_ucmd!()
+-            .pipe_in("100E6\n\n50e10\n+100000\n\n10000K78\n10E\n\n\n1000EDKLD\n\n\n100E6\n\n50e10\n+100000\n\n")
+-            .arg(exponents_positive_general_param)
+-            .succeeds()
+-            .stdout_only("\n\n\n\n\n\n\n\n10000K78\n1000EDKLD\n10E\n+100000\n+100000\n100E6\n100E6\n50e10\n50e10\n");
+-    }
++    test_helper("exponents_general", "-g");
+ }
+ 
+ #[test]
+@@ -334,62 +331,32 @@ fn test_numeric_unique_ints2() {
+ 
+ #[test]
+ fn test_keys_open_ended() {
+-    let input = "aa bb cc\ndd aa ff\ngg aa cc\n";
+-    new_ucmd!()
+-        .args(&["-k", "2.2"])
+-        .pipe_in(input)
+-        .succeeds()
+-        .stdout_only("gg aa cc\ndd aa ff\naa bb cc\n");
++    test_helper("keys_open_ended", "-k 2.3");
+ }
+ 
+ #[test]
+ fn test_keys_closed_range() {
+-    let input = "aa bb cc\ndd aa ff\ngg aa cc\n";
+-    new_ucmd!()
+-        .args(&["-k", "2.2,2.2"])
+-        .pipe_in(input)
+-        .succeeds()
+-        .stdout_only("dd aa ff\ngg aa cc\naa bb cc\n");
++    test_helper("keys_closed_range", "-k 2.2,2.2");
+ }
+ 
+ #[test]
+ fn test_keys_multiple_ranges() {
+-    let input = "aa bb cc\ndd aa ff\ngg aa cc\n";
+-    new_ucmd!()
+-        .args(&["-k", "2,2", "-k", "3,3"])
+-        .pipe_in(input)
+-        .succeeds()
+-        .stdout_only("gg aa cc\ndd aa ff\naa bb cc\n");
++    test_helper("keys_multiple_ranges", "-k 2,2 -k 3,3");
+ }
+ 
+ #[test]
+ fn test_keys_no_field_match() {
+-    let input = "aa aa aa aa\naa bb cc\ndd aa ff\n";
+-    new_ucmd!()
+-        .args(&["-k", "4,4"])
+-        .pipe_in(input)
+-        .succeeds()
+-        .stdout_only("aa bb cc\ndd aa ff\naa aa aa aa\n");
++    test_helper("keys_no_field_match", "-k 4,4");
+ }
+ 
+ #[test]
+ fn test_keys_no_char_match() {
+-    let input = "aaa\nba\nc\n";
+-    new_ucmd!()
+-        .args(&["-k", "1.2"])
+-        .pipe_in(input)
+-        .succeeds()
+-        .stdout_only("c\nba\naaa\n");
++    test_helper("keys_no_char_match", "-k 1.2");
+ }
+ 
+ #[test]
+ fn test_keys_custom_separator() {
+-    let input = "aaxbbxcc\nddxaaxff\nggxaaxcc\n";
+-    new_ucmd!()
+-        .args(&["-k", "2.2,2.2", "-t", "x"])
+-        .pipe_in(input)
+-        .succeeds()
+-        .stdout_only("ddxaaxff\nggxaaxcc\naaxbbxcc\n");
++    test_helper("keys_custom_separator", "-k 2.2,2.2 -t x");
+ }
+ 
+ #[test]
+@@ -416,6 +383,13 @@ fn test_keys_invalid_field_zero() {
+         .stderr_only("sort: error: field index was 0");
+ }
+ 
++#[test]
++fn test_keys_invalid_char_zero() {
++    new_ucmd!().args(&["-k", "1.0"]).fails().stderr_only(
++        "sort: error: invalid character index 0 in `1.0` for the start position of a field",
++    );
++}
++
+ #[test]
+ fn test_keys_with_options() {
+     let input = "aa 3 cc\ndd 1 ff\ngg 2 cc\n";
+diff --git a/tests/fixtures/sort/default_unsorted_ints.expected.debug b/tests/fixtures/sort/default_unsorted_ints.expected.debug
+new file mode 100644
+index 00000000000..2bf082d3be9
+--- /dev/null
++++ b/tests/fixtures/sort/default_unsorted_ints.expected.debug
+@@ -0,0 +1,200 @@
++1
++_
++10
++__
++100
++___
++11
++__
++12
++__
++13
++__
++14
++__
++15
++__
++16
++__
++17
++__
++18
++__
++19
++__
++2
++_
++20
++__
++21
++__
++22
++__
++23
++__
++24
++__
++25
++__
++26
++__
++27
++__
++28
++__
++29
++__
++3
++_
++30
++__
++31
++__
++32
++__
++33
++__
++34
++__
++35
++__
++36
++__
++37
++__
++38
++__
++39
++__
++4
++_
++40
++__
++41
++__
++42
++__
++43
++__
++44
++__
++45
++__
++46
++__
++47
++__
++48
++__
++49
++__
++5
++_
++50
++__
++51
++__
++52
++__
++53
++__
++54
++__
++55
++__
++56
++__
++57
++__
++58
++__
++59
++__
++6
++_
++60
++__
++61
++__
++62
++__
++63
++__
++64
++__
++65
++__
++66
++__
++67
++__
++68
++__
++69
++__
++7
++_
++70
++__
++71
++__
++72
++__
++73
++__
++74
++__
++75
++__
++76
++__
++77
++__
++78
++__
++79
++__
++8
++_
++80
++__
++81
++__
++82
++__
++83
++__
++84
++__
++85
++__
++86
++__
++87
++__
++88
++__
++89
++__
++9
++_
++90
++__
++91
++__
++92
++__
++93
++__
++94
++__
++95
++__
++96
++__
++97
++__
++98
++__
++99
++__
+diff --git a/tests/fixtures/sort/dictionary_order.expected.debug b/tests/fixtures/sort/dictionary_order.expected.debug
+new file mode 100644
+index 00000000000..f4a2d17dbf2
+--- /dev/null
++++ b/tests/fixtures/sort/dictionary_order.expected.debug
+@@ -0,0 +1,9 @@
++bbb
++___
++___
++./bbc
++_____
++_____
++bbd
++___
++___
+diff --git a/tests/fixtures/sort/exponents-positive-numeric.expected.debug b/tests/fixtures/sort/exponents-positive-numeric.expected.debug
+new file mode 100644
+index 00000000000..f5a32bad1a2
+--- /dev/null
++++ b/tests/fixtures/sort/exponents-positive-numeric.expected.debug
+@@ -0,0 +1,36 @@
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
+++100000
++^ no match for key
++_______
++10E
++__
++___
++50e10
++__
++_____
++100E6
++___
++_____
++1000EDKLD
++____
++_________
++10000K78
++_____
++________
+diff --git a/tests/fixtures/sort/exponents_general.expected b/tests/fixtures/sort/exponents_general.expected
+new file mode 100644
+index 00000000000..524b6e67f40
+--- /dev/null
++++ b/tests/fixtures/sort/exponents_general.expected
+@@ -0,0 +1,19 @@
++
++
++
++
++
++
++
++
++5.5.5.5
++10E
++1000EDKLD
++10000K78
+++100000
+++100000
++100E6
++100E6
++10e10e10e10
++50e10
++50e10
+diff --git a/tests/fixtures/sort/exponents_general.expected.debug b/tests/fixtures/sort/exponents_general.expected.debug
+new file mode 100644
+index 00000000000..4dea45c3924
+--- /dev/null
++++ b/tests/fixtures/sort/exponents_general.expected.debug
+@@ -0,0 +1,57 @@
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++5.5.5.5
++___
++_______
++10E
++__
++___
++1000EDKLD
++____
++_________
++10000K78
++_____
++________
+++100000
++_______
++_______
+++100000
++_______
++_______
++100E6
++_____
++_____
++100E6
++_____
++_____
++10e10e10e10
++_____
++___________
++50e10
++_____
++_____
++50e10
++_____
++_____
+diff --git a/tests/fixtures/sort/human-numeric-whitespace.expected.debug b/tests/fixtures/sort/human-numeric-whitespace.expected.debug
+new file mode 100644
+index 00000000000..66afcda6649
+--- /dev/null
++++ b/tests/fixtures/sort/human-numeric-whitespace.expected.debug
+@@ -0,0 +1,33 @@
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++456K
++____
++____
++4568K
++_____
++_____
++>>>456M
++   ____
++_______
++              6.2G
++              ____
++__________________
+diff --git a/tests/fixtures/sort/human_block_sizes.expected.debug b/tests/fixtures/sort/human_block_sizes.expected.debug
+new file mode 100644
+index 00000000000..5f4860a8540
+--- /dev/null
++++ b/tests/fixtures/sort/human_block_sizes.expected.debug
+@@ -0,0 +1,33 @@
++844K
++____
++____
++981K
++____
++____
++11M
++___
++___
++13M
++___
++___
++14M
++___
++___
++16M
++___
++___
++18M
++___
++___
++19M
++___
++___
++20M
++___
++___
++981T
++____
++____
++20P
++___
++___
+diff --git a/tests/fixtures/sort/ignore_case.expected.debug b/tests/fixtures/sort/ignore_case.expected.debug
+new file mode 100644
+index 00000000000..08f0abb8d52
+--- /dev/null
++++ b/tests/fixtures/sort/ignore_case.expected.debug
+@@ -0,0 +1,21 @@
++aaa
++___
++___
++BBB
++___
++___
++ccc
++___
++___
++DDD
++___
++___
++eee
++___
++___
++FFF
++___
++___
++ggg
++___
++___
+diff --git a/tests/fixtures/sort/keys_closed_range.expected b/tests/fixtures/sort/keys_closed_range.expected
+new file mode 100644
+index 00000000000..45005621bc4
+--- /dev/null
++++ b/tests/fixtures/sort/keys_closed_range.expected
+@@ -0,0 +1,6 @@
++dd aa ff
++gg aa cc
++aa bb cc
++èè éé èè
++👩‍🔬 👩‍🔬 👩‍🔬
++💣💣 💣💣 💣💣
+diff --git a/tests/fixtures/sort/keys_closed_range.expected.debug b/tests/fixtures/sort/keys_closed_range.expected.debug
+new file mode 100644
+index 00000000000..b78db4af181
+--- /dev/null
++++ b/tests/fixtures/sort/keys_closed_range.expected.debug
+@@ -0,0 +1,18 @@
++dd aa ff
++   _
++________
++gg aa cc
++   _
++________
++aa bb cc
++   _
++________
++èè éé èè
++   _
++________
++👩‍🔬 👩‍🔬 👩‍🔬
++     __
++______________
++💣💣 💣💣 💣💣
++     __
++______________
+diff --git a/tests/fixtures/sort/keys_custom_separator.expected b/tests/fixtures/sort/keys_custom_separator.expected
+new file mode 100644
+index 00000000000..2aba4203318
+--- /dev/null
++++ b/tests/fixtures/sort/keys_custom_separator.expected
+@@ -0,0 +1,3 @@
++ddxaaxff
++ggxaaxcc
++aaxbbxcc
+diff --git a/tests/fixtures/sort/keys_custom_separator.expected.debug b/tests/fixtures/sort/keys_custom_separator.expected.debug
+new file mode 100644
+index 00000000000..5d4dbc776dc
+--- /dev/null
++++ b/tests/fixtures/sort/keys_custom_separator.expected.debug
+@@ -0,0 +1,9 @@
++ddxaaxff
++    _
++________
++ggxaaxcc
++    _
++________
++aaxbbxcc
++    _
++________
+diff --git a/tests/fixtures/sort/keys_multiple_ranges.expected b/tests/fixtures/sort/keys_multiple_ranges.expected
+new file mode 100644
+index 00000000000..09e4e87298e
+--- /dev/null
++++ b/tests/fixtures/sort/keys_multiple_ranges.expected
+@@ -0,0 +1,6 @@
++gg aa cc
++dd aa ff
++aa bb cc
++èè éé èè
++👩‍🔬 👩‍🔬 👩‍🔬
++💣💣 💣💣 💣💣
+diff --git a/tests/fixtures/sort/keys_multiple_ranges.expected.debug b/tests/fixtures/sort/keys_multiple_ranges.expected.debug
+new file mode 100644
+index 00000000000..830e9afd091
+--- /dev/null
++++ b/tests/fixtures/sort/keys_multiple_ranges.expected.debug
+@@ -0,0 +1,24 @@
++gg aa cc
++  ___
++     ___
++________
++dd aa ff
++  ___
++     ___
++________
++aa bb cc
++  ___
++     ___
++________
++èè éé èè
++  ___
++     ___
++________
++👩‍🔬 👩‍🔬 👩‍🔬
++    _____
++         _____
++______________
++💣💣 💣💣 💣💣
++    _____
++         _____
++______________
+diff --git a/tests/fixtures/sort/keys_no_char_match.expected b/tests/fixtures/sort/keys_no_char_match.expected
+new file mode 100644
+index 00000000000..dcb361837fd
+--- /dev/null
++++ b/tests/fixtures/sort/keys_no_char_match.expected
+@@ -0,0 +1,3 @@
++c
++ba
++aaa
+diff --git a/tests/fixtures/sort/keys_no_char_match.expected.debug b/tests/fixtures/sort/keys_no_char_match.expected.debug
+new file mode 100644
+index 00000000000..5287a0de9e4
+--- /dev/null
++++ b/tests/fixtures/sort/keys_no_char_match.expected.debug
+@@ -0,0 +1,9 @@
++c
++ ^ no match for key
++_
++ba
++ _
++__
++aaa
++ __
++___
+diff --git a/tests/fixtures/sort/keys_no_field_match.expected b/tests/fixtures/sort/keys_no_field_match.expected
+new file mode 100644
+index 00000000000..e2f183e13b9
+--- /dev/null
++++ b/tests/fixtures/sort/keys_no_field_match.expected
+@@ -0,0 +1,6 @@
++aa bb cc
++dd aa ff
++gg aa cc
++èè éé èè
++👩‍🔬 👩‍🔬 👩‍🔬
++💣💣 💣💣 💣💣
+diff --git a/tests/fixtures/sort/keys_no_field_match.expected.debug b/tests/fixtures/sort/keys_no_field_match.expected.debug
+new file mode 100644
+index 00000000000..60197b1deaa
+--- /dev/null
++++ b/tests/fixtures/sort/keys_no_field_match.expected.debug
+@@ -0,0 +1,18 @@
++aa bb cc
++        ^ no match for key
++________
++dd aa ff
++        ^ no match for key
++________
++gg aa cc
++        ^ no match for key
++________
++èè éé èè
++        ^ no match for key
++________
++👩‍🔬 👩‍🔬 👩‍🔬
++              ^ no match for key
++______________
++💣💣 💣💣 💣💣
++              ^ no match for key
++______________
+diff --git a/tests/fixtures/sort/keys_open_ended.expected b/tests/fixtures/sort/keys_open_ended.expected
+new file mode 100644
+index 00000000000..09e4e87298e
+--- /dev/null
++++ b/tests/fixtures/sort/keys_open_ended.expected
+@@ -0,0 +1,6 @@
++gg aa cc
++dd aa ff
++aa bb cc
++èè éé èè
++👩‍🔬 👩‍🔬 👩‍🔬
++💣💣 💣💣 💣💣
+diff --git a/tests/fixtures/sort/keys_open_ended.expected.debug b/tests/fixtures/sort/keys_open_ended.expected.debug
+new file mode 100644
+index 00000000000..d3a56ffd6f6
+--- /dev/null
++++ b/tests/fixtures/sort/keys_open_ended.expected.debug
+@@ -0,0 +1,18 @@
++gg aa cc
++    ____
++________
++dd aa ff
++    ____
++________
++aa bb cc
++    ____
++________
++èè éé èè
++    ____
++________
++👩‍🔬 👩‍🔬 👩‍🔬
++       _______
++______________
++💣💣 💣💣 💣💣
++       _______
++______________
+diff --git a/tests/fixtures/sort/mixed_floats_ints_chars_numeric.expected.debug b/tests/fixtures/sort/mixed_floats_ints_chars_numeric.expected.debug
+new file mode 100644
+index 00000000000..dbe295a1cca
+--- /dev/null
++++ b/tests/fixtures/sort/mixed_floats_ints_chars_numeric.expected.debug
+@@ -0,0 +1,90 @@
++-2028789030
++___________
++___________
++-896689
++_______
++_______
++-8.90880
++________
++________
++-1
++__
++__
++-.05
++____
++____
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++000
++___
++___
++CARAvan
++^ no match for key
++_______
++00000001
++________
++________
++1
++_
++_
++1.040000000
++___________
++___________
++1.444
++_____
++_____
++1.58590
++_______
++_______
++8.013
++_____
++_____
++45
++__
++__
++46.89
++_____
++_____
++               4567.
++               _____
++____________________
++>>>>37800
++    _____
++_________
++576,446.88800000
++________________
++________________
++576,446.890
++___________
++___________
++4798908.340000000000
++____________________
++____________________
++4798908.45
++__________
++__________
++4798908.8909800
++_______________
++_______________
+diff --git a/tests/fixtures/sort/mixed_floats_ints_chars_numeric_stable.expected.debug b/tests/fixtures/sort/mixed_floats_ints_chars_numeric_stable.expected.debug
+new file mode 100644
+index 00000000000..b2782d93d3c
+--- /dev/null
++++ b/tests/fixtures/sort/mixed_floats_ints_chars_numeric_stable.expected.debug
+@@ -0,0 +1,60 @@
++-2028789030
++___________
++-896689
++_______
++-8.90880
++________
++-1
++__
++-.05
++____
++
++^ no match for key
++
++^ no match for key
++
++^ no match for key
++
++^ no match for key
++
++^ no match for key
++CARAvan
++^ no match for key
++
++^ no match for key
++
++^ no match for key
++
++^ no match for key
++000
++___
++1
++_
++00000001
++________
++1.040000000
++___________
++1.444
++_____
++1.58590
++_______
++8.013
++_____
++45
++__
++46.89
++_____
++               4567.
++               _____
++>>>>37800
++    _____
++576,446.88800000
++________________
++576,446.890
++___________
++4798908.340000000000
++____________________
++4798908.45
++__________
++4798908.8909800
++_______________
+diff --git a/tests/fixtures/sort/mixed_floats_ints_chars_numeric_unique.expected.debug b/tests/fixtures/sort/mixed_floats_ints_chars_numeric_unique.expected.debug
+new file mode 100644
+index 00000000000..782a77724f7
+--- /dev/null
++++ b/tests/fixtures/sort/mixed_floats_ints_chars_numeric_unique.expected.debug
+@@ -0,0 +1,40 @@
++-2028789030
++___________
++-896689
++_______
++-8.90880
++________
++-1
++__
++-.05
++____
++
++^ no match for key
++1
++_
++1.040000000
++___________
++1.444
++_____
++1.58590
++_______
++8.013
++_____
++45
++__
++46.89
++_____
++               4567.
++               _____
++>>>>37800
++    _____
++576,446.88800000
++________________
++576,446.890
++___________
++4798908.340000000000
++____________________
++4798908.45
++__________
++4798908.8909800
++_______________
+diff --git a/tests/fixtures/sort/mixed_floats_ints_chars_numeric_unique_reverse.expected.debug b/tests/fixtures/sort/mixed_floats_ints_chars_numeric_unique_reverse.expected.debug
+new file mode 100644
+index 00000000000..e0389c1d507
+--- /dev/null
++++ b/tests/fixtures/sort/mixed_floats_ints_chars_numeric_unique_reverse.expected.debug
+@@ -0,0 +1,40 @@
++4798908.8909800
++_______________
++4798908.45
++__________
++4798908.340000000000
++____________________
++576,446.890
++___________
++576,446.88800000
++________________
++>>>>37800
++    _____
++               4567.
++               _____
++46.89
++_____
++45
++__
++8.013
++_____
++1.58590
++_______
++1.444
++_____
++1.040000000
++___________
++1
++_
++
++^ no match for key
++-.05
++____
++-1
++__
++-8.90880
++________
++-896689
++_______
++-2028789030
++___________
+diff --git a/tests/fixtures/sort/month_default.expected.debug b/tests/fixtures/sort/month_default.expected.debug
+new file mode 100644
+index 00000000000..2c55a0e2ab3
+--- /dev/null
++++ b/tests/fixtures/sort/month_default.expected.debug
+@@ -0,0 +1,30 @@
++N/A Ut enim ad minim veniam, quis
++^ no match for key
++_________________________________
++Jan Lorem ipsum dolor sit amet
++___
++______________________________
++mar laboris nisi ut aliquip ex ea
++___
++_________________________________
++May sed do eiusmod tempor incididunt
++___
++____________________________________
++JUN nostrud exercitation ullamco
++___
++________________________________
++Jul 1 should remain 2,1,3
++___
++_________________________
++Jul 2 these three lines
++___
++_______________________
++Jul 3 if --stable is provided
++___
++_____________________________
++Oct ut labore et dolore magna aliqua
++___
++____________________________________
++Dec consectetur adipiscing elit
++___
++_______________________________
+diff --git a/tests/fixtures/sort/month_stable.expected.debug b/tests/fixtures/sort/month_stable.expected.debug
+new file mode 100644
+index 00000000000..4163ba39a63
+--- /dev/null
++++ b/tests/fixtures/sort/month_stable.expected.debug
+@@ -0,0 +1,20 @@
++N/A Ut enim ad minim veniam, quis
++^ no match for key
++Jan Lorem ipsum dolor sit amet
++___
++mar laboris nisi ut aliquip ex ea
++___
++May sed do eiusmod tempor incididunt
++___
++JUN nostrud exercitation ullamco
++___
++Jul 2 these three lines
++___
++Jul 1 should remain 2,1,3
++___
++Jul 3 if --stable is provided
++___
++Oct ut labore et dolore magna aliqua
++___
++Dec consectetur adipiscing elit
++___
+diff --git a/tests/fixtures/sort/months-dedup.expected.debug b/tests/fixtures/sort/months-dedup.expected.debug
+new file mode 100644
+index 00000000000..aded4b95159
+--- /dev/null
++++ b/tests/fixtures/sort/months-dedup.expected.debug
+@@ -0,0 +1,12 @@
++
++^ no match for key
++JAN
++___
++apr
++___
++MAY
++___
++JUNNNN
++___
++AUG 
++___
+diff --git a/tests/fixtures/sort/months-whitespace.expected.debug b/tests/fixtures/sort/months-whitespace.expected.debug
+new file mode 100644
+index 00000000000..ef626f505a2
+--- /dev/null
++++ b/tests/fixtures/sort/months-whitespace.expected.debug
+@@ -0,0 +1,24 @@
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++JAN
++___
++___
++  FEb
++  ___
++_____
++ apr
++ ___
++____
++ apr
++ ___
++____
++>>>JUNNNN
++   ___
++_________
++AUG 
++___
++____
+diff --git a/tests/fixtures/sort/multiple_decimals_general.expected b/tests/fixtures/sort/multiple_decimals_general.expected
+new file mode 100644
+index 00000000000..b08ada32491
+--- /dev/null
++++ b/tests/fixtures/sort/multiple_decimals_general.expected
+@@ -0,0 +1,37 @@
++
++
++
++
++
++
++
++CARAvan
++  NaN
++	-inf
++-2028789030
++-896689
++-8.90880
++-1
++-.05
++000
++00000001
++1
++1.040000000
++1.444
++1.58590
++8.013
++45
++46.89
++576,446.88800000
++576,446.890
++										4567..457
++               4567.
++4567.1
++4567.34
++				37800
++						45670.89079.098
++						45670.89079.1
++4798908.340000000000
++4798908.45
++4798908.8909800
++inf
+diff --git a/tests/fixtures/sort/multiple_decimals_general.expected.debug b/tests/fixtures/sort/multiple_decimals_general.expected.debug
+new file mode 100644
+index 00000000000..1bf5d26692b
+--- /dev/null
++++ b/tests/fixtures/sort/multiple_decimals_general.expected.debug
+@@ -0,0 +1,111 @@
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++CARAvan
++^ no match for key
++_______
++  NaN
++  ___
++_____
++>-inf
++ ____
++_____
++-2028789030
++___________
++___________
++-896689
++_______
++_______
++-8.90880
++________
++________
++-1
++__
++__
++-.05
++____
++____
++000
++___
++___
++00000001
++________
++________
++1
++_
++_
++1.040000000
++___________
++___________
++1.444
++_____
++_____
++1.58590
++_______
++_______
++8.013
++_____
++_____
++45
++__
++__
++46.89
++_____
++_____
++576,446.88800000
++___
++________________
++576,446.890
++___
++___________
++>>>>>>>>>>4567..457
++          _____
++___________________
++               4567.
++               _____
++____________________
++4567.1
++______
++______
++4567.34
++_______
++_______
++>>>>37800
++    _____
++_________
++>>>>>>45670.89079.098
++      ___________
++_____________________
++>>>>>>45670.89079.1
++      ___________
++___________________
++4798908.340000000000
++____________________
++____________________
++4798908.45
++__________
++__________
++4798908.8909800
++_______________
++_______________
++inf
++___
++___
+diff --git a/tests/fixtures/sort/multiple_decimals_numeric.expected.debug b/tests/fixtures/sort/multiple_decimals_numeric.expected.debug
+new file mode 100644
+index 00000000000..f40ade9aa75
+--- /dev/null
++++ b/tests/fixtures/sort/multiple_decimals_numeric.expected.debug
+@@ -0,0 +1,105 @@
++-2028789030
++___________
++___________
++-896689
++_______
++_______
++-8.90880
++________
++________
++-1
++__
++__
++-.05
++____
++____
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++000
++___
++___
++CARAvan
++^ no match for key
++_______
++00000001
++________
++________
++1
++_
++_
++1.040000000
++___________
++___________
++1.444
++_____
++_____
++1.58590
++_______
++_______
++8.013
++_____
++_____
++45
++__
++__
++46.89
++_____
++_____
++>>>>>>>>>>4567..457
++          _____
++___________________
++               4567.
++               _____
++____________________
++4567.1
++______
++______
++4567.34
++_______
++_______
++>>>>37800
++    _____
++_________
++>>>>>>45670.89079.098
++      ___________
++_____________________
++>>>>>>45670.89079.1
++      ___________
++___________________
++576,446.88800000
++________________
++________________
++576,446.890
++___________
++___________
++4798908.340000000000
++____________________
++____________________
++4798908.45
++__________
++__________
++4798908.8909800
++_______________
++_______________
+diff --git a/tests/fixtures/sort/numeric-floats-with-nan2.expected.debug b/tests/fixtures/sort/numeric-floats-with-nan2.expected.debug
+new file mode 100644
+index 00000000000..b5a2c2f6441
+--- /dev/null
++++ b/tests/fixtures/sort/numeric-floats-with-nan2.expected.debug
+@@ -0,0 +1,69 @@
++-8.90880
++________
++________
++-.05
++____
++____
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++
++^ no match for key
++^ no match for key
++Karma
++^ no match for key
++_____
++1
++_
++_
++1.0/0.0
++___
++_______
++1.040000000
++___________
++___________
++1.2
++___
++___
++1.444
++_____
++_____
++1.58590
++_______
++_______
+diff --git a/tests/fixtures/sort/numeric_fixed_floats.expected.debug b/tests/fixtures/sort/numeric_fixed_floats.expected.debug
+new file mode 100644
+index 00000000000..fa8a909c556
+--- /dev/null
++++ b/tests/fixtures/sort/numeric_fixed_floats.expected.debug
+@@ -0,0 +1,6 @@
++.00
++___
++___
++.01
++___
++___
+diff --git a/tests/fixtures/sort/numeric_floats.expected.debug b/tests/fixtures/sort/numeric_floats.expected.debug
+new file mode 100644
+index 00000000000..e24056376fd
+--- /dev/null
++++ b/tests/fixtures/sort/numeric_floats.expected.debug
+@@ -0,0 +1,6 @@
++.02
++___
++___
++.03
++___
++___
+diff --git a/tests/fixtures/sort/numeric_floats_and_ints.expected.debug b/tests/fixtures/sort/numeric_floats_and_ints.expected.debug
+new file mode 100644
+index 00000000000..c43d6bfb6f2
+--- /dev/null
++++ b/tests/fixtures/sort/numeric_floats_and_ints.expected.debug
+@@ -0,0 +1,6 @@
++0
++_
++_
++.02
++___
++___
+diff --git a/tests/fixtures/sort/numeric_floats_with_nan.expected.debug b/tests/fixtures/sort/numeric_floats_with_nan.expected.debug
+new file mode 100644
+index 00000000000..07e72db539b
+--- /dev/null
++++ b/tests/fixtures/sort/numeric_floats_with_nan.expected.debug
+@@ -0,0 +1,9 @@
++NaN
++^ no match for key
++___
++.02
++___
++___
++.03
++___
++___
+diff --git a/tests/fixtures/sort/numeric_unfixed_floats.expected.debug b/tests/fixtures/sort/numeric_unfixed_floats.expected.debug
+new file mode 100644
+index 00000000000..a60daf6234d
+--- /dev/null
++++ b/tests/fixtures/sort/numeric_unfixed_floats.expected.debug
+@@ -0,0 +1,6 @@
++.000
++____
++____
++.01
++___
++___
+diff --git a/tests/fixtures/sort/numeric_unique.expected.debug b/tests/fixtures/sort/numeric_unique.expected.debug
+new file mode 100644
+index 00000000000..79ec70364fe
+--- /dev/null
++++ b/tests/fixtures/sort/numeric_unique.expected.debug
+@@ -0,0 +1,4 @@
++-10 bb
++___
++aa
++^ no match for key
+diff --git a/tests/fixtures/sort/numeric_unsorted_ints.expected.debug b/tests/fixtures/sort/numeric_unsorted_ints.expected.debug
+new file mode 100644
+index 00000000000..b16931f5ea8
+--- /dev/null
++++ b/tests/fixtures/sort/numeric_unsorted_ints.expected.debug
+@@ -0,0 +1,300 @@
++1
++_
++_
++2
++_
++_
++3
++_
++_
++4
++_
++_
++5
++_
++_
++6
++_
++_
++7
++_
++_
++8
++_
++_
++9
++_
++_
++10
++__
++__
++11
++__
++__
++12
++__
++__
++13
++__
++__
++14
++__
++__
++15
++__
++__
++16
++__
++__
++17
++__
++__
++18
++__
++__
++19
++__
++__
++20
++__
++__
++21
++__
++__
++22
++__
++__
++23
++__
++__
++24
++__
++__
++25
++__
++__
++26
++__
++__
++27
++__
++__
++28
++__
++__
++29
++__
++__
++30
++__
++__
++31
++__
++__
++32
++__
++__
++33
++__
++__
++34
++__
++__
++35
++__
++__
++36
++__
++__
++37
++__
++__
++38
++__
++__
++39
++__
++__
++40
++__
++__
++41
++__
++__
++42
++__
++__
++43
++__
++__
++44
++__
++__
++45
++__
++__
++46
++__
++__
++47
++__
++__
++48
++__
++__
++49
++__
++__
++50
++__
++__
++51
++__
++__
++52
++__
++__
++53
++__
++__
++54
++__
++__
++55
++__
++__
++56
++__
++__
++57
++__
++__
++58
++__
++__
++59
++__
++__
++60
++__
++__
++61
++__
++__
++62
++__
++__
++63
++__
++__
++64
++__
++__
++65
++__
++__
++66
++__
++__
++67
++__
++__
++68
++__
++__
++69
++__
++__
++70
++__
++__
++71
++__
++__
++72
++__
++__
++73
++__
++__
++74
++__
++__
++75
++__
++__
++76
++__
++__
++77
++__
++__
++78
++__
++__
++79
++__
++__
++80
++__
++__
++81
++__
++__
++82
++__
++__
++83
++__
++__
++84
++__
++__
++85
++__
++__
++86
++__
++__
++87
++__
++__
++88
++__
++__
++89
++__
++__
++90
++__
++__
++91
++__
++__
++92
++__
++__
++93
++__
++__
++94
++__
++__
++95
++__
++__
++96
++__
++__
++97
++__
++__
++98
++__
++__
++99
++__
++__
++100
++___
++___
+diff --git a/tests/fixtures/sort/numeric_unsorted_ints_unique.expected.debug b/tests/fixtures/sort/numeric_unsorted_ints_unique.expected.debug
+new file mode 100644
+index 00000000000..072a57ccfb5
+--- /dev/null
++++ b/tests/fixtures/sort/numeric_unsorted_ints_unique.expected.debug
+@@ -0,0 +1,8 @@
++1
++_
++2
++_
++3
++_
++4
++_
+diff --git a/tests/fixtures/sort/version.expected.debug b/tests/fixtures/sort/version.expected.debug
+new file mode 100644
+index 00000000000..2d922b5c0e0
+--- /dev/null
++++ b/tests/fixtures/sort/version.expected.debug
+@@ -0,0 +1,12 @@
++1.2.3-alpha
++___________
++___________
++1.2.3-alpha2
++____________
++____________
++1.12.4
++______
++______
++11.2.3
++______
++______
+diff --git a/tests/fixtures/sort/words_unique.expected.debug b/tests/fixtures/sort/words_unique.expected.debug
+new file mode 100644
+index 00000000000..0c32daf7495
+--- /dev/null
++++ b/tests/fixtures/sort/words_unique.expected.debug
+@@ -0,0 +1,6 @@
++aaa
++___
++bbb
++___
++zzz
++___
+diff --git a/tests/fixtures/sort/zero-terminated.expected.debug b/tests/fixtures/sort/zero-terminated.expected.debug
+new file mode 100644
+index 00000000000..fbef272b02c
+--- /dev/null
++++ b/tests/fixtures/sort/zero-terminated.expected.debug
+@@ -0,0 +1,84 @@
++../..
++_____
++../../by-util
++_____________
++../../common
++____________
++../../fixtures
++______________
++../../fixtures/cat
++__________________
++../../fixtures/cksum
++____________________
++../../fixtures/comm
++___________________
++../../fixtures/cp
++_________________
++../../fixtures/cp/dir_with_mount
++________________________________
++../../fixtures/cp/dir_with_mount/copy_me
++________________________________________
++../../fixtures/cp/hello_dir
++___________________________
++../../fixtures/cp/hello_dir_with_file
++_____________________________________
++../../fixtures/csplit
++_____________________
++../../fixtures/cut
++__________________
++../../fixtures/cut/sequences
++____________________________
++../../fixtures/dircolors
++________________________
++../../fixtures/du
++_________________
++../../fixtures/du/subdir
++________________________
++../../fixtures/du/subdir/deeper
++_______________________________
++../../fixtures/du/subdir/links
++______________________________
++../../fixtures/env
++__________________
++../../fixtures/expand
++_____________________
++../../fixtures/fmt
++__________________
++../../fixtures/fold
++___________________
++../../fixtures/hashsum
++______________________
++../../fixtures/head
++___________________
++../../fixtures/join
++___________________
++../../fixtures/mv
++_________________
++../../fixtures/nl
++_________________
++../../fixtures/numfmt
++_____________________
++../../fixtures/od
++_________________
++../../fixtures/paste
++____________________
++../../fixtures/ptx
++__________________
++../../fixtures/shuf
++___________________
++../../fixtures/sort
++___________________
++../../fixtures/sum
++__________________
++../../fixtures/tac
++__________________
++../../fixtures/tail
++___________________
++../../fixtures/tsort
++____________________
++../../fixtures/unexpand
++_______________________
++../../fixtures/uniq
++___________________
++../../fixtures/wc
++_________________

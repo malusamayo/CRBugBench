@@ -1,0 +1,180 @@
+diff --git a/ingestion/src/metadata/ingestion/source/pipeline/spline/client.py b/ingestion/src/metadata/ingestion/source/pipeline/spline/client.py
+index bff917ecbfc6..ad3f3a5f2892 100644
+--- a/ingestion/src/metadata/ingestion/source/pipeline/spline/client.py
++++ b/ingestion/src/metadata/ingestion/source/pipeline/spline/client.py
+@@ -19,6 +19,7 @@
+ )
+ from metadata.ingestion.ometa.client import REST, ClientConfig
+ from metadata.ingestion.source.pipeline.spline.models import (
++    AttributeDetail,
+     ExecutionDetail,
+     ExecutionEvents,
+ )
+@@ -91,3 +92,21 @@ def get_lineage_details(self, pipeline_id: str) -> List[dict]:
+             logger.error(f"failed to fetch pipeline list due to: {exe}")
+ 
+         return None
++
++    def get_column_lineage_details(
++        self, pipeline_id: str, attribute_id: str
++    ) -> List[dict]:
++        """
++        Method returns the column lineage details
++        """
++        try:
++            response = self.client.get(
++                f"/attribute-lineage-and-impact?execId={pipeline_id}&attributeId={attribute_id}"
++            )
++            if response:
++                return AttributeDetail(**response)
++        except Exception as exe:
++            logger.debug(traceback.format_exc())
++            logger.error(f"failed to fetch pipeline list due to: {exe}")
++
++        return None
+diff --git a/ingestion/src/metadata/ingestion/source/pipeline/spline/metadata.py b/ingestion/src/metadata/ingestion/source/pipeline/spline/metadata.py
+index b8717519d2c5..2d640ec455db 100644
+--- a/ingestion/src/metadata/ingestion/source/pipeline/spline/metadata.py
++++ b/ingestion/src/metadata/ingestion/source/pipeline/spline/metadata.py
+@@ -27,10 +27,15 @@
+ from metadata.generated.schema.metadataIngestion.workflow import (
+     Source as WorkflowSource,
+ )
+-from metadata.generated.schema.type.entityLineage import EntitiesEdge, LineageDetails
++from metadata.generated.schema.type.entityLineage import (
++    ColumnLineage,
++    EntitiesEdge,
++    LineageDetails,
++)
+ from metadata.generated.schema.type.entityReference import EntityReference
++from metadata.ingestion.api.source import InvalidSourceException
++from metadata.ingestion.lineage.sql_lineage import get_column_fqn
+ from metadata.ingestion.api.models import Either
+-from metadata.ingestion.api.steps import InvalidSourceException
+ from metadata.ingestion.models.pipeline_status import OMetaPipelineStatus
+ from metadata.ingestion.source.pipeline.pipeline_service import PipelineServiceSource
+ from metadata.ingestion.source.pipeline.spline.models import ExecutionEvent
+@@ -154,7 +159,7 @@ def _get_table_from_datasource_name(self, datasource: str) -> Optional[Table]:
+ 
+         return None
+ 
+-    def yield_pipeline_lineage_details(
++    def yield_pipeline_lineage_details(  # pylint: disable=too-many-locals
+         self, pipeline_details: ExecutionEvent
+     ) -> Iterable[Either[AddLineageRequest]]:
+         """
+@@ -171,6 +176,35 @@ def yield_pipeline_lineage_details(
+             and lineage_details.executionPlan.inputs
+             and lineage_details.executionPlan.output
+         ):
++            target_to_sources_map = {}
++            for attr_id in lineage_details.executionPlan.extra.attributes:
++                col_lineage_details = self.client.get_column_lineage_details(
++                    pipeline_details.executionPlanId, attr_id.id
++                )
++                for edge in col_lineage_details.lineage.edges:
++                    source = edge.source
++                    target = edge.target
++                    if target:
++                        source_name = next(
++                            (
++                                node.name
++                                for node in col_lineage_details.lineage.nodes
++                                if node.id == source
++                            ),
++                            None,
++                        )
++                        target_name = next(
++                            (
++                                node.name
++                                for node in col_lineage_details.lineage.nodes
++                                if node.id == target
++                            ),
++                            None,
++                        )
++                        if target_name and source_name:
++                            target_to_sources_map.setdefault(target_name, []).append(
++                                source_name
++                            )
+             from_entities = lineage_details.executionPlan.inputs
+             to_entity = lineage_details.executionPlan.output
+ 
+@@ -195,6 +229,19 @@ def yield_pipeline_lineage_details(
+                                         type="pipeline",
+                                     )
+                                 ),
++                              columnsLineage=[
++                                    ColumnLineage(
++                                        fromColumns=[
++                                            get_column_fqn(from_table, src_col)
++                                            for src_col in source_columns
++                                        ],
++                                        toColumn=get_column_fqn(
++                                            to_table, target_column
++                                        ),
++                                    )
++                                    for target_column, source_columns in target_to_sources_map.items()
++                                ],
++                            ),
+                                 fromEntity=EntityReference(
+                                     id=from_table.id, type="table"
+                                 ),
+diff --git a/ingestion/src/metadata/ingestion/source/pipeline/spline/models.py b/ingestion/src/metadata/ingestion/source/pipeline/spline/models.py
+index b976ef289f20..b1d6bf21013d 100644
+--- a/ingestion/src/metadata/ingestion/source/pipeline/spline/models.py
++++ b/ingestion/src/metadata/ingestion/source/pipeline/spline/models.py
+@@ -13,7 +13,7 @@
+ """
+ from typing import List, Optional
+ 
+-from pydantic import BaseModel
++from pydantic import BaseModel, Field
+ 
+ 
+ class ExecutionEvent(BaseModel):
+@@ -37,12 +37,44 @@ class Output(BaseModel):
+     source: Optional[str]
+ 
+ 
++class AttributesNames(BaseModel):
++    id: Optional[str]
++    name: Optional[str]
++    dataTypeId: Optional[str]
++
++
++class Extra(BaseModel):
++    appName: Optional[str]
++    attributes: Optional[List[AttributesNames]] = []
++
++
+ class ExecutionPlan(BaseModel):
+-    _id: Optional[str]
++    id: Optional[str] = Field(..., alias="_id")
+     name: Optional[str]
+     inputs: Optional[List[Inputs]] = []
+     output: Optional[Output]
++    extra: Optional[Extra]
+ 
+ 
+ class ExecutionDetail(BaseModel):
+     executionPlan: Optional[ExecutionPlan]
++
++
++class ColNodes(BaseModel):
++    id: Optional[str] = Field(..., alias="_id")
++    name: Optional[str]
++    originOpId: Optional[str]
++
++
++class ColLineage(BaseModel):
++    source: Optional[str]
++    target: Optional[str]
++
++
++class Lineage(BaseModel):
++    edges: Optional[List[ColLineage]] = []
++    nodes: Optional[List[ColNodes]] = []
++
++
++class AttributeDetail(BaseModel):
++    lineage: Optional[Lineage]

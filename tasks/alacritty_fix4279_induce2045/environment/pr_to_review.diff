@@ -1,0 +1,2557 @@
+commit 35efb4619c4b7a77b3c30de763856bc4441e236e
+Author: Christian Duerr <chrisduerr@users.noreply.github.com>
+Date:   Thu Feb 7 22:36:45 2019 +0000
+
+    Dynamically resize terminal for errors/warnings
+    
+    The warning and error messages now don't overwrite other terminal
+    content anymore but instead resize the terminal to make sure that text
+    can always be read.
+    
+    Instead of just showing that there is a new error and pointing to the log,
+    errors will now be displayed fully in multiple lines of text, assuming that
+    there is enough space left in the terminal.
+    
+    Explicit mouse click handling has also been added to the message bar,
+    which made it possible to add a simple `close` button in the form of
+    `[X]`.
+    
+    Alacritty's log file location is now stored in the `$ALACRITTY_LOG`
+    environment variable which the shell inherits automatically.
+    
+    Previously there were some issues with the log file only being deleted
+    when certain methods for closing Alacritty were used (like typing
+    `exit`). This has been reworked and now Ctrl+D, exit and signals should
+    all work properly.
+    
+    Before the config is reloaded, all current messages are now dropped.
+    This should help with multiple terminals all getting clogged up at the
+    same time when the config is broken.
+    
+    When one message is removed, all other duplicate messages are
+    automatically removed too.
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b61d1aaf..a1d9465d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,11 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ ### Added
+ 
+ - Window class on Wayland is set to `Alacritty` by default
++- Log file location is stored in the `ALACRITTY_LOG` environment variable
++- Close button has been added to the error/warning messages
+ 
+ ### Changed
+ 
+ - Improve scrolling accuracy with devices sending fractional updates (like touchpads)
+ - `scrolling.multiplier` now affects normal scrolling with touchpads
++- Error/Warning bar doesn't overwrite the terminal anymore
++- Full error/warning messages are displayed
++- Config error messages are automatically removed when the config is fixed
+ 
+ ### Fixed
+ 
+@@ -25,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ - Corrected the `window.decorations` config documentation for macOS
+ - Fix IME position on HiDPI displays
+ - URLs not opening while terminal is scrolled
++- Reliably remove log file when Alacritty is closed and persistent logging is disabled
++
++### Removed
++
++- `clear` doesn't remove error/warning messages anymore
+ 
+ ## Version 0.2.7
+ 
+diff --git a/Cargo.toml b/Cargo.toml
+index 7032fe55..b75c9789 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -49,6 +49,7 @@ static_assertions = "0.3.0"
+ terminfo = "0.6.1"
+ url = "1.7.1"
+ time = "0.1.40"
++crossbeam-channel = "0.3.8"
+ 
+ [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os="dragonfly", target_os="openbsd"))'.dependencies]
+ x11-dl = "2"
+diff --git a/src/ansi.rs b/src/ansi.rs
+index 34a765f7..5d6f1e14 100644
+--- a/src/ansi.rs
++++ b/src/ansi.rs
+@@ -21,7 +21,8 @@ use vte;
+ use base64;
+ use crate::index::{Column, Line, Contains};
+ 
+-use crate::{MouseCursor, Rgb};
++use crate::MouseCursor;
++use crate::term::color::Rgb;
+ 
+ // Parse color arguments
+ //
+@@ -1395,7 +1396,7 @@ mod tests {
+     use std::io;
+     use crate::index::{Line, Column};
+     use super::{Processor, Handler, Attr, TermInfo, Color, StandardCharset, CharsetIndex, parse_rgb_color, parse_number};
+-    use crate::Rgb;
++    use crate::term::color::Rgb;
+ 
+     /// The /dev/null of `io::Write`
+     struct Void;
+diff --git a/src/config/mod.rs b/src/config/mod.rs
+index c487ceb7..4ff0cb78 100644
+--- a/src/config/mod.rs
++++ b/src/config/mod.rs
+@@ -5,7 +5,7 @@
+ //! the config file will also hold user and platform specific keybindings.
+ use std::borrow::Cow;
+ use std::{env, fmt};
+-use std::fs::{self, File};
++use std::fs::File;
+ use std::io::{self, Read, Write};
+ use std::path::{Path, PathBuf};
+ use std::str::FromStr;
+@@ -13,7 +13,6 @@ use std::sync::mpsc;
+ use std::time::Duration;
+ use std::collections::HashMap;
+ 
+-use crate::Rgb;
+ use font::Size;
+ use serde_yaml;
+ use serde::{self, de, Deserialize};
+@@ -26,9 +25,11 @@ use crate::cli::Options;
+ use crate::input::{Action, Binding, MouseBinding, KeyBinding};
+ use crate::index::{Line, Column};
+ use crate::ansi::{CursorStyle, NamedColor, Color};
++use crate::term::color::Rgb;
+ 
+ mod bindings;
+ 
++pub const SOURCE_FILE_PATH: &str = file!();
+ const MAX_SCROLLBACK_LINES: u32 = 100_000;
+ static DEFAULT_ALACRITTY_CONFIG: &'static str =
+     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/alacritty.yml"));
+@@ -1691,7 +1692,7 @@ impl Config {
+ 
+         path = path.join("alacritty/alacritty.yml");
+ 
+-        fs::create_dir_all(path.parent().unwrap())?;
++        std::fs::create_dir_all(path.parent().unwrap())?;
+ 
+         File::create(&path)?.write_all(DEFAULT_ALACRITTY_CONFIG.as_bytes())?;
+ 
+@@ -1868,16 +1869,6 @@ impl Config {
+         self.persistent_logging
+     }
+ 
+-    pub fn load_from<P: Into<PathBuf>>(path: P) -> Result<Config> {
+-        let path = path.into();
+-        let raw = Config::read_file(path.as_path())?;
+-        let mut config: Config = serde_yaml::from_str(&raw)?;
+-        config.config_path = Some(path);
+-        config.print_deprecation_warnings();
+-
+-        Ok(config)
+-    }
+-
+     /// Overrides the `dynamic_title` configuration based on `--title`.
+     pub fn update_dynamic_title(mut self, options: &Options) -> Self {
+         if options.title.is_some() {
+@@ -1886,15 +1877,35 @@ impl Config {
+         self
+     }
+ 
+-    fn read_file<P: AsRef<Path>>(path: P) -> Result<String> {
+-        let mut f = fs::File::open(path)?;
++    pub fn load_from(path: PathBuf) -> Config {
++        let mut config = Config::reload_from(&path).unwrap_or_else(|_| Config::default());
++        config.config_path = Some(path);
++        config
++    }
++
++    pub fn reload_from(path: &PathBuf) -> Result<Config> {
++        match Config::read_config(path) {
++            Ok(config) => Ok(config),
++            Err(err) => {
++                error!("Unable to load config {:?}: {}", path, err);
++                Err(err)
++            }
++        }
++    }
++
++    fn read_config(path: &PathBuf) -> Result<Config> {
+         let mut contents = String::new();
+-        f.read_to_string(&mut contents)?;
++        File::open(path)?.read_to_string(&mut contents)?;
++
++        // Prevent parsing error with empty string
+         if contents.is_empty() {
+-            return Err(Error::Empty);
++            return Ok(Config::default());
+         }
+ 
+-        Ok(contents)
++        let mut config: Config = serde_yaml::from_str(&contents)?;
++        config.print_deprecation_warnings();
++
++        Ok(config)
+     }
+ 
+     fn print_deprecation_warnings(&mut self) {
+@@ -2201,7 +2212,7 @@ impl SecondaryFontDescription {
+ 
+ pub struct Monitor {
+     _thread: ::std::thread::JoinHandle<()>,
+-    rx: mpsc::Receiver<Config>,
++    rx: mpsc::Receiver<PathBuf>,
+ }
+ 
+ pub trait OnConfigReload {
+@@ -2216,7 +2227,7 @@ impl OnConfigReload for crate::display::Notifier {
+ 
+ impl Monitor {
+     /// Get pending config changes
+-    pub fn pending_config(&self) -> Option<Config> {
++    pub fn pending(&self) -> Option<PathBuf> {
+         let mut config = None;
+         while let Ok(new) = self.rx.try_recv() {
+             config = Some(new);
+@@ -2224,6 +2235,7 @@ impl Monitor {
+ 
+         config
+     }
++
+     pub fn new<H, P>(path: P, mut handler: H) -> Monitor
+         where H: OnConfigReload + Send + 'static,
+               P: Into<PathBuf>
+@@ -2260,22 +2272,7 @@ impl Monitor {
+                                 continue;
+                             }
+ 
+-                            let config = match Config::load_from(&path) {
+-                                Ok(config) => {
+-                                    config
+-                                },
+-                                Err(err) => {
+-                                    if let Error::Empty = err {
+-                                        info!("Config file {:?} is empty; loading default", path);
+-                                        Config::default()
+-                                    } else {
+-                                        error!("Ignoring invalid config: {}", err);
+-                                        continue;
+-                                    }
+-                                }
+-                            };
+-
+-                            let _ = config_tx.send(config);
++                            let _ = config_tx.send(path);
+                             handler.on_config_reload();
+                         }
+                         _ => {}
+diff --git a/src/display.rs b/src/display.rs
+index 2e4e741a..29b79218 100644
+--- a/src/display.rs
++++ b/src/display.rs
+@@ -25,12 +25,13 @@ use crate::config::Config;
+ use font::{self, Rasterize};
+ use crate::meter::Meter;
+ use crate::renderer::{self, GlyphCache, QuadRenderer};
+-use crate::renderer::lines::Lines;
++use crate::renderer::rects::{Rects, Rect};
+ use crate::term::{Term, SizeInfo, RenderableCell};
+ use crate::sync::FairMutex;
+ use crate::window::{self, Window};
+-use crate::logging::LoggerProxy;
+-use crate::Rgb;
++use crate::term::color::Rgb;
++use crate::index::Line;
++use crate::message_bar::Message;
+ 
+ #[derive(Debug)]
+ pub enum Error {
+@@ -101,7 +102,7 @@ pub struct Display {
+     meter: Meter,
+     font_size: font::Size,
+     size_info: SizeInfo,
+-    logger_proxy: LoggerProxy,
++    last_message: Option<Message>,
+ }
+ 
+ /// Can wakeup the render loop from other threads
+@@ -132,11 +133,7 @@ impl Display {
+         &self.size_info
+     }
+ 
+-    pub fn new(
+-        config: &Config,
+-        options: &cli::Options,
+-        logger_proxy: LoggerProxy
+-    ) -> Result<Display, Error> {
++    pub fn new(config: &Config, options: &cli::Options) -> Result<Display, Error> {
+         // Extract some properties from config
+         let render_timer = config.render_timer();
+ 
+@@ -229,7 +226,7 @@ impl Display {
+             meter: Meter::new(),
+             font_size: font::Size::new(0.),
+             size_info,
+-            logger_proxy,
++            last_message: None,
+         })
+     }
+ 
+@@ -297,7 +294,8 @@ impl Display {
+         &mut self,
+         terminal: &mut MutexGuard<'_, Term>,
+         config: &Config,
+-        items: &mut [&mut dyn OnResize],
++        pty_resize_handle: &mut dyn OnResize,
++        processor_resize_handle: &mut dyn OnResize,
+     ) {
+         // Resize events new_size and are handled outside the poll_events
+         // iterator. This has the effect of coalescing multiple resize
+@@ -313,7 +311,10 @@ impl Display {
+         let dpr = self.window.hidpi_factor();
+ 
+         // Font size/DPI factor modification detected
+-        if terminal.font_size != self.font_size || (dpr - self.size_info.dpr).abs() > f64::EPSILON {
++        let font_changed = terminal.font_size != self.font_size
++            || (dpr - self.size_info.dpr).abs() > f64::EPSILON;
++
++        if font_changed || self.last_message != terminal.message_buffer_mut().message() {
+             if new_size == None {
+                 // Force a resize to refresh things
+                 new_size = Some(PhysicalSize::new(
+@@ -323,8 +324,11 @@ impl Display {
+             }
+ 
+             self.font_size = terminal.font_size;
++            self.last_message = terminal.message_buffer_mut().message();
+             self.size_info.dpr = dpr;
++        }
+ 
++        if font_changed {
+             self.update_glyph_cache(config);
+         }
+ 
+@@ -350,10 +354,14 @@ impl Display {
+ 
+             let size = &self.size_info;
+             terminal.resize(size);
++            processor_resize_handle.on_resize(size);
+ 
+-            for item in items {
+-                item.on_resize(size)
++            // Subtract message bar lines for pty size
++            let mut pty_size = *size;
++            if let Some(message) = terminal.message_buffer_mut().message() {
++                pty_size.height -= pty_size.cell_height * message.text(&size).len() as f32;
+             }
++            pty_resize_handle.on_resize(&pty_size);
+ 
+             self.window.resize(psize);
+             self.renderer.resize(psize, self.size_info.padding_x, self.size_info.padding_y);
+@@ -376,6 +384,9 @@ impl Display {
+             .renderable_cells(config, window_focused)
+             .collect();
+ 
++        // Get message from terminal to ignore modifications after lock is dropped
++        let message_buffer = terminal.message_buffer_mut().message();
++
+         // Clear dirty flag
+         terminal.dirty = !terminal.visual_bell.completed();
+ 
+@@ -413,7 +424,7 @@ impl Display {
+         {
+             let glyph_cache = &mut self.glyph_cache;
+             let metrics = glyph_cache.font_metrics();
+-            let mut cell_line_rects = Lines::new(&metrics, &size_info);
++            let mut rects = Rects::new(&metrics, &size_info);
+ 
+             // Draw grid
+             {
+@@ -423,7 +434,7 @@ impl Display {
+                     // Iterate over all non-empty cells in the grid
+                     for cell in grid_cells {
+                         // Update underline/strikeout
+-                        cell_line_rects.update_lines(&cell);
++                        rects.update_lines(&cell);
+ 
+                         // Draw the cell
+                         api.render_cell(cell, glyph_cache);
+@@ -431,8 +442,35 @@ impl Display {
+                 });
+             }
+ 
+-            // Draw rectangles
+-            self.renderer.draw_rects(config, &size_info, visual_bell_intensity, cell_line_rects);
++            if let Some(message) = message_buffer {
++                let text = message.text(&size_info);
++
++                // Create a new rectangle for the background
++                let start_line = size_info.lines().0 - text.len();
++                let y = size_info.padding_y + size_info.cell_height * start_line as f32;
++                let rect = Rect::new(0., y, size_info.width, size_info.height - y);
++                rects.push(rect, message.color());
++
++                // Draw rectangles including the new background
++                self.renderer.draw_rects(config, &size_info, visual_bell_intensity, rects);
++
++                // Relay messages to the user
++                let mut offset = 1;
++                for message_text in text.iter().rev() {
++                    self.renderer.with_api(config, &size_info, |mut api| {
++                        api.render_string(
++                            &message_text,
++                            Line(size_info.lines().saturating_sub(offset)),
++                            glyph_cache,
++                            None,
++                        );
++                    });
++                    offset += 1;
++                }
++            } else {
++                // Draw rectangles
++                self.renderer.draw_rects(config, &size_info, visual_bell_intensity, rects);
++            }
+ 
+             // Draw render timer
+             if self.render_timer {
+@@ -443,36 +481,7 @@ impl Display {
+                     b: 0x53,
+                 };
+                 self.renderer.with_api(config, &size_info, |mut api| {
+-                    api.render_string(&timing[..], size_info.lines() - 2, glyph_cache, color);
+-                });
+-            }
+-
+-            // Display errors and warnings
+-            if self.logger_proxy.errors() {
+-                let msg = match self.logger_proxy.log_path() {
+-                    Some(path) => format!(" ERROR! See log at {} ", path),
+-                    None => " ERROR! See log in stderr ".into(),
+-                };
+-                let color = Rgb {
+-                    r: 0xff,
+-                    g: 0x00,
+-                    b: 0x00,
+-                };
+-                self.renderer.with_api(config, &size_info, |mut api| {
+-                    api.render_string(&msg, size_info.lines() - 1, glyph_cache, color);
+-                });
+-            } else if self.logger_proxy.warnings() {
+-                let msg = match self.logger_proxy.log_path() {
+-                    Some(path) => format!(" WARNING! See log at {} ", path),
+-                    None => " WARNING! See log in stderr ".into(),
+-                };
+-                let color = Rgb {
+-                    r: 0xff,
+-                    g: 0xff,
+-                    b: 0x00,
+-                };
+-                self.renderer.with_api(config, &size_info, |mut api| {
+-                    api.render_string(&msg, size_info.lines() - 1, glyph_cache, color);
++                    api.render_string(&timing[..], size_info.lines() - 2, glyph_cache, Some(color));
+                 });
+             }
+         }
+diff --git a/src/event.rs b/src/event.rs
+index c3b5bb2d..75d27d36 100644
+--- a/src/event.rs
++++ b/src/event.rs
+@@ -16,7 +16,6 @@ use glutin::dpi::PhysicalSize;
+ 
+ #[cfg(unix)]
+ use crate::tty;
+-use crate::ansi::{Handler, ClearMode};
+ use crate::grid::Scroll;
+ use crate::config::{self, Config};
+ use crate::cli::Options;
+@@ -25,7 +24,7 @@ use crate::index::{Line, Column, Side, Point};
+ use crate::input::{self, MouseBinding, KeyBinding};
+ use crate::selection::Selection;
+ use crate::sync::FairMutex;
+-use crate::term::{Term, SizeInfo, TermMode, Search};
++use crate::term::{Term, SizeInfo};
+ use crate::term::cell::Cell;
+ use crate::util::{limit, start_daemon};
+ use crate::util::fmt::Red;
+@@ -55,10 +54,6 @@ impl<'a, N: Notify + 'a> input::ActionContext for ActionContext<'a, N> {
+         self.notifier.notify(val);
+     }
+ 
+-    fn terminal_mode(&self) -> TermMode {
+-        *self.terminal.mode()
+-    }
+-
+     fn size_info(&self) -> SizeInfo {
+         *self.size_info
+     }
+@@ -78,10 +73,6 @@ impl<'a, N: Notify + 'a> input::ActionContext for ActionContext<'a, N> {
+         }
+     }
+ 
+-    fn clear_history(&mut self) {
+-        self.terminal.clear_screen(ClearMode::Saved);
+-    }
+-
+     fn copy_selection(&self, buffer: ClipboardBuffer) {
+         if let Some(selected) = self.terminal.selection_to_string() {
+             if !selected.is_empty() {
+@@ -126,10 +117,6 @@ impl<'a, N: Notify + 'a> input::ActionContext for ActionContext<'a, N> {
+         self.terminal.dirty = true;
+     }
+ 
+-    fn url(&self, point: Point<usize>) -> Option<String> {
+-        self.terminal.url_search(point)
+-    }
+-
+     fn line_selection(&mut self, point: Point) {
+         let point = self.terminal.visible_to_buffer(point);
+         *self.terminal.selection_mut() = Some(Selection::lines(point));
+@@ -140,14 +127,6 @@ impl<'a, N: Notify + 'a> input::ActionContext for ActionContext<'a, N> {
+         self.terminal.pixels_to_coords(self.mouse.x as usize, self.mouse.y as usize)
+     }
+ 
+-    fn change_font_size(&mut self, delta: f32) {
+-        self.terminal.change_font_size(delta);
+-    }
+-
+-    fn reset_font_size(&mut self) {
+-        self.terminal.reset_font_size();
+-    }
+-
+     #[inline]
+     fn mouse_mut(&mut self) -> &mut Mouse {
+         self.mouse
+@@ -179,8 +158,13 @@ impl<'a, N: Notify + 'a> input::ActionContext for ActionContext<'a, N> {
+     }
+ 
+     #[inline]
+-    fn clear_log(&mut self) {
+-        self.terminal.clear_log();
++    fn terminal(&self) -> &Term {
++        self.terminal
++    }
++
++    #[inline]
++    fn terminal_mut(&mut self) -> &mut Term {
++        self.terminal
+     }
+ 
+     fn spawn_new_instance(&mut self) {
+@@ -393,8 +377,7 @@ impl<N: Notify> Processor<N> {
+                                 .expect("write config.json");
+                         }
+ 
+-                        // FIXME should do a more graceful shutdown
+-                        ::std::process::exit(0);
++                        processor.ctx.terminal.exit();
+                     },
+                     Resized(lsize) => {
+                         // Resize events are emitted via glutin/winit with logical sizes
+diff --git a/src/input.rs b/src/input.rs
+index c77a9f49..26a12de6 100644
+--- a/src/input.rs
++++ b/src/input.rs
+@@ -29,10 +29,12 @@ use crate::config::{self, Key};
+ use crate::grid::Scroll;
+ use crate::event::{ClickState, Mouse};
+ use crate::index::{Line, Column, Side, Point};
+-use crate::term::SizeInfo;
++use crate::term::{Term, SizeInfo, Search};
+ use crate::term::mode::TermMode;
+ use crate::util::fmt::Red;
+ use crate::util::start_daemon;
++use crate::message_bar;
++use crate::ansi::{Handler, ClearMode};
+ 
+ pub const FONT_SIZE_STEP: f32 = 0.5;
+ 
+@@ -54,7 +56,6 @@ pub struct Processor<'a, A: 'a> {
+ 
+ pub trait ActionContext {
+     fn write_to_pty<B: Into<Cow<'static, [u8]>>>(&mut self, _: B);
+-    fn terminal_mode(&self) -> TermMode;
+     fn size_info(&self) -> SizeInfo;
+     fn copy_selection(&self, _: ClipboardBuffer);
+     fn clear_selection(&mut self);
+@@ -69,13 +70,10 @@ pub trait ActionContext {
+     fn received_count(&mut self) -> &mut usize;
+     fn suppress_chars(&mut self) -> &mut bool;
+     fn last_modifiers(&mut self) -> &mut ModifiersState;
+-    fn change_font_size(&mut self, delta: f32);
+-    fn reset_font_size(&mut self);
+     fn scroll(&mut self, scroll: Scroll);
+-    fn clear_history(&mut self);
+     fn hide_window(&mut self);
+-    fn url(&self, _: Point<usize>) -> Option<String>;
+-    fn clear_log(&mut self);
++    fn terminal(&self) -> &Term;
++    fn terminal_mut(&mut self) -> &mut Term;
+     fn spawn_new_instance(&mut self);
+ }
+ 
+@@ -296,17 +294,16 @@ impl Action {
+                 ctx.hide_window();
+             },
+             Action::Quit => {
+-                // FIXME should do a more graceful shutdown
+-                ::std::process::exit(0);
++                ctx.terminal_mut().exit();
+             },
+             Action::IncreaseFontSize => {
+-               ctx.change_font_size(FONT_SIZE_STEP);
++               ctx.terminal_mut().change_font_size(FONT_SIZE_STEP);
+             },
+             Action::DecreaseFontSize => {
+-               ctx.change_font_size(-FONT_SIZE_STEP);
++               ctx.terminal_mut().change_font_size(-FONT_SIZE_STEP);
+             }
+             Action::ResetFontSize => {
+-               ctx.reset_font_size();
++               ctx.terminal_mut().reset_font_size();
+             },
+             Action::ScrollPageUp => {
+                 ctx.scroll(Scroll::PageUp);
+@@ -321,10 +318,10 @@ impl Action {
+                 ctx.scroll(Scroll::Bottom);
+             },
+             Action::ClearHistory => {
+-                ctx.clear_history();
++                ctx.terminal_mut().clear_screen(ClearMode::Saved);
+             },
+             Action::ClearLogNotice => {
+-                ctx.clear_log();
++                ctx.terminal_mut().message_buffer_mut().pop();
+             },
+             Action::SpawnNewInstance => {
+                 ctx.spawn_new_instance();
+@@ -334,7 +331,7 @@ impl Action {
+     }
+ 
+     fn paste<A: ActionContext>(&self, ctx: &mut A, contents: &str) {
+-        if ctx.terminal_mode().contains(TermMode::BRACKETED_PASTE) {
++        if ctx.terminal().mode().contains(TermMode::BRACKETED_PASTE) {
+             ctx.write_to_pty(&b"\x1b[200~"[..]);
+             ctx.write_to_pty(contents.replace("\x1b","").into_bytes());
+             ctx.write_to_pty(&b"\x1b[201~"[..]);
+@@ -396,8 +393,13 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
+             self.ctx.mouse_mut().block_url_launcher = true;
+         }
+ 
++        // Ignore motions over the message bar
++        if self.mouse_over_message_bar(point) {
++            return;
++        }
++
+         if self.ctx.mouse().left_button_state == ElementState::Pressed
+-            && (modifiers.shift || !self.ctx.terminal_mode().intersects(report_mode))
++            && (modifiers.shift || !self.ctx.terminal().mode().intersects(report_mode))
+         {
+             self.ctx.update_selection(
+                 Point {
+@@ -406,7 +408,7 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
+                 },
+                 cell_side,
+             );
+-        } else if self.ctx.terminal_mode().intersects(motion_mode)
++        } else if self.ctx.terminal().mode().intersects(motion_mode)
+             // Only report motion when changing cells
+             && (prev_line != self.ctx.mouse().line || prev_col != self.ctx.mouse().column)
+             && size_info.contains_point(x, y)
+@@ -417,7 +419,7 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
+                 self.mouse_report(33, ElementState::Pressed, modifiers);
+             } else if self.ctx.mouse().right_button_state == ElementState::Pressed {
+                 self.mouse_report(34, ElementState::Pressed, modifiers);
+-            } else if self.ctx.terminal_mode().contains(TermMode::MOUSE_MOTION) {
++            } else if self.ctx.terminal().mode().contains(TermMode::MOUSE_MOTION) {
+                 self.mouse_report(35, ElementState::Pressed, modifiers);
+             }
+         }
+@@ -430,7 +432,8 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
+         let cell_x = x.saturating_sub(size_info.padding_x as usize) % size_info.cell_width as usize;
+         let half_cell_width = (size_info.cell_width / 2.0) as usize;
+ 
+-        let additional_padding = (size_info.width - size_info.padding_x * 2.) % size_info.cell_width;
++        let additional_padding =
++            (size_info.width - size_info.padding_x * 2.) % size_info.cell_width;
+         let end_of_grid = size_info.width - size_info.padding_x - additional_padding;
+ 
+         if cell_x > half_cell_width
+@@ -485,7 +488,7 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
+         }
+ 
+         // Report mouse events
+-        if self.ctx.terminal_mode().contains(TermMode::SGR_MOUSE) {
++        if self.ctx.terminal().mode().contains(TermMode::SGR_MOUSE) {
+             self.sgr_mouse_report(button + mods, state);
+         } else if let ElementState::Released = state {
+             self.normal_mouse_report(3 + mods);
+@@ -494,19 +497,24 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
+         }
+     }
+ 
+-    pub fn on_mouse_double_click(&mut self, button: MouseButton) {
+-        if let (Some(point) , MouseButton::Left) = (self.ctx.mouse_coords(), button) {
++    pub fn on_mouse_double_click(&mut self, button: MouseButton, point: Point) {
++        if button == MouseButton::Left {
+             self.ctx.semantic_selection(point);
+         }
+     }
+ 
+-    pub fn on_mouse_triple_click(&mut self, button: MouseButton) {
+-        if let (Some(point), MouseButton::Left) = (self.ctx.mouse_coords(), button) {
++    pub fn on_mouse_triple_click(&mut self, button: MouseButton, point: Point) {
++        if button == MouseButton::Left {
+             self.ctx.line_selection(point);
+         }
+     }
+ 
+-    pub fn on_mouse_press(&mut self, button: MouseButton, modifiers: ModifiersState) {
++    pub fn on_mouse_press(
++        &mut self,
++        button: MouseButton,
++        modifiers: ModifiersState,
++        point: Point,
++    ) {
+         let now = Instant::now();
+         let elapsed = self.ctx.mouse().last_click_timestamp.elapsed();
+         self.ctx.mouse_mut().last_click_timestamp = now;
+@@ -518,14 +526,14 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
+                 if !button_changed && elapsed < self.mouse_config.double_click.threshold =>
+             {
+                 self.ctx.mouse_mut().block_url_launcher = true;
+-                self.on_mouse_double_click(button);
++                self.on_mouse_double_click(button, point);
+                 ClickState::DoubleClick
+             },
+             ClickState::DoubleClick
+                 if !button_changed && elapsed < self.mouse_config.triple_click.threshold =>
+             {
+                 self.ctx.mouse_mut().block_url_launcher = true;
+-                self.on_mouse_triple_click(button);
++                self.on_mouse_triple_click(button, point);
+                 ClickState::TripleClick
+             },
+             _ => {
+@@ -535,20 +543,20 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
+                 self.ctx.clear_selection();
+ 
+                 // Start new empty selection
+-                if let Some(point) = self.ctx.mouse_coords() {
+-                    let side = self.ctx.mouse().cell_side;
+-                    self.ctx.simple_selection(point, side);
+-                }
+-
+-                let report_modes = TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION;
+-                if !modifiers.shift && self.ctx.terminal_mode().intersects(report_modes) {
+-                    match button {
+-                        MouseButton::Left   => self.mouse_report(0, ElementState::Pressed, modifiers),
+-                        MouseButton::Middle => self.mouse_report(1, ElementState::Pressed, modifiers),
+-                        MouseButton::Right  => self.mouse_report(2, ElementState::Pressed, modifiers),
++                let side = self.ctx.mouse().cell_side;
++                self.ctx.simple_selection(point, side);
++
++                let report_modes =
++                    TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION;
++                if !modifiers.shift && self.ctx.terminal().mode().intersects(report_modes) {
++                    let code = match button {
++                        MouseButton::Left => 0,
++                        MouseButton::Middle => 1,
++                        MouseButton::Right => 2,
+                         // Can't properly report more than three buttons.
+-                        MouseButton::Other(_) => (),
++                        MouseButton::Other(_) => return,
+                     };
++                    self.mouse_report(code, ElementState::Pressed, modifiers);
+                     return;
+                 }
+ 
+@@ -557,38 +565,40 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
+         };
+     }
+ 
+-    pub fn on_mouse_release(&mut self, button: MouseButton, modifiers: ModifiersState) {
+-        let report_modes = TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION;
+-        if !modifiers.shift && self.ctx.terminal_mode().intersects(report_modes)
+-        {
+-            match button {
+-                MouseButton::Left   => self.mouse_report(0, ElementState::Released, modifiers),
+-                MouseButton::Middle => self.mouse_report(1, ElementState::Released, modifiers),
+-                MouseButton::Right  => self.mouse_report(2, ElementState::Released, modifiers),
++    pub fn on_mouse_release(
++        &mut self,
++        button: MouseButton,
++        modifiers: ModifiersState,
++        point: Point,
++    ) {
++        let report_modes =
++            TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION;
++        if !modifiers.shift && self.ctx.terminal().mode().intersects(report_modes) {
++            let code = match button {
++                MouseButton::Left => 0,
++                MouseButton::Middle => 1,
++                MouseButton::Right => 2,
+                 // Can't properly report more than three buttons.
+-                MouseButton::Other(_) => (),
++                MouseButton::Other(_) => return,
+             };
++            self.mouse_report(code, ElementState::Released, modifiers);
+             return;
+         } else if button == MouseButton::Left {
+-            self.launch_url(modifiers);
++            self.launch_url(modifiers, point);
+         }
+ 
+-        if self.save_to_clipboard {
+-            self.ctx.copy_selection(ClipboardBuffer::Primary);
+-        }
+-        self.ctx.copy_selection(ClipboardBuffer::Selection);
++        self.copy_selection();
+     }
+ 
+     // Spawn URL launcher when clicking on URLs
+-    fn launch_url(&self, modifiers: ModifiersState) -> Option<()> {
++    fn launch_url(&self, modifiers: ModifiersState, point: Point) -> Option<()> {
+         if !self.mouse_config.url.modifiers.relaxed_eq(modifiers)
+             || self.ctx.mouse().block_url_launcher
+         {
+             return None;
+         }
+ 
+-        let point = self.ctx.mouse_coords()?;
+-        let text = self.ctx.url(point.into())?;
++        let text = self.ctx.terminal().url_search(point.into())?;
+ 
+         let launcher = self.mouse_config.url.launcher.as_ref()?;
+         let mut args = launcher.args().to_vec();
+@@ -602,7 +612,12 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
+         Some(())
+     }
+ 
+-    pub fn on_mouse_wheel(&mut self, delta: MouseScrollDelta, phase: TouchPhase, modifiers: ModifiersState) {
++    pub fn on_mouse_wheel(
++        &mut self,
++        delta: MouseScrollDelta,
++        phase: TouchPhase,
++        modifiers: ModifiersState,
++    ) {
+         match delta {
+             MouseScrollDelta::LineDelta(_columns, lines) => {
+                 let new_scroll_px = lines * self.ctx.size_info().cell_height;
+@@ -634,7 +649,7 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
+             .faux_scrollback_lines
+             .unwrap_or(self.scrolling_config.faux_multiplier as usize);
+ 
+-        if self.ctx.terminal_mode().intersects(mouse_modes) {
++        if self.ctx.terminal().mode().intersects(mouse_modes) {
+             self.ctx.mouse_mut().scroll_px += new_scroll_px;
+ 
+             let code = if new_scroll_px > 0 { 64 } else { 65 };
+@@ -643,7 +658,7 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
+             for _ in 0..lines {
+                 self.mouse_report(code, ElementState::Pressed, modifiers);
+             }
+-        } else if self.ctx.terminal_mode().contains(TermMode::ALT_SCREEN)
++        } else if self.ctx.terminal().mode().contains(TermMode::ALT_SCREEN)
+             && faux_multiplier > 0
+             && !modifiers.shift
+         {
+@@ -672,7 +687,7 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
+     }
+ 
+     pub fn on_focus_change(&mut self, is_focused: bool) {
+-        if self.ctx.terminal_mode().contains(TermMode::FOCUS_IN_OUT) {
++        if self.ctx.terminal().mode().contains(TermMode::FOCUS_IN_OUT) {
+             let chr = if is_focused {
+                 "I"
+             } else {
+@@ -684,7 +699,12 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
+         }
+     }
+ 
+-    pub fn mouse_input(&mut self, state: ElementState, button: MouseButton, modifiers: ModifiersState) {
++    pub fn mouse_input(
++        &mut self,
++        state: ElementState,
++        button: MouseButton,
++        modifiers: ModifiersState
++    ) {
+         match button {
+             MouseButton::Left => self.ctx.mouse_mut().left_button_state = state,
+             MouseButton::Middle => self.ctx.mouse_mut().middle_button_state = state,
+@@ -692,12 +712,22 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
+             _ => (),
+         }
+ 
+-        match state {
+-            ElementState::Pressed => {
+-                self.process_mouse_bindings(modifiers, button);
+-                self.on_mouse_press(button, modifiers);
+-            },
+-            ElementState::Released => self.on_mouse_release(button, modifiers),
++        let point = match self.ctx.mouse_coords() {
++            Some(point) => point,
++            None => return,
++        };
++
++        // Skip normal mouse events if the message bar has been clicked
++        if self.mouse_over_message_bar(point) {
++            self.on_message_bar_click(state, point);
++        } else {
++            match state {
++                ElementState::Pressed => {
++                    self.process_mouse_bindings(modifiers, button);
++                    self.on_mouse_press(button, modifiers, point);
++                },
++                ElementState::Released => self.on_mouse_release(button, modifiers, point),
++            }
+         }
+ 
+         self.ctx.mouse_mut().last_button = button;
+@@ -759,14 +789,19 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
+         for binding in self.key_bindings {
+             let is_triggered = match binding.trigger {
+                 Key::Scancode(_) => binding.is_triggered_by(
+-                    self.ctx.terminal_mode(),
++                    *self.ctx.terminal().mode(),
+                     input.modifiers,
+                     &Key::Scancode(input.scancode),
+                     false,
+                 ),
+                 _ => if let Some(key) = input.virtual_keycode {
+                     let key = Key::from_glutin_input(key);
+-                    binding.is_triggered_by(self.ctx.terminal_mode(), input.modifiers, &key, false)
++                    binding.is_triggered_by(
++                        *self.ctx.terminal().mode(),
++                        input.modifiers,
++                        &key,
++                        false
++                    )
+                 } else {
+                     false
+                 },
+@@ -791,9 +826,9 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
+     fn process_mouse_bindings(&mut self, mods: ModifiersState, button: MouseButton) -> bool {
+         let mut has_binding = false;
+         for binding in self.mouse_bindings {
+-            if binding.is_triggered_by(self.ctx.terminal_mode(), mods, &button, true) {
++            if binding.is_triggered_by(*self.ctx.terminal().mode(), mods, &button, true) {
+                 // binding was triggered; run the action
+-                let mouse_mode = !mods.shift && self.ctx.terminal_mode().intersects(
++                let mouse_mode = !mods.shift && self.ctx.terminal().mode().intersects(
+                     TermMode::MOUSE_REPORT_CLICK
+                     | TermMode::MOUSE_DRAG
+                     | TermMode::MOUSE_MOTION
+@@ -805,6 +840,43 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
+ 
+         has_binding
+     }
++
++    /// Check if a point is within the message bar
++    fn mouse_over_message_bar(&mut self, point: Point) -> bool {
++        if let Some(message) = self.ctx.terminal_mut().message_buffer_mut().message() {
++            let size = self.ctx.size_info();
++            point.line.0 >= size.lines().saturating_sub(message.text(&size).len())
++        } else {
++            false
++        }
++    }
++
++    /// Handle clicks on the message bar.
++    fn on_message_bar_click(&mut self, button_state: ElementState, point: Point) {
++        match button_state {
++            ElementState::Released => self.copy_selection(),
++            ElementState::Pressed => {
++                let size = self.ctx.size_info();
++                if let Some(message) = self.ctx.terminal_mut().message_buffer_mut().message() {
++                    if point.col + message_bar::CLOSE_BUTTON_TEXT.len() >= size.cols()
++                        && point.line == size.lines() - message.text(&size).len()
++                    {
++                        self.ctx.terminal_mut().message_buffer_mut().pop();
++                    }
++                }
++
++                self.ctx.clear_selection();
++            }
++        }
++    }
++
++    /// Copy text selection.
++    fn copy_selection(&mut self) {
++        if self.save_to_clipboard {
++            self.ctx.copy_selection(ClipboardBuffer::Primary);
++        }
++        self.ctx.copy_selection(ClipboardBuffer::Selection);
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -820,6 +892,7 @@ mod tests {
+     use crate::index::{Point, Side};
+     use crate::selection::Selection;
+     use crate::grid::Scroll;
++    use crate::message_bar::MessageBuffer;
+ 
+     use super::{Action, Binding, Processor};
+     use copypasta::Buffer as ClipboardBuffer;
+@@ -851,15 +924,15 @@ mod tests {
+         fn simple_selection(&mut self, _point: Point, _side: Side) {}
+         fn copy_selection(&self, _buffer: ClipboardBuffer) {}
+         fn clear_selection(&mut self) {}
+-        fn change_font_size(&mut self, _delta: f32) {}
+-        fn reset_font_size(&mut self) {}
+-        fn clear_history(&mut self) {}
+-        fn clear_log(&mut self) {}
+         fn hide_window(&mut self) {}
+         fn spawn_new_instance(&mut self) {}
+ 
+-        fn terminal_mode(&self) -> TermMode {
+-            *self.terminal.mode()
++        fn terminal(&self) -> &Term {
++            &self.terminal
++        }
++
++        fn terminal_mut(&mut self) -> &mut Term {
++            &mut self.terminal
+         }
+ 
+         fn size_info(&self) -> SizeInfo {
+@@ -897,10 +970,6 @@ mod tests {
+             self.mouse
+         }
+ 
+-        fn url(&self, _: Point<usize>) -> Option<String> {
+-            None
+-        }
+-
+         fn received_count(&mut self) -> &mut usize {
+             &mut self.received_count
+         }
+@@ -936,7 +1005,7 @@ mod tests {
+                     dpr: 1.0,
+                 };
+ 
+-                let mut terminal = Term::new(&config, size);
++                let mut terminal = Term::new(&config, size, MessageBuffer::new());
+ 
+                 let mut mouse = Mouse::default();
+                 mouse.click_state = $initial_state;
+diff --git a/src/lib.rs b/src/lib.rs
+index f99510f2..8cf0f026 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -46,10 +46,9 @@ pub mod term;
+ pub mod tty;
+ pub mod util;
+ pub mod window;
++pub mod message_bar;
+ mod url;
+ 
+-use std::ops::Mul;
+-
+ pub use crate::grid::Grid;
+ pub use crate::term::Term;
+ 
+@@ -60,31 +59,6 @@ pub enum MouseCursor {
+     Text,
+ }
+ 
+-#[derive(Debug, Eq, PartialEq, Copy, Clone, Default, Serialize, Deserialize)]
+-pub struct Rgb {
+-    pub r: u8,
+-    pub g: u8,
+-    pub b: u8,
+-}
+-
+-// a multiply function for Rgb, as the default dim is just *2/3
+-impl Mul<f32> for Rgb {
+-    type Output = Rgb;
+-
+-    fn mul(self, rhs: f32) -> Rgb {
+-        let result = Rgb {
+-            r: (f32::from(self.r) * rhs).max(0.0).min(255.0) as u8,
+-            g: (f32::from(self.g) * rhs).max(0.0).min(255.0) as u8,
+-            b: (f32::from(self.b) * rhs).max(0.0).min(255.0) as u8
+-        };
+-
+-        trace!("Scaling RGB by {} from {:?} to {:?}", rhs, self, result);
+-
+-        result
+-    }
+-}
+-
+-
+ pub mod gl {
+     #![allow(clippy::all)]
+     include!(concat!(env!("OUT_DIR"), "/gl_bindings.rs"));
+diff --git a/src/logging.rs b/src/logging.rs
+index 1f51d2b2..0b1d25a4 100644
+--- a/src/logging.rs
++++ b/src/logging.rs
+@@ -17,85 +17,52 @@
+ //! The main executable is supposed to call `initialize()` exactly once during
+ //! startup. All logging messages are written to stdout, given that their
+ //! log-level is sufficient for the level configured in `cli::Options`.
+-use crate::cli;
+-use log::{self, Level};
+-use time;
+-
+ use std::env;
+-use std::fs::{self, File, OpenOptions};
++use std::fs::{File, OpenOptions};
+ use std::io::{self, LineWriter, Stdout, Write};
+ use std::path::PathBuf;
+ use std::process;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, Mutex};
+ 
+-pub fn initialize(options: &cli::Options) -> Result<LoggerProxy, log::SetLoggerError> {
++use crossbeam_channel::Sender;
++use log::{self, Level};
++use time;
++
++use crate::cli;
++use crate::message_bar::Message;
++use crate::term::color;
++
++const ALACRITTY_LOG_ENV: &str = "ALACRITTY_LOG";
++
++pub fn initialize(
++    options: &cli::Options,
++    message_tx: Sender<Message>,
++) -> Result<Option<PathBuf>, log::SetLoggerError> {
+     // Use env_logger if RUST_LOG environment variable is defined. Otherwise,
+     // use the alacritty-only logger.
+     if ::std::env::var("RUST_LOG").is_ok() {
+         ::env_logger::try_init()?;
+-        Ok(LoggerProxy::default())
++        Ok(None)
+     } else {
+-        let logger = Logger::new(options.log_level);
+-        let proxy = logger.proxy();
+-
++        let logger = Logger::new(options.log_level, message_tx);
++        let path = logger.file_path();
+         log::set_boxed_logger(Box::new(logger))?;
+-
+-        Ok(proxy)
++        Ok(path)
+     }
+ }
+ 
+-/// Proxy object for bidirectional communicating with the global logger.
+-#[derive(Clone, Default)]
+-pub struct LoggerProxy {
+-    errors: Arc<AtomicBool>,
+-    warnings: Arc<AtomicBool>,
+-    logfile_proxy: OnDemandLogFileProxy,
+-}
+-
+-impl LoggerProxy {
+-    /// Check for new logged errors.
+-    pub fn errors(&self) -> bool {
+-        self.errors.load(Ordering::Relaxed)
+-    }
+-
+-    /// Check for new logged warnings.
+-    pub fn warnings(&self) -> bool {
+-        self.warnings.load(Ordering::Relaxed)
+-    }
+-
+-    /// Get the path of the log file if it has been created.
+-    pub fn log_path(&self) -> Option<&str> {
+-        if self.logfile_proxy.created.load(Ordering::Relaxed) {
+-            Some(&self.logfile_proxy.path)
+-        } else {
+-            None
+-        }
+-    }
+-
+-    /// Clear log warnings/errors from the Alacritty UI.
+-    pub fn clear(&mut self) {
+-        self.errors.store(false, Ordering::Relaxed);
+-        self.warnings.store(false, Ordering::Relaxed);
+-    }
+-
+-    pub fn delete_log(&mut self) {
+-        self.logfile_proxy.delete_log();
+-    }
+-}
+-
+-struct Logger {
++pub struct Logger {
+     level: log::LevelFilter,
+     logfile: Mutex<OnDemandLogFile>,
+     stdout: Mutex<LineWriter<Stdout>>,
+-    errors: Arc<AtomicBool>,
+-    warnings: Arc<AtomicBool>,
++    message_tx: Sender<Message>,
+ }
+ 
+ impl Logger {
+     // False positive, see: https://github.com/rust-lang-nursery/rust-clippy/issues/734
+     #[allow(clippy::new_ret_no_self)]
+-    fn new(level: log::LevelFilter) -> Self {
++    fn new(level: log::LevelFilter, message_tx: Sender<Message>) -> Self {
+         log::set_max_level(level);
+ 
+         let logfile = Mutex::new(OnDemandLogFile::new());
+@@ -105,16 +72,15 @@ impl Logger {
+             level,
+             logfile,
+             stdout,
+-            errors: Arc::new(AtomicBool::new(false)),
+-            warnings: Arc::new(AtomicBool::new(false)),
++            message_tx,
+         }
+     }
+ 
+-    fn proxy(&self) -> LoggerProxy {
+-        LoggerProxy {
+-            errors: self.errors.clone(),
+-            warnings: self.warnings.clone(),
+-            logfile_proxy: self.logfile.lock().expect("").proxy(),
++    fn file_path(&self) -> Option<PathBuf> {
++        if let Ok(logfile) = self.logfile.lock() {
++            Some(logfile.path().clone())
++        } else {
++            None
+         }
+     }
+ }
+@@ -125,61 +91,62 @@ impl log::Log for Logger {
+     }
+ 
+     fn log(&self, record: &log::Record<'_>) {
+-        if self.enabled(record.metadata()) &&
+-           record.target().starts_with("alacritty")
+-        {
++        if self.enabled(record.metadata()) && record.target().starts_with("alacritty") {
+             let now = time::strftime("%F %R", &time::now()).unwrap();
+ 
+             let msg = if record.level() >= Level::Trace {
+-                format!("[{}] [{}] [{}:{}] {}\n",
+-                        now,
+-                        record.level(),
+-                        record.file().unwrap_or("?"),
+-                        record.line()
+-                              .map(|l| l.to_string())
+-                              .unwrap_or_else(|| "?".into()),
+-                        record.args())
++                format!(
++                    "[{}] [{}] [{}:{}] {}\n",
++                    now,
++                    record.level(),
++                    record.file().unwrap_or("?"),
++                    record
++                        .line()
++                        .map(|l| l.to_string())
++                        .unwrap_or_else(|| "?".into()),
++                    record.args()
++                )
+             } else {
+-                format!("[{}] [{}] {}\n",
+-                        now,
+-                        record.level(),
+-                        record.args())
++                format!("[{}] [{}] {}\n", now, record.level(), record.args())
+             };
+ 
+             if let Ok(ref mut logfile) = self.logfile.lock() {
+                 let _ = logfile.write_all(msg.as_ref());
++
++                if record.level() <= Level::Warn {
++                    #[cfg(not(windows))]
++                    let env_var = format!("${}", ALACRITTY_LOG_ENV);
++                    #[cfg(windows)]
++                    let env_var = format!("%{}%", ALACRITTY_LOG_ENV);
++
++                    let msg = format!(
++                        "[{}] See log at {} ({}):\n{}",
++                        record.level(),
++                        logfile.path.to_string_lossy(),
++                        env_var,
++                        record.args(),
++                    );
++                    let color = match record.level() {
++                        Level::Error => color::RED,
++                        Level::Warn => color::YELLOW,
++                        _ => unreachable!(),
++                    };
++
++                    let mut message = Message::new(msg, color);
++                    message.set_topic(record.file().unwrap_or("?").into());
++                    let _ = self.message_tx.send(message);
++                }
+             }
+ 
+             if let Ok(ref mut stdout) = self.stdout.lock() {
+                 let _ = stdout.write_all(msg.as_ref());
+             }
+-
+-            match record.level() {
+-                Level::Error => self.errors.store(true, Ordering::Relaxed),
+-                Level::Warn => self.warnings.store(true, Ordering::Relaxed),
+-                _ => (),
+-            }
+         }
+     }
+ 
+     fn flush(&self) {}
+ }
+ 
+-#[derive(Clone, Default)]
+-struct OnDemandLogFileProxy {
+-    created: Arc<AtomicBool>,
+-    path: String,
+-}
+-
+-impl OnDemandLogFileProxy {
+-    fn delete_log(&mut self) {
+-        if self.created.load(Ordering::Relaxed) && fs::remove_file(&self.path).is_ok() {
+-            let _ = writeln!(io::stdout(), "Deleted log file at {:?}", self.path);
+-            self.created.store(false, Ordering::Relaxed);
+-        }
+-    }
+-}
+-
+ struct OnDemandLogFile {
+     file: Option<LineWriter<File>>,
+     created: Arc<AtomicBool>,
+@@ -191,6 +158,9 @@ impl OnDemandLogFile {
+         let mut path = env::temp_dir();
+         path.push(format!("Alacritty-{}.log", process::id()));
+ 
++        // Set log path as an environment variable
++        env::set_var(ALACRITTY_LOG_ENV, path.as_os_str());
++
+         OnDemandLogFile {
+             path,
+             file: None,
+@@ -227,11 +197,8 @@ impl OnDemandLogFile {
+         Ok(self.file.as_mut().unwrap())
+     }
+ 
+-    fn proxy(&self) -> OnDemandLogFileProxy {
+-        OnDemandLogFileProxy {
+-            created: self.created.clone(),
+-            path: self.path.to_string_lossy().to_string(),
+-        }
++    fn path(&self) -> &PathBuf {
++        &self.path
+     }
+ }
+ 
+diff --git a/src/main.rs b/src/main.rs
+index a5564cd2..0c7a6b49 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -33,6 +33,8 @@ use log::{info, error};
+ 
+ use std::error::Error;
+ use std::sync::Arc;
++use std::io::{self, Write};
++use std::fs;
+ 
+ #[cfg(target_os = "macos")]
+ use std::env;
+@@ -43,15 +45,16 @@ use std::os::unix::io::AsRawFd;
+ #[cfg(target_os = "macos")]
+ use alacritty::locale;
+ use alacritty::{cli, event, die};
+-use alacritty::config::{self, Config, Error as ConfigError};
++use alacritty::config::{self, Config};
+ use alacritty::display::Display;
+ use alacritty::event_loop::{self, EventLoop, Msg};
+-use alacritty::logging::{self, LoggerProxy};
++use alacritty::logging;
+ use alacritty::panic;
+ use alacritty::sync::FairMutex;
+ use alacritty::term::Term;
+-use alacritty::tty::{self, process_should_exit};
++use alacritty::tty;
+ use alacritty::util::fmt::Red;
++use alacritty::message_bar::MessageBuffer;
+ 
+ fn main() {
+     panic::attach_handler();
+@@ -65,11 +68,25 @@ fn main() {
+     // Load command line options
+     let options = cli::Options::load();
+ 
++    // Setup storage for message UI
++    let message_buffer = MessageBuffer::new();
++
+     // Initialize the logger as soon as possible as to capture output from other subsystems
+-    let logger_proxy = logging::initialize(&options).expect("Unable to initialize logger");
++    let log_file =
++        logging::initialize(&options, message_buffer.tx()).expect("Unable to initialize logger");
+ 
+     // Load configuration file
+-    let config = load_config(&options).update_dynamic_title(&options);
++    // If the file is a command line argument, we won't write a generated default file
++    let config_path = options.config_path()
++        .or_else(Config::installed_config)
++        .or_else(|| Config::write_defaults().ok())
++        .map(|path| path.to_path_buf());
++    let config = if let Some(path) = config_path {
++        Config::load_from(path).update_dynamic_title(&options)
++    } else {
++        error!("Unable to write the default config");
++        Config::default()
++    };
+ 
+     // Switch to home directory
+     #[cfg(target_os = "macos")]
+@@ -78,34 +95,19 @@ fn main() {
+     #[cfg(target_os = "macos")]
+     locale::set_locale_environment();
+ 
++    // Store if log file should be deleted before moving config
++    let persistent_logging = options.persistent_logging || config.persistent_logging();
++
+     // Run alacritty
+-    if let Err(err) = run(config, &options, logger_proxy) {
++    if let Err(err) = run(config, &options, message_buffer) {
+         die!("Alacritty encountered an unrecoverable error:\n\n\t{}\n", Red(err));
+     }
+-}
+-
+-/// Load configuration
+-///
+-/// If a configuration file is given as a command line argument we don't
+-/// generate a default file. If an empty configuration file is given, i.e.
+-/// /dev/null, we load the compiled-in defaults.)
+-fn load_config(options: &cli::Options) -> Config {
+-    let config_path = options.config_path()
+-        .or_else(Config::installed_config)
+-        .or_else(|| Config::write_defaults().ok());
+-
+-    if let Some(config_path) = config_path {
+-        Config::load_from(&*config_path).unwrap_or_else(|err| {
+-            match err {
+-                ConfigError::Empty => info!("Config file {:?} is empty; loading default", config_path),
+-                _ => error!("Unable to load default config: {}", err),
+-            }
+ 
+-            Config::default()
+-        })
+-    } else {
+-        error!("Unable to write the default config");
+-        Config::default()
++    // Clean up logfile
++    if let Some(log_file) = log_file {
++        if !persistent_logging && fs::remove_file(&log_file).is_ok() {
++            let _ = writeln!(io::stdout(), "Deleted log file at {:?}", log_file);
++        }
+     }
+ }
+ 
+@@ -116,7 +118,7 @@ fn load_config(options: &cli::Options) -> Config {
+ fn run(
+     mut config: Config,
+     options: &cli::Options,
+-    mut logger_proxy: LoggerProxy,
++    message_buffer: MessageBuffer,
+ ) -> Result<(), Box<dyn Error>> {
+     info!("Welcome to Alacritty");
+     if let Some(config_path) = config.path() {
+@@ -129,7 +131,7 @@ fn run(
+     // Create a display.
+     //
+     // The display manages a window and can draw the terminal
+-    let mut display = Display::new(&config, options, logger_proxy.clone())?;
++    let mut display = Display::new(&config, options)?;
+ 
+     info!(
+         "PTY Dimensions: {:?} x {:?}",
+@@ -142,8 +144,7 @@ fn run(
+     // This object contains all of the state about what's being displayed. It's
+     // wrapped in a clonable mutex since both the I/O loop and display need to
+     // access it.
+-    let mut terminal = Term::new(&config, display.size().to_owned());
+-    terminal.set_logger_proxy(logger_proxy.clone());
++    let terminal = Term::new(&config, display.size().to_owned(), message_buffer);
+     let terminal = Arc::new(FairMutex::new(terminal));
+ 
+     // Find the window ID for setting $WINDOWID
+@@ -220,17 +221,25 @@ fn run(
+         let mut terminal_lock = processor.process_events(&terminal, display.window());
+ 
+         // Handle config reloads
+-        if let Some(new_config) = config_monitor
+-            .as_ref()
+-            .and_then(|monitor| monitor.pending_config())
+-        {
+-            config = new_config.update_dynamic_title(options);
+-            display.update_config(&config);
+-            processor.update_config(&config);
+-            terminal_lock.update_config(&config);
++        if let Some(ref path) = config_monitor.as_ref().and_then(|monitor| monitor.pending()) {
++            // Clear old config messages from bar
++            terminal_lock.message_buffer_mut().remove_topic(config::SOURCE_FILE_PATH);
++
++            if let Ok(new_config) = Config::reload_from(path) {
++                config = new_config.update_dynamic_title(options);
++                display.update_config(&config);
++                processor.update_config(&config);
++                terminal_lock.update_config(&config);
++            }
++
+             terminal_lock.dirty = true;
+         }
+ 
++        // Begin shutdown if the flag was raised
++        if terminal_lock.should_exit() {
++            break;
++        }
++
+         // Maybe draw the terminal
+         if terminal_lock.needs_draw() {
+             // Try to update the position of the input method editor
+@@ -241,18 +250,13 @@ fn run(
+             //
+             // The second argument is a list of types that want to be notified
+             // of display size changes.
+-            display.handle_resize(&mut terminal_lock, &config, &mut [&mut resize_handle, &mut processor]);
++            display.handle_resize(&mut terminal_lock, &config, &mut resize_handle, &mut processor);
+ 
+             drop(terminal_lock);
+ 
+             // Draw the current state of the terminal
+             display.draw(&terminal, &config);
+         }
+-
+-        // Begin shutdown if the flag was raised.
+-        if process_should_exit() {
+-            break;
+-        }
+     }
+ 
+     loop_tx
+@@ -268,9 +272,5 @@ fn run(
+ 
+     info!("Goodbye");
+ 
+-    if !options.persistent_logging && !config.persistent_logging() {
+-        logger_proxy.delete_log();
+-    }
+-
+     Ok(())
+ }
+diff --git a/src/message_bar.rs b/src/message_bar.rs
+new file mode 100644
+index 00000000..bbd705aa
+--- /dev/null
++++ b/src/message_bar.rs
+@@ -0,0 +1,517 @@
++// Copyright 2016 Joe Wilm, The Alacritty Project Contributors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++use crossbeam_channel::{Receiver, Sender};
++
++use crate::term::color::Rgb;
++use crate::term::SizeInfo;
++
++pub const CLOSE_BUTTON_TEXT: &str = "[X]";
++const CLOSE_BUTTON_PADDING: usize = 1;
++const MIN_FREE_LINES: usize = 3;
++const TRUNCATED_MESSAGE: &str = "[MESSAGE TRUNCATED]";
++
++/// Message for display in the MessageBuffer
++#[derive(Debug, Eq, PartialEq, Clone)]
++pub struct Message {
++    text: String,
++    color: Rgb,
++    topic: Option<String>,
++}
++
++impl Message {
++    /// Create a new message
++    pub fn new(text: String, color: Rgb) -> Message {
++        Message {
++            text,
++            color,
++            topic: None,
++        }
++    }
++
++    /// Formatted message text lines
++    pub fn text(&self, size_info: &SizeInfo) -> Vec<String> {
++        let num_cols = size_info.cols().0;
++        let max_lines = size_info.lines().saturating_sub(MIN_FREE_LINES);
++        let button_len = CLOSE_BUTTON_TEXT.len();
++
++        // Split line to fit the screen
++        let mut lines = Vec::new();
++        let mut line = String::new();
++        for c in self.text.trim().chars() {
++            if c == '\n'
++                || line.len() == num_cols
++                // Keep space in first line for button
++                || (lines.is_empty()
++                    && num_cols >= button_len
++                    && line.len() == num_cols.saturating_sub(button_len + CLOSE_BUTTON_PADDING))
++            {
++                // Attempt to wrap on word boundaries
++                if let (Some(index), true) = (line.rfind(char::is_whitespace), c != '\n') {
++                    let split = line.split_off(index + 1);
++                    line.pop();
++                    lines.push(Self::pad_text(line, num_cols));
++                    line = split
++                } else {
++                    lines.push(Self::pad_text(line, num_cols));
++                    line = String::new();
++                }
++            }
++
++            if c != '\n' {
++                line.push(c);
++            }
++        }
++        lines.push(Self::pad_text(line, num_cols));
++
++        // Truncate output if it's too long
++        if lines.len() > max_lines {
++            lines.truncate(max_lines);
++            if TRUNCATED_MESSAGE.len() <= num_cols {
++                if let Some(line) = lines.iter_mut().last() {
++                    *line = Self::pad_text(TRUNCATED_MESSAGE.into(), num_cols);
++                }
++            }
++        }
++
++        // Append close button to first line
++        if button_len <= num_cols {
++            if let Some(line) = lines.get_mut(0) {
++                line.truncate(num_cols - button_len);
++                line.push_str(CLOSE_BUTTON_TEXT);
++            }
++        }
++
++        lines
++    }
++
++    /// Message color
++    #[inline]
++    pub fn color(&self) -> Rgb {
++        self.color
++    }
++
++    /// Message topic
++    #[inline]
++    pub fn topic(&self) -> Option<&String> {
++        self.topic.as_ref()
++    }
++
++    /// Update the message topic
++    #[inline]
++    pub fn set_topic(&mut self, topic: String) {
++        self.topic = Some(topic);
++    }
++
++    /// Right-pad text to fit a specific number of columns
++    #[inline]
++    fn pad_text(mut text: String, num_cols: usize) -> String {
++        let padding_len = num_cols.saturating_sub(text.len());
++        text.extend(vec![' '; padding_len]);
++        text
++    }
++}
++
++/// Storage for message bar
++#[derive(Debug)]
++pub struct MessageBuffer {
++    current: Option<Message>,
++    messages: Receiver<Message>,
++    tx: Sender<Message>,
++}
++
++impl MessageBuffer {
++    /// Create new message buffer
++    pub fn new() -> MessageBuffer {
++        let (tx, messages) = crossbeam_channel::unbounded();
++        MessageBuffer {
++            current: None,
++            messages,
++            tx,
++        }
++    }
++
++    /// Check if there are any messages queued
++    #[inline]
++    pub fn is_empty(&self) -> bool {
++        self.current.is_none()
++    }
++
++    /// Current message
++    #[inline]
++    pub fn message(&mut self) -> Option<Message> {
++        if let Some(current) = &self.current {
++            Some(current.clone())
++        } else {
++            self.current = self.messages.try_recv().ok();
++            self.current.clone()
++        }
++    }
++
++    /// Channel for adding new messages
++    #[inline]
++    pub fn tx(&self) -> Sender<Message> {
++        self.tx.clone()
++    }
++
++    /// Remove the currently visible message
++    #[inline]
++    pub fn pop(&mut self) {
++        // Remove all duplicates
++        for msg in self
++            .messages
++            .try_iter()
++            .take(self.messages.len())
++            .filter(|m| Some(m) != self.current.as_ref())
++        {
++            let _ = self.tx.send(msg);
++        }
++
++        // Remove the message itself
++        self.current = self.messages.try_recv().ok();
++    }
++
++    /// Remove all messages with a specific topic
++    #[inline]
++    pub fn remove_topic(&mut self, topic: &str) {
++        // Filter messages currently pending
++        for msg in self
++            .messages
++            .try_iter()
++            .take(self.messages.len())
++            .filter(|m| m.topic().map(|s| s.as_str()) != Some(topic))
++        {
++            let _ = self.tx.send(msg);
++        }
++
++        // Remove the currently active message
++        self.current = self.messages.try_recv().ok();
++    }
++}
++
++impl Default for MessageBuffer {
++    fn default() -> MessageBuffer {
++        MessageBuffer::new()
++    }
++}
++
++#[cfg(test)]
++mod test {
++    use super::{Message, MessageBuffer, MIN_FREE_LINES};
++    use crate::term::{color, SizeInfo};
++
++    #[test]
++    fn appends_close_button() {
++        let input = "a";
++        let mut message_buffer = MessageBuffer::new();
++        message_buffer
++            .tx()
++            .send(Message::new(input.into(), color::RED))
++            .unwrap();
++        let size = SizeInfo {
++            width: 7.,
++            height: 10.,
++            cell_width: 1.,
++            cell_height: 1.,
++            padding_x: 0.,
++            padding_y: 0.,
++            dpr: 0.,
++        };
++
++        let lines = message_buffer.message().unwrap().text(&size);
++
++        assert_eq!(lines, vec![String::from("a   [X]")]);
++    }
++
++    #[test]
++    fn multiline_close_button_first_line() {
++        let input = "fo\nbar";
++        let mut message_buffer = MessageBuffer::new();
++        message_buffer
++            .tx()
++            .send(Message::new(input.into(), color::RED))
++            .unwrap();
++        let size = SizeInfo {
++            width: 6.,
++            height: 10.,
++            cell_width: 1.,
++            cell_height: 1.,
++            padding_x: 0.,
++            padding_y: 0.,
++            dpr: 0.,
++        };
++
++        let lines = message_buffer.message().unwrap().text(&size);
++
++        assert_eq!(lines, vec![String::from("fo [X]"), String::from("bar   ")]);
++    }
++
++    #[test]
++    fn splits_on_newline() {
++        let input = "a\nb";
++        let mut message_buffer = MessageBuffer::new();
++        message_buffer
++            .tx()
++            .send(Message::new(input.into(), color::RED))
++            .unwrap();
++        let size = SizeInfo {
++            width: 6.,
++            height: 10.,
++            cell_width: 1.,
++            cell_height: 1.,
++            padding_x: 0.,
++            padding_y: 0.,
++            dpr: 0.,
++        };
++
++        let lines = message_buffer.message().unwrap().text(&size);
++
++        assert_eq!(lines.len(), 2);
++    }
++
++    #[test]
++    fn splits_on_length() {
++        let input = "foobar1";
++        let mut message_buffer = MessageBuffer::new();
++        message_buffer
++            .tx()
++            .send(Message::new(input.into(), color::RED))
++            .unwrap();
++        let size = SizeInfo {
++            width: 6.,
++            height: 10.,
++            cell_width: 1.,
++            cell_height: 1.,
++            padding_x: 0.,
++            padding_y: 0.,
++            dpr: 0.,
++        };
++
++        let lines = message_buffer.message().unwrap().text(&size);
++
++        assert_eq!(lines.len(), 2);
++    }
++
++    #[test]
++    fn empty_with_shortterm() {
++        let input = "foobar";
++        let mut message_buffer = MessageBuffer::new();
++        message_buffer
++            .tx()
++            .send(Message::new(input.into(), color::RED))
++            .unwrap();
++        let size = SizeInfo {
++            width: 6.,
++            height: 0.,
++            cell_width: 1.,
++            cell_height: 1.,
++            padding_x: 0.,
++            padding_y: 0.,
++            dpr: 0.,
++        };
++
++        let lines = message_buffer.message().unwrap().text(&size);
++
++        assert_eq!(lines.len(), 0);
++    }
++
++    #[test]
++    fn truncates_long_messages() {
++        let input = "hahahahahahahahahahaha truncate this because it's too long for the term";
++        let mut message_buffer = MessageBuffer::new();
++        message_buffer
++            .tx()
++            .send(Message::new(input.into(), color::RED))
++            .unwrap();
++        let size = SizeInfo {
++            width: 22.,
++            height: (MIN_FREE_LINES + 2) as f32,
++            cell_width: 1.,
++            cell_height: 1.,
++            padding_x: 0.,
++            padding_y: 0.,
++            dpr: 0.,
++        };
++
++        let lines = message_buffer.message().unwrap().text(&size);
++
++        assert_eq!(
++            lines,
++            vec![
++                String::from("hahahahahahahahaha [X]"),
++                String::from("[MESSAGE TRUNCATED]   ")
++            ]
++        );
++    }
++
++    #[test]
++    fn hide_button_when_too_narrow() {
++        let input = "ha";
++        let mut message_buffer = MessageBuffer::new();
++        message_buffer
++            .tx()
++            .send(Message::new(input.into(), color::RED))
++            .unwrap();
++        let size = SizeInfo {
++            width: 2.,
++            height: 10.,
++            cell_width: 1.,
++            cell_height: 1.,
++            padding_x: 0.,
++            padding_y: 0.,
++            dpr: 0.,
++        };
++
++        let lines = message_buffer.message().unwrap().text(&size);
++
++        assert_eq!(lines, vec![String::from("ha")]);
++    }
++
++    #[test]
++    fn hide_truncated_when_too_narrow() {
++        let input = "hahahahahahahahaha";
++        let mut message_buffer = MessageBuffer::new();
++        message_buffer
++            .tx()
++            .send(Message::new(input.into(), color::RED))
++            .unwrap();
++        let size = SizeInfo {
++            width: 2.,
++            height: (MIN_FREE_LINES + 2) as f32,
++            cell_width: 1.,
++            cell_height: 1.,
++            padding_x: 0.,
++            padding_y: 0.,
++            dpr: 0.,
++        };
++
++        let lines = message_buffer.message().unwrap().text(&size);
++
++        assert_eq!(lines, vec![String::from("ha"), String::from("ha")]);
++    }
++
++    #[test]
++    fn add_newline_for_button() {
++        let input = "test";
++        let mut message_buffer = MessageBuffer::new();
++        message_buffer
++            .tx()
++            .send(Message::new(input.into(), color::RED))
++            .unwrap();
++        let size = SizeInfo {
++            width: 5.,
++            height: 10.,
++            cell_width: 1.,
++            cell_height: 1.,
++            padding_x: 0.,
++            padding_y: 0.,
++            dpr: 0.,
++        };
++
++        let lines = message_buffer.message().unwrap().text(&size);
++
++        assert_eq!(lines, vec![String::from("t [X]"), String::from("est  ")]);
++    }
++
++    #[test]
++    fn remove_topic() {
++        let mut message_buffer = MessageBuffer::new();
++        for i in 0..10 {
++            let mut msg = Message::new(i.to_string(), color::RED);
++            if i % 2 == 0 && i < 5 {
++                msg.set_topic("topic".into());
++            }
++            message_buffer.tx().send(msg).unwrap();
++        }
++
++        message_buffer.remove_topic("topic");
++
++        // Count number of messages
++        let mut num_messages = 0;
++        while message_buffer.message().is_some() {
++            num_messages += 1;
++            message_buffer.pop();
++        }
++
++        assert_eq!(num_messages, 7);
++    }
++
++    #[test]
++    fn pop() {
++        let mut message_buffer = MessageBuffer::new();
++        let one = Message::new(String::from("one"), color::RED);
++        message_buffer.tx().send(one.clone()).unwrap();
++        let two = Message::new(String::from("two"), color::YELLOW);
++        message_buffer.tx().send(two.clone()).unwrap();
++
++        assert_eq!(message_buffer.message(), Some(one));
++
++        message_buffer.pop();
++
++        assert_eq!(message_buffer.message(), Some(two));
++    }
++
++    #[test]
++    fn wrap_on_words() {
++        let input = "a\nbc defg";
++        let mut message_buffer = MessageBuffer::new();
++        message_buffer
++            .tx()
++            .send(Message::new(input.into(), color::RED))
++            .unwrap();
++        let size = SizeInfo {
++            width: 5.,
++            height: 10.,
++            cell_width: 1.,
++            cell_height: 1.,
++            padding_x: 0.,
++            padding_y: 0.,
++            dpr: 0.,
++        };
++
++        let lines = message_buffer.message().unwrap().text(&size);
++
++        assert_eq!(
++            lines,
++            vec![
++                String::from("a [X]"),
++                String::from("bc   "),
++                String::from("defg ")
++            ]
++        );
++    }
++
++    #[test]
++    fn remove_duplicates() {
++        let mut message_buffer = MessageBuffer::new();
++        for _ in 0..10 {
++            let msg = Message::new(String::from("test"), color::RED);
++            message_buffer.tx().send(msg).unwrap();
++        }
++        message_buffer.tx().send(Message::new(String::from("other"), color::RED)).unwrap();
++        message_buffer.tx().send(Message::new(String::from("test"), color::YELLOW)).unwrap();
++        let _ = message_buffer.message();
++
++        message_buffer.pop();
++
++        // Count number of messages
++        let mut num_messages = 0;
++        while message_buffer.message().is_some() {
++            num_messages += 1;
++            message_buffer.pop();
++        }
++
++        assert_eq!(num_messages, 2);
++    }
++}
+diff --git a/src/renderer/mod.rs b/src/renderer/mod.rs
+index e96d35a5..9a33410f 100644
+--- a/src/renderer/mod.rs
++++ b/src/renderer/mod.rs
+@@ -29,12 +29,12 @@ use notify::{watcher, DebouncedEvent, RecursiveMode, Watcher};
+ use crate::gl::types::*;
+ use crate::gl;
+ use crate::index::{Column, Line, RangeInclusive};
+-use crate::Rgb;
++use crate::term::color::Rgb;
+ use crate::config::{self, Config, Delta};
+ use crate::term::{self, cell, RenderableCell};
+-use crate::renderer::lines::Lines;
++use crate::renderer::rects::{Rect, Rects};
+ 
+-pub mod lines;
++pub mod rects;
+ 
+ // Shader paths for live reload
+ static TEXT_SHADER_F_PATH: &'static str = concat!(env!("CARGO_MANIFEST_DIR"), "/res/text.f.glsl");
+@@ -668,7 +668,7 @@ impl QuadRenderer {
+         config: &Config,
+         props: &term::SizeInfo,
+         visual_bell_intensity: f64,
+-        cell_line_rects: Lines,
++        cell_line_rects: Rects,
+     ) {
+         // Swap to rectangle rendering program
+         unsafe {
+@@ -866,20 +866,6 @@ impl QuadRenderer {
+     }
+ }
+ 
+-#[derive(Debug, Copy, Clone)]
+-pub struct Rect<T> {
+-    x: T,
+-    y: T,
+-    width: T,
+-    height: T,
+-}
+-
+-impl<T> Rect<T> {
+-    pub fn new(x: T, y: T, width: T, height: T) -> Self {
+-        Rect { x, y, width, height }
+-    }
+-}
+-
+ impl<'a> RenderApi<'a> {
+     pub fn clear(&self, color: Rgb) {
+         let alpha = self.config.background_opacity().get();
+@@ -941,8 +927,9 @@ impl<'a> RenderApi<'a> {
+         string: &str,
+         line: Line,
+         glyph_cache: &mut GlyphCache,
+-        color: Rgb
++        color: Option<Rgb>
+     ) {
++        let bg_alpha = color.map(|_| 1.0).unwrap_or(0.0);
+         let col = Column(0);
+ 
+         let cells = string
+@@ -956,10 +943,10 @@ impl<'a> RenderApi<'a> {
+                     chars[0] = c;
+                     chars
+                 },
+-                bg: color,
++                bg: color.unwrap_or(Rgb { r: 0, g: 0, b: 0}),
+                 fg: Rgb { r: 0, g: 0, b: 0 },
+                 flags: cell::Flags::empty(),
+-                bg_alpha: 1.0,
++                bg_alpha,
+             })
+             .collect::<Vec<_>>();
+ 
+diff --git a/src/renderer/lines.rs b/src/renderer/rects.rs
+similarity index 89%
+rename from src/renderer/lines.rs
+rename to src/renderer/rects.rs
+index 3c250caf..e066c365 100644
+--- a/src/renderer/lines.rs
++++ b/src/renderer/rects.rs
+@@ -13,14 +13,27 @@
+ // limitations under the License.
+ use std::collections::HashMap;
+ 
+-use crate::renderer::Rect;
+ use crate::term::cell::Flags;
+ use crate::term::{RenderableCell, SizeInfo};
+-use crate::Rgb;
++use crate::term::color::Rgb;
+ use font::Metrics;
+ 
+-/// Lines for underline and strikeout.
+-pub struct Lines<'a> {
++#[derive(Debug, Copy, Clone)]
++pub struct Rect<T> {
++    pub x: T,
++    pub y: T,
++    pub width: T,
++    pub height: T,
++}
++
++impl<T> Rect<T> {
++    pub fn new(x: T, y: T, width: T, height: T) -> Self {
++        Rect { x, y, width, height }
++    }
++}
++
++/// Rects for underline, strikeout and more.
++pub struct Rects<'a> {
+     inner: Vec<(Rect<f32>, Rgb)>,
+     last_starts: HashMap<Flags, Option<RenderableCell>>,
+     last_cell: Option<RenderableCell>,
+@@ -28,7 +41,7 @@ pub struct Lines<'a> {
+     size: &'a SizeInfo,
+ }
+ 
+-impl<'a> Lines<'a> {
++impl<'a> Rects<'a> {
+     pub fn new(metrics: &'a Metrics, size: &'a SizeInfo) -> Self {
+         let mut last_starts = HashMap::new();
+         last_starts.insert(Flags::UNDERLINE, None);
+@@ -43,7 +56,7 @@ impl<'a> Lines<'a> {
+         }
+     }
+ 
+-    /// Convert the stored lines to rectangles for the renderer.
++    /// Convert the stored rects to rectangles for the renderer.
+     pub fn rects(mut self) -> Vec<(Rect<f32>, Rgb)> {
+         // If there's still a line pending, draw it until the last cell
+         for (flag, start_cell) in self.last_starts.iter_mut() {
+@@ -107,6 +120,11 @@ impl<'a> Lines<'a> {
+ 
+         self.last_cell = Some(*cell);
+     }
++
++    // Add a rectangle
++    pub fn push(&mut self, rect: Rect<f32>, color: Rgb) {
++        self.inner.push((rect, color));
++    }
+ }
+ 
+ /// Create a rectangle that starts on the left of `start` and ends on the right
+diff --git a/src/term/color.rs b/src/term/color.rs
+index 638cbd76..abd7527a 100644
+--- a/src/term/color.rs
++++ b/src/term/color.rs
+@@ -1,11 +1,38 @@
+-use std::ops::{Index, IndexMut};
++use std::ops::{Index, IndexMut, Mul};
+ use std::fmt;
+ 
+-use crate::{Rgb, ansi};
++use crate::ansi;
+ use crate::config::Colors;
+ 
+ pub const COUNT: usize = 270;
+ 
++pub const RED: Rgb = Rgb { r: 0xff, g: 0x0, b: 0x0 };
++pub const YELLOW: Rgb = Rgb { r: 0xff, g: 0xff, b: 0x0 };
++
++#[derive(Debug, Eq, PartialEq, Copy, Clone, Default, Serialize, Deserialize)]
++pub struct Rgb {
++    pub r: u8,
++    pub g: u8,
++    pub b: u8,
++}
++
++// a multiply function for Rgb, as the default dim is just *2/3
++impl Mul<f32> for Rgb {
++    type Output = Rgb;
++
++    fn mul(self, rhs: f32) -> Rgb {
++        let result = Rgb {
++            r: (f32::from(self.r) * rhs).max(0.0).min(255.0) as u8,
++            g: (f32::from(self.g) * rhs).max(0.0).min(255.0) as u8,
++            b: (f32::from(self.b) * rhs).max(0.0).min(255.0) as u8
++        };
++
++        trace!("Scaling RGB by {} from {:?} to {:?}", rhs, self, result);
++
++        result
++    }
++}
++
+ /// List of indexed colors
+ ///
+ /// The first 16 entries are the standard ansi named colors. Items 16..232 are
+diff --git a/src/term/mod.rs b/src/term/mod.rs
+index c49ecbcc..76ac9c25 100644
+--- a/src/term/mod.rs
++++ b/src/term/mod.rs
+@@ -27,16 +27,17 @@ use crate::grid::{BidirectionalIterator, Grid, Indexed, IndexRegion, DisplayIter
+ use crate::index::{self, Point, Column, Line, IndexRange, Contains, RangeInclusive, Linear};
+ use crate::selection::{self, Selection, Locations};
+ use crate::config::{Config, VisualBellAnimation};
+-use crate::{MouseCursor, Rgb};
++use crate::MouseCursor;
+ use copypasta::{Clipboard, Load, Store};
+ use crate::input::FONT_SIZE_STEP;
+-use crate::logging::LoggerProxy;
+ use crate::url::UrlParser;
++use crate::message_bar::MessageBuffer;
++use crate::term::color::Rgb;
++use crate::term::cell::{LineLength, Cell};
++use crate::tty;
+ 
+ pub mod cell;
+ pub mod color;
+-pub use self::cell::Cell;
+-use self::cell::LineLength;
+ 
+ /// A type that can expand a given point to a region
+ ///
+@@ -793,8 +794,11 @@ pub struct Term {
+     /// Automatically scroll to bottom when new lines are added
+     auto_scroll: bool,
+ 
+-    /// Proxy object for clearing displayed errors and warnings
+-    logger_proxy: Option<LoggerProxy>,
++    /// Buffer to store messages for the message bar
++    message_buffer: MessageBuffer,
++
++    /// Hint that Alacritty should be closed
++    should_exit: bool,
+ }
+ 
+ /// Terminal size info
+@@ -835,10 +839,10 @@ impl SizeInfo {
+     }
+ 
+     pub fn contains_point(&self, x: usize, y:usize) -> bool {
+-        x <= (self.width - self.padding_x) as usize &&
+-            x >= self.padding_x as usize &&
+-            y <= (self.height - self.padding_y) as usize &&
+-            y >= self.padding_y as usize
++        x < (self.width - self.padding_x) as usize
++            && x >= self.padding_x as usize
++            && y < (self.height - self.padding_y) as usize
++            && y >= self.padding_y as usize
+     }
+ 
+     pub fn pixels_to_coords(&self, x: usize, y: usize) -> Point {
+@@ -858,14 +862,6 @@ impl Term {
+         &self.grid.selection
+     }
+ 
+-    /// Clear displayed errors and warnings.
+-    pub fn clear_log(&mut self) {
+-        if let Some(ref mut logger_proxy) = self.logger_proxy {
+-            logger_proxy.clear();
+-        }
+-    }
+-
+-
+     pub fn selection_mut(&mut self) -> &mut Option<Selection> {
+         &mut self.grid.selection
+     }
+@@ -885,7 +881,7 @@ impl Term {
+         self.next_mouse_cursor.take()
+     }
+ 
+-    pub fn new(config: &Config, size: SizeInfo) -> Term {
++    pub fn new(config: &Config, size: SizeInfo, message_buffer: MessageBuffer) -> Term {
+         let num_cols = size.cols();
+         let num_lines = size.lines();
+ 
+@@ -929,14 +925,11 @@ impl Term {
+             dynamic_title: config.dynamic_title(),
+             tabspaces,
+             auto_scroll: config.scrolling().auto_scroll,
+-            logger_proxy: None,
++            message_buffer,
++            should_exit: false,
+         }
+     }
+ 
+-    pub fn set_logger_proxy(&mut self, logger_proxy: LoggerProxy) {
+-        self.logger_proxy = Some(logger_proxy);
+-    }
+-
+     pub fn change_font_size(&mut self, delta: f32) {
+         // Saturating addition with minimum font size FONT_SIZE_STEP
+         let new_size = self.font_size + Size::new(delta);
+@@ -1169,7 +1162,7 @@ impl Term {
+     }
+ 
+     /// Resize terminal to new dimensions
+-    pub fn resize(&mut self, size : &SizeInfo) {
++    pub fn resize(&mut self, size: &SizeInfo) {
+         debug!("Resizing terminal");
+ 
+         // Bounds check; lots of math assumes width and height are > 0
+@@ -1184,6 +1177,10 @@ impl Term {
+         let mut num_cols = size.cols();
+         let mut num_lines = size.lines();
+ 
++        if let Some(message) = self.message_buffer.message() {
++            num_lines -= message.text(size).len();
++        }
++
+         self.size_info = *size;
+ 
+         if old_cols == num_cols && old_lines == num_lines {
+@@ -1315,6 +1312,26 @@ impl Term {
+     pub fn background_color(&self) -> Rgb {
+         self.colors[NamedColor::Background]
+     }
++
++    #[inline]
++    pub fn message_buffer_mut(&mut self) -> &mut MessageBuffer {
++        &mut self.message_buffer
++    }
++
++    #[inline]
++    pub fn message_buffer(&self) -> &MessageBuffer {
++        &self.message_buffer
++    }
++
++    #[inline]
++    pub fn exit(&mut self) {
++        self.should_exit = true;
++    }
++
++    #[inline]
++    pub fn should_exit(&self) -> bool {
++        tty::process_should_exit() || self.should_exit
++    }
+ }
+ 
+ impl ansi::TermInfo for Term {
+@@ -1859,10 +1876,7 @@ impl ansi::Handler for Term {
+                         .each(|cell| cell.reset(&template));
+                 }
+             },
+-            ansi::ClearMode::All => {
+-                self.clear_log();
+-                self.grid.region_mut(..).each(|c| c.reset(&template));
+-            },
++            ansi::ClearMode::All => self.grid.region_mut(..).each(|c| c.reset(&template)),
+             ansi::ClearMode::Above => {
+                 // If clearing more than one line
+                 if self.cursor.point.line > Line(1) {
+@@ -2129,6 +2143,7 @@ mod tests {
+     use crate::input::FONT_SIZE_STEP;
+     use font::Size;
+     use crate::config::Config;
++    use crate::message_bar::MessageBuffer;
+ 
+     #[test]
+     fn semantic_selection_works() {
+@@ -2141,7 +2156,7 @@ mod tests {
+             padding_y: 0.0,
+             dpr: 1.0,
+         };
+-        let mut term = Term::new(&Default::default(), size);
++        let mut term = Term::new(&Default::default(), size, MessageBuffer::new());
+         let mut grid: Grid<Cell> = Grid::new(Line(3), Column(5), 0, Cell::default());
+         for i in 0..5 {
+             for j in 0..2 {
+@@ -2185,7 +2200,7 @@ mod tests {
+             padding_y: 0.0,
+             dpr: 1.0,
+         };
+-        let mut term = Term::new(&Default::default(), size);
++        let mut term = Term::new(&Default::default(), size, MessageBuffer::new());
+         let mut grid: Grid<Cell> = Grid::new(Line(1), Column(5), 0, Cell::default());
+         for i in 0..5 {
+             grid[Line(0)][Column(i)].c = 'a';
+@@ -2211,7 +2226,7 @@ mod tests {
+             padding_y: 0.0,
+             dpr: 1.0,
+         };
+-        let mut term = Term::new(&Default::default(), size);
++        let mut term = Term::new(&Default::default(), size, MessageBuffer::new());
+         let mut grid: Grid<Cell> = Grid::new(Line(3), Column(3), 0, Cell::default());
+         for l in 0..3 {
+             if l != 1 {
+@@ -2256,7 +2271,7 @@ mod tests {
+             padding_y: 0.0,
+             dpr: 1.0,
+         };
+-        let mut term = Term::new(&Default::default(), size);
++        let mut term = Term::new(&Default::default(), size, MessageBuffer::new());
+         let cursor = Point::new(Line(0), Column(0));
+         term.configure_charset(CharsetIndex::G0,
+                                StandardCharset::SpecialCharacterAndLineDrawing);
+@@ -2276,7 +2291,7 @@ mod tests {
+             dpr: 1.0,
+         };
+         let config: Config = Default::default();
+-        let mut term: Term = Term::new(&config, size);
++        let mut term: Term = Term::new(&config, size, MessageBuffer::new());
+         term.change_font_size(font_size);
+ 
+         let expected_font_size: Size = config.font().size() + Size::new(font_size);
+@@ -2305,7 +2320,7 @@ mod tests {
+             dpr: 1.0,
+         };
+         let config: Config = Default::default();
+-        let mut term: Term = Term::new(&config, size);
++        let mut term: Term = Term::new(&config, size, MessageBuffer::new());
+ 
+         term.change_font_size(-100.0);
+ 
+@@ -2325,7 +2340,7 @@ mod tests {
+             dpr: 1.0,
+         };
+         let config: Config = Default::default();
+-        let mut term: Term = Term::new(&config, size);
++        let mut term: Term = Term::new(&config, size, MessageBuffer::new());
+ 
+         term.change_font_size(10.0);
+         term.reset_font_size();
+@@ -2346,7 +2361,7 @@ mod tests {
+             dpr: 1.0
+         };
+         let config: Config = Default::default();
+-        let mut term: Term = Term::new(&config, size);
++        let mut term: Term = Term::new(&config, size, MessageBuffer::new());
+ 
+         // Add one line of scrollback
+         term.grid.scroll_up(&(Line(0)..Line(1)), Line(1), &Cell::default());
+@@ -2373,6 +2388,7 @@ mod benches {
+ 
+     use crate::grid::Grid;
+     use crate::config::Config;
++    use crate::message_bar::MessageBuffer;
+ 
+     use super::{SizeInfo, Term};
+     use super::cell::Cell;
+@@ -2411,7 +2427,7 @@ mod benches {
+ 
+         let config = Config::default();
+ 
+-        let mut terminal = Term::new(&config, size);
++        let mut terminal = Term::new(&config, size, MessageBuffer::new());
+         mem::swap(&mut terminal.grid, &mut grid);
+ 
+         b.iter(|| {
+diff --git a/src/url.rs b/src/url.rs
+index 0db083be..836c36ba 100644
+--- a/src/url.rs
++++ b/src/url.rs
+@@ -128,7 +128,9 @@ mod tests {
+ 
+     use crate::grid::Grid;
+     use crate::index::{Column, Line, Point};
+-    use crate::term::{Cell, Search, SizeInfo, Term};
++    use crate::term::{Search, SizeInfo, Term};
++    use crate::term::cell::Cell;
++    use crate::message_bar::MessageBuffer;
+ 
+     fn url_create_term(input: &str) -> Term {
+         let size = SizeInfo {
+@@ -141,7 +143,7 @@ mod tests {
+             dpr: 1.0,
+         };
+ 
+-        let mut term = Term::new(&Default::default(), size);
++        let mut term = Term::new(&Default::default(), size, MessageBuffer::new());
+         let mut grid: Grid<Cell> = Grid::new(Line(1), Column(input.len()), 0, Cell::default());
+ 
+         for (i, c) in input.chars().enumerate() {
+diff --git a/tests/ref.rs b/tests/ref.rs
+index 1ab012d4..75c6e459 100644
+--- a/tests/ref.rs
++++ b/tests/ref.rs
+@@ -10,10 +10,11 @@ use alacritty::Grid;
+ use alacritty::Term;
+ use alacritty::ansi;
+ use alacritty::index::Column;
+-use alacritty::term::Cell;
++use alacritty::term::cell::Cell;
+ use alacritty::term::SizeInfo;
+ use alacritty::util::fmt::{Red, Green};
+ use alacritty::config::Config;
++use alacritty::message_bar::MessageBuffer;
+ 
+ macro_rules! ref_tests {
+     ($($name:ident)*) => {
+@@ -90,7 +91,7 @@ fn ref_test(dir: &Path) {
+     let mut config: Config = Default::default();
+     config.set_history(ref_config.history_size);
+ 
+-    let mut terminal = Term::new(&config, size);
++    let mut terminal = Term::new(&config, size, MessageBuffer::new());
+     let mut parser = ansi::Processor::new();
+ 
+     for byte in recording {

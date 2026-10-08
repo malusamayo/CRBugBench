@@ -1,0 +1,159 @@
+diff --git a/alacritty/src/main.rs b/alacritty/src/main.rs
+index ae02a55115a..1c561a87558 100644
+--- a/alacritty/src/main.rs
++++ b/alacritty/src/main.rs
+@@ -185,19 +185,11 @@ fn alacritty(mut options: Options) -> Result<(), Box<dyn Error>> {
+     #[cfg(target_os = "macos")]
+     macos::disable_autofill();
+ 
+-    // Create the IPC socket listener.
++    // Spawn the Unix I/O event polling thread.
+     #[cfg(unix)]
+-    let socket_path = if config.ipc_socket() {
+-        match IoListener::spawn(&options, window_event_loop.create_proxy()) {
+-            Ok(handle) => Some(handle.ipc_socket_path),
+-            Err(err) if options.daemon => return Err(err.into()),
+-            Err(err) => {
+-                log::warn!("Unable to create socket: {err:?}");
+-                None
+-            },
+-        }
+-    } else {
+-        None
++    let socket_path = match IoListener::spawn(&config, &options, window_event_loop.create_proxy()) {
++        Ok(handle) => handle.ipc_socket_path,
++        Err(err) => return Err(err.into()),
+     };
+ 
+     // Setup automatic RAII cleanup for our files.
+diff --git a/alacritty/src/polling/mod.rs b/alacritty/src/polling/mod.rs
+index d2a93362169..e292fa34756 100644
+--- a/alacritty/src/polling/mod.rs
++++ b/alacritty/src/polling/mod.rs
+@@ -11,6 +11,7 @@ use winit::event_loop::EventLoopProxy;
+ 
+ use alacritty_terminal::thread;
+ 
++use crate::UiConfig;
+ use crate::cli::Options;
+ use crate::event::Event;
+ use crate::polling::ipc::IpcListener;
+@@ -27,8 +28,8 @@ const IPC_READ_KEY: usize = 0;
+ 
+ /// Unix I/O event listener.
+ pub struct IoListener {
++    ipc_listener: Option<IpcListener>,
+     signal_listener: SignalListener,
+-    ipc_listener: IpcListener,
+     events: Events,
+     poller: Poller,
+ }
+@@ -36,6 +37,7 @@ pub struct IoListener {
+ impl IoListener {
+     /// Create background thread to listen for I/O events.
+     pub fn spawn(
++        config: &UiConfig,
+         options: &Options,
+         event_proxy: EventLoopProxy<Event>,
+     ) -> Result<IoListenerHandle, IoError> {
+@@ -43,19 +45,26 @@ impl IoListener {
+         let events = Events::new();
+ 
+         // Create socket listener for IPC messages.
+-        let ipc_socket_path = options.socket.clone().unwrap_or_else(|| {
+-            let mut path = ipc::socket_dir();
+-            path.push(format!("{}-{}.sock", ipc::socket_prefix(), process::id()));
+-            path
+-        });
+-        let ipc_listener = IpcListener::new(options, event_proxy.clone(), &ipc_socket_path)?;
++        let (ipc_socket_path, ipc_listener) = if config.ipc_socket() {
++            let ipc_socket_path = options.socket.clone().unwrap_or_else(|| {
++                let mut path = ipc::socket_dir();
++                path.push(format!("{}-{}.sock", ipc::socket_prefix(), process::id()));
++                path
++            });
++            let ipc_listener = IpcListener::new(options, event_proxy.clone(), &ipc_socket_path)?;
++            (Some(ipc_socket_path), Some(ipc_listener))
++        } else {
++            (None, None)
++        };
+ 
+         // Create listener for Unix signals.
+         let signal_listener = SignalListener::new(event_proxy)?;
+ 
+         // SAFETY: Correct drop order is taken care of by `Drop` implementation.
+         unsafe { poller.add(&signal_listener.pipe, PollEvent::readable(SIGNAL_READ_KEY))? };
+-        unsafe { poller.add(&ipc_listener.socket, PollEvent::readable(IPC_READ_KEY))? };
++        if let Some(ipc_listener) = &ipc_listener {
++            unsafe { poller.add(&ipc_listener.socket, PollEvent::readable(IPC_READ_KEY))? };
++        }
+ 
+         let mut listener = Self { signal_listener, ipc_listener, events, poller };
+ 
+@@ -74,15 +83,19 @@ impl IoListener {
+     fn poll(&mut self) -> Result<(), IoError> {
+         // Ensure interests are present for the next poll.
+         self.poller.modify(&self.signal_listener.pipe, PollEvent::readable(SIGNAL_READ_KEY))?;
+-        self.poller.modify(&self.ipc_listener.socket, PollEvent::readable(IPC_READ_KEY))?;
++        if let Some(ipc_listener) = &self.ipc_listener {
++            self.poller.modify(&ipc_listener.socket, PollEvent::readable(IPC_READ_KEY))?;
++        }
+ 
+         // Wait for the next event to be ready.
+         self.events.clear();
+         self.poller.wait(&mut self.events, None)?;
+ 
+         for event in self.events.iter() {
+-            if event.key == IPC_READ_KEY {
+-                self.ipc_listener.process_message()?;
++            if event.key == IPC_READ_KEY
++                && let Some(ipc_listener) = &mut self.ipc_listener
++            {
++                ipc_listener.process_message()?;
+             } else if event.key == SIGNAL_READ_KEY {
+                 self.signal_listener.process_signal()?;
+             }
+@@ -97,7 +110,9 @@ impl Drop for IoListener {
+         if let Err(err) = self.poller.delete(&self.signal_listener.pipe) {
+             error!("Failed to remove signal listener interest: {err}");
+         }
+-        if let Err(err) = self.poller.delete(&self.ipc_listener.socket) {
++        if let Some(ipc_listener) = &self.ipc_listener
++            && let Err(err) = self.poller.delete(&ipc_listener.socket)
++        {
+             error!("Failed to remove IPC listener interest: {err}");
+         }
+     }
+@@ -105,5 +120,5 @@ impl Drop for IoListener {
+ 
+ /// Public I/O event listener state.
+ pub struct IoListenerHandle {
+-    pub ipc_socket_path: PathBuf,
++    pub ipc_socket_path: Option<PathBuf>,
+ }
+diff --git a/alacritty/src/polling/signal.rs b/alacritty/src/polling/signal.rs
+index 17bd1b24a2e..88bf0655347 100644
+--- a/alacritty/src/polling/signal.rs
++++ b/alacritty/src/polling/signal.rs
+@@ -1,6 +1,6 @@
+ //! Unix signal listener.
+ 
+-use std::io::Error as IoError;
++use std::io::{Error as IoError, Read};
+ use std::os::unix::net::UnixStream;
+ 
+ use signal_hook::consts::{SIGINT, SIGTERM};
+@@ -25,8 +25,13 @@ impl SignalListener {
+ 
+     /// Process the next signal.
+     pub fn process_signal(&mut self) -> Result<(), IoError> {
++        // Submit shutdown request to the main event loop.
+         let event = Event::new(EventType::Shutdown, None);
+         let _ = self.event_proxy.send_event(event);
++
++        // Ensure signal is drained from pipe.
++        self.pipe.read_exact(&mut [0])?;
++
+         Ok(())
+     }
+ }

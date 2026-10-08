@@ -1,0 +1,58 @@
+# Code Review Task
+
+You are a maintainer reviewing a pull request to the `blakeblackshear/frigate` repository.
+
+**PR title:** Use UTC for recordings (#4656)
+
+**PR description / commit message:**
+
+Use UTC for recordings (#4656)
+
+* Write files in UTC and update folder structure to not conflict
+
+* Add timezone arg for events summary
+
+* Fixes for timezone in calls
+
+* Use timezone for recording and recordings summary endpoints
+
+* Fix sqlite parsing
+
+* Fix sqlite parsing
+
+* Fix recordings summary with timezone
+
+* Fix
+
+* Formatting
+
+* Add pytz
+
+* Fix default timezone
+
+* Add note about times being displayed in localtime
+
+* Improve timezone wording and show actual timezone
+
+* Add alternate endpoint to cover existing usecase to avoid breaking change
+
+* Formatting
+
+## Working environment
+
+The repository is checked out at `/app/frigate` at this PR's **base commit**
+(the state before this PR), with full history up to that commit -- use
+`git log` / `git blame` to understand surrounding code, call sites, and
+conventions. The proposed change is the diff in `/app/pr_to_review.diff`.
+
+## Your task
+
+Perform a thorough, critical code review of this pull request. Look for bugs,
+correctness issues, regressions, security problems, broken edge cases, and
+anything else a maintainer should require changed before merging.
+
+For every issue you find: name the file and specific lines, explain what is
+wrong and why, and suggest a concrete fix. Rank the issues by severity.
+If the PR looks correct, say so.
+
+Write your review to `/app/review.md`.

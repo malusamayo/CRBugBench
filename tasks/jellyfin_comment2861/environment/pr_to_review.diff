@@ -1,0 +1,430 @@
+diff --git a/Emby.Server.Implementations/HttpServer/HttpListenerHost.cs b/Emby.Server.Implementations/HttpServer/HttpListenerHost.cs
+index 5ae65a4e3df..211a0c1d999 100644
+--- a/Emby.Server.Implementations/HttpServer/HttpListenerHost.cs
++++ b/Emby.Server.Implementations/HttpServer/HttpListenerHost.cs
+@@ -14,6 +14,7 @@
+ using MediaBrowser.Common.Extensions;
+ using MediaBrowser.Common.Net;
+ using MediaBrowser.Controller;
++using MediaBrowser.Controller.Authentication;
+ using MediaBrowser.Controller.Configuration;
+ using MediaBrowser.Controller.Net;
+ using MediaBrowser.Model.Events;
+@@ -230,7 +231,8 @@ private int GetStatusCode(Exception ex)
+             switch (ex)
+             {
+                 case ArgumentException _: return 400;
+-                case SecurityException _: return 401;
++                case AuthenticationException _: return 401;
++                case SecurityException _: return 403;
+                 case DirectoryNotFoundException _:
+                 case FileNotFoundException _:
+                 case ResourceNotFoundException _: return 404;
+@@ -239,55 +241,52 @@ private int GetStatusCode(Exception ex)
+             }
+         }
+ 
+-        private async Task ErrorHandler(Exception ex, IRequest httpReq, bool logExceptionStackTrace, string urlToLog)
++        private async Task ErrorHandler(Exception ex, IRequest httpReq, int statusCode, string urlToLog)
+         {
+-            try
+-            {
+-                ex = GetActualException(ex);
+-
+-                if (logExceptionStackTrace)
+-                {
+-                    _logger.LogError(ex, "Error processing request. URL: {Url}", urlToLog);
+-                }
+-                else
+-                {
+-                    _logger.LogError("Error processing request: {Message}. URL: {Url}", ex.Message.TrimEnd('.'), urlToLog);
+-                }
+-
+-                var httpRes = httpReq.Response;
++            bool ignoreStackTrace =
++                ex is SocketException
++                || ex is IOException
++                || ex is OperationCanceledException
++                || ex is SecurityException
++                || ex is AuthenticationException
++                || ex is FileNotFoundException;
+ 
+-                if (httpRes.HasStarted)
+-                {
+-                    return;
+-                }
++            if (ignoreStackTrace)
++            {
++                _logger.LogError("Error processing request: {Message}. URL: {Url}", ex.Message.TrimEnd('.'), urlToLog);
++            }
++            else
++            {
++                _logger.LogError(ex, "Error processing request. URL: {Url}", urlToLog);
++            }
+ 
+-                var statusCode = GetStatusCode(ex);
+-                httpRes.StatusCode = statusCode;
++            var httpRes = httpReq.Response;
+ 
+-                var errContent = NormalizeExceptionMessage(ex.Message);
+-                httpRes.ContentType = "text/plain";
+-                httpRes.ContentLength = errContent.Length;
+-                await httpRes.WriteAsync(errContent).ConfigureAwait(false);
+-            }
+-            catch (Exception errorEx)
++            if (httpRes.HasStarted)
+             {
+-                _logger.LogError(errorEx, "Error this.ProcessRequest(context)(Exception while writing error to the response). URL: {Url}", urlToLog);
++                return;
+             }
++
++            httpRes.StatusCode = statusCode;
++
++            var errContent = NormalizeExceptionMessage(ex) ?? string.Empty;
++            httpRes.ContentType = "text/plain";
++            httpRes.ContentLength = errContent.Length;
++            await httpRes.WriteAsync(errContent).ConfigureAwait(false);
+         }
+ 
+-        private string NormalizeExceptionMessage(string msg)
++        private string NormalizeExceptionMessage(Exception ex)
+         {
+-            if (msg == null)
++            // Do not expose the exception message for AuthenticationException
++            if (ex is AuthenticationException)
+             {
+-                return string.Empty;
++                return null;
+             }
+ 
+             // Strip any information we don't want to reveal
+-
+-            msg = msg.Replace(_config.ApplicationPaths.ProgramSystemPath, string.Empty, StringComparison.OrdinalIgnoreCase);
+-            msg = msg.Replace(_config.ApplicationPaths.ProgramDataPath, string.Empty, StringComparison.OrdinalIgnoreCase);
+-
+-            return msg;
++            return ex.Message
++                ?.Replace(_config.ApplicationPaths.ProgramSystemPath, string.Empty, StringComparison.OrdinalIgnoreCase)
++                .Replace(_config.ApplicationPaths.ProgramDataPath, string.Empty, StringComparison.OrdinalIgnoreCase);
+         }
+ 
+         /// <summary>
+@@ -536,22 +535,32 @@ public async Task RequestHandler(IHttpRequest httpReq, string urlString, string
+                     throw new FileNotFoundException();
+                 }
+             }
+-            catch (Exception ex)
++            catch (Exception requestEx)
+             {
+-                // Do not handle exceptions manually when in development mode
+-                // The framework-defined development exception page will be returned instead
+-                if (_hostEnvironment.IsDevelopment())
++                try
+                 {
+-                    throw;
++                    var requestInnerEx = GetActualException(requestEx);
++                    var statusCode = GetStatusCode(requestInnerEx);
++
++                    // Do not handle 500 server exceptions manually when in development mode
++                    // The framework-defined development exception page will be returned instead
++                    if (statusCode == 500 && _hostEnvironment.IsDevelopment())
++                    {
++                        throw;
++                    }
++
++                    await ErrorHandler(requestInnerEx, httpReq, statusCode, urlToLog).ConfigureAwait(false);
+                 }
++                catch (Exception handlerException)
++                {
++                    var aggregateEx = new AggregateException("Error while handling request exception", requestEx, handlerException);
++                    _logger.LogError(aggregateEx, "Error while handling exception in response to {Url}", urlToLog);
+ 
+-                bool ignoreStackTrace =
+-                    ex is SocketException
+-                    || ex is IOException
+-                    || ex is OperationCanceledException
+-                    || ex is SecurityException
+-                    || ex is FileNotFoundException;
+-                await ErrorHandler(ex, httpReq, !ignoreStackTrace, urlToLog).ConfigureAwait(false);
++                    if (_hostEnvironment.IsDevelopment())
++                    {
++                        throw aggregateEx;
++                    }
++                }
+             }
+             finally
+             {
+diff --git a/Emby.Server.Implementations/HttpServer/Security/AuthService.cs b/Emby.Server.Implementations/HttpServer/Security/AuthService.cs
+index 58421aaf196..256b24924ea 100644
+--- a/Emby.Server.Implementations/HttpServer/Security/AuthService.cs
++++ b/Emby.Server.Implementations/HttpServer/Security/AuthService.cs
+@@ -2,6 +2,7 @@
+ 
+ using System;
+ using System.Linq;
++using System.Security.Authentication;
+ using Emby.Server.Implementations.SocketSharp;
+ using MediaBrowser.Common.Net;
+ using MediaBrowser.Controller.Configuration;
+@@ -68,7 +69,7 @@ private User ValidateUser(IRequest request, IAuthenticationAttributes authAttrib
+ 
+             if (user == null && auth.UserId != Guid.Empty)
+             {
+-                throw new SecurityException("User with Id " + auth.UserId + " not found");
++                throw new AuthenticationException("User with Id " + auth.UserId + " not found");
+             }
+ 
+             if (user != null)
+@@ -108,18 +109,12 @@ private void ValidateUserAccess(
+         {
+             if (user.Policy.IsDisabled)
+             {
+-                throw new SecurityException("User account has been disabled.")
+-                {
+-                    SecurityExceptionType = SecurityExceptionType.Unauthenticated
+-                };
++                throw new SecurityException("User account has been disabled.");
+             }
+ 
+             if (!user.Policy.EnableRemoteAccess && !_networkManager.IsInLocalNetwork(request.RemoteIp))
+             {
+-                throw new SecurityException("User account has been disabled.")
+-                {
+-                    SecurityExceptionType = SecurityExceptionType.Unauthenticated
+-                };
++                throw new SecurityException("User account has been disabled.");
+             }
+ 
+             if (!user.Policy.IsAdministrator
+@@ -128,10 +123,7 @@ private void ValidateUserAccess(
+             {
+                 request.Response.Headers.Add("X-Application-Error-Code", "ParentalControl");
+ 
+-                throw new SecurityException("This user account is not allowed access at this time.")
+-                {
+-                    SecurityExceptionType = SecurityExceptionType.ParentalControl
+-                };
++                throw new SecurityException("This user account is not allowed access at this time.");
+             }
+         }
+ 
+@@ -190,10 +182,7 @@ private static void ValidateRoles(string[] roles, User user)
+             {
+                 if (user == null || !user.Policy.IsAdministrator)
+                 {
+-                    throw new SecurityException("User does not have admin access.")
+-                    {
+-                        SecurityExceptionType = SecurityExceptionType.Unauthenticated
+-                    };
++                    throw new SecurityException("User does not have admin access.");
+                 }
+             }
+ 
+@@ -201,10 +190,7 @@ private static void ValidateRoles(string[] roles, User user)
+             {
+                 if (user == null || !user.Policy.EnableContentDeletion)
+                 {
+-                    throw new SecurityException("User does not have delete access.")
+-                    {
+-                        SecurityExceptionType = SecurityExceptionType.Unauthenticated
+-                    };
++                    throw new SecurityException("User does not have delete access.");
+                 }
+             }
+ 
+@@ -212,10 +198,7 @@ private static void ValidateRoles(string[] roles, User user)
+             {
+                 if (user == null || !user.Policy.EnableContentDownloading)
+                 {
+-                    throw new SecurityException("User does not have download access.")
+-                    {
+-                        SecurityExceptionType = SecurityExceptionType.Unauthenticated
+-                    };
++                    throw new SecurityException("User does not have download access.");
+                 }
+             }
+         }
+@@ -230,14 +213,14 @@ private void ValidateSecurityToken(IRequest request, string token)
+         {
+             if (string.IsNullOrEmpty(token))
+             {
+-                throw new SecurityException("Access token is required.");
++                throw new AuthenticationException("Access token is required.");
+             }
+ 
+             var info = GetTokenInfo(request);
+ 
+             if (info == null)
+             {
+-                throw new SecurityException("Access token is invalid or expired.");
++                throw new AuthenticationException("Access token is invalid or expired.");
+             }
+ 
+             //if (!string.IsNullOrEmpty(info.UserId))
+diff --git a/Emby.Server.Implementations/Library/DefaultAuthenticationProvider.cs b/Emby.Server.Implementations/Library/DefaultAuthenticationProvider.cs
+index ab036eca7ad..52c8facc3e7 100644
+--- a/Emby.Server.Implementations/Library/DefaultAuthenticationProvider.cs
++++ b/Emby.Server.Implementations/Library/DefaultAuthenticationProvider.cs
+@@ -47,7 +47,7 @@ public Task<ProviderAuthenticationResult> Authenticate(string username, string p
+         {
+             if (resolvedUser == null)
+             {
+-                throw new ArgumentNullException(nameof(resolvedUser));
++                throw new AuthenticationException($"Specified user does not exist.");
+             }
+ 
+             bool success = false;
+diff --git a/Emby.Server.Implementations/Library/UserManager.cs b/Emby.Server.Implementations/Library/UserManager.cs
+index 15076a194dc..06f890eba63 100644
+--- a/Emby.Server.Implementations/Library/UserManager.cs
++++ b/Emby.Server.Implementations/Library/UserManager.cs
+@@ -20,6 +20,7 @@
+ using MediaBrowser.Controller.Dto;
+ using MediaBrowser.Controller.Entities;
+ using MediaBrowser.Controller.Library;
++using MediaBrowser.Controller.Net;
+ using MediaBrowser.Controller.Persistence;
+ using MediaBrowser.Controller.Plugins;
+ using MediaBrowser.Controller.Providers;
+@@ -327,23 +328,19 @@ public async Task<User> AuthenticateUser(
+             if (user.Policy.IsDisabled)
+             {
+                 _logger.LogInformation("Authentication request for {UserName} has been denied because this account is currently disabled (IP: {IP}).", username, remoteEndPoint);
+-                throw new AuthenticationException(
+-                    string.Format(
+-                        CultureInfo.InvariantCulture,
+-                        "The {0} account is currently disabled. Please consult with your administrator.",
+-                        user.Name));
++                throw new SecurityException($"The {user.Name} account is currently disabled. Please consult with your administrator.");
+             }
+ 
+             if (!user.Policy.EnableRemoteAccess && !_networkManager.IsInLocalNetwork(remoteEndPoint))
+             {
+                 _logger.LogInformation("Authentication request for {UserName} forbidden: remote access disabled and user not in local network (IP: {IP}).", username, remoteEndPoint);
+-                throw new AuthenticationException("Forbidden.");
++                throw new SecurityException("Forbidden.");
+             }
+ 
+             if (!user.IsParentalScheduleAllowed())
+             {
+                 _logger.LogInformation("Authentication request for {UserName} is not allowed at this time due parental restrictions (IP: {IP}).", username, remoteEndPoint);
+-                throw new AuthenticationException("User is not allowed access at this time.");
++                throw new SecurityException("User is not allowed access at this time.");
+             }
+ 
+             // Update LastActivityDate and LastLoginDate, then save
+diff --git a/Emby.Server.Implementations/Session/SessionManager.cs b/Emby.Server.Implementations/Session/SessionManager.cs
+index de768333d83..c93c02c480c 100644
+--- a/Emby.Server.Implementations/Session/SessionManager.cs
++++ b/Emby.Server.Implementations/Session/SessionManager.cs
+@@ -1414,7 +1414,7 @@ private async Task<AuthenticationResult> AuthenticateNewSessionInternal(Authenti
+             if (user == null)
+             {
+                 AuthenticationFailed?.Invoke(this, new GenericEventArgs<AuthenticationRequest>(request));
+-                throw new SecurityException("Invalid username or password entered.");
++                throw new AuthenticationException("Invalid username or password entered.");
+             }
+ 
+             if (!string.IsNullOrEmpty(request.DeviceId)
+diff --git a/MediaBrowser.Api/UserService.cs b/MediaBrowser.Api/UserService.cs
+index 4015143497f..78fc6c6941d 100644
+--- a/MediaBrowser.Api/UserService.cs
++++ b/MediaBrowser.Api/UserService.cs
+@@ -426,7 +426,7 @@ public async Task<object> Post(AuthenticateUserByName request)
+             catch (SecurityException e)
+             {
+                 // rethrow adding IP address to message
+-                throw new SecurityException($"[{Request.RemoteIp}] {e.Message}");
++                throw new SecurityException($"[{Request.RemoteIp}] {e.Message}", e);
+             }
+         }
+ 
+diff --git a/MediaBrowser.Controller/Authentication/AuthenticationException.cs b/MediaBrowser.Controller/Authentication/AuthenticationException.cs
+index 62eca3ea9fd..081f877f729 100644
+--- a/MediaBrowser.Controller/Authentication/AuthenticationException.cs
++++ b/MediaBrowser.Controller/Authentication/AuthenticationException.cs
+@@ -7,23 +7,29 @@ namespace MediaBrowser.Controller.Authentication
+     /// </summary>
+     public class AuthenticationException : Exception
+     {
+-        /// <inheritdoc />
++        /// <summary>
++        /// Initializes a new instance of the <see cref="AuthenticationException"/> class.
++        /// </summary>
+         public AuthenticationException() : base()
+         {
+-
+         }
+ 
+-        /// <inheritdoc />
++        /// <summary>
++        /// Initializes a new instance of the <see cref="AuthenticationException"/> class.
++        /// </summary>
++        /// <param name="message">The message that describes the error.</param>
+         public AuthenticationException(string message) : base(message)
+         {
+-
+         }
+ 
+-        /// <inheritdoc />
++        /// <summary>
++        /// Initializes a new instance of the <see cref="AuthenticationException"/> class.
++        /// </summary>
++        /// <param name="message">The message that describes the error.</param>
++        /// <param name="innerException">The exception that is the cause of the current exception, or a null reference if no inner exception is specified.</param>
+         public AuthenticationException(string message, Exception innerException)
+             : base(message, innerException)
+         {
+-
+         }
+     }
+ }
+diff --git a/MediaBrowser.Controller/Net/SecurityException.cs b/MediaBrowser.Controller/Net/SecurityException.cs
+index 3ccecf0eb8a..a5b94ea5e3d 100644
+--- a/MediaBrowser.Controller/Net/SecurityException.cs
++++ b/MediaBrowser.Controller/Net/SecurityException.cs
+@@ -2,20 +2,36 @@
+ 
+ namespace MediaBrowser.Controller.Net
+ {
++    /// <summary>
++    /// The exception that is thrown when a user is authenticated, but not authorized to access a requested resource.
++    /// </summary>
+     public class SecurityException : Exception
+     {
++        /// <summary>
++        /// Initializes a new instance of the <see cref="SecurityException"/> class.
++        /// </summary>
++        public SecurityException()
++            : base()
++        {
++        }
++
++        /// <summary>
++        /// Initializes a new instance of the <see cref="SecurityException"/> class.
++        /// </summary>
++        /// <param name="message">The message that describes the error.</param>
+         public SecurityException(string message)
+             : base(message)
+         {
+-
+         }
+ 
+-        public SecurityExceptionType SecurityExceptionType { get; set; }
+-    }
+-
+-    public enum SecurityExceptionType
+-    {
+-        Unauthenticated = 0,
+-        ParentalControl = 1
++        /// <summary>
++        /// Initializes a new instance of the <see cref="SecurityException"/> class.
++        /// </summary>
++        /// <param name="message">The message that describes the error</param>
++        /// <param name="innerException">The exception that is the cause of the current exception, or a null reference if no inner exception is specified.</param>
++        public SecurityException(string message, Exception innerException)
++            : base(message, innerException)
++        {
++        }
+     }
+ }

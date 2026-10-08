@@ -1,0 +1,436 @@
+commit b8745420dac265973da0e34716f161d05c8e0766
+Author: pierre-l <pierre.larger@gmail.com>
+Date:   Mon Jun 6 12:45:52 2022 +0200
+
+    Use the `IndexUid` and `StarOr` in `meilisearch_auth::Key`
+    Move `meilisearch_http::routes::StarOr` to `meilisearch_types::star_or`
+    
+    Fixes #2158
+
+diff --git a/meilisearch-auth/src/key.rs b/meilisearch-auth/src/key.rs
+index 0e336a7db..eb72aaa72 100644
+--- a/meilisearch-auth/src/key.rs
++++ b/meilisearch-auth/src/key.rs
+@@ -2,6 +2,8 @@ use crate::action::Action;
+ use crate::error::{AuthControllerError, Result};
+ use crate::store::KeyId;
+ 
++use meilisearch_types::index_uid::IndexUid;
++use meilisearch_types::star_or::StarOr;
+ use serde::{Deserialize, Serialize};
+ use serde_json::{from_value, Value};
+ use time::format_description::well_known::Rfc3339;
+@@ -17,7 +19,7 @@ pub struct Key {
+     pub name: Option<String>,
+     pub uid: KeyId,
+     pub actions: Vec<Action>,
+-    pub indexes: Vec<String>,
++    pub indexes: Vec<StarOr<IndexUid>>,
+     #[serde(with = "time::serde::rfc3339::option")]
+     pub expires_at: Option<OffsetDateTime>,
+     #[serde(with = "time::serde::rfc3339")]
+@@ -136,7 +138,7 @@ impl Key {
+             description: Some("Use it for anything that is not a search operation. Caution! Do not expose it on a public frontend".to_string()),
+             uid,
+             actions: vec![Action::All],
+-            indexes: vec!["*".to_string()],
++            indexes: vec![StarOr::Star],
+             expires_at: None,
+             created_at: now,
+             updated_at: now,
+@@ -151,7 +153,7 @@ impl Key {
+             description: Some("Use it to search from the frontend".to_string()),
+             uid,
+             actions: vec![Action::Search],
+-            indexes: vec!["*".to_string()],
++            indexes: vec![StarOr::Star],
+             expires_at: None,
+             created_at: now,
+             updated_at: now,
+diff --git a/meilisearch-auth/src/lib.rs b/meilisearch-auth/src/lib.rs
+index e41fd92f4..81443348a 100644
+--- a/meilisearch-auth/src/lib.rs
++++ b/meilisearch-auth/src/lib.rs
+@@ -5,6 +5,7 @@ mod key;
+ mod store;
+ 
+ use std::collections::{HashMap, HashSet};
++use std::ops::Deref;
+ use std::path::Path;
+ use std::sync::Arc;
+ 
+@@ -16,6 +17,7 @@ use uuid::Uuid;
+ pub use action::{actions, Action};
+ use error::{AuthControllerError, Result};
+ pub use key::Key;
++use meilisearch_types::star_or::StarOr;
+ use store::generate_key_as_base64;
+ pub use store::open_auth_store_env;
+ use store::HeedAuthStore;
+@@ -87,20 +89,22 @@ impl AuthController {
+             .get_api_key(uid)?
+             .ok_or_else(|| AuthControllerError::ApiKeyNotFound(uid.to_string()))?;
+ 
+-        if !key.indexes.iter().any(|i| i.as_str() == "*") {
++        if !key.indexes.iter().any(|i| i == &StarOr::Star) {
+             filters.search_rules = match search_rules {
+                 // Intersect search_rules with parent key authorized indexes.
+                 Some(search_rules) => SearchRules::Map(
+                     key.indexes
+                         .into_iter()
+                         .filter_map(|index| {
+-                            search_rules
+-                                .get_index_search_rules(&index)
+-                                .map(|index_search_rules| (index, Some(index_search_rules)))
++                            search_rules.get_index_search_rules(index.deref()).map(
++                                |index_search_rules| {
++                                    (String::from(index), Some(index_search_rules))
++                                },
++                            )
+                         })
+                         .collect(),
+                 ),
+-                None => SearchRules::Set(key.indexes.into_iter().collect()),
++                None => SearchRules::Set(key.indexes.into_iter().map(String::from).collect()),
+             };
+         } else if let Some(search_rules) = search_rules {
+             filters.search_rules = search_rules;
+diff --git a/meilisearch-auth/src/store.rs b/meilisearch-auth/src/store.rs
+index d1af1b4ab..0355c4579 100644
+--- a/meilisearch-auth/src/store.rs
++++ b/meilisearch-auth/src/store.rs
+@@ -3,12 +3,14 @@ use std::cmp::Reverse;
+ use std::convert::TryFrom;
+ use std::convert::TryInto;
+ use std::fs::create_dir_all;
++use std::ops::Deref;
+ use std::path::Path;
+ use std::str;
+ use std::sync::Arc;
+ 
+ use enum_iterator::IntoEnumIterator;
+ use hmac::{Hmac, Mac};
++use meilisearch_types::star_or::StarOr;
+ use milli::heed::types::{ByteSlice, DecodeIgnore, SerdeJson};
+ use milli::heed::{Database, Env, EnvOpenOptions, RwTxn};
+ use sha2::{Digest, Sha256};
+@@ -92,7 +94,7 @@ impl HeedAuthStore {
+             key.actions.clone()
+         };
+ 
+-        let no_index_restriction = key.indexes.contains(&"*".to_owned());
++        let no_index_restriction = key.indexes.contains(&StarOr::Star);
+         for action in actions {
+             if no_index_restriction {
+                 // If there is no index restriction we put None.
+@@ -102,7 +104,7 @@ impl HeedAuthStore {
+                 for index in key.indexes.iter() {
+                     db.put(
+                         &mut wtxn,
+-                        &(&uid, &action, Some(index.as_bytes())),
++                        &(&uid, &action, Some(index.deref().as_bytes())),
+                         &key.expires_at,
+                     )?;
+                 }
+diff --git a/meilisearch-http/src/routes/api_key.rs b/meilisearch-http/src/routes/api_key.rs
+index 3513d23ca..7605fa644 100644
+--- a/meilisearch-http/src/routes/api_key.rs
++++ b/meilisearch-http/src/routes/api_key.rs
+@@ -151,7 +151,7 @@ impl KeyView {
+             key: generated_key,
+             uid: key.uid,
+             actions: key.actions,
+-            indexes: key.indexes,
++            indexes: key.indexes.into_iter().map(String::from).collect(),
+             expires_at: key.expires_at,
+             created_at: key.created_at,
+             updated_at: key.updated_at,
+diff --git a/meilisearch-http/src/routes/indexes/documents.rs b/meilisearch-http/src/routes/indexes/documents.rs
+index 1d97e0736..2becc6db1 100644
+--- a/meilisearch-http/src/routes/indexes/documents.rs
++++ b/meilisearch-http/src/routes/indexes/documents.rs
+@@ -10,6 +10,7 @@ use meilisearch_lib::index_controller::{DocumentAdditionFormat, Update};
+ use meilisearch_lib::milli::update::IndexDocumentsMethod;
+ use meilisearch_lib::MeiliSearch;
+ use meilisearch_types::error::ResponseError;
++use meilisearch_types::star_or::StarOr;
+ use mime::Mime;
+ use once_cell::sync::Lazy;
+ use serde::Deserialize;
+@@ -22,7 +23,7 @@ use crate::error::MeilisearchHttpError;
+ use crate::extractors::authentication::{policies::*, GuardedData};
+ use crate::extractors::payload::Payload;
+ use crate::extractors::sequential_extractor::SeqHandler;
+-use crate::routes::{fold_star_or, PaginationView, StarOr};
++use crate::routes::{fold_star_or, PaginationView};
+ use crate::task::SummarizedTaskView;
+ 
+ static ACCEPTED_CONTENT_TYPE: Lazy<Vec<String>> = Lazy::new(|| {
+diff --git a/meilisearch-http/src/routes/mod.rs b/meilisearch-http/src/routes/mod.rs
+index 97351b584..f61854c48 100644
+--- a/meilisearch-http/src/routes/mod.rs
++++ b/meilisearch-http/src/routes/mod.rs
+@@ -1,5 +1,3 @@
+-use std::str::FromStr;
+-
+ use actix_web::{web, HttpResponse};
+ use log::debug;
+ use serde::{Deserialize, Serialize};
+@@ -9,6 +7,7 @@ use time::OffsetDateTime;
+ use meilisearch_lib::index::{Settings, Unchecked};
+ use meilisearch_lib::MeiliSearch;
+ use meilisearch_types::error::ResponseError;
++use meilisearch_types::star_or::StarOr;
+ 
+ use crate::extractors::authentication::{policies::*, GuardedData};
+ 
+@@ -27,26 +26,6 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
+         .service(web::scope("/indexes").configure(indexes::configure));
+ }
+ 
+-/// A type that tries to match either a star (*) or
+-/// any other thing that implements `FromStr`.
+-#[derive(Debug)]
+-pub enum StarOr<T> {
+-    Star,
+-    Other(T),
+-}
+-
+-impl<T: FromStr> FromStr for StarOr<T> {
+-    type Err = T::Err;
+-
+-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+-        if s.trim() == "*" {
+-            Ok(StarOr::Star)
+-        } else {
+-            T::from_str(s).map(StarOr::Other)
+-        }
+-    }
+-}
+-
+ /// Extracts the raw values from the `StarOr` types and
+ /// return None if a `StarOr::Star` is encountered.
+ pub fn fold_star_or<T, O>(content: impl IntoIterator<Item = StarOr<T>>) -> Option<O>
+diff --git a/meilisearch-http/src/routes/tasks.rs b/meilisearch-http/src/routes/tasks.rs
+index b8fc428a1..fed7fa634 100644
+--- a/meilisearch-http/src/routes/tasks.rs
++++ b/meilisearch-http/src/routes/tasks.rs
+@@ -4,6 +4,7 @@ use meilisearch_lib::tasks::TaskFilter;
+ use meilisearch_lib::MeiliSearch;
+ use meilisearch_types::error::ResponseError;
+ use meilisearch_types::index_uid::IndexUid;
++use meilisearch_types::star_or::StarOr;
+ use serde::Deserialize;
+ use serde_cs::vec::CS;
+ use serde_json::json;
+@@ -13,7 +14,7 @@ use crate::extractors::authentication::{policies::*, GuardedData};
+ use crate::extractors::sequential_extractor::SeqHandler;
+ use crate::task::{TaskListView, TaskStatus, TaskType, TaskView};
+ 
+-use super::{fold_star_or, StarOr};
++use super::fold_star_or;
+ 
+ const DEFAULT_LIMIT: fn() -> usize = || 20;
+ 
+diff --git a/meilisearch-http/tests/auth/api_keys.rs b/meilisearch-http/tests/auth/api_keys.rs
+index 28be81c91..9dcbd9b55 100644
+--- a/meilisearch-http/tests/auth/api_keys.rs
++++ b/meilisearch-http/tests/auth/api_keys.rs
+@@ -358,6 +358,32 @@ async fn error_add_api_key_invalid_parameters_indexes() {
+     assert_eq!(response, expected_response);
+ }
+ 
++#[actix_rt::test]
++async fn error_add_api_key_invalid_index_uids() {
++    let mut server = Server::new_auth().await;
++    server.use_api_key("MASTER_KEY");
++
++    let content = json!({
++        "description": Value::Null,
++        "indexes": ["invalid index # / \\name with spaces"],
++        "actions": [
++            "documents.add"
++        ],
++        "expiresAt": "2050-11-13T00:00:00"
++    });
++    let (response, code) = server.add_api_key(content).await;
++
++    let expected_response = json!({
++        "message": r#"`indexes` field value `["invalid index # / \\name with spaces"]` is invalid. It should be an array of string representing index names."#,
++        "code": "invalid_api_key_indexes",
++        "type": "invalid_request",
++        "link": "https://docs.meilisearch.com/errors#invalid_api_key_indexes"
++    });
++
++    assert_eq!(response, expected_response);
++    assert_eq!(code, 400);
++}
++
+ #[actix_rt::test]
+ async fn error_add_api_key_invalid_parameters_actions() {
+     let mut server = Server::new_auth().await;
+diff --git a/meilisearch-types/src/lib.rs b/meilisearch-types/src/lib.rs
+index cfc66c899..2d685c2dc 100644
+--- a/meilisearch-types/src/lib.rs
++++ b/meilisearch-types/src/lib.rs
+@@ -1,2 +1,3 @@
+ pub mod error;
+ pub mod index_uid;
++pub mod star_or;
+diff --git a/meilisearch-types/src/star_or.rs b/meilisearch-types/src/star_or.rs
+new file mode 100644
+index 000000000..02c9c3524
+--- /dev/null
++++ b/meilisearch-types/src/star_or.rs
+@@ -0,0 +1,138 @@
++use serde::de::Visitor;
++use serde::{Deserialize, Deserializer, Serialize, Serializer};
++use std::fmt::{Display, Formatter};
++use std::marker::PhantomData;
++use std::ops::Deref;
++use std::str::FromStr;
++
++/// A type that tries to match either a star (*) or
++/// any other thing that implements `FromStr`.
++#[derive(Debug)]
++pub enum StarOr<T> {
++    Star,
++    Other(T),
++}
++
++impl<T: FromStr> FromStr for StarOr<T> {
++    type Err = T::Err;
++
++    fn from_str(s: &str) -> Result<Self, Self::Err> {
++        if s.trim() == "*" {
++            Ok(StarOr::Star)
++        } else {
++            T::from_str(s).map(StarOr::Other)
++        }
++    }
++}
++
++impl<T: Deref<Target = str>> Deref for StarOr<T> {
++    type Target = str;
++
++    fn deref(&self) -> &Self::Target {
++        match self {
++            Self::Star => "*",
++            Self::Other(t) => t.deref(),
++        }
++    }
++}
++
++impl<T: Into<String>> From<StarOr<T>> for String {
++    fn from(s: StarOr<T>) -> Self {
++        match s {
++            StarOr::Star => "*".to_string(),
++            StarOr::Other(t) => t.into(),
++        }
++    }
++}
++
++impl<T: PartialEq> PartialEq for StarOr<T> {
++    fn eq(&self, other: &Self) -> bool {
++        match (self, other) {
++            (Self::Star, Self::Star) => true,
++            (Self::Other(left), Self::Other(right)) if left.eq(right) => true,
++            _ => false,
++        }
++    }
++}
++
++impl<T: PartialEq + Eq> Eq for StarOr<T> {}
++
++impl<'de, T, E> Deserialize<'de> for StarOr<T>
++where
++    T: FromStr<Err = E>,
++    E: Display,
++{
++    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
++    where
++        D: Deserializer<'de>,
++    {
++        /// Serde can't differentiate between `StarOr::Star` and `StarOr::Other` without a tag.
++        /// Simply using `#[serde(untagged)]` + `#[serde(rename="*")]` will lead to attempting to
++        /// deserialize everything as a `StarOr::Other`, including "*".
++        /// [`#[serde(other)]`](https://serde.rs/variant-attrs.html#other) might have helped but is
++        /// not supported on untagged enums.
++        struct StarOrVisitor<T>(PhantomData<T>);
++
++        impl<'de, T, FE> Visitor<'de> for StarOrVisitor<T>
++        where
++            T: FromStr<Err = FE>,
++            FE: Display,
++        {
++            type Value = StarOr<T>;
++
++            fn expecting(&self, formatter: &mut Formatter) -> std::fmt::Result {
++                formatter.write_str("a string")
++            }
++
++            fn visit_str<SE>(self, v: &str) -> Result<Self::Value, SE>
++            where
++                SE: serde::de::Error,
++            {
++                match v {
++                    "*" => Ok(StarOr::Star),
++                    v => {
++                        let other = FromStr::from_str(v).map_err(|e: T::Err| {
++                            SE::custom(format!("Invalid `other` value: {}", e))
++                        })?;
++                        Ok(StarOr::Other(other))
++                    }
++                }
++            }
++        }
++
++        deserializer.deserialize_str(StarOrVisitor(PhantomData))
++    }
++}
++
++impl<T> Serialize for StarOr<T>
++where
++    T: Deref<Target = str>,
++{
++    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
++    where
++        S: Serializer,
++    {
++        match self {
++            StarOr::Star => serializer.serialize_str("*"),
++            StarOr::Other(other) => serializer.serialize_str(other.deref()),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::{json, Value};
++
++    #[test]
++    fn star_or_serde_roundtrip() {
++        fn roundtrip(content: Value, expected: StarOr<String>) {
++            let deserialized: StarOr<String> = serde_json::from_value(content.clone()).unwrap();
++            assert_eq!(deserialized, expected);
++            assert_eq!(content, serde_json::to_value(deserialized).unwrap());
++        }
++
++        roundtrip(json!("products"), StarOr::Other("products".to_string()));
++        roundtrip(json!("*"), StarOr::Star);
++    }
++}
+diff --git a/permissive-json-pointer/src/lib.rs b/permissive-json-pointer/src/lib.rs
+index 56382beae..8f97ab2de 100644
+--- a/permissive-json-pointer/src/lib.rs
++++ b/permissive-json-pointer/src/lib.rs
+@@ -206,7 +206,7 @@ fn create_value(value: &Document, mut selectors: HashSet<&str>) -> Document {
+     new_value
+ }
+ 
+-fn create_array(array: &Vec<Value>, selectors: &HashSet<&str>) -> Vec<Value> {
++fn create_array(array: &[Value], selectors: &HashSet<&str>) -> Vec<Value> {
+     let mut res = Vec::new();
+ 
+     for value in array {

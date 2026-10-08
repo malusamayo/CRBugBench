@@ -1,0 +1,152 @@
+commit bad82b8f8bdaab01e94e786fa099b00ab781025c
+Author: Brennan <brecon@microsoft.com>
+Date:   Mon Jul 26 23:12:50 2021 -0700
+
+    [Java] Fix nullref when Stop is called during connect (#34046)
+
+diff --git a/src/SignalR/clients/java/signalr/core/src/main/java/com/microsoft/signalr/HubConnection.java b/src/SignalR/clients/java/signalr/core/src/main/java/com/microsoft/signalr/HubConnection.java
+index 42cbfff3ef..1e2ce1bc5a 100644
+--- a/src/SignalR/clients/java/signalr/core/src/main/java/com/microsoft/signalr/HubConnection.java
++++ b/src/SignalR/clients/java/signalr/core/src/main/java/com/microsoft/signalr/HubConnection.java
+@@ -411,28 +411,37 @@ public class HubConnection implements AutoCloseable {
+      * @return A Completable that completes when the connection has been stopped.
+      */
+     private Completable stop(String errorMessage) {
+-        Transport transport;
++        ConnectionState connectionState;
++        Completable startTask;
+         this.state.lock();
+         try {
+             if (this.state.getHubConnectionState() == HubConnectionState.DISCONNECTED) {
+                 return Completable.complete();
+             }
+ 
++            connectionState = this.state.getConnectionStateUnsynchronized(false);
++
+             if (errorMessage != null) {
+-                this.state.getConnectionStateUnsynchronized(false).stopError = errorMessage;
++                connectionState.stopError = errorMessage;
+                 logger.error("HubConnection disconnected with an error: {}.", errorMessage);
+             } else {
+                 logger.debug("Stopping HubConnection.");
+             }
+ 
+-            transport = this.state.getConnectionStateUnsynchronized(false).transport;
++            startTask = connectionState.startTask;
+         } finally {
+             this.state.unlock();
+         }
+ 
+-        Completable stop = transport.stop();
+-        stop.onErrorComplete().subscribe();
+-        return stop;
++        Completable stopTask = startTask.onErrorComplete().andThen(Completable.defer(() ->
++        {
++            Completable stop = connectionState.transport.stop();
++            stop.onErrorComplete().subscribe();
++            return stop;
++        }));
++        stopTask.onErrorComplete().subscribe();
++
++        return stopTask;
+     }
+ 
+     private void ReceiveLoop(ByteBuffer payload)
+@@ -1396,7 +1405,7 @@ public class HubConnection implements AutoCloseable {
+             if (!handshakeReceived) {
+                 List<Byte> handshakeByteList = new ArrayList<Byte>();
+                 byte curr = payload.get();
+-                                // Add the handshake to handshakeBytes, but not the record separator
++                // Add the handshake to handshakeBytes, but not the record separator
+                 while (curr != RECORD_SEPARATOR) {
+                     handshakeByteList.add(curr);
+                     curr = payload.get();
+diff --git a/src/SignalR/clients/java/signalr/test/src/main/java/com/microsoft/signalr/HubConnectionTest.java b/src/SignalR/clients/java/signalr/test/src/main/java/com/microsoft/signalr/HubConnectionTest.java
+index 20e5d9b2b4..4df658ee1d 100644
+--- a/src/SignalR/clients/java/signalr/test/src/main/java/com/microsoft/signalr/HubConnectionTest.java
++++ b/src/SignalR/clients/java/signalr/test/src/main/java/com/microsoft/signalr/HubConnectionTest.java
+@@ -22,6 +22,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
+ import ch.qos.logback.classic.spi.ILoggingEvent;
+ import io.reactivex.rxjava3.core.Completable;
+ import io.reactivex.rxjava3.core.Observable;
++import io.reactivex.rxjava3.core.Scheduler;
+ import io.reactivex.rxjava3.core.Single;
+ import io.reactivex.rxjava3.disposables.Disposable;
+ import io.reactivex.rxjava3.schedulers.Schedulers;
+@@ -44,7 +45,7 @@ class HubConnectionTest {
+         hubConnection.start().timeout(30, TimeUnit.SECONDS).blockingAwait();
+         assertEquals(HubConnectionState.CONNECTED, hubConnection.getConnectionState());
+ 
+-        hubConnection.stop();
++        hubConnection.stop().timeout(30, TimeUnit.SECONDS).blockingAwait();
+         assertEquals(HubConnectionState.DISCONNECTED, hubConnection.getConnectionState());
+     }
+ 
+@@ -99,7 +100,7 @@ class HubConnectionTest {
+         hubConnection.start().timeout(30, TimeUnit.SECONDS).blockingAwait();
+         assertEquals(HubConnectionState.CONNECTED, hubConnection.getConnectionState());
+ 
+-        hubConnection.stop();
++        hubConnection.stop().timeout(30, TimeUnit.SECONDS).blockingAwait();
+         assertEquals(HubConnectionState.DISCONNECTED, hubConnection.getConnectionState());
+     }
+ 
+@@ -2564,7 +2565,7 @@ class HubConnectionTest {
+             assertNull(value1.get());
+             value1.set("Closed callback ran.");
+         });
+-        hubConnection.stop();
++        hubConnection.stop().timeout(30, TimeUnit.SECONDS).blockingAwait();
+ 
+         assertEquals(HubConnectionState.DISCONNECTED, hubConnection.getConnectionState());
+         assertEquals(value1.get(), "Closed callback ran.");
+@@ -2589,7 +2590,7 @@ class HubConnectionTest {
+ 
+         assertNull(value1.get());
+         assertNull(value2.get());
+-        hubConnection.stop();
++        hubConnection.stop().timeout(30, TimeUnit.SECONDS).blockingAwait();
+ 
+         assertEquals(HubConnectionState.DISCONNECTED, hubConnection.getConnectionState());
+         assertEquals("Closed callback ran.",value1.get());
+@@ -3891,4 +3892,40 @@ class HubConnectionTest {
+ 
+         assertTrue(close.blockingAwait(30, TimeUnit.SECONDS));
+     }
++
++    @Test
++    public void hubConnectionStopDuringConnecting() {
++        MockTransport mockTransport = new MockTransport();
++        CompletableSubject waitForStop = CompletableSubject.create();
++        TestHttpClient client = new TestHttpClient()
++                .on("POST", "http://example.com/negotiate?negotiateVersion=1", (req) ->
++                {
++                    return Single.defer(() -> {
++                        waitForStop.blockingAwait();
++                        return Single.just(new HttpResponse(200, "",
++                            TestUtils.stringToByteBuffer("{\"connectionId\":\"bVOiRPG8-6YiJ6d7ZcTOVQ\",\"availableTransports\":[{\"transport\":\"WebSockets\",\"transferFormats\":[\"Text\",\"Binary\"]}]}")));
++                    }).subscribeOn(Schedulers.computation());
++                });
++
++        CompletableSubject close = CompletableSubject.create();
++
++        HubConnection hubConnection = HubConnectionBuilder
++            .create("http://example.com")
++            .withTransportImplementation(mockTransport)
++            .withHttpClient(client)
++            .build();
++
++        hubConnection.onClosed(e -> {
++            close.onComplete();
++        });
++        hubConnection.start();
++        assertEquals(HubConnectionState.CONNECTING, hubConnection.getConnectionState());
++
++        Completable stopTask = hubConnection.stop();
++        waitForStop.onComplete();
++        stopTask.timeout(30, TimeUnit.SECONDS).blockingAwait();
++        assertEquals(HubConnectionState.DISCONNECTED, hubConnection.getConnectionState());
++
++        assertTrue(close.blockingAwait(30, TimeUnit.SECONDS));
++    }
+ }

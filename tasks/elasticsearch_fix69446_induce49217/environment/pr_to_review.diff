@@ -1,0 +1,250 @@
+commit 6681cc0df5029daf21584bc4406fa1616943b3b0
+Author: Armin Braun <me@obrown.io>
+Date:   Mon Nov 18 13:13:39 2019 +0100
+
+    Fix RepoCleanup not Removed on Master-Failover (#49217)
+    
+    The logic for `cleanupInProgress()` was backwards everywhere (method itself and
+    all but one user). Also, we weren't checking it when removing a repository.
+    
+    This lead to a bug (in the one spot that didn't use the method backwards) that prevented
+    the cleanup cluster state entry from ever being removed from the cluster state if master
+    failed over during the cleanup process.
+    
+    This change corrects the backwards logic, adds a test that makes sure the cleanup
+    is always removed and adds a check that prevents repository removal during cleanup
+    to the repositories service.
+    
+    Also, the failure handling logic in the cleanup action was broken. Repeated invocation would lead to the cleanup being removed from the cluster state even if it was in progress. Fixed by adding a flag that indicates whether or not any removal of the cleanup task from the cluster state must be executed. Sorry for mixing this in here, but I had to fix it in the same PR, as the first test (for master-failover) otherwise would often just delete the blocked cleanup action as a result of a transport master action retry.
+
+diff --git a/server/src/main/java/org/elasticsearch/action/admin/cluster/repositories/cleanup/TransportCleanupRepositoryAction.java b/server/src/main/java/org/elasticsearch/action/admin/cluster/repositories/cleanup/TransportCleanupRepositoryAction.java
+index 0ffdb27f8010..418c6f3fefd7 100644
+--- a/server/src/main/java/org/elasticsearch/action/admin/cluster/repositories/cleanup/TransportCleanupRepositoryAction.java
++++ b/server/src/main/java/org/elasticsearch/action/admin/cluster/repositories/cleanup/TransportCleanupRepositoryAction.java
+@@ -93,7 +93,7 @@ public final class TransportCleanupRepositoryAction extends TransportMasterNodeA
+         clusterService.addStateApplier(event -> {
+             if (event.localNodeMaster() && event.previousState().nodes().isLocalNodeElectedMaster() == false) {
+                 final RepositoryCleanupInProgress repositoryCleanupInProgress = event.state().custom(RepositoryCleanupInProgress.TYPE);
+-                if (repositoryCleanupInProgress == null || repositoryCleanupInProgress.cleanupInProgress() == false) {
++                if (repositoryCleanupInProgress == null || repositoryCleanupInProgress.hasCleanupInProgress() == false) {
+                     return;
+                 }
+                 clusterService.submitStateUpdateTask("clean up repository cleanup task after master failover",
+@@ -122,7 +122,7 @@ public final class TransportCleanupRepositoryAction extends TransportMasterNodeA
+         RepositoryCleanupInProgress cleanupInProgress = currentState.custom(RepositoryCleanupInProgress.TYPE);
+         if (cleanupInProgress != null) {
+             boolean changed = false;
+-            if (cleanupInProgress.cleanupInProgress() == false) {
++            if (cleanupInProgress.hasCleanupInProgress()) {
+                 cleanupInProgress = new RepositoryCleanupInProgress();
+                 changed = true;
+             }
+@@ -172,10 +172,13 @@ public final class TransportCleanupRepositoryAction extends TransportMasterNodeA
+         logger.info("Running cleanup operations on repository [{}][{}]", repositoryName, repositoryStateId);
+         clusterService.submitStateUpdateTask("cleanup repository [" + repositoryName + "][" + repositoryStateId + ']',
+             new ClusterStateUpdateTask() {
++
++                private boolean startedCleanup = false;
++
+                 @Override
+                 public ClusterState execute(ClusterState currentState) {
+                     final RepositoryCleanupInProgress repositoryCleanupInProgress = currentState.custom(RepositoryCleanupInProgress.TYPE);
+-                    if (repositoryCleanupInProgress != null && repositoryCleanupInProgress.cleanupInProgress() == false) {
++                    if (repositoryCleanupInProgress != null && repositoryCleanupInProgress.hasCleanupInProgress()) {
+                         throw new IllegalStateException(
+                             "Cannot cleanup [" + repositoryName + "] - a repository cleanup is already in-progress in ["
+                                 + repositoryCleanupInProgress + "]");
+@@ -202,6 +205,7 @@ public final class TransportCleanupRepositoryAction extends TransportMasterNodeA
+ 
+                 @Override
+                 public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
++                    startedCleanup = true;
+                     logger.debug("Initialized repository cleanup in cluster state for [{}][{}]", repositoryName, repositoryStateId);
+                     threadPool.executor(ThreadPool.Names.SNAPSHOT).execute(ActionRunnable.wrap(listener,
+                         l -> blobStoreRepository.cleanup(
+@@ -218,6 +222,11 @@ public final class TransportCleanupRepositoryAction extends TransportMasterNodeA
+                             "Failed to finish repository cleanup operations on [{}][{}]", repositoryName, repositoryStateId), failure);
+                     }
+                     assert failure != null || result != null;
++                    if (startedCleanup == false) {
++                        logger.debug("No cleanup task to remove from cluster state because we failed to start one", failure);
++                        listener.onFailure(failure);
++                        return;
++                    }
+                     clusterService.submitStateUpdateTask(
+                         "remove repository cleanup task [" + repositoryName + "][" + repositoryStateId + ']',
+                         new ClusterStateUpdateTask() {
+diff --git a/server/src/main/java/org/elasticsearch/cluster/RepositoryCleanupInProgress.java b/server/src/main/java/org/elasticsearch/cluster/RepositoryCleanupInProgress.java
+index e7c8e995dd61..f9be2d326980 100644
+--- a/server/src/main/java/org/elasticsearch/cluster/RepositoryCleanupInProgress.java
++++ b/server/src/main/java/org/elasticsearch/cluster/RepositoryCleanupInProgress.java
+@@ -51,9 +51,13 @@ public final class RepositoryCleanupInProgress extends AbstractNamedDiffable<Clu
+         return new Entry(repository, repositoryStateId);
+     }
+ 
+-    public boolean cleanupInProgress() {
++    public boolean hasCleanupInProgress() {
+         // TODO: Should we allow parallelism across repositories here maybe?
+-        return entries.isEmpty();
++        return entries.isEmpty() == false;
++    }
++
++    public List<Entry> entries() {
++        return List.copyOf(entries);
+     }
+ 
+     @Override
+@@ -106,6 +110,10 @@ public final class RepositoryCleanupInProgress extends AbstractNamedDiffable<Clu
+             this.repositoryStateId = repositoryStateId;
+         }
+ 
++        public String repository() {
++            return repository;
++        }
++
+         @Override
+         public void writeTo(StreamOutput out) throws IOException {
+             out.writeString(repository);
+diff --git a/server/src/main/java/org/elasticsearch/repositories/RepositoriesService.java b/server/src/main/java/org/elasticsearch/repositories/RepositoriesService.java
+index ab14e7e29157..20f083dcff0f 100644
+--- a/server/src/main/java/org/elasticsearch/repositories/RepositoriesService.java
++++ b/server/src/main/java/org/elasticsearch/repositories/RepositoriesService.java
+@@ -435,8 +435,7 @@ public class RepositoriesService extends AbstractLifecycleComponent implements C
+         }
+     }
+ 
+-
+-    private void ensureRepositoryNotInUse(ClusterState clusterState, String repository) {
++    private static void ensureRepositoryNotInUse(ClusterState clusterState, String repository) {
+         if (SnapshotsService.isRepositoryInUse(clusterState, repository) || RestoreService.isRepositoryInUse(clusterState, repository)) {
+             throw new IllegalStateException("trying to modify or unregister repository that is currently used ");
+         }
+diff --git a/server/src/test/java/org/elasticsearch/repositories/blobstore/BlobStoreRepositoryCleanupIT.java b/server/src/test/java/org/elasticsearch/repositories/blobstore/BlobStoreRepositoryCleanupIT.java
+new file mode 100644
+index 000000000000..7ee49e53e265
+--- /dev/null
++++ b/server/src/test/java/org/elasticsearch/repositories/blobstore/BlobStoreRepositoryCleanupIT.java
+@@ -0,0 +1,110 @@
++/*
++ * Licensed to Elasticsearch under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.elasticsearch.repositories.blobstore;
++
++import org.elasticsearch.action.ActionRunnable;
++import org.elasticsearch.action.support.PlainActionFuture;
++import org.elasticsearch.cluster.RepositoryCleanupInProgress;
++import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.common.unit.ByteSizeUnit;
++import org.elasticsearch.common.unit.TimeValue;
++import org.elasticsearch.repositories.RepositoriesService;
++import org.elasticsearch.snapshots.AbstractSnapshotIntegTestCase;
++import org.elasticsearch.test.ESIntegTestCase;
++
++import java.io.ByteArrayInputStream;
++import java.util.concurrent.TimeUnit;
++
++import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
++import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertThrows;
++
++@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, numDataNodes = 0)
++public class BlobStoreRepositoryCleanupIT extends AbstractSnapshotIntegTestCase {
++
++    public void testMasterFailoverDuringCleanup() throws Exception {
++        startBlockedCleanup("test-repo");
++
++        logger.info("-->  stopping master node");
++        internalCluster().stopCurrentMasterNode();
++
++        logger.info("-->  wait for cleanup to finish and disappear from cluster state");
++        assertBusy(() -> {
++            RepositoryCleanupInProgress cleanupInProgress =
++                client().admin().cluster().prepareState().get().getState().custom(RepositoryCleanupInProgress.TYPE);
++            assertFalse(cleanupInProgress.hasCleanupInProgress());
++        }, 30, TimeUnit.SECONDS);
++    }
++
++    public void testRepeatCleanupsDontRemove() throws Exception {
++        final String masterNode = startBlockedCleanup("test-repo");
++
++        logger.info("-->  sending another cleanup");
++        assertThrows(client().admin().cluster().prepareCleanupRepository("test-repo").execute(), IllegalStateException.class);
++
++        logger.info("-->  ensure cleanup is still in progress");
++        final RepositoryCleanupInProgress cleanup =
++            client().admin().cluster().prepareState().get().getState().custom(RepositoryCleanupInProgress.TYPE);
++        assertTrue(cleanup.hasCleanupInProgress());
++
++        logger.info("-->  unblocking master node");
++        unblockNode("test-repo", masterNode);
++
++        logger.info("-->  wait for cleanup to finish and disappear from cluster state");
++        assertBusy(() -> {
++            RepositoryCleanupInProgress cleanupInProgress =
++                client().admin().cluster().prepareState().get().getState().custom(RepositoryCleanupInProgress.TYPE);
++            assertFalse(cleanupInProgress.hasCleanupInProgress());
++        }, 30, TimeUnit.SECONDS);
++    }
++
++    private String startBlockedCleanup(String repoName) throws Exception {
++        logger.info("-->  starting two master nodes and one data node");
++        internalCluster().startMasterOnlyNodes(2);
++        internalCluster().startDataOnlyNodes(1);
++
++        logger.info("-->  creating repository");
++        assertAcked(client().admin().cluster().preparePutRepository(repoName)
++            .setType("mock").setSettings(Settings.builder()
++                .put("location", randomRepoPath())
++                .put("compress", randomBoolean())
++                .put("chunk_size", randomIntBetween(100, 1000), ByteSizeUnit.BYTES)));
++
++        logger.info("-->  snapshot");
++        client().admin().cluster().prepareCreateSnapshot(repoName, "test-snap")
++            .setWaitForCompletion(true).get();
++
++        final RepositoriesService service = internalCluster().getInstance(RepositoriesService.class, internalCluster().getMasterName());
++        final BlobStoreRepository repository = (BlobStoreRepository) service.repository(repoName);
++
++        logger.info("--> creating a garbage data blob");
++        final PlainActionFuture<Void> garbageFuture = PlainActionFuture.newFuture();
++        repository.threadPool().generic().execute(ActionRunnable.run(garbageFuture, () -> repository.blobStore()
++            .blobContainer(repository.basePath()).writeBlob("snap-foo.dat", new ByteArrayInputStream(new byte[1]), 1, true)));
++        garbageFuture.get();
++
++        final String masterNode = blockMasterFromFinalizingSnapshotOnIndexFile(repoName);
++
++        logger.info("--> starting repository cleanup");
++        client().admin().cluster().prepareCleanupRepository(repoName).execute();
++
++        logger.info("--> waiting for block to kick in on " + masterNode);
++        waitForBlock(masterNode, repoName, TimeValue.timeValueSeconds(60));
++        return masterNode;
++    }
++}
+diff --git a/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/slm/SnapshotRetentionTask.java b/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/slm/SnapshotRetentionTask.java
+index e32f926fe821..25de192e76d0 100644
+--- a/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/slm/SnapshotRetentionTask.java
++++ b/x-pack/plugin/ilm/src/main/java/org/elasticsearch/xpack/slm/SnapshotRetentionTask.java
+@@ -440,7 +440,7 @@ public class SnapshotRetentionTask implements SchedulerEngine.Listener {
+ 
+         // Cannot delete while a repository is being cleaned
+         final RepositoryCleanupInProgress repositoryCleanupInProgress = state.custom(RepositoryCleanupInProgress.TYPE);
+-        if (repositoryCleanupInProgress != null && repositoryCleanupInProgress.cleanupInProgress() == false) {
++        if (repositoryCleanupInProgress != null && repositoryCleanupInProgress.hasCleanupInProgress()) {
+             return false;
+         }
+ 

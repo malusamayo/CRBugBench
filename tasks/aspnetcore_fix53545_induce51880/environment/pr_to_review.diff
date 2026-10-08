@@ -1,0 +1,438 @@
+commit 7601b50339a8ca3b8cf0103895dd1e36c5de6bc1
+Author: James Newton-King <james@newtonking.com>
+Date:   Thu Nov 9 23:26:25 2023 +0800
+
+    Fix ambiguous route analyzer false positive with action replacement (#51880)
+
+diff --git a/src/Framework/AspNetCoreAnalyzers/src/Analyzers/Mvc/DetectAmbiguousActionRoutes.cs b/src/Framework/AspNetCoreAnalyzers/src/Analyzers/Mvc/DetectAmbiguousActionRoutes.cs
+index 37916d9514..3bb454473c 100644
+--- a/src/Framework/AspNetCoreAnalyzers/src/Analyzers/Mvc/DetectAmbiguousActionRoutes.cs
++++ b/src/Framework/AspNetCoreAnalyzers/src/Analyzers/Mvc/DetectAmbiguousActionRoutes.cs
+@@ -18,8 +18,10 @@ using WellKnownType = WellKnownTypeData.WellKnownType;
+ 
+ public partial class MvcAnalyzer
+ {
+-    private static void DetectAmbiguousActionRoutes(SymbolAnalysisContext context, WellKnownTypes wellKnownTypes, List<ActionRoute> actionRoutes)
++    private static void DetectAmbiguousActionRoutes(SymbolAnalysisContext context, WellKnownTypes wellKnownTypes, RoutePatternTree? controllerRoutePattern, List<ActionRoute> actionRoutes)
+     {
++        var controllerHasActionReplacement = controllerRoutePattern != null ? HasActionReplacementToken(controllerRoutePattern) : false;
++
+         // Ambiguous action route detection is conservative in what it detects to avoid false positives.
+         //
+         // Successfully matched action routes must:
+@@ -31,19 +33,45 @@ public partial class MvcAnalyzer
+         {
+             // Group action routes together. When multiple match in a group, then report action routes to diagnostics.
+             var groupedByParent = actionRoutes
+-                .GroupBy(ar => new ActionRouteGroupKey(ar.ActionSymbol, ar.RouteUsageModel.RoutePattern, ar.HttpMethods, wellKnownTypes));
++                .GroupBy(ar => new ActionRouteGroupKey(ar.ActionSymbol, ar.RouteUsageModel.RoutePattern, ar.HttpMethods, controllerHasActionReplacement, wellKnownTypes));
+ 
+-            foreach (var ambigiousGroup in groupedByParent.Where(g => g.Count() >= 2))
++            foreach (var ambiguousGroup in groupedByParent.Where(g => g.Count() >= 2))
+             {
+-                foreach (var ambigiousActionRoute in ambigiousGroup)
++                foreach (var ambiguousActionRoute in ambiguousGroup)
+                 {
+                     context.ReportDiagnostic(Diagnostic.Create(
+                         DiagnosticDescriptors.AmbiguousActionRoute,
+-                        ambigiousActionRoute.RouteUsageModel.UsageContext.RouteToken.GetLocation(),
+-                        ambigiousActionRoute.RouteUsageModel.RoutePattern.Root.ToString()));
++                        ambiguousActionRoute.RouteUsageModel.UsageContext.RouteToken.GetLocation(),
++                        ambiguousActionRoute.RouteUsageModel.RoutePattern.Root.ToString()));
++                }
++            }
++        }
++    }
++
++    private static bool HasActionReplacementToken(RoutePatternTree routePattern)
++    {
++        for (var i = 0; i < routePattern.Root.Parts.Length; i++)
++        {
++            if (routePattern.Root.Parts[i] is RoutePatternSegmentNode segment)
++            {
++                for (var j = 0; j < segment.Children.Length; j++)
++                {
++                    if (segment.Children[j] is RoutePatternReplacementNode replacementNode)
++                    {
++                        if (!replacementNode.TextToken.IsMissing)
++                        {
++                            var name = replacementNode.TextToken.Value!.ToString();
++                            if (string.Equals(name, "action", StringComparison.OrdinalIgnoreCase))
++                            {
++                                return true;
++                            }
++                        }
++                    }
+                 }
+             }
+         }
++
++        return false;
+     }
+ 
+     private readonly struct ActionRouteGroupKey : IEquatable<ActionRouteGroupKey>
+@@ -51,9 +79,11 @@ public partial class MvcAnalyzer
+         public IMethodSymbol ActionSymbol { get; }
+         public RoutePatternTree RoutePattern { get; }
+         public ImmutableArray<string> HttpMethods { get; }
++        public string ActionName { get; }
++        public bool HasActionReplacement { get; }
+         private readonly WellKnownTypes _wellKnownTypes;
+ 
+-        public ActionRouteGroupKey(IMethodSymbol actionSymbol, RoutePatternTree routePattern, ImmutableArray<string> httpMethods, WellKnownTypes wellKnownTypes)
++        public ActionRouteGroupKey(IMethodSymbol actionSymbol, RoutePatternTree routePattern, ImmutableArray<string> httpMethods, bool controllerHasActionReplacement, WellKnownTypes wellKnownTypes)
+         {
+             Debug.Assert(!httpMethods.IsDefault);
+ 
+@@ -61,6 +91,18 @@ public partial class MvcAnalyzer
+             RoutePattern = routePattern;
+             HttpMethods = httpMethods;
+             _wellKnownTypes = wellKnownTypes;
++            ActionName = GetActionName(ActionSymbol, _wellKnownTypes);
++            HasActionReplacement = controllerHasActionReplacement || HasActionReplacementToken(RoutePattern);
++        }
++
++        private static string GetActionName(IMethodSymbol actionSymbol, WellKnownTypes wellKnownTypes)
++        {
++            var actionNameAttribute = actionSymbol.GetAttributes(wellKnownTypes.Get(WellKnownType.Microsoft_AspNetCore_Mvc_ActionNameAttribute), inherit: true).FirstOrDefault();
++            if (actionNameAttribute != null && actionNameAttribute.ConstructorArguments.Length > 0 && actionNameAttribute.ConstructorArguments[0].Value is string name)
++            {
++                return name;
++            }
++            return actionSymbol.Name;
+         }
+ 
+         public override bool Equals(object obj)
+@@ -76,6 +118,7 @@ public partial class MvcAnalyzer
+         {
+             return
+                 AmbiguousRoutePatternComparer.Instance.Equals(RoutePattern, other.RoutePattern) &&
++                (!HasActionReplacement || string.Equals(ActionName, other.ActionName, StringComparison.OrdinalIgnoreCase)) &&
+                 HasMatchingHttpMethods(HttpMethods, other.HttpMethods) &&
+                 CanMatchActions(_wellKnownTypes, ActionSymbol, other.ActionSymbol);
+         }
+diff --git a/src/Framework/AspNetCoreAnalyzers/src/Analyzers/Mvc/MvcAnalyzer.cs b/src/Framework/AspNetCoreAnalyzers/src/Analyzers/Mvc/MvcAnalyzer.cs
+index 88652688bb..aadb9ffe63 100644
+--- a/src/Framework/AspNetCoreAnalyzers/src/Analyzers/Mvc/MvcAnalyzer.cs
++++ b/src/Framework/AspNetCoreAnalyzers/src/Analyzers/Mvc/MvcAnalyzer.cs
+@@ -5,7 +5,9 @@ using System;
+ using System.Collections.Concurrent;
+ using System.Collections.Generic;
+ using System.Collections.Immutable;
++using System.Linq;
+ using System.Threading;
++using Microsoft.AspNetCore.Analyzers.Infrastructure.RoutePattern;
+ using Microsoft.AspNetCore.Analyzers.RouteEmbeddedLanguage.Infrastructure;
+ using Microsoft.AspNetCore.App.Analyzers.Infrastructure;
+ using Microsoft.CodeAnalysis;
+@@ -47,9 +49,20 @@ public partial class MvcAnalyzer : DiagnosticAnalyzer
+                         actionRoutes = new List<ActionRoute>();
+                     }
+ 
++                    RoutePatternTree? controllerRoutePattern = null;
++                    var controllerRouteAttribute = namedTypeSymbol.GetAttributes(wellKnownTypes.Get(WellKnownType.Microsoft_AspNetCore_Mvc_RouteAttribute), inherit: true).FirstOrDefault();
++                    if (controllerRouteAttribute != null)
++                    {
++                        var routeUsage = GetRouteUsageModel(controllerRouteAttribute, routeUsageCache, context.CancellationToken);
++                        if (routeUsage != null)
++                        {
++                            controllerRoutePattern = routeUsage.RoutePattern;
++                        }
++                    }
++
+                     PopulateActionRoutes(context, wellKnownTypes, routeUsageCache, namedTypeSymbol, actionRoutes);
+ 
+-                    DetectAmbiguousActionRoutes(context, wellKnownTypes, actionRoutes);
++                    DetectAmbiguousActionRoutes(context, wellKnownTypes, controllerRoutePattern, actionRoutes);
+ 
+                     // Return to the pool.
+                     actionRoutes.Clear();
+diff --git a/src/Framework/AspNetCoreAnalyzers/test/Mvc/DetectAmbiguousActionRoutesTest.cs b/src/Framework/AspNetCoreAnalyzers/test/Mvc/DetectAmbiguousActionRoutesTest.cs
+index 9cadb599f8..285ff95c36 100644
+--- a/src/Framework/AspNetCoreAnalyzers/test/Mvc/DetectAmbiguousActionRoutesTest.cs
++++ b/src/Framework/AspNetCoreAnalyzers/test/Mvc/DetectAmbiguousActionRoutesTest.cs
+@@ -40,6 +40,284 @@ internal class Program
+         await VerifyCS.VerifyAnalyzerAsync(source, expectedDiagnostics);
+     }
+ 
++    [Fact]
++    public async Task ActionReplacementToken_DifferentActionNames_NoDiagnostics()
++    {
++        // Arrange
++        var source = @"
++using Microsoft.AspNetCore.Builder;
++using Microsoft.AspNetCore.Mvc;
++public class WeatherForecastController : ControllerBase
++{
++    [Route(""[action]"")]
++    public object Get() => new object();
++
++    [Route(""[action]"")]
++    public object Get1() => new object();
++}
++internal class Program
++{
++    static void Main(string[] args)
++    {
++    }
++}
++";
++
++        // Act & Assert
++        await VerifyCS.VerifyAnalyzerAsync(source);
++    }
++
++    [Fact]
++    public async Task ActionReplacementToken_SameActionName_HasDiagnostics()
++    {
++        // Arrange
++        var source = @"
++using Microsoft.AspNetCore.Builder;
++using Microsoft.AspNetCore.Mvc;
++public class WeatherForecastController : ControllerBase
++{
++    [Route({|#0:""[action]""|})]
++    public object Get() => new object();
++
++    [Route({|#1:""[action]""|})]
++    public object Get(int i) => new object();
++}
++internal class Program
++{
++    static void Main(string[] args)
++    {
++    }
++}
++";
++
++        var expectedDiagnostics = new[] {
++            new DiagnosticResult(DiagnosticDescriptors.AmbiguousActionRoute).WithArguments("[action]").WithLocation(0),
++            new DiagnosticResult(DiagnosticDescriptors.AmbiguousActionRoute).WithArguments("[action]").WithLocation(1)
++        };
++
++        // Act & Assert
++        await VerifyCS.VerifyAnalyzerAsync(source, expectedDiagnostics);
++    }
++
++    [Fact]
++    public async Task ActionReplacementToken_ActionNameAttribute_HasDiagnostics()
++    {
++        // Arrange
++        var source = @"
++using Microsoft.AspNetCore.Builder;
++using Microsoft.AspNetCore.Mvc;
++public class WeatherForecastController : ControllerBase
++{
++    [Route({|#0:""[action]""|})]
++    public object Get() => new object();
++
++    [Route({|#1:""[action]""|})]
++    [ActionName(""get"")]
++    public object Get1(int i) => new object();
++}
++internal class Program
++{
++    static void Main(string[] args)
++    {
++    }
++}
++";
++
++        var expectedDiagnostics = new[] {
++            new DiagnosticResult(DiagnosticDescriptors.AmbiguousActionRoute).WithArguments("[action]").WithLocation(0),
++            new DiagnosticResult(DiagnosticDescriptors.AmbiguousActionRoute).WithArguments("[action]").WithLocation(1)
++        };
++
++        // Act & Assert
++        await VerifyCS.VerifyAnalyzerAsync(source, expectedDiagnostics);
++    }
++
++    [Fact]
++    public async Task ActionReplacementToken_ActionNameAttributeNullValue_NoDiagnostics()
++    {
++        // Arrange
++        var source = @"
++using Microsoft.AspNetCore.Builder;
++using Microsoft.AspNetCore.Mvc;
++public class WeatherForecastController : ControllerBase
++{
++    [Route({|#0:""[action]""|})]
++    public object Get() => new object();
++
++    [Route({|#1:""[action]""|})]
++    [ActionName(null)]
++    public object Get1(int i) => new object();
++}
++internal class Program
++{
++    static void Main(string[] args)
++    {
++    }
++}
++";
++
++        // Act & Assert
++        await VerifyCS.VerifyAnalyzerAsync(source);
++    }
++
++    [Fact]
++    public async Task ActionReplacementToken_OnController_NoDiagnostics()
++    {
++        // Arrange
++        var source = @"
++using Microsoft.AspNetCore.Builder;
++using Microsoft.AspNetCore.Mvc;
++[Route(""[controller]/[action]"")]
++public class WeatherForecastController : ControllerBase
++{
++    [Route(""{i}"")]
++    public object Get(int i) => new object();
++
++    [Route(""{i}"")]
++    public object Get1(int i) => new object();
++}
++internal class Program
++{
++    static void Main(string[] args)
++    {
++    }
++}
++";
++
++        // Act & Assert
++        await VerifyCS.VerifyAnalyzerAsync(source);
++    }
++
++    [Fact]
++    public async Task ActionReplacementToken_OnBaseController_NoDiagnostics()
++    {
++        // Arrange
++        var source = @"
++using Microsoft.AspNetCore.Builder;
++using Microsoft.AspNetCore.Mvc;
++[Route(""[controller]/[action]"")]
++public class MyControllerBase : ControllerBase
++{
++}
++public class WeatherForecastController : MyControllerBase
++{
++    [Route(""{i}"")]
++    public object Get(int i) => new object();
++
++    [Route(""{i}"")]
++    public object Get1(int i) => new object();
++}
++internal class Program
++{
++    static void Main(string[] args)
++    {
++    }
++}
++";
++
++        // Act & Assert
++        await VerifyCS.VerifyAnalyzerAsync(source);
++    }
++
++    [Fact]
++    public async Task ActionReplacementToken_OnBaseControllerButOverridden_HasDiagnostics()
++    {
++        // Arrange
++        var source = @"
++using Microsoft.AspNetCore.Builder;
++using Microsoft.AspNetCore.Mvc;
++[Route(""[controller]/[action]"")]
++public class MyControllerBase : ControllerBase
++{
++}
++[Route(""api"")]
++public class WeatherForecastController : MyControllerBase
++{
++    [Route({|#0:""{i}""|})]
++    public object Get(int i) => new object();
++
++    [Route({|#1:""{i}""|})]
++    public object Get1(int i) => new object();
++}
++internal class Program
++{
++    static void Main(string[] args)
++    {
++    }
++}
++";
++
++        var expectedDiagnostics = new[] {
++            new DiagnosticResult(DiagnosticDescriptors.AmbiguousActionRoute).WithArguments("{i}").WithLocation(0),
++            new DiagnosticResult(DiagnosticDescriptors.AmbiguousActionRoute).WithArguments("{i}").WithLocation(1)
++        };
++
++        // Act & Assert
++        await VerifyCS.VerifyAnalyzerAsync(source, expectedDiagnostics);
++    }
++
++    [Fact]
++    public async Task ActionReplacementToken_OnController_ActionName_NoDiagnostics()
++    {
++        // Arrange
++        var source = @"
++using Microsoft.AspNetCore.Builder;
++using Microsoft.AspNetCore.Mvc;
++[Route(""[controller]/[action]"")]
++public class WeatherForecastController : ControllerBase
++{
++    [Route(""{i}"")]
++    public object Get(int i) => new object();
++
++    [Route(""{s}"")]
++    [ActionName(name: ""getWithString"")]
++    public object Get(string s) => new object();
++}
++internal class Program
++{
++    static void Main(string[] args)
++    {
++    }
++}
++";
++
++        // Act & Assert
++        await VerifyCS.VerifyAnalyzerAsync(source);
++    }
++
++    [Fact]
++    public async Task ActionReplacementToken_OnController_ActionNameOnBase_NoDiagnostics()
++    {
++        // Arrange
++        var source = @"
++using Microsoft.AspNetCore.Builder;
++using Microsoft.AspNetCore.Mvc;
++public abstract class MyControllerBase : ControllerBase
++{
++    [ActionName(name: ""getWithString"")]
++    public abstract object Get(string s);
++}
++[Route(""[controller]/[action]"")]
++public class WeatherForecastController : MyControllerBase
++{
++    [Route(""{i}"")]
++    public object Get(int i) => new object();
++
++    [Route(""{s}"")]
++    public override object Get(string s) => new object();
++}
++internal class Program
++{
++    static void Main(string[] args)
++    {
++    }
++}
++";
++
++        // Act & Assert
++        await VerifyCS.VerifyAnalyzerAsync(source);
++    }
++
+     [Fact]
+     public async Task MixedRoutes_DifferentAction_HasDiagnostics()
+     {

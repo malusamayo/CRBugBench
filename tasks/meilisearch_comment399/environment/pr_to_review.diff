@@ -1,0 +1,674 @@
+diff --git a/meilisearch-core/src/store/mod.rs b/meilisearch-core/src/store/mod.rs
+index aee29ce00a7..198e250e4ad 100644
+--- a/meilisearch-core/src/store/mod.rs
++++ b/meilisearch-core/src/store/mod.rs
+@@ -179,16 +179,8 @@ impl Index {
+         update::push_clear_all(writer, self.updates, self.updates_results)
+     }
+ 
+-    pub fn synonyms_addition(&self) -> update::SynonymsAddition {
+-        update::SynonymsAddition::new(
+-            self.updates,
+-            self.updates_results,
+-            self.updates_notifier.clone(),
+-        )
+-    }
+-
+-    pub fn synonyms_deletion(&self) -> update::SynonymsDeletion {
+-        update::SynonymsDeletion::new(
++    pub fn synonyms_update(&self) -> update::SynonymsUpdate {
++        update::SynonymsUpdate::new(
+             self.updates,
+             self.updates_results,
+             self.updates_notifier.clone(),
+diff --git a/meilisearch-core/src/update/mod.rs b/meilisearch-core/src/update/mod.rs
+index cc6f369d22f..239884a8860 100644
+--- a/meilisearch-core/src/update/mod.rs
++++ b/meilisearch-core/src/update/mod.rs
+@@ -5,8 +5,7 @@ mod documents_deletion;
+ mod schema_update;
+ mod stop_words_addition;
+ mod stop_words_deletion;
+-mod synonyms_addition;
+-mod synonyms_deletion;
++mod synonyms_update;
+ 
+ pub use self::clear_all::{apply_clear_all, push_clear_all};
+ pub use self::customs_update::{apply_customs_update, push_customs_update};
+@@ -17,8 +16,7 @@ pub use self::documents_deletion::{apply_documents_deletion, DocumentsDeletion};
+ pub use self::schema_update::{apply_schema_update, push_schema_update};
+ pub use self::stop_words_addition::{apply_stop_words_addition, StopWordsAddition};
+ pub use self::stop_words_deletion::{apply_stop_words_deletion, StopWordsDeletion};
+-pub use self::synonyms_addition::{apply_synonyms_addition, SynonymsAddition};
+-pub use self::synonyms_deletion::{apply_synonyms_deletion, SynonymsDeletion};
++pub use self::synonyms_update::{apply_synonyms_update, SynonymsUpdate};
+ 
+ use std::cmp;
+ use std::collections::{BTreeMap, BTreeSet, HashMap};
+@@ -82,16 +80,9 @@ impl Update {
+         }
+     }
+ 
+-    fn synonyms_addition(data: BTreeMap<String, Vec<String>>) -> Update {
++    fn synonyms_update(data: BTreeMap<String, Vec<String>>) -> Update {
+         Update {
+-            data: UpdateData::SynonymsAddition(data),
+-            enqueued_at: Utc::now(),
+-        }
+-    }
+-
+-    fn synonyms_deletion(data: BTreeMap<String, Option<Vec<String>>>) -> Update {
+-        Update {
+-            data: UpdateData::SynonymsDeletion(data),
++            data: UpdateData::SynonymsUpdate(data),
+             enqueued_at: Utc::now(),
+         }
+     }
+@@ -119,8 +110,7 @@ pub enum UpdateData {
+     DocumentsAddition(Vec<HashMap<String, serde_json::Value>>),
+     DocumentsPartial(Vec<HashMap<String, serde_json::Value>>),
+     DocumentsDeletion(Vec<DocumentId>),
+-    SynonymsAddition(BTreeMap<String, Vec<String>>),
+-    SynonymsDeletion(BTreeMap<String, Option<Vec<String>>>),
++    SynonymsUpdate(BTreeMap<String, Vec<String>>),
+     StopWordsAddition(BTreeSet<String>),
+     StopWordsDeletion(BTreeSet<String>),
+ }
+@@ -140,12 +130,9 @@ impl UpdateData {
+             UpdateData::DocumentsDeletion(deletion) => UpdateType::DocumentsDeletion {
+                 number: deletion.len(),
+             },
+-            UpdateData::SynonymsAddition(addition) => UpdateType::SynonymsAddition {
++            UpdateData::SynonymsUpdate(addition) => UpdateType::SynonymsUpdate {
+                 number: addition.len(),
+             },
+-            UpdateData::SynonymsDeletion(deletion) => UpdateType::SynonymsDeletion {
+-                number: deletion.len(),
+-            },
+             UpdateData::StopWordsAddition(addition) => UpdateType::StopWordsAddition {
+                 number: addition.len(),
+             },
+@@ -165,8 +152,7 @@ pub enum UpdateType {
+     DocumentsAddition { number: usize },
+     DocumentsPartial { number: usize },
+     DocumentsDeletion { number: usize },
+-    SynonymsAddition { number: usize },
+-    SynonymsDeletion { number: usize },
++    SynonymsUpdate { number: usize },
+     StopWordsAddition { number: usize },
+     StopWordsDeletion { number: usize },
+ }
+@@ -361,25 +347,14 @@ pub fn update_task<'a, 'b>(
+ 
+             (update_type, result, start.elapsed())
+         }
+-        UpdateData::SynonymsAddition(synonyms) => {
+-            let start = Instant::now();
+-
+-            let update_type = UpdateType::SynonymsAddition {
+-                number: synonyms.len(),
+-            };
+-
+-            let result = apply_synonyms_addition(writer, index.main, index.synonyms, synonyms);
+-
+-            (update_type, result, start.elapsed())
+-        }
+-        UpdateData::SynonymsDeletion(synonyms) => {
++        UpdateData::SynonymsUpdate(synonyms) => {
+             let start = Instant::now();
+ 
+-            let update_type = UpdateType::SynonymsDeletion {
++            let update_type = UpdateType::SynonymsUpdate {
+                 number: synonyms.len(),
+             };
+ 
+-            let result = apply_synonyms_deletion(writer, index.main, index.synonyms, synonyms);
++            let result = apply_synonyms_update(writer, index.main, index.synonyms, synonyms);
+ 
+             (update_type, result, start.elapsed())
+         }
+diff --git a/meilisearch-core/src/update/synonyms_deletion.rs b/meilisearch-core/src/update/synonyms_deletion.rs
+deleted file mode 100644
+index eeff7b6cc6d..00000000000
+--- a/meilisearch-core/src/update/synonyms_deletion.rs
++++ /dev/null
+@@ -1,158 +0,0 @@
+-use std::collections::BTreeMap;
+-use std::iter::FromIterator;
+-
+-use fst::{set::OpBuilder, SetBuilder};
+-use sdset::SetBuf;
+-
+-use crate::database::{MainT, UpdateT};
+-use crate::automaton::normalize_str;
+-use crate::database::{UpdateEvent, UpdateEventsEmitter};
+-use crate::update::{next_update_id, Update};
+-use crate::{store, MResult};
+-
+-pub struct SynonymsDeletion {
+-    updates_store: store::Updates,
+-    updates_results_store: store::UpdatesResults,
+-    updates_notifier: UpdateEventsEmitter,
+-    synonyms: BTreeMap<String, Option<Vec<String>>>,
+-}
+-
+-impl SynonymsDeletion {
+-    pub fn new(
+-        updates_store: store::Updates,
+-        updates_results_store: store::UpdatesResults,
+-        updates_notifier: UpdateEventsEmitter,
+-    ) -> SynonymsDeletion {
+-        SynonymsDeletion {
+-            updates_store,
+-            updates_results_store,
+-            updates_notifier,
+-            synonyms: BTreeMap::new(),
+-        }
+-    }
+-
+-    pub fn delete_all_alternatives_of<S: AsRef<str>>(&mut self, synonym: S) {
+-        let synonym = normalize_str(synonym.as_ref());
+-        self.synonyms.insert(synonym, None);
+-    }
+-
+-    pub fn delete_specific_alternatives_of<S, T, I>(&mut self, synonym: S, alternatives: I)
+-    where
+-        S: AsRef<str>,
+-        T: AsRef<str>,
+-        I: Iterator<Item = T>,
+-    {
+-        let synonym = normalize_str(synonym.as_ref());
+-        let value = self.synonyms.entry(synonym).or_insert(None);
+-        let alternatives = alternatives.map(|s| s.as_ref().to_lowercase());
+-        match value {
+-            Some(v) => v.extend(alternatives),
+-            None => *value = Some(Vec::from_iter(alternatives)),
+-        }
+-    }
+-
+-    pub fn finalize(self, writer: &mut heed::RwTxn<UpdateT>) -> MResult<u64> {
+-        let _ = self.updates_notifier.send(UpdateEvent::NewUpdate);
+-        let update_id = push_synonyms_deletion(
+-            writer,
+-            self.updates_store,
+-            self.updates_results_store,
+-            self.synonyms,
+-        )?;
+-        Ok(update_id)
+-    }
+-}
+-
+-pub fn push_synonyms_deletion(
+-    writer: &mut heed::RwTxn<UpdateT>,
+-    updates_store: store::Updates,
+-    updates_results_store: store::UpdatesResults,
+-    deletion: BTreeMap<String, Option<Vec<String>>>,
+-) -> MResult<u64> {
+-    let last_update_id = next_update_id(writer, updates_store, updates_results_store)?;
+-
+-    let update = Update::synonyms_deletion(deletion);
+-    updates_store.put_update(writer, last_update_id, &update)?;
+-
+-    Ok(last_update_id)
+-}
+-
+-pub fn apply_synonyms_deletion(
+-    writer: &mut heed::RwTxn<MainT>,
+-    main_store: store::Main,
+-    synonyms_store: store::Synonyms,
+-    deletion: BTreeMap<String, Option<Vec<String>>>,
+-) -> MResult<()> {
+-    let mut delete_whole_synonym_builder = SetBuilder::memory();
+-
+-    for (synonym, alternatives) in deletion {
+-        match alternatives {
+-            Some(alternatives) => {
+-                let prev_alternatives = synonyms_store.synonyms(writer, synonym.as_bytes())?;
+-                let prev_alternatives = match prev_alternatives {
+-                    Some(alternatives) => alternatives,
+-                    None => continue,
+-                };
+-
+-                let delta_alternatives = {
+-                    let alternatives = SetBuf::from_dirty(alternatives);
+-                    let mut builder = SetBuilder::memory();
+-                    builder.extend_iter(alternatives).unwrap();
+-                    builder.into_inner().and_then(fst::Set::from_bytes).unwrap()
+-                };
+-
+-                let op = OpBuilder::new()
+-                    .add(prev_alternatives.stream())
+-                    .add(delta_alternatives.stream())
+-                    .difference();
+-
+-                let (alternatives, empty_alternatives) = {
+-                    let mut builder = SetBuilder::memory();
+-                    let len = builder.get_ref().len();
+-                    builder.extend_stream(op).unwrap();
+-                    let is_empty = len == builder.get_ref().len();
+-                    let bytes = builder.into_inner().unwrap();
+-                    let alternatives = fst::Set::from_bytes(bytes).unwrap();
+-
+-                    (alternatives, is_empty)
+-                };
+-
+-                if empty_alternatives {
+-                    delete_whole_synonym_builder.insert(synonym.as_bytes())?;
+-                } else {
+-                    synonyms_store.put_synonyms(writer, synonym.as_bytes(), &alternatives)?;
+-                }
+-            }
+-            None => {
+-                delete_whole_synonym_builder.insert(&synonym).unwrap();
+-                synonyms_store.del_synonyms(writer, synonym.as_bytes())?;
+-            }
+-        }
+-    }
+-
+-    let delta_synonyms = delete_whole_synonym_builder
+-        .into_inner()
+-        .and_then(fst::Set::from_bytes)
+-        .unwrap();
+-
+-    let synonyms = match main_store.synonyms_fst(writer)? {
+-        Some(synonyms) => {
+-            let op = OpBuilder::new()
+-                .add(synonyms.stream())
+-                .add(delta_synonyms.stream())
+-                .difference();
+-
+-            let mut synonyms_builder = SetBuilder::memory();
+-            synonyms_builder.extend_stream(op).unwrap();
+-            synonyms_builder
+-                .into_inner()
+-                .and_then(fst::Set::from_bytes)
+-                .unwrap()
+-        }
+-        None => fst::Set::default(),
+-    };
+-
+-    main_store.put_synonyms_fst(writer, &synonyms)?;
+-
+-    Ok(())
+-}
+diff --git a/meilisearch-core/src/update/synonyms_addition.rs b/meilisearch-core/src/update/synonyms_update.rs
+similarity index 75%
+rename from meilisearch-core/src/update/synonyms_addition.rs
+rename to meilisearch-core/src/update/synonyms_update.rs
+index 21aa8ef9bc1..d381359d7f9 100644
+--- a/meilisearch-core/src/update/synonyms_addition.rs
++++ b/meilisearch-core/src/update/synonyms_update.rs
+@@ -1,6 +1,6 @@
+ use std::collections::BTreeMap;
+ 
+-use fst::{set::OpBuilder, SetBuilder};
++use fst::SetBuilder;
+ use sdset::SetBuf;
+ 
+ use crate::database::{MainT, UpdateT};
+@@ -9,20 +9,20 @@ use crate::database::{UpdateEvent, UpdateEventsEmitter};
+ use crate::update::{next_update_id, Update};
+ use crate::{store, MResult};
+ 
+-pub struct SynonymsAddition {
++pub struct SynonymsUpdate {
+     updates_store: store::Updates,
+     updates_results_store: store::UpdatesResults,
+     updates_notifier: UpdateEventsEmitter,
+     synonyms: BTreeMap<String, Vec<String>>,
+ }
+ 
+-impl SynonymsAddition {
++impl SynonymsUpdate {
+     pub fn new(
+         updates_store: store::Updates,
+         updates_results_store: store::UpdatesResults,
+         updates_notifier: UpdateEventsEmitter,
+-    ) -> SynonymsAddition {
+-        SynonymsAddition {
++    ) -> SynonymsUpdate {
++        SynonymsUpdate {
+             updates_store,
+             updates_results_store,
+             updates_notifier,
+@@ -46,7 +46,7 @@ impl SynonymsAddition {
+ 
+     pub fn finalize(self, writer: &mut heed::RwTxn<UpdateT>) -> MResult<u64> {
+         let _ = self.updates_notifier.send(UpdateEvent::NewUpdate);
+-        let update_id = push_synonyms_addition(
++        let update_id = push_synonyms_update(
+             writer,
+             self.updates_store,
+             self.updates_results_store,
+@@ -56,7 +56,7 @@ impl SynonymsAddition {
+     }
+ }
+ 
+-pub fn push_synonyms_addition(
++pub fn push_synonyms_update(
+     writer: &mut heed::RwTxn<UpdateT>,
+     updates_store: store::Updates,
+     updates_results_store: store::UpdatesResults,
+@@ -64,13 +64,13 @@ pub fn push_synonyms_addition(
+ ) -> MResult<u64> {
+     let last_update_id = next_update_id(writer, updates_store, updates_results_store)?;
+ 
+-    let update = Update::synonyms_addition(addition);
++    let update = Update::synonyms_update(addition);
+     updates_store.put_update(writer, last_update_id, &update)?;
+ 
+     Ok(last_update_id)
+ }
+ 
+-pub fn apply_synonyms_addition(
++pub fn apply_synonyms_update(
+     writer: &mut heed::RwTxn<MainT>,
+     main_store: store::Main,
+     synonyms_store: store::Synonyms,
+@@ -92,28 +92,11 @@ pub fn apply_synonyms_addition(
+         synonyms_store.put_synonyms(writer, word.as_bytes(), &alternatives)?;
+     }
+ 
+-    let delta_synonyms = synonyms_builder
++    let synonyms = synonyms_builder
+         .into_inner()
+         .and_then(fst::Set::from_bytes)
+         .unwrap();
+ 
+-    let synonyms = match main_store.synonyms_fst(writer)? {
+-        Some(synonyms) => {
+-            let op = OpBuilder::new()
+-                .add(synonyms.stream())
+-                .add(delta_synonyms.stream())
+-                .r#union();
+-
+-            let mut synonyms_builder = SetBuilder::memory();
+-            synonyms_builder.extend_stream(op).unwrap();
+-            synonyms_builder
+-                .into_inner()
+-                .and_then(fst::Set::from_bytes)
+-                .unwrap()
+-        }
+-        None => delta_synonyms,
+-    };
+-
+     main_store.put_synonyms_fst(writer, &synonyms)?;
+ 
+     Ok(())
+diff --git a/meilisearch-http/src/models/update_operation.rs b/meilisearch-http/src/models/update_operation.rs
+index 84f99af7c5b..e7a41b10b9a 100644
+--- a/meilisearch-http/src/models/update_operation.rs
++++ b/meilisearch-http/src/models/update_operation.rs
+@@ -6,7 +6,7 @@ pub enum UpdateOperation {
+     ClearAllDocuments,
+     DocumentsAddition,
+     DocumentsDeletion,
+-    SynonymsAddition,
++    SynonymsUpdate,
+     SynonymsDeletion,
+     StopWordsAddition,
+     StopWordsDeletion,
+@@ -22,7 +22,7 @@ impl fmt::Display for UpdateOperation {
+             ClearAllDocuments => write!(f, "ClearAllDocuments"),
+             DocumentsAddition => write!(f, "DocumentsAddition"),
+             DocumentsDeletion => write!(f, "DocumentsDeletion"),
+-            SynonymsAddition => write!(f, "SynonymsAddition"),
++            SynonymsUpdate => write!(f, "SynonymsUpdate"),
+             SynonymsDeletion => write!(f, "SynonymsDelettion"),
+             StopWordsAddition => write!(f, "StopWordsAddition"),
+             StopWordsDeletion => write!(f, "StopWordsDeletion"),
+diff --git a/meilisearch-http/src/routes/mod.rs b/meilisearch-http/src/routes/mod.rs
+index 744e531fb1a..0bf5367e3ae 100644
+--- a/meilisearch-http/src/routes/mod.rs
++++ b/meilisearch-http/src/routes/mod.rs
+@@ -60,21 +60,9 @@ pub fn load_routes(app: &mut tide::App<Data>) {
+                         .post(document::delete_multiple_documents);
+                 });
+ 
+-                router.at("/synonyms").nest(|router| {
+-                    router
+-                        .at("/")
+-                        .get(synonym::list)
+-                        .post(synonym::create)
+-                        .delete(synonym::clear);
+-
+-                    router
+-                        .at("/:synonym")
+-                        .get(synonym::get)
+-                        .put(synonym::update)
+-                        .delete(synonym::delete);
+-
+-                    router.at("/batch").post(synonym::batch_write);
+-                });
++                router.at("/synonyms")
++                    .get(synonym::get)
++                    .post(synonym::update);
+ 
+                 router.at("/stop-words").nest(|router| {
+                     router
+diff --git a/meilisearch-http/src/routes/synonym.rs b/meilisearch-http/src/routes/synonym.rs
+index 5affed2097b..fc6c9c5f0b3 100644
+--- a/meilisearch-http/src/routes/synonym.rs
++++ b/meilisearch-http/src/routes/synonym.rs
+@@ -1,9 +1,9 @@
+ use std::collections::HashMap;
+ 
+ use http::StatusCode;
+-use serde::{Deserialize, Serialize};
+ use tide::response::IntoResponse;
+ use tide::{Context, Response};
++use indexmap::IndexMap;
+ 
+ use crate::error::{ResponseError, SResult};
+ use crate::helpers::tide::ContextExt;
+@@ -11,23 +11,7 @@ use crate::models::token::ACL::*;
+ use crate::routes::document::IndexUpdateResponse;
+ use crate::Data;
+ 
+-#[derive(Clone, Serialize, Deserialize)]
+-#[serde(untagged)]
+-pub enum Synonym {
+-    OneWay(SynonymOneWay),
+-    MultiWay { synonyms: Vec<String> },
+-}
+-
+-#[derive(Clone, Serialize, Deserialize)]
+-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+-pub struct SynonymOneWay {
+-    pub input: String,
+-    pub synonyms: Vec<String>,
+-}
+-
+-pub type Synonyms = Vec<Synonym>;
+-
+-pub async fn list(ctx: Context<Data>) -> SResult<Response> {
++pub async fn get(ctx: Context<Data>) -> SResult<Response> {
+     ctx.is_allowed(SettingsRead)?;
+     let index = ctx.index()?;
+ 
+@@ -42,7 +26,7 @@ pub async fn list(ctx: Context<Data>) -> SResult<Response> {
+     let synonyms_fst = synonyms_fst.unwrap_or_default();
+     let synonyms_list = synonyms_fst.stream().into_strs().map_err(ResponseError::internal)?;
+ 
+-    let mut response = HashMap::new();
++    let mut response = IndexMap::new();
+ 
+     let index_synonyms = &index.synonyms;
+ 
+@@ -60,171 +44,23 @@ pub async fn list(ctx: Context<Data>) -> SResult<Response> {
+     Ok(tide::response::json(response))
+ }
+ 
+-pub async fn get(ctx: Context<Data>) -> SResult<Response> {
+-    ctx.is_allowed(SettingsRead)?;
+-    let synonym = ctx.url_param("synonym")?;
+-    let index = ctx.index()?;
+-
+-    let db = &ctx.state().db;
+-    let reader = db.main_read_txn().map_err(ResponseError::internal)?;
+-
+-    let synonym_list = index
+-        .synonyms
+-        .synonyms(&reader, synonym.as_bytes())
+-        .map_err(ResponseError::internal)?;
+-
+-    let list = match synonym_list {
+-        Some(list) => list.stream().into_strs().map_err(ResponseError::internal)?,
+-        None => Vec::new(),
+-    };
+-
+-    Ok(tide::response::json(list))
+-}
+-
+-pub async fn create(mut ctx: Context<Data>) -> SResult<Response> {
+-    ctx.is_allowed(SettingsWrite)?;
+-
+-    let data: Synonym = ctx.body_json().await.map_err(ResponseError::bad_request)?;
+-
+-    let index = ctx.index()?;
+-
+-    let db = &ctx.state().db;
+-    let mut writer = db.update_write_txn().map_err(ResponseError::internal)?;
+-
+-    let mut synonyms_addition = index.synonyms_addition();
+-
+-    match data.clone() {
+-        Synonym::OneWay(content) => {
+-            synonyms_addition.add_synonym(content.input, content.synonyms.into_iter())
+-        }
+-        Synonym::MultiWay { mut synonyms } => {
+-            if synonyms.len() > 1 {
+-                for _ in 0..synonyms.len() {
+-                    let (first, elems) = synonyms.split_first().unwrap();
+-                    synonyms_addition.add_synonym(first, elems.iter());
+-                    synonyms.rotate_left(1);
+-                }
+-            }
+-        }
+-    }
+-
+-    let update_id = synonyms_addition
+-        .finalize(&mut writer)
+-        .map_err(ResponseError::internal)?;
+-
+-    writer.commit().map_err(ResponseError::internal)?;
+-
+-    let response_body = IndexUpdateResponse { update_id };
+-    Ok(tide::response::json(response_body)
+-        .with_status(StatusCode::ACCEPTED)
+-        .into_response())
+-}
+-
+ pub async fn update(mut ctx: Context<Data>) -> SResult<Response> {
+     ctx.is_allowed(SettingsWrite)?;
+-    let synonym = ctx.url_param("synonym")?;
+-    let index = ctx.index()?;
+-    let data: Vec<String> = ctx.body_json().await.map_err(ResponseError::bad_request)?;
+ 
+-    let db = &ctx.state().db;
+-    let mut writer = db.update_write_txn().map_err(ResponseError::internal)?;
++    let data: HashMap<String, Vec<String>> = ctx.body_json().await.map_err(ResponseError::bad_request)?;
+ 
+-    let mut synonyms_addition = index.synonyms_addition();
+-    synonyms_addition.add_synonym(synonym.clone(), data.clone().into_iter());
+-    let update_id = synonyms_addition
+-        .finalize(&mut writer)
+-        .map_err(ResponseError::internal)?;
+-
+-    writer.commit().map_err(ResponseError::internal)?;
+-
+-    let response_body = IndexUpdateResponse { update_id };
+-    Ok(tide::response::json(response_body)
+-        .with_status(StatusCode::ACCEPTED)
+-        .into_response())
+-}
+-
+-pub async fn delete(ctx: Context<Data>) -> SResult<Response> {
+-    ctx.is_allowed(SettingsWrite)?;
+-    let synonym = ctx.url_param("synonym")?;
+     let index = ctx.index()?;
+ 
+     let db = &ctx.state().db;
+     let mut writer = db.update_write_txn().map_err(ResponseError::internal)?;
+ 
+-    let mut synonyms_deletion = index.synonyms_deletion();
+-    synonyms_deletion.delete_all_alternatives_of(synonym);
+-    let update_id = synonyms_deletion
+-        .finalize(&mut writer)
+-        .map_err(ResponseError::internal)?;
+-
+-    writer.commit().map_err(ResponseError::internal)?;
+-
+-    let response_body = IndexUpdateResponse { update_id };
+-    Ok(tide::response::json(response_body)
+-        .with_status(StatusCode::ACCEPTED)
+-        .into_response())
+-}
+-
+-pub async fn batch_write(mut ctx: Context<Data>) -> SResult<Response> {
+-    ctx.is_allowed(SettingsWrite)?;
+-
+-    let data: Synonyms = ctx.body_json().await.map_err(ResponseError::bad_request)?;
+-
+-    let index = ctx.index()?;
++    let mut synonyms_update = index.synonyms_update();
+ 
+-    let db = &ctx.state().db;
+-    let mut writer = db.update_write_txn().map_err(ResponseError::internal)?;
+-
+-    let mut synonyms_addition = index.synonyms_addition();
+-    for raw in data {
+-        match raw {
+-            Synonym::OneWay(content) => {
+-                synonyms_addition.add_synonym(content.input, content.synonyms.into_iter())
+-            }
+-            Synonym::MultiWay { mut synonyms } => {
+-                if synonyms.len() > 1 {
+-                    for _ in 0..synonyms.len() {
+-                        let (first, elems) = synonyms.split_first().unwrap();
+-                        synonyms_addition.add_synonym(first, elems.iter());
+-                        synonyms.rotate_left(1);
+-                    }
+-                }
+-            }
+-        }
++    for (input, synonyms) in data {
++        synonyms_update.add_synonym(input, synonyms.into_iter());
+     }
+-    let update_id = synonyms_addition
+-        .finalize(&mut writer)
+-        .map_err(ResponseError::internal)?;
+ 
+-    writer.commit().map_err(ResponseError::internal)?;
+-
+-    let response_body = IndexUpdateResponse { update_id };
+-    Ok(tide::response::json(response_body)
+-        .with_status(StatusCode::ACCEPTED)
+-        .into_response())
+-}
+-
+-pub async fn clear(ctx: Context<Data>) -> SResult<Response> {
+-    ctx.is_allowed(SettingsWrite)?;
+-    let index = ctx.index()?;
+-
+-    let db = &ctx.state().db;
+-    let reader = db.main_read_txn().map_err(ResponseError::internal)?;
+-    let mut writer = db.update_write_txn().map_err(ResponseError::internal)?;
+-
+-    let synonyms_fst = index
+-        .main
+-        .synonyms_fst(&reader)
+-        .map_err(ResponseError::internal)?;
+-
+-    let synonyms_fst = synonyms_fst.unwrap_or_default();
+-    let synonyms_list = synonyms_fst.stream().into_strs().map_err(ResponseError::internal)?;
+-
+-    let mut synonyms_deletion = index.synonyms_deletion();
+-    for synonym in synonyms_list {
+-        synonyms_deletion.delete_all_alternatives_of(synonym);
+-    }
+-    let update_id = synonyms_deletion
++    let update_id = synonyms_update
+         .finalize(&mut writer)
+         .map_err(ResponseError::internal)?;
+ 

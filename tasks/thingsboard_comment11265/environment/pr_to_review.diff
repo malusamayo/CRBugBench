@@ -1,0 +1,199 @@
+diff --git a/application/src/main/resources/thingsboard.yml b/application/src/main/resources/thingsboard.yml
+index 4e5458bd18f..60c76eb3df6 100644
+--- a/application/src/main/resources/thingsboard.yml
++++ b/application/src/main/resources/thingsboard.yml
+@@ -951,6 +951,7 @@ transport:
+     max_wrong_credentials_per_ip: "${TB_TRANSPORT_MAX_WRONG_CREDENTIALS_PER_IP:10}"
+     # Timeout (in milliseconds) to expire block IP addresses
+     ip_block_timeout: "${TB_TRANSPORT_IP_BLOCK_TIMEOUT:60000}"
++  max_message_size: "${TB_TRANSPORT_MAX_MESSAGE_SIZE:500000}" # max transport message size
+   # Local HTTP transport parameters
+   http:
+     # Enable/Disable local HTTP transport protocol
+diff --git a/application/src/test/java/org/thingsboard/server/system/BaseHttpDeviceApiTest.java b/application/src/test/java/org/thingsboard/server/system/BaseHttpDeviceApiTest.java
+index 532b212af97..674cdc21d4f 100644
+--- a/application/src/test/java/org/thingsboard/server/system/BaseHttpDeviceApiTest.java
++++ b/application/src/test/java/org/thingsboard/server/system/BaseHttpDeviceApiTest.java
+@@ -15,12 +15,15 @@
+  */
+ package org.thingsboard.server.system;
+ 
++import com.fasterxml.jackson.databind.node.ObjectNode;
+ import org.junit.Before;
+ import org.junit.Test;
+ import org.springframework.test.context.TestPropertySource;
+ import org.springframework.test.web.servlet.ResultActions;
+ import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
++import org.thingsboard.common.util.JacksonUtil;
+ import org.thingsboard.server.common.data.Device;
++import org.thingsboard.server.common.data.StringUtils;
+ import org.thingsboard.server.common.data.security.DeviceCredentials;
+ import org.thingsboard.server.controller.AbstractControllerTest;
+ 
+@@ -29,6 +32,7 @@
+ import java.util.Random;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
++import static org.assertj.core.api.Assertions.assertThat;
+ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.asyncDispatch;
+ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+@@ -40,6 +44,7 @@
+  */
+ @TestPropertySource(properties = {
+         "transport.http.enabled=true",
++        "transport.max_message_size=100"
+ })
+ public abstract class BaseHttpDeviceApiTest extends AbstractControllerTest {
+ 
+@@ -74,6 +79,26 @@ public void testGetAttributes() throws Exception {
+         doGetAsync("/api/v1/" + deviceCredentials.getCredentialsId() + "/attributes?clientKeys=keyA,keyB,keyC").andExpect(status().isOk());
+     }
+ 
++    @Test
++    public void testReplyToCommandWithLargeResponse() throws Exception {
++        String errorResponse = doPostAsync("/api/v1/" + deviceCredentials.getCredentialsId() + "/rpc/5",
++                JacksonUtil.toString(createRpcResponsePayload(101)),
++                String.class,
++                status().is5xxServerError());
++        assertThat(errorResponse).isEqualTo("Max message size exceeded for device [" + device.getId() + "]");
++
++        doPostAsync("/api/v1/" + deviceCredentials.getCredentialsId() + "/rpc/5",
++                JacksonUtil.toString(createRpcResponsePayload(10)),
++                String.class,
++                status().isOk());
++    }
++
++    private ObjectNode createRpcResponsePayload(int bodyLength) {
++        ObjectNode rpcResponseBody = JacksonUtil.newObjectNode();
++        rpcResponseBody.put("result", StringUtils.randomAlphabetic(bodyLength));
++        return rpcResponseBody;
++    }
++
+     protected ResultActions doGetAsync(String urlTemplate, Object... urlVariables) throws Exception {
+         MockHttpServletRequestBuilder getRequest;
+         getRequest = get(urlTemplate, urlVariables);
+diff --git a/common/message/src/main/java/org/thingsboard/server/common/msg/tools/MaxMessageSizeExceededException.java b/common/message/src/main/java/org/thingsboard/server/common/msg/tools/MaxMessageSizeExceededException.java
+new file mode 100644
+index 00000000000..629e1f0947a
+--- /dev/null
++++ b/common/message/src/main/java/org/thingsboard/server/common/msg/tools/MaxMessageSizeExceededException.java
+@@ -0,0 +1,30 @@
++/**
++ * Copyright © 2016-2024 The Thingsboard Authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.thingsboard.server.common.msg.tools;
++
++import lombok.Getter;
++import org.thingsboard.server.common.data.id.DeviceId;
++
++public class MaxMessageSizeExceededException extends RuntimeException {
++
++    @Getter
++    private final DeviceId deviceId;
++
++    public MaxMessageSizeExceededException(DeviceId deviceId) {
++        super(String.format("Max message size exceeded for device [%s]", deviceId));
++        this.deviceId = deviceId;
++    }
++}
+diff --git a/common/transport/http/src/main/java/org/thingsboard/server/transport/http/DeviceApiController.java b/common/transport/http/src/main/java/org/thingsboard/server/transport/http/DeviceApiController.java
+index 58a5629dae0..3968995fdb4 100644
+--- a/common/transport/http/src/main/java/org/thingsboard/server/transport/http/DeviceApiController.java
++++ b/common/transport/http/src/main/java/org/thingsboard/server/transport/http/DeviceApiController.java
+@@ -45,6 +45,8 @@
+ import org.thingsboard.server.common.data.id.DeviceId;
+ import org.thingsboard.server.common.data.ota.OtaPackageType;
+ import org.thingsboard.server.common.data.rpc.RpcStatus;
++import org.thingsboard.server.common.msg.tools.MaxMessageSizeExceededException;
++import org.thingsboard.server.common.msg.tools.TbRateLimitsException;
+ import org.thingsboard.server.common.transport.SessionMsgListener;
+ import org.thingsboard.server.common.transport.TransportContext;
+ import org.thingsboard.server.common.transport.TransportService;
+@@ -559,7 +561,12 @@ public void onSuccess(Void msg) {
+ 
+         @Override
+         public void onError(Throwable e) {
+-            responseWriter.setResult(new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR));
++            if (e instanceof MaxMessageSizeExceededException || e instanceof TbRateLimitsException) {
++                log.debug("Failed to process request in HttpOkCallback: {}", e.getMessage());
++            } else {
++                log.debug("Failed to process request in HttpOkCallback", e);
++            }
++            responseWriter.setResult(new ResponseEntity<>(e.getMessage(), HttpStatus.INTERNAL_SERVER_ERROR));
+         }
+     }
+ 
+diff --git a/common/transport/transport-api/src/main/java/org/thingsboard/server/common/transport/service/DefaultTransportService.java b/common/transport/transport-api/src/main/java/org/thingsboard/server/common/transport/service/DefaultTransportService.java
+index 8e48061db67..2146868c0d6 100644
+--- a/common/transport/transport-api/src/main/java/org/thingsboard/server/common/transport/service/DefaultTransportService.java
++++ b/common/transport/transport-api/src/main/java/org/thingsboard/server/common/transport/service/DefaultTransportService.java
+@@ -62,6 +62,7 @@
+ import org.thingsboard.server.common.msg.notification.NotificationRuleProcessor;
+ import org.thingsboard.server.common.msg.queue.ServiceType;
+ import org.thingsboard.server.common.msg.queue.TopicPartitionInfo;
++import org.thingsboard.server.common.msg.tools.MaxMessageSizeExceededException;
+ import org.thingsboard.server.common.msg.tools.TbRateLimitsException;
+ import org.thingsboard.server.common.stats.MessagesStats;
+ import org.thingsboard.server.common.stats.StatsFactory;
+@@ -156,6 +157,8 @@ public class DefaultTransportService extends TransportActivityManager implements
+     private int notificationsPollDuration;
+     @Value("${transport.stats.enabled:false}")
+     private boolean statsEnabled;
++    @Value("${transport.max_message_size:500000}")
++    private int maxMessageSize;
+ 
+     @Autowired
+     @Lazy
+@@ -623,7 +626,7 @@ public void process(TransportProtos.SessionInfoProto sessionInfo, TransportProto
+ 
+     @Override
+     public void process(TransportProtos.SessionInfoProto sessionInfo, TransportProtos.ToDeviceRpcResponseMsg msg, TransportServiceCallback<Void> callback) {
+-        if (checkLimits(sessionInfo, msg, callback)) {
++        if (checkLimits(sessionInfo, msg, callback) && checkMsgSize(sessionInfo, callback, msg.getPayload(), msg.getError()) ) {
+             recordActivityInternal(sessionInfo);
+             sendToDeviceActor(sessionInfo, TransportToDeviceActorMsg.newBuilder().setSessionInfo(sessionInfo).setToDeviceRPCCallResponse(msg).build(),
+                     new ApiStatsProxyCallback<>(getTenantId(sessionInfo), getCustomerId(sessionInfo), 1, callback));
+@@ -685,7 +688,7 @@ private void processTimeout(String requestId) {
+ 
+     @Override
+     public void process(TransportProtos.SessionInfoProto sessionInfo, TransportProtos.ToServerRpcRequestMsg msg, TransportServiceCallback<Void> callback) {
+-        if (checkLimits(sessionInfo, msg, callback)) {
++        if (checkLimits(sessionInfo, msg, callback) && checkMsgSize(sessionInfo, callback, msg.getMethodName(), msg.getParams())) {
+             recordActivityInternal(sessionInfo);
+             UUID sessionId = toSessionId(sessionInfo);
+             TenantId tenantId = getTenantId(sessionInfo);
+@@ -824,6 +827,21 @@ public void log(TransportProtos.SessionInfoProto sessionInfo, String msg) {
+         process(sessionInfo, postTelemetryMsg, TransportServiceCallback.EMPTY);
+     }
+ 
++    private boolean checkMsgSize(TransportProtos.SessionInfoProto sessionInfo, TransportServiceCallback<?> callback, CharSequence... payload) {
++        int size = 0;
++        for (CharSequence item : payload) {
++            size += item.length();
++            if (size > maxMessageSize) {
++                if (callback != null) {
++                    DeviceId deviceId = new DeviceId(new UUID(sessionInfo.getDeviceIdMSB(), sessionInfo.getDeviceIdLSB()));
++                    callback.onError(new MaxMessageSizeExceededException(deviceId));
++                }
++                return false;
++            }
++        }
++        return true;
++    }
++
+     private boolean checkLimits(TransportProtos.SessionInfoProto sessionInfo, Object msg, TransportServiceCallback<?> callback) {
+         return checkLimits(sessionInfo, msg, callback, 0);
+     }

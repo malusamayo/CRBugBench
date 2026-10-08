@@ -1,0 +1,487 @@
+diff --git a/.pre-commit-config.yaml b/.pre-commit-config.yaml
+index 409506f2dc82..c14eb07fa1e9 100644
+--- a/.pre-commit-config.yaml
++++ b/.pre-commit-config.yaml
+@@ -43,7 +43,7 @@ repos:
+             "--skip=./tests,.git,*.css,*.csv,*.html,*.ini,*.ipynb,*.js,*.json,*.lock,*.scss,*.txt,*.yaml,build/pyinstaller/*",
+           ]
+   - repo: https://github.com/pre-commit/mirrors-mypy
+-    rev: "v0.942"
++    rev: "v0.950"
+     hooks:
+       - id: mypy
+         args: ["--ignore-missing-imports", '--exclude=/setup\.py$']
+diff --git a/openbb_terminal/parent_classes.py b/openbb_terminal/parent_classes.py
+index bd65d7ed6a54..81dc78e15ad5 100644
+--- a/openbb_terminal/parent_classes.py
++++ b/openbb_terminal/parent_classes.py
+@@ -438,7 +438,9 @@ def call_load(self, other_args: List[str]):
+             "--source",
+             action="store",
+             dest="source",
+-            choices=["yf", "av", "iex"] if "-i" not in other_args else ["yf"],
++            choices=["yf", "av", "iex", "polygon"]
++            if "-i" not in other_args
++            else ["yf", "polygon"],
+             default="yf",
+             help="Source of historical data.",
+         )
+diff --git a/openbb_terminal/stocks/stocks_controller.py b/openbb_terminal/stocks/stocks_controller.py
+index 37fb195ced17..439e5982e723 100644
+--- a/openbb_terminal/stocks/stocks_controller.py
++++ b/openbb_terminal/stocks/stocks_controller.py
+@@ -43,6 +43,7 @@ class StocksController(StockBaseController):
+         "candle",
+         "news",
+         "resources",
++        "codes",
+     ]
+     CHOICES_MENUS = [
+         "ta",
+@@ -111,7 +112,9 @@ def print_help(self):
+ {self.add_info}[cmds]
+     quote       view the current price for a specific stock ticker
+     candle      view a candle chart for a specific stock ticker
+-    news        latest news of the company[/cmds] [src][News API][/src]
++    news        latest news of the company [src][News API][/src]
++    codes       FIGI, SIK and SIC codes codes[/cmds] [src][Polygon.io][/src]
++
+ [menu]
+ >   options     options menu,  \t\t\t e.g.: chains, open interest, greeks, parity
+ >   disc        discover trending stocks, \t e.g.: map, sectors, high short interest
+@@ -224,6 +227,22 @@ def call_quote(self, other_args: List[str]):
+             other_args, self.ticker + "." + self.suffix if self.suffix else self.ticker
+         )
+ 
++    @log_start_end(log=logger)
++    def call_codes(self, _):
++        """Process codes command"""
++        parser = argparse.ArgumentParser(
++            add_help=False,
++            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
++            prog="codes",
++            description="Show CIK, FIGI and SCI code from polygon for loaded ticker.",
++        )
++        ns_parser = parse_known_args_and_warn(parser, _)
++        if ns_parser:
++            if not self.ticker:
++                console.print("No ticker loaded. First use `load {ticker}`\n")
++                return
++            stocks_helper.show_codes_polygon(self.ticker)
++
+     @log_start_end(log=logger)
+     def call_candle(self, other_args: List[str]):
+         """Process candle command"""
+diff --git a/openbb_terminal/stocks/stocks_helper.py b/openbb_terminal/stocks/stocks_helper.py
+index 2c57c64fdeda..a5d317f8f516 100644
+--- a/openbb_terminal/stocks/stocks_helper.py
++++ b/openbb_terminal/stocks/stocks_helper.py
+@@ -17,13 +17,15 @@
+ import plotly.graph_objects as go
+ import pyEX
+ import pytz
++import requests
++
+ import yfinance as yf
+ from alpha_vantage.timeseries import TimeSeries
+ from numpy.core.fromnumeric import transpose
+ from plotly.subplots import make_subplots
+ from scipy import stats
+ 
+-from openbb_terminal.config_terminal import theme
++from openbb_terminal.config_terminal import theme, API_POLYGON_KEY
+ from openbb_terminal import config_terminal as cfg
+ from openbb_terminal.helper_funcs import (
+     export_data,
+@@ -238,6 +240,7 @@ def search(
+     export_data(export, os.path.dirname(os.path.abspath(__file__)), "search", df)
+ 
+ 
++# pylint:disable=too-many-return-statements
+ def load(
+     ticker: str,
+     start: datetime = (datetime.now() - timedelta(days=1100)),
+@@ -405,42 +408,134 @@ def load(
+ 
+             df_stock_candidate.sort_index(ascending=True, inplace=True)
+ 
++        # Polygon source
++        elif source == "polygon":
++
++            request_url = (
++                f"https://api.polygon.io/v2/aggs/ticker/"
++                f"{ticker.upper()}/range/1/day/{start.strftime('%Y-%m-%d')}/{end.strftime('%Y-%m-%d')}?adjusted=true"
++                f"&sort=desc&limit=49999&apiKey={API_POLYGON_KEY}"
++            )
++            r = requests.get(request_url)
++            if r.status_code != 200:
++                console.print("[red]Error in polygon request[/red]")
++                return pd.DataFrame()
++
++            r_json = r.json()
++            if "results" not in r_json.keys():
++                console.print("[red]No results found in polygon reply.[/red]")
++                return pd.DataFrame()
++
++            df_stock_candidate = pd.DataFrame(r_json["results"])
++
++            df_stock_candidate = df_stock_candidate.rename(
++                columns={
++                    "o": "Open",
++                    "c": "Adj Close",
++                    "h": "High",
++                    "l": "Low",
++                    "t": "date",
++                    "v": "Volume",
++                    "n": "Transactions",
++                }
++            )
++            df_stock_candidate["date"] = pd.to_datetime(
++                df_stock_candidate.date, unit="ms"
++            )
++            # TODO: Clean up Close vs Adj Close throughout
++            df_stock_candidate["Close"] = df_stock_candidate["Adj Close"]
++            df_stock_candidate = df_stock_candidate.sort_values(by="date")
++            df_stock_candidate = df_stock_candidate.set_index("date")
++
+         s_start = df_stock_candidate.index[0]
+         s_interval = f"{interval}min"
+         int_string = "Daily" if interval == 1440 else "Intraday"
+ 
+     else:
+ 
+-        s_int = str(interval) + "m"
+-        s_interval = s_int + "in"
+-        d_granularity = {"1m": 6, "5m": 59, "15m": 59, "30m": 59, "60m": 729}
++        if source == "yf":
++            s_int = str(interval) + "m"
++            s_interval = s_int + "in"
++            d_granularity = {"1m": 6, "5m": 59, "15m": 59, "30m": 59, "60m": 729}
+ 
+-        s_start_dt = datetime.utcnow() - timedelta(days=d_granularity[s_int])
+-        s_date_start = s_start_dt.strftime("%Y-%m-%d")
++            s_start_dt = datetime.utcnow() - timedelta(days=d_granularity[s_int])
++            s_date_start = s_start_dt.strftime("%Y-%m-%d")
+ 
+-        df_stock_candidate = yf.download(
+-            ticker,
+-            start=s_date_start if s_start_dt > start else start.strftime("%Y-%m-%d"),
+-            progress=False,
+-            interval=s_int,
+-            prepost=prepost,
+-        )
++            df_stock_candidate = yf.download(
++                ticker,
++                start=s_date_start
++                if s_start_dt > start
++                else start.strftime("%Y-%m-%d"),
++                progress=False,
++                interval=s_int,
++                prepost=prepost,
++            )
++
++            # Check that loading a stock was not successful
++            if df_stock_candidate.empty:
++                console.print()
++                return pd.DataFrame()
+ 
+-        # Check that loading a stock was not successful
+-        if df_stock_candidate.empty:
+-            console.print("")
+-            return pd.DataFrame()
++            df_stock_candidate.index = df_stock_candidate.index.tz_localize(None)
+ 
+-        df_stock_candidate.index = df_stock_candidate.index.tz_localize(None)
++            if s_start_dt > start:
++                s_start = pytz.utc.localize(s_start_dt)
++            else:
++                s_start = start
+ 
+-        if s_start_dt > start:
+-            s_start = pytz.utc.localize(s_start_dt)
+-        else:
+-            s_start = start
++            df_stock_candidate.index.name = "date"
++
++        elif source == "polygon":
++            request_url = (
++                f"https://api.polygon.io/v2/aggs/ticker/"
++                f"{ticker.upper()}/range/{interval}/minute/{start.strftime('%Y-%m-%d')}/{end.strftime('%Y-%m-%d')}"
++                f"?adjusted=true&sort=desc&limit=49999&apiKey={API_POLYGON_KEY}"
++            )
++            r = requests.get(request_url)
++            if r.status_code != 200:
++                console.print("[red]Error in polygon request[/red]")
++                return pd.DataFrame()
+ 
+-        df_stock_candidate.index.name = "date"
++            r_json = r.json()
++            if "results" not in r_json.keys():
++                console.print("[red]No results found in polygon reply.[/red]")
++                return pd.DataFrame()
++
++            df_stock_candidate = pd.DataFrame(r_json["results"])
++
++            df_stock_candidate = df_stock_candidate.rename(
++                columns={
++                    "o": "Open",
++                    "c": "Close",
++                    "h": "High",
++                    "l": "Low",
++                    "t": "date",
++                    "v": "Volume",
++                    "n": "Transactions",
++                }
++            )
++            df_stock_candidate["date"] = pd.to_datetime(
++                df_stock_candidate.date, unit="ms"
++            )
++            df_stock_candidate["Adj Close"] = df_stock_candidate.Close
++            df_stock_candidate = df_stock_candidate.sort_values(by="date")
++
++            df_stock_candidate = df_stock_candidate.set_index("date")
++            # Check that loading a stock was not successful
++            if df_stock_candidate.empty:
++                console.print()
++                return pd.DataFrame()
++
++            df_stock_candidate.index = df_stock_candidate.index.tz_localize(None)
++            s_start_dt = df_stock_candidate.index[0]
+ 
++            if s_start_dt > start:
++                s_start = pytz.utc.localize(s_start_dt)
++            else:
++                s_start = start
++            s_interval = f"{interval}min"
+         int_string = "Intraday"
++
+     s_intraday = (f"Intraday {s_interval}", int_string)[interval == 1440]
+ 
+     console.print(
+@@ -1176,3 +1271,33 @@ def show_quick_performance(stock_df: pd.DataFrame, ticker: str):
+         df, show_index=False, headers=df.columns, title=f"{ticker.upper()} Performance"
+     )
+     console.print()
++
++
++def show_codes_polygon(ticker: str):
++    """Show FIGI, SIC and SIK codes for ticker
++
++    Parameters
++    ----------
++    ticker: str
++        Stock ticker
++    """
++    link = f"https://api.polygon.io/v3/reference/tickers/{ticker.upper()}?apiKey={API_POLYGON_KEY}"
++    r = requests.get(link)
++    if r.status_code != 200:
++        console.print("[red]Error in polygon request[/red]\n")
++        return
++    r_json = r.json()
++    if "results" not in r_json.keys():
++        console.print("[red]Results not found in polygon request[/red]")
++        return
++    r_json = r_json["results"]
++    cols = ["cik", "composite_figi", "share_class_figi", "sic_code"]
++    vals = []
++    for col in cols:
++        vals.append(r_json[col])
++    df = pd.DataFrame({"codes": [c.upper() for c in cols], "vals": vals})
++    df.codes = df.codes.apply(lambda x: x.replace("_", " "))
++    print_rich_table(
++        df, show_index=False, headers=["", ""], title=f"{ticker.upper()} Codes"
++    )
++    console.print()
+diff --git a/tests/openbb_terminal/stocks/cassettes/test_stocks_helper/test_load[1440-polygon].yaml b/tests/openbb_terminal/stocks/cassettes/test_stocks_helper/test_load[1440-polygon].yaml
+new file mode 100644
+index 000000000000..06ced74ca416
+--- /dev/null
++++ b/tests/openbb_terminal/stocks/cassettes/test_stocks_helper/test_load[1440-polygon].yaml
+@@ -0,0 +1,45 @@
++interactions:
++- request:
++    body: null
++    headers:
++      Accept:
++      - '*/*'
++      Accept-Encoding:
++      - gzip, deflate
++      Connection:
++      - keep-alive
++      User-Agent:
++      - python-requests/2.27.1
++    method: GET
++    uri: https://api.polygon.io/v2/aggs/ticker/GME/range/1/day/2021-12-01/2021-12-02?adjusted=true&apiKey=MOCK_API_KEY2&limit=49999&sort=desc
++  response:
++    body:
++      string: !!binary |
++        H4sIAAAAAAAA/0zQ30orQQwG8Hf5bk8Ykvk/c3sQL0R8ABFZdweslpbuzFSk9N1l7dKaq+Qj8CM5
++        oW3GzzIj4/7xDoRDL/P3/33fNWRNmEvt21ZvwTB99NrKhNzmXq4LyM8nHJG14hik/GNPOH4hSxTF
++        WjRhvwyOMF5C5wnvSxuUNYQtsgSjOBAasngTrRbNSxF2yN4lzWdaDeOcM+6v4lTyLl6UlJS9OCGp
++        aH8dzayE3QoFxXKFjLHxBkUOEs4vhNqG1isynh6wnHnopbbXzYQMGdlMybzJmJK2w6SFzWST8a54
++        P0QBYVwfdv4JAAD///xwuyVhAQAA
++    headers:
++      Connection:
++      - keep-alive
++      Content-Encoding:
++      - gzip
++      Content-Length:
++      - '249'
++      Content-Type:
++      - application/json
++      Date:
++      - Tue, 03 May 2022 01:55:58 GMT
++      Server:
++      - nginx/1.19.2
++      Strict-Transport-Security:
++      - max-age=15724800; includeSubDomains
++      Vary:
++      - Accept-Encoding
++      X-Request-Id:
++      - 1c03d93b1c9924ad2103d49365e66a81
++    status:
++      code: 200
++      message: OK
++version: 1
+diff --git a/tests/openbb_terminal/stocks/cassettes/test_stocks_helper/test_load[60-polygon].yaml b/tests/openbb_terminal/stocks/cassettes/test_stocks_helper/test_load[60-polygon].yaml
+new file mode 100644
+index 000000000000..c7b2cd7382ad
+--- /dev/null
++++ b/tests/openbb_terminal/stocks/cassettes/test_stocks_helper/test_load[60-polygon].yaml
+@@ -0,0 +1,57 @@
++interactions:
++- request:
++    body: null
++    headers:
++      Accept:
++      - '*/*'
++      Accept-Encoding:
++      - gzip, deflate
++      Connection:
++      - keep-alive
++      User-Agent:
++      - python-requests/2.27.1
++    method: GET
++    uri: https://api.polygon.io/v2/aggs/ticker/GME/range/60/minute/2021-12-01/2021-12-02?adjusted=true&apiKey=MOCK_API_KEY2&limit=49999&sort=desc
++  response:
++    body:
++      string: !!binary |
++        H4sIAAAAAAAA/2RWX2/bRw78LvssEMs/Sy71ejjcw+FwH6AoCkVWkbRGgthSiiLIdy8kL7ms66f1
++        2pghZ8jZ3/d2/XT+/fLSju0///t3O7Svt8vLn//6cvt8bcepfmgvl9fb8/V1XZEf2unpt9vr9fLU
++        jteX2yX/ox1/+t6+tSP3fmjf/mhHnAjj0L7k6Zynj3l6ztO1HVF5ytT++Dm0z+2IPw4PUHMNUIKu
++        wguXoAcwgQTy23FBc8Um2dg0Fjj2OXfJRp121RroAb1L1o1rc25c0YVLzEN0I9NAzbpxC2K4wBl4
++        uC+GDiSFYdBmsC4UtaMNkeDoYK5zcXTgmRy6VZ9vBOYgWAhQSwsdLZpAwsGbgDUJGIwXQc8OJsrC
++        N/DSgM5iq5J7wVcMfAaZ6Cm/L3gGCwMEPCVCGFLcVSnuKveZPgweUnxw4u2wbCNUsw3UYDGHIpP2
++        4rTZlMWhzMPH4rAJ3UwWh1SvO2YfFEIxdNsMw4rT6GaxAzyJMXdLYIjt9ZKwWjaFwX1Pooci1ODi
++        NeLMiZ2IZRMULayQ8BnGbmDkpBaBRi8+UxavpFxiYaj9A/m+hB/X1fMaqkAVLdayxHDiBhXoJO/L
++        lXeIZR7Zi8yRBPNeVuCZpr6ac+ixR7og364SdRRlh2bAWIkvNpeMAcv02uFlC5qANnLnUi/F2Pne
++        fQb2PnI1KUveQ+1Z8wZm91Iyec4zlcAdnJOWk+zvtMUCWSM8IRFJigw4dMlg/s4ujaktkDW5ZW7D
++        ZJLtdKKeT8N9h99wzWvE0lDPhOql6llDnFg5pozZUWgPBuGMCBzgmVFRPGxJYOooBDXDERGjCxae
++        e/EUeN7repu8R0yc1zE2xB/P3ruR5lkjHHlQZjgxbT8dxHGtnyMIjySQ5YATDBxB8XYfLFaD3GnO
++        tNdZIgGdwKat184ZbM25I9ypHxwCSyfv9aVgqzE+BlG+FKIj8s8HdLToYkCsqDOMpZIb+NDVhNND
++        veT4W4zzzOd0dqYYUjfoQmvyfcKKWB+RAtQ7YDjh8kiwYNAa46ocGyvc47Vzh868PjbuvxgFxVou
++        99RoQtkGrQFOFDljU3bpZhTyGOiKAw9t1keAG2BZAa3hna/CyOH3CTx9KyKB+nhePubl874M6FET
++        nDihtUA7a0IPTmxNaE3o+58DWmqUM/34+dBer6fr7bUd2///2+5fqF9vl9frL5+e2rE9nbqrXM4n
++        edIPH/rJ6IOdzuYn+/U8zvPcDu0cH7s//goAAP//YRjZryALAAA=
++    headers:
++      Connection:
++      - keep-alive
++      Content-Encoding:
++      - gzip
++      Content-Length:
++      - '950'
++      Content-Type:
++      - application/json
++      Date:
++      - Tue, 03 May 2022 01:56:32 GMT
++      Server:
++      - nginx/1.19.2
++      Strict-Transport-Security:
++      - max-age=15724800; includeSubDomains
++      Vary:
++      - Accept-Encoding
++      X-Request-Id:
++      - da0964eca4d6bb0a72b7ac79a7fc5c8c
++    status:
++      code: 200
++      message: OK
++version: 1
+diff --git a/tests/openbb_terminal/stocks/csv/test_stocks_helper/test_load[1440-polygon].csv b/tests/openbb_terminal/stocks/csv/test_stocks_helper/test_load[1440-polygon].csv
+new file mode 100644
+index 000000000000..94eb1d111173
+--- /dev/null
++++ b/tests/openbb_terminal/stocks/csv/test_stocks_helper/test_load[1440-polygon].csv
+@@ -0,0 +1,3 @@
++date,Volume,vw,Open,Adj Close,High,Low,Transactions,Close
++2021-12-01 05:00:00,2355535.0,185.9658,199.4,179.84,200.105,177.01,80717,179.84
++2021-12-02 05:00:00,2087100.0,181.0212,185.0,181.56,187.43,173.07,65920,181.56
+diff --git a/tests/openbb_terminal/stocks/csv/test_stocks_helper/test_load[60-polygon].csv b/tests/openbb_terminal/stocks/csv/test_stocks_helper/test_load[60-polygon].csv
+new file mode 100644
+index 000000000000..203538b659de
+--- /dev/null
++++ b/tests/openbb_terminal/stocks/csv/test_stocks_helper/test_load[60-polygon].csv
+@@ -0,0 +1,30 @@
++date,Volume,vw,Open,Close,High,Low,Transactions,Adj Close
++2021-12-01 09:00:00,546,198.3936,198.53,198.6,198.6,198.53,32,198.6
++2021-12-01 11:00:00,542,198.3895,198.4,198.15,198.4,198.15,23,198.15
++2021-12-01 12:00:00,784,197.7727,197.62,198.0,198.0,197.11,46,198.0
++2021-12-01 13:00:00,4301,199.0332,199.0728,199.0,199.4,198.9,226,199.0
++2021-12-01 14:00:00,180326,197.0425,198.8,195.95,200.105,194.88,6634,195.95
++2021-12-01 15:00:00,214650,195.0177,195.86,193.58,197.9565,192.28,7382,193.58
++2021-12-01 16:00:00,119345,192.7876,193.77,191.17,194.4,190.94,5522,191.17
++2021-12-01 17:00:00,223232,189.4917,191.435,186.44,192.5155,186.44,9288,186.44
++2021-12-01 18:00:00,343818,186.3801,186.24,186.28,189.05,184.0,13527,186.28
++2021-12-01 19:00:00,339142,184.2188,185.99,183.0,186.84,181.865,11115,183.0
++2021-12-01 20:00:00,864827,180.2043,183.16,179.71,183.2569,177.01,23637,179.71
++2021-12-01 21:00:00,11246,182.1564,179.0,184.0,186.0,179.0,485,184.0
++2021-12-01 22:00:00,632,182.0535,181.0,181.9,184.0,181.0,29,181.9
++2021-12-01 23:00:00,944,183.3905,183.2,183.6,183.9,183.2,29,183.6
++2021-12-02 00:00:00,1076,182.3794,182.7,182.5,182.7,182.2,24,182.5
++2021-12-02 09:00:00,867,184.7675,186.0,183.95,186.0,183.95,56,183.95
++2021-12-02 10:00:00,163,184.0249,184.0,184.0,184.0,184.0,5,184.0
++2021-12-02 12:00:00,6263,181.5567,184.0,180.88,184.0,180.0,347,180.88
++2021-12-02 13:00:00,8118,181.6179,184.0,180.51,184.5,180.1,271,180.51
++2021-12-02 14:00:00,382310,184.5475,181.48,184.01,187.43,179.15,11846,184.01
++2021-12-02 15:00:00,633595,178.0774,184.15,181.01,184.24,173.07,19771,181.01
++2021-12-02 16:00:00,235354,181.2923,181.545,181.66,183.1699,179.1,7784,181.66
++2021-12-02 17:00:00,212161,183.4819,181.9,183.72,184.999,181.545,6308,183.72
++2021-12-02 18:00:00,212153,180.3668,183.73,180.0,183.814,177.94,6299,180.0
++2021-12-02 19:00:00,117544,180.7968,180.38,181.65,181.8,179.41,4017,181.65
++2021-12-02 20:00:00,233546,181.2516,182.15,181.71,183.3599,180.24,7042,181.71
++2021-12-02 21:00:00,1088,181.7202,181.56,182.0,182.0,181.56,46,182.0
++2021-12-02 22:00:00,796,182.0643,182.05,182.45,182.45,181.35,25,182.45
++2021-12-02 23:00:00,300,181.5,181.5,181.5,181.5,181.5,1,181.5
+diff --git a/tests/openbb_terminal/stocks/test_stocks_helper.py b/tests/openbb_terminal/stocks/test_stocks_helper.py
+index 4045c60476bb..1ee9264904ea 100644
+--- a/tests/openbb_terminal/stocks/test_stocks_helper.py
++++ b/tests/openbb_terminal/stocks/test_stocks_helper.py
+@@ -20,6 +20,7 @@ def vcr_config():
+             ("date", "MOCK_DATE"),
+             ("token", "MOCK_TOKEN"),
+             ("apikey", "MOCK_API_KEY"),
++            ("apiKey", "MOCK_API_KEY2"),
+         ]
+     }
+ 
+@@ -59,6 +60,8 @@ def test_search(mocker, use_tab):
+         (1440, "iex"),
+         (1440, "yf"),
+         (60, "yf"),
++        (1440, "polygon"),
++        (60, "polygon"),
+     ],
+ )
+ def test_load(interval, recorder, source):
+diff --git a/website/data/menu/main.yml b/website/data/menu/main.yml
+index ee36bc5d1fb6..4d63b39cd26a 100755
+--- a/website/data/menu/main.yml
++++ b/website/data/menu/main.yml
+@@ -16,6 +16,8 @@ main:
+             ref: "/terminal/stocks/quote"
+           - name: news
+             ref: "/terminal/stocks/news"
++          - name: codes
++            ref: "terminal/stocks/codes"
+           - name: discovery
+             ref: "/terminal/stocks/discovery"
+             sub:

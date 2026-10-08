@@ -1,0 +1,311 @@
+diff --git a/src/Microsoft.ML.TorchSharp/NasBert/TextClassificationTrainer.cs b/src/Microsoft.ML.TorchSharp/NasBert/TextClassificationTrainer.cs
+index 8cd63f7c64..ac0d53297f 100644
+--- a/src/Microsoft.ML.TorchSharp/NasBert/TextClassificationTrainer.cs
++++ b/src/Microsoft.ML.TorchSharp/NasBert/TextClassificationTrainer.cs
+@@ -27,6 +27,7 @@
+ using System.IO;
+ using System.CodeDom;
+ using System.Runtime.CompilerServices;
++using Microsoft.ML.Data.IO;
+ 
+ [assembly: LoadableClass(typeof(TextClassificationTransformer), null, typeof(SignatureLoadModel),
+     TextClassificationTransformer.UserName, TextClassificationTransformer.LoaderSignature)]
+@@ -70,7 +71,6 @@ public sealed class TextClassificationTrainer : IEstimator<TextClassificationTra
+     {
+         private readonly IHost _host;
+         private readonly Options _options;
+-        private TextClassificationTransformer _transformer;
+         private const string ModelUrl = "models/NasBert2000000.tsm";
+ 
+         internal sealed class Options : TransformInputBase
+@@ -290,6 +290,7 @@ internal TextClassificationTrainer(IHostEnvironment env, Options options)
+ 
+         public TextClassificationTransformer Fit(IDataView input)
+         {
++            TextClassificationTransformer transformer = default;
+             using (var ch = _host.Start("TrainModel"))
+             using (var pch = _host.StartProgressChannel("Training model"))
+             {
+@@ -304,11 +305,13 @@ public TextClassificationTransformer Fit(IDataView input)
+                     if (_options.ValidationSet != null)
+                         trainer.Validate(pch, ch, i);
+                 }
+-                _transformer = new TextClassificationTransformer(_host, _options, trainer.Model, trainer.Tokenizer.Vocabulary);
++                var labelCol = input.Schema.GetColumnOrNull(_options.LabelColumnName);
+ 
+-                _transformer.GetOutputSchema(input.Schema);
++                transformer = new TextClassificationTransformer(_host, _options, trainer.Model, new DataViewSchema.DetachedColumn(labelCol.Value));
++
++                transformer.GetOutputSchema(input.Schema);
+             }
+-            return _transformer;
++            return transformer;
+         }
+ 
+         private class Trainer
+@@ -668,7 +671,6 @@ public sealed class TextClassificationTransformer : RowToRowTransformerBase
+ 
+         private readonly Device _device;
+         private readonly TextClassificationModel _model;
+-        private readonly Vocabulary _vocabulary;
+         private readonly TextClassificationTrainer.Options _options;
+ 
+         private readonly string _predictedLabelColumnName;
+@@ -676,23 +678,25 @@ public sealed class TextClassificationTransformer : RowToRowTransformerBase
+ 
+         public readonly SchemaShape.Column SentenceColumn;
+         public readonly SchemaShape.Column SentenceColumn2;
+-        public readonly SchemaShape.Column LabelColumn;
++        public readonly DataViewSchema.DetachedColumn LabelColumn;
+ 
+         internal const string LoaderSignature = "NASBERT";
+ 
+-        internal TextClassificationTransformer(IHostEnvironment env, TextClassificationTrainer.Options options, TextClassificationModel model, Vocabulary vocabulary)
++        private static readonly FuncStaticMethodInfo1<object, Delegate> _decodeInitMethodInfo
++                = new FuncStaticMethodInfo1<object, Delegate>(DecodeInit<int>);
++
++        internal TextClassificationTransformer(IHostEnvironment env, TextClassificationTrainer.Options options, TextClassificationModel model, DataViewSchema.DetachedColumn labelColumn)
+            : base(Contracts.CheckRef(env, nameof(env)).Register(nameof(TextClassificationTransformer)))
+         {
+             _device = TorchUtils.InitializeDevice(env);
+ 
+             _options = options;
+-            LabelColumn = new SchemaShape.Column(_options.LabelColumnName, SchemaShape.Column.VectorKind.Scalar, NumberDataViewType.UInt32, true);
++            LabelColumn = labelColumn;
+             SentenceColumn = new SchemaShape.Column(_options.Sentence1ColumnName, SchemaShape.Column.VectorKind.Scalar, TextDataViewType.Instance, false);
+             SentenceColumn2 = _options.Sentence2ColumnName == default ? default : new SchemaShape.Column(_options.Sentence2ColumnName, SchemaShape.Column.VectorKind.Scalar, TextDataViewType.Instance, false);
+             _predictedLabelColumnName = _options.PredictionColumnName;
+             _scoreColumnName = _options.ScoreColumnName;
+ 
+-            _vocabulary = vocabulary;
+             _model = model;
+ 
+             if (_device == CUDA)
+@@ -736,7 +740,28 @@ private static TextClassificationTransformer Create(IHostEnvironment env, ModelL
+             if (!ctx.TryLoadBinaryStream("TSModel", r => model.load(r)))
+                 throw env.ExceptDecode();
+ 
+-            return new TextClassificationTransformer(env, options, model, vocabulary);
++            BinarySaver saver = new BinarySaver(env, new BinarySaver.Arguments());
++            DataViewType type;
++            object value;
++            env.CheckDecode(saver.TryLoadTypeAndValue(ctx.Reader.BaseStream, out type, out value));
++            var vecType = type as VectorDataViewType;
++            env.CheckDecode(vecType != null);
++            env.CheckDecode(value != null);
++            var labelGetter = Microsoft.ML.Internal.Utilities.Utils.MarshalInvoke(_decodeInitMethodInfo, vecType.ItemType.RawType, value);
++
++            var meta = new DataViewSchema.Annotations.Builder();
++            meta.Add(AnnotationUtils.Kinds.KeyValues, type, labelGetter);
++
++            var labelCol = new DataViewSchema.DetachedColumn(options.LabelColumnName, type, meta.ToAnnotations());
++
++            return new TextClassificationTransformer(env, options, model, labelCol);
++        }
++
++        private static Delegate DecodeInit<T>(object value)
++        {
++            VBuffer<T> buffValue = (VBuffer<T>)value;
++            ValueGetter<VBuffer<T>> buffGetter = (ref VBuffer<T> dst) => buffValue.CopyTo(ref dst);
++            return buffGetter;
+         }
+ 
+         public SchemaShape GetOutputSchema(SchemaShape inputSchema)
+@@ -744,8 +769,8 @@ public SchemaShape GetOutputSchema(SchemaShape inputSchema)
+             Host.CheckValue(inputSchema, nameof(inputSchema));
+ 
+             CheckInputSchema(inputSchema);
+-            inputSchema.TryFindColumn(LabelColumn.Name, out var labelCol);
+-            var predLabelMetadata = new SchemaShape(labelCol.Annotations.Where(x => x.Name == AnnotationUtils.Kinds.KeyValues)
++            var labelAnnotationsColumn = new SchemaShape.Column(AnnotationUtils.Kinds.SlotNames, SchemaShape.Column.VectorKind.Vector, LabelColumn.Annotations.Schema[AnnotationUtils.Kinds.SlotNames].Type, false);
++            var predLabelMetadata = new SchemaShape(new SchemaShape.Column[] { labelAnnotationsColumn }
+                 .Concat(AnnotationUtils.GetTrainerOutputAnnotation()));
+ 
+             var outColumns = inputSchema.ToDictionary(x => x.Name);
+@@ -753,7 +778,7 @@ public SchemaShape GetOutputSchema(SchemaShape inputSchema)
+                     NumberDataViewType.UInt32, true, predLabelMetadata);
+ 
+             outColumns[_scoreColumnName] = new SchemaShape.Column(_scoreColumnName, SchemaShape.Column.VectorKind.Vector,
+-                   NumberDataViewType.Single, false, new SchemaShape(AnnotationUtils.AnnotationsForMulticlassScoreColumn(labelCol)));
++                   NumberDataViewType.Single, false, new SchemaShape(AnnotationUtils.AnnotationsForMulticlassScoreColumn(labelAnnotationsColumn)));
+ 
+             return new SchemaShape(outColumns.Values);
+         }
+@@ -775,12 +800,6 @@ private void CheckInputSchema(SchemaShape inputSchema)
+                     throw Host.ExceptSchemaMismatch(nameof(inputSchema), "sentence2", SentenceColumn2.Name,
+                         SentenceColumn2.GetTypeString(), sentenceCol2.GetTypeString());
+             }
+-
+-            if (!inputSchema.TryFindColumn(LabelColumn.Name, out var labelCol))
+-                throw Host.ExceptSchemaMismatch(nameof(inputSchema), "label", LabelColumn.Name);
+-            if (!LabelColumn.IsCompatibleWith(labelCol))
+-                throw Host.ExceptSchemaMismatch(nameof(inputSchema), "label", LabelColumn.Name,
+-                    LabelColumn.GetTypeString(), labelCol.GetTypeString());
+         }
+ 
+         private static VersionInfo GetVersionInfo()
+@@ -819,6 +838,22 @@ private protected override void SaveModel(ModelSaveContext ctx)
+             {
+                 _model.save(w);
+             });
++
++            var labelColType = LabelColumn.Annotations.Schema[AnnotationUtils.Kinds.KeyValues].Type as VectorDataViewType;
++            Microsoft.ML.Internal.Utilities.Utils.MarshalActionInvoke(SaveLabelValues<int>, labelColType.ItemType.RawType, ctx);
++        }
++
++        private void SaveLabelValues<T>(ModelSaveContext ctx)
++        {
++            ValueGetter<VBuffer<T>> getter = LabelColumn.Annotations.GetGetter<VBuffer<T>>(LabelColumn.Annotations.Schema[AnnotationUtils.Kinds.KeyValues]);
++            var val = default(VBuffer<T>);
++            getter(ref val);
++
++            BinarySaver saver = new BinarySaver(Host, new BinarySaver.Arguments());
++            int bytesWritten;
++            var labelColType = LabelColumn.Annotations.Schema[AnnotationUtils.Kinds.KeyValues].Type as VectorDataViewType;
++            if (!saver.TryWriteTypeAndValue<VBuffer<T>>(ctx.Writer.BaseStream, labelColType, ref val, out bytesWritten))
++                throw Host.Except("We do not know how to serialize label names of type '{0}'", labelColType.ItemType);
+         }
+ 
+         private protected override IRowMapper MakeRowMapper(DataViewSchema schema) => new Mapper(this, schema);
+@@ -827,25 +862,24 @@ private sealed class Mapper : MapperBase
+         {
+             private readonly TextClassificationTransformer _parent;
+             private readonly HashSet<int> _inputColIndices;
+-            private readonly DataViewSchema.Column _labelCol;
+             private readonly DataViewSchema _inputSchema;
+-            private static readonly FuncInstanceMethodInfo1<Mapper, Delegate> _makeLabelAnnotationGetter
+-                = FuncInstanceMethodInfo1<Mapper, Delegate>.Create(target => target.GetLabelAnnotations<int>);
++
++            private static readonly FuncInstanceMethodInfo1<Mapper, DataViewSchema.DetachedColumn, Delegate> _makeLabelAnnotationGetter
++                = FuncInstanceMethodInfo1<Mapper, DataViewSchema.DetachedColumn, Delegate>.Create(target => target.GetLabelAnnotations<int>);
++
+ 
+             public Mapper(TextClassificationTransformer parent, DataViewSchema inputSchema) :
+                 base(Contracts.CheckRef(parent, nameof(parent)).Host.Register(nameof(Mapper)), inputSchema, parent)
+             {
+                 _parent = parent;
+                 _inputColIndices = new HashSet<int>();
+-                int col = 0;
+-                if (inputSchema.TryGetColumnIndex(parent._options.Sentence1ColumnName, out col))
++                if (inputSchema.TryGetColumnIndex(parent._options.Sentence1ColumnName, out var col))
+                     _inputColIndices.Add(col);
+ 
+                 if (parent._options.Sentence2ColumnName != default)
+                     if (inputSchema.TryGetColumnIndex(parent._options.Sentence2ColumnName, out col))
+                         _inputColIndices.Add(col);
+ 
+-                _labelCol = inputSchema[_parent._options.LabelColumnName];
+                 _inputSchema = inputSchema;
+ 
+                 torch.random.manual_seed(1);
+@@ -855,8 +889,9 @@ public Mapper(TextClassificationTransformer parent, DataViewSchema inputSchema)
+             protected override DataViewSchema.DetachedColumn[] GetOutputColumnsCore()
+             {
+                 var info = new DataViewSchema.DetachedColumn[2];
+-                var keyType = _labelCol.Annotations.Schema.GetColumnOrNull(AnnotationUtils.Kinds.KeyValues)?.Type as VectorDataViewType;
+-                var getter = Microsoft.ML.Internal.Utilities.Utils.MarshalInvoke(_makeLabelAnnotationGetter, this, keyType.ItemType.RawType);
++                var keyType = _parent.LabelColumn.Annotations.Schema.GetColumnOrNull(AnnotationUtils.Kinds.KeyValues)?.Type as VectorDataViewType;
++                var getter = Microsoft.ML.Internal.Utilities.Utils.MarshalInvoke(_makeLabelAnnotationGetter, this, keyType.ItemType.RawType, _parent.LabelColumn);
++
+ 
+                 var meta = new DataViewSchema.Annotations.Builder();
+                 meta.Add(AnnotationUtils.Kinds.ScoreColumnKind, TextDataViewType.Instance, (ref ReadOnlyMemory<char> value) => { value = AnnotationUtils.Const.ScoreColumnKind.MulticlassClassification.AsMemory(); });
+@@ -865,15 +900,18 @@ protected override DataViewSchema.DetachedColumn[] GetOutputColumnsCore()
+                 meta.Add(AnnotationUtils.Kinds.TrainingLabelValues, keyType, getter);
+                 meta.Add(AnnotationUtils.Kinds.SlotNames, keyType, getter);
+ 
+-                info[0] = new DataViewSchema.DetachedColumn(_parent._options.PredictionColumnName, new KeyDataViewType(typeof(uint), _parent._options.NumberOfClasses), _labelCol.Annotations);
++                var labelBuilder = new DataViewSchema.Annotations.Builder();
++                labelBuilder.Add(AnnotationUtils.Kinds.KeyValues, keyType, getter);
++
++                info[0] = new DataViewSchema.DetachedColumn(_parent._options.PredictionColumnName, new KeyDataViewType(typeof(uint), _parent._options.NumberOfClasses), labelBuilder.ToAnnotations());
+ 
+                 info[1] = new DataViewSchema.DetachedColumn(_parent._options.ScoreColumnName, new VectorDataViewType(NumberDataViewType.Single, _parent._options.NumberOfClasses), meta.ToAnnotations());
+                 return info;
+             }
+ 
+-            private Delegate GetLabelAnnotations<T>()
++            private Delegate GetLabelAnnotations<T>(DataViewSchema.DetachedColumn labelCol)
+             {
+-                return _labelCol.Annotations.GetGetter<VBuffer<T>>(_labelCol.Annotations.Schema[AnnotationUtils.Kinds.KeyValues]);
++                return labelCol.Annotations.GetGetter<VBuffer<T>>(labelCol.Annotations.Schema[AnnotationUtils.Kinds.KeyValues]);
+             }
+ 
+             private ValueGetter<uint> GetScoreColumnSetId(DataViewSchema schema)
+diff --git a/test/Microsoft.ML.Tests/TextClassificationTests.cs b/test/Microsoft.ML.Tests/TextClassificationTests.cs
+index 866ebb3baa..0be120701e 100644
+--- a/test/Microsoft.ML.Tests/TextClassificationTests.cs
++++ b/test/Microsoft.ML.Tests/TextClassificationTests.cs
+@@ -29,6 +29,11 @@ private class TestSingleSentenceData
+             public string Sentiment;
+         }
+ 
++        private class TestSingleSentenceDataNoLabel
++        {
++            public string Sentence1;
++        }
++
+         private class TestDoubleSentenceData
+         {
+             public string Sentence;
+@@ -82,7 +87,8 @@ public void TestSingleSentence2Classes()
+                          Sentiment = "Negative"
+                      }
+                 }));
+-            var estimator = ML.Transforms.Conversion.MapValueToKey("Label", "Sentiment")
++            var chain = new EstimatorChain<ITransformer>();
++            var estimator = chain.Append(ML.Transforms.Conversion.MapValueToKey("Label", "Sentiment"), TransformerScope.TrainTest)
+                 .Append(ML.MulticlassClassification.Trainers.TextClassification(outputColumnName: "outputColumn"))
+                 .Append(ML.Transforms.Conversion.MapKeyToValue("outputColumn"));
+ 
+@@ -96,11 +102,49 @@ public void TestSingleSentence2Classes()
+             var transformer = estimator.Fit(dataView);
+             var transformerSchema = transformer.GetOutputSchema(dataView.Schema);
+ 
++            var filteredModel = transformer.GetModelFor(TransformerScope.Scoring);
++
+             Assert.Equal(6, transformerSchema.Count);
+             Assert.Equal("outputColumn", transformerSchema[4].Name);
+             Assert.Equal(TextDataViewType.Instance, transformerSchema[4].Type);
+ 
+-            var predictedLabel = transformer.Transform(dataView).GetColumn<ReadOnlyMemory<char>>(transformerSchema[4].Name);
++            var dataNoLabel = ML.Data.LoadFromEnumerable(
++                new List<TestSingleSentenceDataNoLabel>(new TestSingleSentenceDataNoLabel[] {
++                    new ()
++                    {   // Testing longer than 512 words.
++                        Sentence1 = "ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community . ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community . ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community . ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .ultimately feels as flat as the scruffy sands of its titular community .",
++                    },
++                     new ()
++                     {
++                         Sentence1 = "with a sharp script and strong performances",
++                     },
++                     new ()
++                     {
++                         Sentence1 = "that director m. night shyamalan can weave an eerie spell and",
++                     },
++                     new ()
++                     {
++                         Sentence1 = "comfortable",
++                     },
++                     new ()
++                     {
++                         Sentence1 = "does have its charms .",
++                     },
++                     new ()
++                     {
++                         Sentence1 = "banal as the telling",
++                     },
++                     new ()
++                     {
++                         Sentence1 = "faithful without being forceful , sad without being shrill , `` a walk to remember '' succeeds through sincerity .",
++                     },
++                     new ()
++                     {
++                         Sentence1 = "leguizamo 's best movie work so far",
++                     }
++                }));
++
++            var predictedLabel = filteredModel.Transform(dataNoLabel).GetColumn<ReadOnlyMemory<char>>(transformerSchema[4].Name);
+ 
+             // Make sure that we can use the multiclass evaluate method
+             var metrics = ML.MulticlassClassification.Evaluate(transformer.Transform(dataView), predictedLabelColumnName: "outputColumn");

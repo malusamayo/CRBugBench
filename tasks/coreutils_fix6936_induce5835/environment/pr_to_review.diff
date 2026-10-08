@@ -1,0 +1,153 @@
+commit 2ec4e9f78490f5cd8d4ccff4ac87a442da5461b2
+Author: Sylvestre Ledru <sylvestre@debian.org>
+Date:   Sun Jan 14 00:39:00 2024 +0100
+
+    mv: preserve the xattr
+    
+    Should make tests/mv/acl pass
+
+diff --git a/.vscode/cspell.dictionaries/jargon.wordlist.txt b/.vscode/cspell.dictionaries/jargon.wordlist.txt
+index dca883dc8..20e26990f 100644
+--- a/.vscode/cspell.dictionaries/jargon.wordlist.txt
++++ b/.vscode/cspell.dictionaries/jargon.wordlist.txt
+@@ -42,6 +42,7 @@ fileio
+ filesystem
+ filesystems
+ flamegraph
++fsxattr
+ fullblock
+ getfacl
+ gibi
+@@ -133,6 +134,7 @@ urand
+ whitespace
+ wordlist
+ wordlists
++xattrs
+ 
+ # * abbreviations
+ consts
+diff --git a/src/uu/mv/Cargo.toml b/src/uu/mv/Cargo.toml
+index 83a10ef6b..83d68bc3d 100644
+--- a/src/uu/mv/Cargo.toml
++++ b/src/uu/mv/Cargo.toml
+@@ -21,6 +21,7 @@ indicatif = { workspace = true }
+ uucore = { workspace = true, features = [
+   "backup-control",
+   "fs",
++  "fsxattr",
+   "update-control",
+ ] }
+ 
+diff --git a/src/uu/mv/src/mv.rs b/src/uu/mv/src/mv.rs
+index 223ac9119..9f24cf770 100644
+--- a/src/uu/mv/src/mv.rs
++++ b/src/uu/mv/src/mv.rs
+@@ -27,7 +27,10 @@ use uucore::fs::{
+     are_hardlinks_or_one_way_symlink_to_same_file, are_hardlinks_to_same_file,
+     path_ends_with_terminator,
+ };
++#[cfg(all(unix, not(target_os = "macos")))]
++use uucore::fsxattr;
+ use uucore::update_control;
++
+ // These are exposed for projects (e.g. nushell) that want to create an `Options` value, which
+ // requires these enums
+ pub use uucore::{backup_control::BackupMode, update_control::UpdateMode};
+@@ -631,6 +634,10 @@ fn rename_with_fallback(
+                     None
+                 };
+ 
++            #[cfg(all(unix, not(target_os = "macos")))]
++            let xattrs =
++                fsxattr::retrieve_xattrs(from).unwrap_or_else(|_| std::collections::HashMap::new());
++
+             let result = if let Some(ref pb) = progress_bar {
+                 move_dir_with_progress(from, to, &options, |process_info: TransitProcess| {
+                     pb.set_position(process_info.copied_bytes);
+@@ -641,6 +648,9 @@ fn rename_with_fallback(
+                 move_dir(from, to, &options)
+             };
+ 
++            #[cfg(all(unix, not(target_os = "macos")))]
++            fsxattr::apply_xattrs(to, xattrs).unwrap();
++
+             if let Err(err) = result {
+                 return match err.kind {
+                     fs_extra::error::ErrorKind::PermissionDenied => Err(io::Error::new(
+@@ -651,6 +661,11 @@ fn rename_with_fallback(
+                 };
+             }
+         } else {
++            #[cfg(all(unix, not(target_os = "macos")))]
++            fs::copy(from, to)
++                .and_then(|_| fsxattr::copy_xattrs(&from, &to))
++                .and_then(|_| fs::remove_file(from))?;
++            #[cfg(any(target_os = "macos", not(unix)))]
+             fs::copy(from, to).and_then(|_| fs::remove_file(from))?;
+         }
+     }
+diff --git a/src/uucore/Cargo.toml b/src/uucore/Cargo.toml
+index 557cdc4dd..8500faeff 100644
+--- a/src/uucore/Cargo.toml
++++ b/src/uucore/Cargo.toml
+@@ -78,7 +78,7 @@ encoding = ["data-encoding", "data-encoding-macro", "z85", "thiserror"]
+ entries = ["libc"]
+ fs = ["dunce", "libc", "winapi-util", "windows-sys"]
+ fsext = ["libc", "time", "windows-sys"]
+-fsxattr = [ "xattr" ]
++fsxattr = ["xattr"]
+ lines = []
+ format = ["itertools"]
+ mode = ["libc"]
+diff --git a/tests/by-util/test_mv.rs b/tests/by-util/test_mv.rs
+index 175b91e7d..dd05ffbcd 100644
+--- a/tests/by-util/test_mv.rs
++++ b/tests/by-util/test_mv.rs
+@@ -1569,6 +1569,47 @@ fn test_mv_dir_into_path_slash() {
+     assert!(at.dir_exists("f/b"));
+ }
+ 
++#[cfg(all(unix, not(target_os = "macos")))]
++#[test]
++fn test_acl() {
++    use std::process::Command;
++
++    use crate::common::util::compare_xattrs;
++
++    let scene = TestScenario::new(util_name!());
++    let at = &scene.fixtures;
++    let path1 = "a";
++    let path2 = "b";
++    let file = "a/file";
++    let file_target = "b/file";
++    at.mkdir(path1);
++    at.mkdir(path2);
++    at.touch(file);
++
++    let path = at.plus_as_string(file);
++    // calling the command directly. xattr requires some dev packages to be installed
++    // and it adds a complex dependency just for a test
++    match Command::new("setfacl")
++        .args(["-m", "group::rwx", &path1])
++        .status()
++        .map(|status| status.code())
++    {
++        Ok(Some(0)) => {}
++        Ok(_) => {
++            println!("test skipped: setfacl failed");
++            return;
++        }
++        Err(e) => {
++            println!("test skipped: setfacl failed with {}", e);
++            return;
++        }
++    }
++
++    scene.ucmd().arg(&path).arg(path2).succeeds();
++
++    assert!(compare_xattrs(&file, &file_target));
++}
++
+ // Todo:
+ 
+ // $ at.touch a b

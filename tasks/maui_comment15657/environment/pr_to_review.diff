@@ -1,0 +1,1007 @@
+diff --git a/eng/cake/dotnet.cake b/eng/cake/dotnet.cake
+index c4cfb3c761bb..2b640c7de4b7 100644
+--- a/eng/cake/dotnet.cake
++++ b/eng/cake/dotnet.cake
+@@ -162,6 +162,24 @@ Task("dotnet-samples")
+         RunMSBuildWithDotNet("./Microsoft.Maui.Samples.slnf", properties, binlogPrefix: "sample-");
+     });
+ 
++Task("dotnet-legacy-controlgallery")
++    .IsDependentOn("dotnet-legacy-controlgallery-android")
++    .IsDependentOn("dotnet-legacy-controlgallery-ios");
++
++Task("dotnet-legacy-controlgallery-ios")
++    .Does(() =>
++    {
++        var properties = new Dictionary<string, string>();
++        RunMSBuildWithDotNet("./src/Compatibility/ControlGallery/src/iOS/Compatibility.ControlGallery.iOS.csproj", properties, binlogPrefix: "controlgallery-ios-");
++    });
++
++Task("dotnet-legacy-controlgallery-android")
++    .Does(() =>
++    {
++        var properties = new Dictionary<string, string>();
++        RunMSBuildWithDotNet("./src/Compatibility/ControlGallery/src/Android/Compatibility.ControlGallery.Android.csproj", properties, binlogPrefix: "controlgallery-android-");
++    });
++
+ Task("dotnet-samples-test")
+     .Does(() =>
+     {
+diff --git a/eng/cake/helpers.cake b/eng/cake/helpers.cake
+index 628bec7ccfa5..3374fb95a8fe 100644
+--- a/eng/cake/helpers.cake
++++ b/eng/cake/helpers.cake
+@@ -121,3 +121,38 @@ bool IsTarget(string target) =>
+ 
+ bool TargetStartsWith(string target) =>
+     Argument<string>("target", "Default").StartsWith(target, StringComparison.InvariantCultureIgnoreCase);
++
++void RunTestsNunit(string unitTestLibrary, NUnit3Settings settings)
++{
++    try
++    {
++        NUnit3(new [] { unitTestLibrary }, settings);
++    }
++    catch
++    {
++        SetTestResultsEnvironmentVariables(settings.Work?.ToString());
++        throw;
++    }
++
++    SetTestResultsEnvironmentVariables(settings.Work?.ToString());
++
++    void SetTestResultsEnvironmentVariables(string? path)
++    {
++        var doc = new System.Xml.XmlDocument();
++        if(string.IsNullOrEmpty(path))
++        {
++            doc.Load("TestResult.xml");
++        }
++        else
++        {
++            doc.Load($"{path}/TestResult.xml");
++        }
++                
++        var root = doc.DocumentElement;
++
++        foreach(System.Xml.XmlAttribute attr in root.Attributes)
++        {
++            SetEnvironmentVariable($"NUNIT_{attr.Name}", attr.Value);
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/eng/devices/android.cake b/eng/devices/android.cake
+index ac669407d519..7974deb5577f 100644
+--- a/eng/devices/android.cake
++++ b/eng/devices/android.cake
+@@ -3,6 +3,8 @@
+ #load "../cake/helpers.cake"
+ #load "../cake/dotnet.cake"
+ 
++#tool nuget:?package=NUnit.ConsoleRunner&version=3.16.3
++
+ string TARGET = Argument("target", "Test");
+ const string defaultVersion = "30";
+ const string dotnetVersion = "net7.0";
+@@ -24,10 +26,12 @@ var TEST_APP_PACKAGE_NAME = Argument("package", EnvironmentVariable("ANDROID_TES
+ var TEST_APP_INSTRUMENTATION = Argument("instrumentation", EnvironmentVariable("ANDROID_TEST_APP_INSTRUMENTATION") ?? "");
+ var TEST_RESULTS = Argument("results", EnvironmentVariable("ANDROID_TEST_RESULTS") ?? "");
+ 
++string TEST_WHERE = Argument("where", EnvironmentVariable("NUNIT_TEST_WHERE") ?? $"");
+ var androidVersion = Argument("apiversion", EnvironmentVariable("ANDROID_PLATFORM_VERSION") ?? defaultVersion);
+ 
+ // other
+ string CONFIGURATION = Argument("configuration", "Debug");
++string TEST_FRAMEWORK = "net472";
+ string ANDROID_AVD = "DEVICE_TESTS_EMULATOR";
+ string DEVICE_ID = "";
+ string DEVICE_ARCH = "";
+@@ -149,7 +153,7 @@ Task("Build")
+ 	.Does(() =>
+ {
+ 	var name = System.IO.Path.GetFileNameWithoutExtension(PROJECT.FullPath);
+-	var binlog = $"{BINLOG_DIR}/{name}-{CONFIGURATION}-android.binlog";
++	var binlog = $"{BINLOG_DIR}/{name}-{CONFIGURATION}-android--{DateTime.UtcNow.ToFileTimeUtc()}.binlog";
+ 
+ 	if (USE_DOTNET)
+ 	{
+@@ -291,13 +295,82 @@ Task("Test")
+ Task("uitest")
+ 	.Does(() =>
+ {
+-	if (string.IsNullOrEmpty(TEST_APP)) {
++	SetupAppPackageNameAndResult();
++	
++	CleanDirectories(TEST_RESULTS);
++
++	InstallApk(TEST_APP, TEST_APP_PACKAGE_NAME, TEST_RESULTS);
++
++	//we need to build tests first to pass ExtraDefineConstants
++	Information("Build UITests project {0}", PROJECT.FullPath);
++	var name = System.IO.Path.GetFileNameWithoutExtension(PROJECT.FullPath);
++	var binlog = $"{BINLOG_DIR}/{name}-{CONFIGURATION}-android-{DateTime.UtcNow.ToFileTimeUtc()}.binlog";
++	DotNetCoreBuild(PROJECT.FullPath, new DotNetCoreBuildSettings {
++			Configuration = CONFIGURATION,
++			ArgumentCustomization = args => args
++				.Append("/p:ExtraDefineConstants=ANDROID")
++				.Append("/bl:" + binlog),
++			ToolPath = DOTNET_PATH,
++	});
++	
++	SetEnvironmentVariable("APPIUM_LOG_FILE", $"{BINLOG_DIR}/appium_android.log");
++
++	Information("Run UITests project {0}", PROJECT.FullPath);
++	RunTestWithLocalDotNet(PROJECT.FullPath, CONFIGURATION,	noBuild: true);
++});
++
++Task("cg-uitest")
++	.Does(() =>
++{
++	SetupAppPackageNameAndResult();
++	
++	CleanDirectories(TEST_RESULTS);
++
++	InstallApk(TEST_APP, TEST_APP_PACKAGE_NAME, TEST_RESULTS);
++
++	//set env var for the app path for Xamarin.UITest setup
++	SetEnvironmentVariable("APP_APK", $"{TEST_APP}");
++
++	// build the test library
++	var binDir = PROJECT.GetDirectory().Combine("bin").Combine(CONFIGURATION + "/" + TEST_FRAMEWORK).FullPath;
++	Information("BinDir: {0}", binDir);
++	var name = System.IO.Path.GetFileNameWithoutExtension(PROJECT.FullPath);
++	var binlog = $"{binDir}/{name}-{CONFIGURATION}-android-{DateTime.UtcNow.ToFileTimeUtc()}.binlog";
++	Information("Build UITests project {0}", PROJECT.FullPath);
++	DotNetBuild(PROJECT.FullPath, new DotNetBuildSettings {
++			Configuration = CONFIGURATION,
++			ArgumentCustomization = args => args
++				.Append("/bl:" + binlog),
++			ToolPath = DOTNET_PATH,
++	});
++	
++	var testLibDllPath = $"{binDir}/Microsoft.Maui.Controls.Android.UITests.dll";
++	Information("Run UITests lib {0}", testLibDllPath);
++	var nunitSettings = new NUnit3Settings { 
++		Configuration = CONFIGURATION,
++		OutputFile = $"{TEST_RESULTS}/android/run_uitests_output-{DateTime.UtcNow.ToFileTimeUtc()}.log",
++		Work = $"{TEST_RESULTS}/android/"
++	};
++
++	if(!string.IsNullOrEmpty(TEST_WHERE))
++	{
++		Information("Add Where filter to NUnit {0}", TEST_WHERE);
++		nunitSettings.Where = TEST_WHERE;
++	}
++	RunTestsNunit(testLibDllPath, nunitSettings);
++});
++
++RunTarget(TARGET);
++
++void SetupAppPackageNameAndResult()
++{
++   if (string.IsNullOrEmpty(TEST_APP)) {
+ 		if (string.IsNullOrEmpty(TEST_APP_PROJECT.FullPath))
+ 			throw new Exception("If no app was specified, an app must be provided.");
+ 		
+ 		var binFolder = TEST_APP_PROJECT.GetDirectory().Combine("bin");
+ 		Information("Test app bin folder {0}", binFolder);
+-		var binDir = binFolder.Combine($"Release/{dotnetVersion}-android").FullPath;
++		var binDir = binFolder.Combine($"{CONFIGURATION}/{TARGET_FRAMEWORK}").FullPath;
+ 		var apps = GetFiles(binDir + "/*-Signed.apk");
+ 		if (apps.Any()) {
+ 			TEST_APP = apps.FirstOrDefault().FullPath;
+@@ -323,9 +396,10 @@ Task("uitest")
+ 	Information("Test App Instrumentation: {0}", TEST_APP_INSTRUMENTATION);
+ 	Information("Test Results Directory: {0}", TEST_RESULTS);
+ 	Information("Test project: {0}", PROJECT);
++}
+ 
+-	CleanDirectories(TEST_RESULTS);
+-
++void InstallApk(string testApp, string testAppPackageName, string testResultsDirectory)
++{
+ 	if (DEVICE_BOOT_WAIT) {
+ 		Information("Waiting for the emulator to finish booting...");
+ 
+@@ -348,35 +422,14 @@ Task("uitest")
+ 	Information("{0}", string.Join("\n", lines));
+ 
+ 	//install apk on the emulator
+-	Information("Install with xharness: {0}",TEST_APP);
++	Information("Install with xharness: {0}", testApp);
+ 	var settings = new DotNetToolSettings {
+ 		DiagnosticOutput = true,
+ 		ArgumentCustomization = args=>args.Append("run xharness android install " +
+-			$"--app=\"{TEST_APP}\" " +
+-			$"--package-name=\"{TEST_APP_PACKAGE_NAME}\" " +
+-			$"--output-directory=\"{TEST_RESULTS}\" " +
++			$"--app=\"{testApp}\" " +
++			$"--package-name=\"{testAppPackageName}\" " +
++			$"--output-directory=\"{testResultsDirectory}\" " +
+ 			$"--verbosity=\"Debug\" ")
+ 	};
+ 	DotNetTool("tool", settings);
+-
+-	//we need to build tests first to pass ExtraDefineConstants
+-	Information("Build UITests project {0}", PROJECT.FullPath);
+-	var name = System.IO.Path.GetFileNameWithoutExtension(PROJECT.FullPath);
+-	var binlog = $"{BINLOG_DIR}/{name}-{CONFIGURATION}-android.binlog";
+-	DotNetBuild(PROJECT.FullPath, new DotNetBuildSettings {
+-			Configuration = CONFIGURATION,
+-			ToolPath = DOTNET_PATH,
+-			ArgumentCustomization = args => args
+-				.Append("/p:ExtraDefineConstants=ANDROID")
+-				.Append("/bl:" + binlog)
+-				//.Append("/tl")
+-			
+-	});
+-
+-	SetEnvironmentVariable("APPIUM_LOG_FILE", $"{BINLOG_DIR}/appium_android.log");
+-
+-	Information("Run UITests project {0}",PROJECT.FullPath);
+-	RunTestWithLocalDotNet(PROJECT.FullPath, CONFIGURATION, noBuild: true);
+-});
+-
+-RunTarget(TARGET);
+\ No newline at end of file
++}
+diff --git a/eng/devices/ios.cake b/eng/devices/ios.cake
+index 639a4ac26d5a..d14681fd8868 100644
+--- a/eng/devices/ios.cake
++++ b/eng/devices/ios.cake
+@@ -2,6 +2,8 @@
+ #load "../cake/helpers.cake"
+ #load "../cake/dotnet.cake"
+ 
++#tool nuget:?package=NUnit.ConsoleRunner&version=3.16.3
++
+ string TARGET = Argument("target", "Test");
+ 
+ const string defaultVersion = "16.2";
+@@ -20,6 +22,8 @@ var TEST_APP = Argument("app", EnvironmentVariable("IOS_TEST_APP") ?? "");
+ FilePath TEST_APP_PROJECT = Argument("appproject", EnvironmentVariable("IOS_TEST_APP_PROJECT") ?? "");
+ var TEST_RESULTS = Argument("results", EnvironmentVariable("IOS_TEST_RESULTS") ?? "");
+ 
++string TEST_WHERE = Argument("where", EnvironmentVariable("NUNIT_TEST_WHERE") ?? $"");
++
+ //these are for appium iOS UITests
+ var udid = Argument("udid", EnvironmentVariable("IOS_SIMULATOR_UDID") ?? "");
+ var iosVersion = Argument("apiversion", EnvironmentVariable("IOS_PLATFORM_VERSION") ?? defaultVersion);
+@@ -29,6 +33,7 @@ string PLATFORM = TEST_DEVICE.ToLower().Contains("simulator") ? "iPhoneSimulator
+ string DOTNET_PLATFORM = TEST_DEVICE.ToLower().Contains("simulator") ? "iossimulator-x64" : "ios-x64";
+ string CONFIGURATION = Argument("configuration", "Debug");
+ bool DEVICE_CLEANUP = Argument("cleanup", true);
++string TEST_FRAMEWORK = "net472";
+ 
+ Information("Project File: {0}", PROJECT);
+ Information("Build Binary Log (binlog): {0}", BINLOG_DIR);
+@@ -204,7 +209,80 @@ Task("Test")
+ Task("uitest")
+ 	.Does(() =>
+ {
+-	if (string.IsNullOrEmpty(TEST_APP) ) {
++	SetupAppPackageNameAndResult();
++
++	CleanDirectories(TEST_RESULTS);
++
++	InstallIpa(TEST_APP, "", TEST_DEVICE, TEST_RESULTS, iosVersion);
++
++	//we need to build tests first to pass ExtraDefineConstants
++	Information("Build UITests project {0}", PROJECT.FullPath);
++	var name = System.IO.Path.GetFileNameWithoutExtension(PROJECT.FullPath);
++	var binlog = $"{BINLOG_DIR}/{name}-{CONFIGURATION}-ios.binlog";
++	DotNetBuild(PROJECT.FullPath, new DotNetBuildSettings {
++			Configuration = CONFIGURATION,
++			ToolPath = DOTNET_PATH,
++			ArgumentCustomization = args => args
++				.Append("/p:ExtraDefineConstants=IOSUITEST")
++				.Append("/bl:" + binlog)
++				//.Append("/tl")
++			
++	});
++
++	SetEnvironmentVariable("APPIUM_LOG_FILE", $"{BINLOG_DIR}/appium_ios.log");
++
++	Information("Run UITests project {0}",PROJECT.FullPath);
++	RunTestWithLocalDotNet(PROJECT.FullPath, CONFIGURATION, noBuild: true);
++});
++
++Task("cg-uitest")
++	.Does(() =>
++{
++	SetupAppPackageNameAndResult();
++	
++	CleanDirectories(TEST_RESULTS);
++
++	InstallIpa(TEST_APP, "com.microsoft.mauicompatibilitygallery", TEST_DEVICE, $"{TEST_RESULTS}/ios", iosVersion);
++
++	//set env var for the app path for Xamarin.UITest setup
++	SetEnvironmentVariable("iOS_APP", $"{TEST_APP}");
++
++	// build the test library
++	var binDir = PROJECT.GetDirectory().Combine("bin").Combine(CONFIGURATION + "/" + TEST_FRAMEWORK).FullPath;
++	Information("BinDir: {0}", binDir);
++	var name = System.IO.Path.GetFileNameWithoutExtension(PROJECT.FullPath);
++	var binlog = $"{binDir}/{name}-{CONFIGURATION}-ios.binlog";
++	Information("Build UITests project {0}", PROJECT.FullPath);
++	DotNetBuild(PROJECT.FullPath, new DotNetBuildSettings {
++			Configuration = CONFIGURATION,
++			ArgumentCustomization = args => args
++				.Append("/bl:" + binlog),
++			ToolPath = DOTNET_PATH,
++	});
++	
++	var testLibDllPath = $"{binDir}/Microsoft.Maui.Controls.iOS.UITests.dll";
++	Information("Run UITests lib {0}", testLibDllPath);
++	var nunitSettings = new NUnit3Settings { 
++		Configuration = CONFIGURATION,
++		OutputFile = $"{TEST_RESULTS}/ios/run_uitests_output.log",
++		Work = $"{TEST_RESULTS}/ios"
++	};
++
++	Information("Outputfile {0}", nunitSettings.OutputFile);
++
++	if(!string.IsNullOrEmpty(TEST_WHERE))
++	{
++		Information("Add Where filter to NUnit {0}", TEST_WHERE);
++		nunitSettings.Where = TEST_WHERE;
++	}
++	RunTestsNunit(testLibDllPath, nunitSettings);
++});
++
++RunTarget(TARGET);
++
++void SetupAppPackageNameAndResult()
++{
++   if (string.IsNullOrEmpty(TEST_APP) ) {
+ 		if (string.IsNullOrEmpty(TEST_APP_PROJECT.FullPath))
+ 			throw new Exception("If no app was specified, an app must be provided.");
+ 		var binDir = USE_DOTNET
+@@ -212,27 +290,30 @@ Task("uitest")
+ 			: TEST_APP_PROJECT.GetDirectory().Combine("bin").Combine(PLATFORM).Combine(CONFIGURATION).FullPath;
+ 		Information("BinDir: {0}", binDir);
+ 		var apps = GetDirectories(binDir + "/*.app");
++		if(apps.Count == 0)
++			throw new Exception("No app was found in the bin directory.");
++		
+ 		TEST_APP = apps.First().FullPath;
+ 	}
+ 	if (string.IsNullOrEmpty(TEST_RESULTS)) {
+-		TEST_RESULTS = TEST_APP + "-results";
++		TEST_RESULTS =  GetTestResultsDirectory().FullPath;
+ 	}
+ 
+ 	Information("Test Device: {0}", TEST_DEVICE);
+ 	Information("Test App: {0}", TEST_APP);
+ 	Information("Test Results Directory: {0}", TEST_RESULTS);
++}
+ 
+-	CleanDirectories(TEST_RESULTS);
+-
+-	Information("Install with xharness: {0}",TEST_APP);
++void InstallIpa(string testApp, string testAppPackageName, string testDevice, string testResultsDirectory, string version)
++{
++	Information("Install with xharness: {0}",testApp);
+ 	var settings = new DotNetToolSettings {
+ 		DiagnosticOutput = true,
+ 		ArgumentCustomization = args => args.Append("run xharness apple install " +
+-		$"--app=\"{TEST_APP}\" " +
+-		$"--targets=\"{TEST_DEVICE}\" " +
+-		$"--output-directory=\"{TEST_RESULTS}\" " +
++		$"--app=\"{testApp}\" " +
++		$"--targets=\"{testDevice}\" " +
++		$"--output-directory=\"{testResultsDirectory}\" " +
+ 		$"--verbosity=\"Debug\" ")
+-
+ 	};
+ 
+ 	try {
+@@ -243,30 +324,8 @@ Task("uitest")
+ 	 	var xharness = sims.Where(s => s.Name.Contains("XHarness")).ToArray();
+ 		var simXH = xharness.First();
+ 		Information("The emulator to run tests: {0} {1}", simXH.Name, simXH.UDID);
+-		Information("The platform version to run tests: {0}", iosVersion);
++		Information("The platform version to run tests: {0}", version);
+ 		SetEnvironmentVariable("IOS_SIMULATOR_UDID",simXH.UDID);
+-		SetEnvironmentVariable("IOS_PLATFORM_VERSION", iosVersion);
+-		
++		SetEnvironmentVariable("IOS_PLATFORM_VERSION", version);
+ 	}
+-
+-	//we need to build tests first to pass ExtraDefineConstants
+-	Information("Build UITests project {0}", PROJECT.FullPath);
+-	var name = System.IO.Path.GetFileNameWithoutExtension(PROJECT.FullPath);
+-	var binlog = $"{BINLOG_DIR}/{name}-{CONFIGURATION}-ios.binlog";
+-	DotNetBuild(PROJECT.FullPath, new DotNetBuildSettings {
+-			Configuration = CONFIGURATION,
+-			ToolPath = DOTNET_PATH,
+-			ArgumentCustomization = args => args
+-				.Append("/p:ExtraDefineConstants=IOSUITEST")
+-				.Append("/bl:" + binlog)
+-				//.Append("/tl")
+-			
+-	});
+-
+-	SetEnvironmentVariable("APPIUM_LOG_FILE", $"{BINLOG_DIR}/appium_ios.log");
+-
+-	Information("Run UITests project {0}",PROJECT.FullPath);
+-	RunTestWithLocalDotNet(PROJECT.FullPath, CONFIGURATION, noBuild: true);
+-});
+-
+-RunTarget(TARGET);
++}
+diff --git a/eng/pipelines/common/ui-tests-compatibility-steps.yml b/eng/pipelines/common/ui-tests-compatibility-steps.yml
+new file mode 100644
+index 000000000000..0f2d64eb3415
+--- /dev/null
++++ b/eng/pipelines/common/ui-tests-compatibility-steps.yml
+@@ -0,0 +1,65 @@
++parameters:
++  platform: '' # [ android, ios, windows, catalyst ]
++  path: '' # path to csproj
++  device: '' # the xharness device to use
++  cakeArgs: '' # additional cake args
++  app: '' #path to app to test
++  version: '' #the iOS version'
++  provisionatorChannel: 'latest'
++  agentPoolAccessToken: ''
++  configuration : "Release"
++  where : "cat==Issues"
++  targetSample: "dotnet-legacy-controlgallery"
++  provisionPlatform: "windows"
++
++steps:
++
++  - template: provision.yml
++    parameters:
++      ${{ if eq(parameters.platform, 'windows') }}:
++        platform: windows
++        skipProvisioning: true
++      ${{ if ne(parameters.platform, 'windows') }}:
++        platform: macos
++        skipProvisioning: false
++      skipXcode: false
++      provisionatorChannel: ${{ parameters.provisionatorChannel }}
++ 
++  - pwsh: ./build.ps1 --target=dotnet --configuration="${{ parameters.configuration }}" --verbosity=diagnostic
++    displayName: 'Install .NET'
++    retryCountOnTaskFailure: 3
++    env:
++      DOTNET_TOKEN: $(dotnetbuilds-internal-container-read-token)
++      PRIVATE_BUILD: $(PrivateBuild)
++
++  - pwsh: echo "##vso[task.prependpath]$(DotNet.Dir)"
++    displayName: 'Add .NET to PATH'
++
++  - pwsh: ./build.ps1 --target=dotnet-buildtasks --configuration="${{ parameters.configuration }}"
++    displayName: 'Build the MSBuild Tasks'
++
++  - pwsh: ./build.ps1 --target=${{ parameters.targetSample }} --configuration="${{ parameters.configuration }}" --${{ parameters.platform }} --verbosity=diagnostic
++    displayName: 'Build the Legacy ControlGallery'
++
++  - pwsh: ./build.ps1 -Script eng/devices/${{ parameters.platform }}.cake --target=cg-uitest --project="${{ parameters.path }}" --appproject="${{ parameters.app }}" --device="${{ parameters.device }}" --apiversion="${{ parameters.version }}" --configuration="${{ parameters.configuration }}" --results="$(TestResultsDirectory)" --binlog="$(LogDirectory)" ${{ parameters.cakeArgs }} --verbosity=diagnostic --where="${{ parameters.where }}"
++    displayName: $(Agent.JobName)
++    # retryCountOnTaskFailure: 2
++  
++  - task: PublishTestResults@2
++    displayName: Publish the $(System.PhaseName) test results
++    condition: always()
++    inputs:
++      testResultsFormat: NUnit
++      testResultsFiles: '**/TestResult*.xml'
++      testRunTitle: '$(System.PhaseName)'
++      searchFolder: '$(TestResultsDirectory)'
++      failTaskOnFailedTests: true
++
++  - task: PublishBuildArtifacts@1
++    condition: always()
++    displayName: publish artifacts
++
++  # This must always be placed as the last step in the job
++  - template: agent-rebooter/mac.v1.yml@yaml-templates
++    parameters:
++      AgentPoolAccessToken: ${{ parameters.agentPoolAccessToken }}
+diff --git a/eng/pipelines/common/ui-tests-steps.yml b/eng/pipelines/common/ui-tests-steps.yml
+index 8a5b646a103f..cebcfe4cbad8 100644
+--- a/eng/pipelines/common/ui-tests-steps.yml
++++ b/eng/pipelines/common/ui-tests-steps.yml
+@@ -59,11 +59,6 @@ steps:
+   - pwsh: ./build.ps1 --target=dotnet-samples --configuration="${{ parameters.configuration }}" --${{ parameters.platform }} --verbosity=diagnostic --usenuget=false
+     displayName: 'Build the samples'
+ 
+-  # - bash: |
+-  #     sudo xcode-select --reset
+-  #   displayName: 'XCode reset'
+-  #   condition: ne('${{ parameters.platform }}' , 'windows')
+-
+   - pwsh: ./build.ps1 -Script eng/devices/${{ parameters.platform }}.cake --target=uitest --project="${{ parameters.path }}" --appproject="${{ parameters.app }}" --device="${{ parameters.device }}" --apiversion="${{ parameters.version }}" --configuration="${{ parameters.configuration }}" --results="$(TestResultsDirectory)" --binlog="$(LogDirectory)" ${{ parameters.cakeArgs }} --verbosity=diagnostic
+     displayName: $(Agent.JobName)
+     retryCountOnTaskFailure: 2
+@@ -75,6 +70,7 @@ steps:
+       testResultsFormat: VSTest
+       testResultsFiles: '$(TestResultsDirectory)/*.trx'
+       testRunTitle: '$(System.PhaseName)'
++      failTaskOnFailedTests: true
+ 
+   - task: PublishBuildArtifacts@1
+     condition: always()
+diff --git a/eng/pipelines/common/ui-tests.yml b/eng/pipelines/common/ui-tests.yml
+index cf0b1225e69a..b9841127c78e 100644
+--- a/eng/pipelines/common/ui-tests.yml
++++ b/eng/pipelines/common/ui-tests.yml
+@@ -3,6 +3,8 @@ parameters:
+   iosPool: { }
+   windowsPool: { }
+   macosPool: { }
++  androidCompatibilityPool: { }
++  iosCompatibilityPool: { }
+   androidApiLevels: [ 30 ]
+   iosVersions: [ 'latest' ]
+   provisionatorChannel: 'latest'
+@@ -15,6 +17,10 @@ parameters:
+       winui: /optional/path/to/winui.csproj
+       mac: /optional/path/to/mac.csproj
+       app: /optional/path/to/app.csproj
++      compatibilityAndroidApp: /optional/path/to/app.csproj
++      compatibilityAndroidTestProject: /optional/path/to/android.csproj
++      compatibilityiOSTestProject: /optional/path/to/ios.csproj
++      compatibilityiOSApp: /optional/path/to/app.csproj
+ 
+ stages:
+ 
+@@ -115,7 +121,7 @@ stages:
+                 displayName: ${{ coalesce(project.desc, project.name) }}
+                 pool: ${{ parameters.macosPool }}
+                 variables:
+-                  REQUIRED_XCODE: 14.2.0
++                  REQUIRED_XCODE: $(DEVICETESTS_REQUIRED_XCODE)
+                 steps:
+                   - template: ui-tests-steps.yml
+                     parameters:
+@@ -125,4 +131,74 @@ stages:
+                       path: ${{ project.mac }}
+                       app: ${{ project.app }}
+                       provisionatorChannel: ${{ parameters.provisionatorChannel }}
+-                      agentPoolAccessToken: ${{ parameters.agentPoolAccessToken }}
+\ No newline at end of file
++                      agentPoolAccessToken: ${{ parameters.agentPoolAccessToken }}
++
++  - stage: android_compatibility_ui_tests
++    displayName: Android Compatibility UITests
++    dependsOn: []
++    jobs:
++      - ${{ each project in parameters.projects }}:
++        - ${{ if ne(project.android, '') }}:
++          - ${{ each api in parameters.androidApiLevels }}:
++            - ${{ if not(containsValue(project.androidApiLevelsExclude, api)) }}:
++              - job: android_compatibility_ui_tests_${{ project.name }}_${{ api }}
++                timeoutInMinutes: 240
++                workspace:
++                  clean: all
++                displayName: ${{ coalesce(project.desc, project.name) }} (API ${{ api }})
++                pool: ${{ parameters.androidCompatibilityPool }}
++                variables:
++                  ${{ if ge(api, 24) }}:
++                    ANDROID_EMULATORS: "system-images;android-${{ api }};google_apis_playstore;x86"
++                  ${{ if lt(api, 24) }}:
++                    ANDROID_EMULATORS: "system-images;android-${{ api }};google_apis;x86"
++                  REQUIRED_XCODE: $(DEVICETESTS_REQUIRED_XCODE)
++                steps:
++                  - template: ui-tests-compatibility-steps.yml
++                    parameters:
++                      platform: android
++                      provisionPlatform: macos
++                      configuration: Debug
++                      version: ${{ api }}
++                      path: ${{ project.compatibilityAndroidTestProject }}
++                      app: ${{ project.compatibilityAndroidApp }}
++                      targetSample: "dotnet-legacy-controlgallery-android"
++                      device: android-emulator-32_${{ api }}
++                      provisionatorChannel: ${{ parameters.provisionatorChannel }}
++                      agentPoolAccessToken: ${{ parameters.agentPoolAccessToken }}
++
++  - stage: ios_compatibility_ui_tests
++    displayName: iOS Compatibility UITests
++    dependsOn: []
++    jobs:
++      - ${{ each project in parameters.projects }}:
++        - ${{ if ne(project.ios, '') }}:
++          - ${{ each version in parameters.iosVersions }}:
++            - ${{ if not(containsValue(project.iosVersionsExclude, version)) }}:
++              - job: ios_compatibility_ui_tests_${{ project.name }}_${{ replace(version, '.', '_') }}
++                timeoutInMinutes: 240
++                workspace:
++                  clean: all
++                displayName: ${{ coalesce(project.desc, project.name) }} (v${{ version }})
++                pool: ${{ parameters.iosCompatibilityPool }}
++                variables:
++                  REQUIRED_XCODE: $(DEVICETESTS_REQUIRED_XCODE)
++                steps:
++                  - template: ui-tests-compatibility-steps.yml
++                    parameters:
++                      platform: ios
++                      provisionPlatform: macos
++                      configuration: Debug
++                      ${{ if eq(version, 'latest') }}:
++                        version: 16.2
++                      ${{ if ne(version, 'latest') }}:
++                        version: ${{ version }}
++                      path: ${{ project.compatibilityiOSTestProject }}
++                      app: ${{ project.compatibilityiOSApp }}
++                      targetSample: "dotnet-legacy-controlgallery-ios"
++                      ${{ if eq(version, 'latest') }}:
++                        device: ios-simulator-64
++                      ${{ if ne(version, 'latest') }}:
++                        device: ios-simulator-64_${{ version }}
++                      provisionatorChannel: ${{ parameters.provisionatorChannel }}
++                      agentPoolAccessToken: ${{ parameters.agentPoolAccessToken }}
+diff --git a/eng/pipelines/ui-tests.yml b/eng/pipelines/ui-tests.yml
+index 152785c5864c..7dfe455b79d4 100644
+--- a/eng/pipelines/ui-tests.yml
++++ b/eng/pipelines/ui-tests.yml
+@@ -87,6 +87,24 @@ parameters:
+       name: $(macosTestsVmPool)
+       vmImage: $(macosTestsVmImage)
+ 
++  - name: androidCompatibilityPool
++    type: object
++    default:
++      name: $(androidTestsVmPool)
++      vmImage: $(androidTestsVmImage)
++      demands:
++        - macOS.Name -equals Ventura
++        - macOS.Architecture -equals x64
++
++  - name: iosCompatibilityPool
++    type: object
++    default:
++      name: $(androidTestsVmPool)
++      vmImage: $(androidTestsVmImage)
++      demands:
++        - macOS.Name -equals Ventura
++        - macOS.Architecture -equals x64
++
+ 
+ resources:
+   repositories:
+@@ -104,6 +122,8 @@ stages:
+       iosPool: ${{ parameters.iosPool }}
+       windowsPool: ${{ parameters.windowsPool }}
+       macosPool: ${{ parameters.macosPool }}
++      androidCompatibilityPool: ${{ parameters.androidCompatibilityPool }}
++      iosCompatibilityPool: ${{ parameters.iosCompatibilityPool }}
+       agentPoolAccessToken: $(AgentPoolAccessToken)
+       ${{ if or(parameters.BuildEverything, and(ne(variables['Build.Reason'], 'PullRequest'), eq(variables['System.TeamProject'], 'devdiv'))) }}:
+         androidApiLevels: [ 30 ]
+@@ -141,6 +161,10 @@ stages:
+           ios: $(System.DefaultWorkingDirectory)/src/Controls/tests/UITests/Controls.AppiumTests.csproj
+           winui: $(System.DefaultWorkingDirectory)/src/Controls/tests/UITests/Controls.AppiumTests.csproj
+           mac: $(System.DefaultWorkingDirectory)/src/Controls/tests/UITests/Controls.AppiumTests.csproj
++          compatibilityAndroidApp: $(System.DefaultWorkingDirectory)/src/Compatibility/ControlGallery/src/Android/Compatibility.ControlGallery.Android.csproj 
++          compatibilityAndroidTestProject: $(System.DefaultWorkingDirectory)/src/Compatibility/ControlGallery/test/Android.UITests/Compatibility.ControlGallery.Android.UITests.csproj
++          compatibilityiOSApp: $(System.DefaultWorkingDirectory)/src/Compatibility/ControlGallery/src/iOS/Compatibility.ControlGallery.iOS.csproj 
++          compatibilityiOSTestProject: $(System.DefaultWorkingDirectory)/src/Compatibility/ControlGallery/test/iOS.UITests/Compatibility.ControlGallery.iOS.UITests.csproj
+         # - name: blazorwebview
+         #   desc: BlazorWebView
+         #   androidApiLevelsExclude: [ 27, 26, 25, 24, 23, 22, 21 ] # BlazorWebView requires a recent version of Chrome
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/Bugzilla26032.xaml.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/Bugzilla26032.xaml.cs
+index 61798509bc4e..b86382351db3 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/Bugzilla26032.xaml.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/Bugzilla26032.xaml.cs
+@@ -53,6 +53,7 @@ protected override void Init()
+ #if UITEST
+ 		[Test]
+ 		[Compatibility.UITests.FailsOnMauiIOS]
++		[Compatibility.UITests.FailsOnMauiAndroid]
+ 		public void SelectedItemTap()
+ 		{
+ 			var id = "1";
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/Bugzilla45926.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/Bugzilla45926.cs
+index 3ee1b39f4dec..5603d28edd9a 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/Bugzilla45926.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/Bugzilla45926.cs
+@@ -66,6 +66,7 @@ protected override void Init()
+ 
+ #if UITEST
+ 		[Test]
++		[Compatibility.UITests.FailsOnMauiAndroid]
+ 		public void Issue45926Test()
+ 		{
+ 			RunningApp.WaitForElement(q => q.Marked("New Page"));
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/Bugzilla51503.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/Bugzilla51503.cs
+index 72d2ec356bc8..c2c5f54f7849 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/Bugzilla51503.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/Bugzilla51503.cs
+@@ -64,6 +64,7 @@ public ChildPage()
+ 
+ #if UITEST
+ 		[Test]
++		[Controls.Compatibility.UITests.FailsOnMauiAndroid]
+ 		public void Issue51503Test()
+ 		{
+ 			for (int i = 0; i < 3; i++)
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/Bugzilla52419.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/Bugzilla52419.cs
+index 4d3b0c9abd4d..502d65f61195 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/Bugzilla52419.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/Bugzilla52419.cs
+@@ -31,6 +31,7 @@ protected override void Init()
+ 
+ #if __ANDROID__
+ 		[Test]
++		[Compatibility.UITests.FailsOnMauiAndroid]
+ 		public void Bugzilla52419Test()
+ 		{
+ 			RunningApp.WaitForElement(q => q.Marked("Push new page"));
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/Github5623.xaml.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/Github5623.xaml.cs
+index b1b0f9d89b6f..d43b9231ca6f 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/Github5623.xaml.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/Github5623.xaml.cs
+@@ -117,6 +117,7 @@ protected override void Init()
+ #if UITEST
+ 		[Test]
+ 		[Compatibility.UITests.FailsOnMauiIOS]
++		[Compatibility.UITests.FailsOnMauiAndroid]
+ 		public void CollectionViewInfiniteScroll()
+ 		{
+ 			RunningApp.WaitForElement("CollectionView5623");
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue13203.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue13203.cs
+index da4eb2431f2f..e6550f79bf63 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue13203.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue13203.cs
+@@ -50,6 +50,7 @@ class Item
+ 
+ #if UITEST
+ 		[Test]
++		[Compatibility.UITests.FailsOnMauiIOS]
+ 		public void CollectionShouldInvalidateOnVisibilityChange()
+ 		{
+ 			RunningApp.WaitForElement(Success);
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue1583_1.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue1583_1.cs
+index 2d4f2e604c34..7dae8d245eed 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue1583_1.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue1583_1.cs
+@@ -67,6 +67,7 @@ void Load(string url)
+ #if UITEST
+ 		[Test]
+ 		[NUnit.Framework.Category(Compatibility.UITests.UITestCategories.UwpIgnore)]
++		[Compatibility.UITests.FailsOnMauiIOS]
+ 		public async Task Issue1583_1_WebviewTest()
+ 		{
+ 			RunningApp.WaitForElement(q => q.Marked("label"), "Could not find label", TimeSpan.FromSeconds(10), null, null);
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue1667.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue1667.cs
+index 77ed2c4780c3..9fdab5bb4884 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue1667.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue1667.cs
+@@ -117,6 +117,7 @@ public void TestCursorPositionAndSelection()
+ #if __IOS__
+ 		[Test]
+ 		[NUnit.Framework.Category(UITestCategories.ManualReview)]
++		[Compatibility.UITests.FailsOnMauiIOS]
+ 		public void TestCursorColorOniOS()
+ 		{
+ 			RunningApp.WaitForElement("CursorTextEntry");
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue1747.xaml.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue1747.xaml.cs
+index 4163c509134d..df3a60acabfa 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue1747.xaml.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue1747.xaml.cs
+@@ -77,6 +77,7 @@ public bool ShouldBeEnabled
+ 
+ #if UITEST
+ 		[Test]
++		[Compatibility.UITests.FailsOnMauiIOS]
+ 		public void Issue1747Test()
+ 		{
+ 			RunningApp.WaitForElement(q => q.Marked(ToggleButtonAutomationId));
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue1799.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue1799.cs
+index 7e225b5fcc1e..2554636f7919 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue1799.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue1799.cs
+@@ -40,6 +40,7 @@ protected override void Init()
+ 
+ #if UITEST
+ 		[Test]
++		[Compatibility.UITests.FailsOnMauiIOS]
+ 		public void ListViewWithoutDataDoesNotCrash()
+ 		{
+ 			var result = RunningApp.WaitForElement(ListView);
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue2035.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue2035.cs
+index 3d978e72ac58..6bdbdaf0a5d0 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue2035.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue2035.cs
+@@ -28,6 +28,7 @@ protected override void Init()
+ 
+ #if UITEST
+ 		[Test]
++		[Compatibility.UITests.FailsOnMauiIOS]
+ 		public void Issue2035Test()
+ 		{
+ 			RunningApp.WaitForElement(q => q.Marked(Success));
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue2259.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue2259.cs
+index bfe009c7063a..1a6dfe9de4d0 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue2259.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue2259.cs
+@@ -157,6 +157,7 @@ protected override void Init()
+ #if UITEST
+ 		[Test]
+ 		[UiTest(typeof(ListView), "ScrollTo")]
++		[Compatibility.UITests.FailsOnMauiIOS]
+ 		public void Issue2259Tests()
+ 		{
+ 			for (int i = 0; i < 20; i++)
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue2411.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue2411.cs
+index 4f7ebc9af350..9c0ed16fe1b8 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue2411.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue2411.cs
+@@ -34,6 +34,7 @@ protected override void Init()
+ 
+ #if UITEST
+ 		[Test]
++		[Compatibility.UITests.FailsOnMauiIOS]
+ #if __ANDROID__
+         [Ignore("Appearing event is tied to virtualization in TabbedPage for Material")]
+ #endif
+@@ -66,6 +67,7 @@ public void Issue2411ScrollToPositionMakeVisible()
+ 
+ 		[Test]
+ 		[Issue(IssueTracker.Github, 2411, "ScrollToPosition.End crashing in TabbedPage", PlatformAffected.Android)]
++		[Compatibility.UITests.FailsOnMauiIOS]
+ #if __MACOS__
+         [Ignore("ScrollTo not implemented on MacOS")]
+ #endif
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue2981.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue2981.cs
+index 90245b2f1730..67853e1b6e0f 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue2981.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue2981.cs
+@@ -32,6 +32,7 @@ protected override void Init()
+ 		// (like LongPress) don't really work. The test should work manually on a touch screen, though.
+ 
+ 		[Test]
++		[Compatibility.UITests.FailsOnMauiIOS]
+ 		public void Issue2981Test()
+ 		{
+ 			RunningApp.Screenshot("I am at Issue 1");
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue3390.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue3390.cs
+index 181f49b277e6..fb2731f6ac5f 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue3390.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue3390.cs
+@@ -53,6 +53,7 @@ protected override void Init()
+ 
+ #if UITEST
+ 		[Test]
++		[Compatibility.UITests.FailsOnMauiIOS]
+ 		public void Issue3390Test()
+ 		{
+ 			RunningApp.Tap("Click me");
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue4597.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue4597.cs
+index 9951760d3575..0113fde36181 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue4597.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue4597.cs
+@@ -199,6 +199,7 @@ public void ButtonFromFileSourceAppearsAndDisappearsCorrectly()
+ 
+ 		[Test]
+ 		[NUnit.Framework.Category(UITestCategories.RequiresInternetConnection)]
++		[Compatibility.UITests.FailsOnMauiIOS]
+ 		public void ButtonFromUriSourceAppearsAndDisappearsCorrectly()
+ 		{
+ 			RunTest(nameof(Button), false);
+@@ -227,8 +228,8 @@ public void ImageCellFromFileSourceAppearsAndDisappearsCorrectly()
+ 			ImageCellTest(true);
+ 		}
+ 
+-[Microsoft.Maui.Controls.Compatibility.UITests.FailsOnMauiAndroid]
+ 		[Test]
++		[Microsoft.Maui.Controls.Compatibility.UITests.FailsOnMauiAndroid]
+ 		[NUnit.Framework.Category(UITestCategories.RequiresInternetConnection)]
+ 		public void ImageCellFromUriSourceAppearsAndDisappearsCorrectly()
+ 		{
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue5367.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue5367.cs
+index 5dc35a1f7ce9..f8a213e15222 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue5367.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue5367.cs
+@@ -52,6 +52,7 @@ protected override void Init()
+ 		[Test]
+ 		[UiTest(typeof(Editor))]
+ 		[Compatibility.UITests.FailsOnMauiIOS]
++		[Compatibility.UITests.FailsOnMauiAndroid]
+ 		public void Issue5367TestMaxLengthCrashesApp()
+ 		{
+ 			RunningApp.WaitForElement(MaxLengthEditor);
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue5500.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue5500.cs
+index e29c0d6e6f21..04d525cbaf47 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue5500.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue5500.cs
+@@ -64,6 +64,7 @@ protected override void OnAppearing()
+ 
+ #if UITEST && __IOS__
+ 		[Test]
++		[Compatibility.UITests.FailsOnMauiIOS]
+ 		public void VerifyEditorTextChangeEventsAreFiring()
+ 		{
+ 			RunningApp.WaitForElement("EditorAutomationId");
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue8167.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue8167.cs
+index 27c9dc251ba5..0e3f540e1ea4 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue8167.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue8167.cs
+@@ -110,6 +110,7 @@ void RaisePropertyChanged(string propertyName)
+ 
+ #if UITEST
+ 		[Test]
++		[Compatibility.UITests.FailsOnMauiIOS]
+ 		public void ThreadpoolBindingUpdateShouldNotCrash()
+ 		{
+ 			RunningApp.WaitForElement(Run);
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue9827.xaml.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue9827.xaml.cs
+index 02b52ec647f4..c80fc9119876 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/Issue9827.xaml.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/Issue9827.xaml.cs
+@@ -50,6 +50,7 @@ protected override void OnAppearing()
+ 
+ #if UITEST
+ 		[Test]
++		[Compatibility.UITests.FailsOnMauiAndroid]
+ 		public void Issue9827Test()
+ 		{
+ 			RunningApp.WaitForElement("Pos:0");
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/LabelTextType.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/LabelTextType.cs
+index dcf5774e062b..beb17363874e 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/LabelTextType.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/LabelTextType.cs
+@@ -72,6 +72,7 @@ protected override void Init()
+ #if UITEST
+ 		[Test]
+ 		[NUnit.Framework.Category(Compatibility.UITests.UITestCategories.UwpIgnore)]
++		[Compatibility.UITests.FailsOnMauiIOS]
+ 		public void LabelToggleHtmlAndPlainTextTest() 
+ 		{
+ 			RunningApp.WaitForElement ("TextTypeLabel");
+diff --git a/src/Compatibility/ControlGallery/src/Issues.Shared/TestPages/TestPages.cs b/src/Compatibility/ControlGallery/src/Issues.Shared/TestPages/TestPages.cs
+index eb817877ca3d..5b48aeeea1bd 100644
+--- a/src/Compatibility/ControlGallery/src/Issues.Shared/TestPages/TestPages.cs
++++ b/src/Compatibility/ControlGallery/src/Issues.Shared/TestPages/TestPages.cs
+@@ -96,8 +96,13 @@ static IApp InitializeApp()
+ #if __ANDROID__
+ 		static IApp InitializeAndroidApp()
+ 		{
+-			var fullApkPath = IOPath.Combine(TestContext.CurrentContext.TestDirectory, AppPaths.ApkPath);
++			var envApkPath = Environment.GetEnvironmentVariable("APP_APK");
+ 
++
++			var fullApkPath = string.IsNullOrEmpty(envApkPath) ? IOPath.Combine(TestContext.CurrentContext.TestDirectory, AppPaths.ApkPath)
++																: envApkPath;
++
++			System.Diagnostics.Debug.WriteLine($"FullAppPath: {fullApkPath}");
+ 			var appConfiguration = ConfigureApp.Android.ApkFile(fullApkPath).Debug();
+ 
+ 			if (TestContext.Parameters.Exists("IncludeScreenShots") &&
+@@ -146,10 +151,17 @@ static IApp InitializeiOSApp()
+ 				iOSVersion = _iosVersion;
+ 			}*/
+ 
++
++			var enviOSPath = Environment.GetEnvironmentVariable("iOS_APP");
++
++
++			var fullApkPath = string.IsNullOrEmpty(enviOSPath) ? IOPath.Combine(TestContext.CurrentContext.TestDirectory, AppPaths.iOSPath)
++																: enviOSPath;
++
+ 			// Running on the simulator
+ 			var app = ConfigureApp.iOS
+ 							.PreferIdeSettings()
+-							.AppBundle(AppPaths.iOSPath)
++							.AppBundle(enviOSPath)
+ 							.Debug()
+ 							.StartApp();
+ 
+diff --git a/src/Compatibility/ControlGallery/src/UITests.Shared/Tests/Legacy-CellsUITests.cs b/src/Compatibility/ControlGallery/src/UITests.Shared/Tests/Legacy-CellsUITests.cs
+index 7dd6f9767601..54d47bb65950 100644
+--- a/src/Compatibility/ControlGallery/src/UITests.Shared/Tests/Legacy-CellsUITests.cs
++++ b/src/Compatibility/ControlGallery/src/UITests.Shared/Tests/Legacy-CellsUITests.cs
+@@ -318,6 +318,7 @@ public void CellsGalleryEntryCellTable()
+ 		}
+ 
+ 		[Test]
++		[Compatibility.UITests.FailsOnMauiAndroid]
+ 		[Category(UITestCategories.Cells)]
+ 		[Description("EntryCell fires .Completed event")]
+ 		[UiTest(typeof(EntryCell), "Completed")]

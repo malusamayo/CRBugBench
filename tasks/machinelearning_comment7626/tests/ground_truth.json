@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "track": "comment",
+  "task": {
+    "pr_number": 7626,
+    "pr_title": "Fix memory leak and stale-model results when hot-swapping PredictionEnginePool",
+    "pr_url": "https://github.com/dotnet/machinelearning/pull/7626",
+    "base_commit": "901da3e8258285c4d4bf4496269ff8fcfea9cc48",
+    "reviewed_commit": "e66c00f0ff3e2849cc130063bd3fb06cca70c241"
+  },
+  "cases": [
+    {
+      "id": "comment:3414710741",
+      "provenance": "A human reviewer flagged this defect in an inline comment on the reviewed pull request.",
+      "summary": "Review comment 3414710741",
+      "description": "Copilot noticed the PredictionEnginePoolPolicy actually uses this method to create engines:\n\n```csharp\npublic override PredictionEngine<TData, TPrediction> Create() =>\n     _mlContext.Model.CreatePredictionEngine<TData, TPrediction>(_model);\n```\n\nit uses this method in turn:\n\n```csharp\npublic static PredictionEngine<TSrc, TDst> CreatePredictionEngine<TSrc, TDst>(\n     this ITransformer transformer,\n     IHostEnvironment env,\n     bool ignoreMissingColumns = true,\n     SchemaDefinition inputSchemaDefinition = null,\n     SchemaDefinition outputSchemaDefinition = null,\n     bool ownsTransformer = true)\n```\n\nnote the last parameter `ownsTransformer` having default=true, which means every single engine thinks it owns it and will gladly dispose it when itself disposed. This seems a slumbering bug actually waiting till we fix the issue with disposing. I guess the solution now passes tests because there is one model they consume without sharing with other engines.",
+      "location": {
+        "path": "src/Microsoft.Extensions.ML/PoolLoader.cs",
+        "line": 103
+      },
+      "evidence": {
+        "attached_diff_hunk": "@@ -37,17 +45,87 @@ public PoolLoader(IServiceProvider sp, PredictionEnginePoolOptions<TData, TPredi\n \n         public ModelLoader Loader { get; }\n         private MLContext Context { get; }\n-        public ObjectPool<PredictionEngine<TData, TPrediction>> PredictionEnginePool { get { return _pool; } }\n+\n+        /// <summary>\n+        /// The active pool generation. Exposed for compatibility; prefer <see cref=\"Get\"/> and\n+        /// <see cref=\"Return\"/>, which route an engine back to the generation that created it.\n+        /// </summary>\n+        public ObjectPool<PredictionEngine<TData, TPrediction>> PredictionEnginePool { get { return Volatile.Read(ref _pool); } }\n+\n+        /// <summary>\n+        /// Rents an engine from the current pool generation, recording its origin so it can be\n+        /// returned to the correct generation later.\n+        /// </summary>\n+        public PredictionEngine<TData, TPrediction> Get()\n+        {\n+            var pool = Volatile.Read(ref _pool);\n+            if (_disposed || pool == null)\n+            {\n+                throw new ObjectDisposedException(nameof(PoolLoader<TData, TPrediction>));\n+            }\n+\n+            var engine = pool.Get();\n+\n+            _rentedEngines.Remove(engine);\n+            _rentedEngines.Add(engine, pool);\n+            return engine;\n+        }\n+\n+        /// <summary>\n+        /// Returns an engine to the generation it was rented from. If that generation has already\n+        /// been disposed by a hot-swap, the engine is disposed instead of being pooled.\n+        /// </summary>\n+        public void Return(PredictionEngine<TData, TPrediction> engine)\n+        {\n+            if (engine == null)\n+            {\n+                throw new ArgumentNullException(nameof(engine));\n+            }\n+\n+            if (_rentedEngines.TryGetValue(engine, out var origin))\n+            {\n+                _rentedEngines.Remove(engine);\n+                origin.Return(engine);\n+            }\n+            else\n+            {\n+                engine.Dispose();\n+            }\n+        }\n \n         private void LoadPool()\n         {\n+            if (_disposed)\n+            {\n+                return;\n+            }\n+\n             var predictionEnginePolicy = new PredictionEnginePoolPolicy<TData, TPrediction>(Context, Loader.GetModel());",
+        "thread_resolution": "kotlarmilos: Confirmed and fixed, thanks for catching this. Create() was using the default ownsTransformer of true, so every engine in a generation thought it owned the single shared transformer, and once we actually dispose engines the first disposal tears the model down for its siblings. Engines are now created with OwnsTransformer set to false, and PoolLoader owns the shared model's lifetime per generation, disposing it with the generation and guarded by reference equality so a model still used by the surviving generation is never disposed."
+      },
+      "metadata": {
+        "comment_id": 3414710741,
+        "reviewer": "rosebyte",
+        "url": "https://github.com/dotnet/machinelearning/pull/7626#discussion_r3414710741",
+        "classify_confidence": null,
+        "is_outdated": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,549 @@
+commit 93998dc4a7e944e28083fb383c26a5006bfa3af1
+Author: RoosterDragon <RoosterDragon@outlook.com>
+Date:   Sun May 22 15:20:38 2022 +0100
+
+    Add a PathFinderOverlay to visualize path searches.
+    
+    Activated with the '/path-debug' chat command, this displays the explored search space and costs when searching for paths. It supports custom movement layers, bi-directional searches as well as visualizing searches over the abstract graph of the HierarchicalPathFinder. The most recent search among selected units is shown.
+
+diff --git a/OpenRA.Mods.Common/Pathfinder/HierarchicalPathFinder.cs b/OpenRA.Mods.Common/Pathfinder/HierarchicalPathFinder.cs
+index 2cef1b7a9f..d0333449d7 100644
+--- a/OpenRA.Mods.Common/Pathfinder/HierarchicalPathFinder.cs
++++ b/OpenRA.Mods.Common/Pathfinder/HierarchicalPathFinder.cs
+@@ -586,11 +586,13 @@ namespace OpenRA.Mods.Common.Pathfinder
+ 		/// </summary>
+ 		public List<CPos> FindPath(Actor self, IReadOnlyCollection<CPos> sources, CPos target,
+ 			BlockedByActor check, int heuristicWeightPercentage, Func<CPos, int> customCost,
+-			Actor ignoreActor, bool laneBias)
++			Actor ignoreActor, bool laneBias, PathFinderOverlay pathFinderOverlay)
+ 		{
+ 			if (costEstimator == null)
+ 				return PathFinder.NoPath;
+ 
++			pathFinderOverlay?.NewRecording(self, sources, target);
++
+ 			RebuildDirtyGrids();
+ 
+ 			var targetAbstractCell = AbstractCellForLocalCell(target);
+@@ -622,7 +624,7 @@ namespace OpenRA.Mods.Common.Pathfinder
+ 			// Determine an abstract path to all sources, for use in a unidirectional search.
+ 			var estimatedSearchSize = (abstractGraph.Count + 2) / 8;
+ 			using (var reverseAbstractSearch = PathSearch.ToTargetCellOverGraph(
+-				fullGraph.GetConnections, locomotor, target, target, estimatedSearchSize))
++				fullGraph.GetConnections, locomotor, target, target, estimatedSearchSize, pathFinderOverlay?.RecordAbstractEdges(self)))
+ 			{
+ 				var sourcesWithPathableNodes = new List<CPos>(sourcesWithReachableNodes.Count);
+ 				foreach (var source in sourcesWithReachableNodes)
+@@ -637,7 +639,8 @@ namespace OpenRA.Mods.Common.Pathfinder
+ 
+ 				using (var fromSrc = GetLocalPathSearch(
+ 					self, sourcesWithPathableNodes, target, customCost, ignoreActor, check, laneBias, null, heuristicWeightPercentage,
+-					heuristic: Heuristic(reverseAbstractSearch, estimatedSearchSize)))
++					heuristic: Heuristic(reverseAbstractSearch, estimatedSearchSize),
++					recorder: pathFinderOverlay?.RecordLocalEdges(self)))
+ 					return fromSrc.FindPath();
+ 			}
+ 		}
+@@ -649,7 +652,7 @@ namespace OpenRA.Mods.Common.Pathfinder
+ 		/// </summary>
+ 		public List<CPos> FindPath(Actor self, CPos source, CPos target,
+ 			BlockedByActor check, int heuristicWeightPercentage, Func<CPos, int> customCost,
+-			Actor ignoreActor, bool laneBias)
++			Actor ignoreActor, bool laneBias, PathFinderOverlay pathFinderOverlay)
+ 		{
+ 			if (costEstimator == null)
+ 				return PathFinder.NoPath;
+@@ -670,15 +673,20 @@ namespace OpenRA.Mods.Common.Pathfinder
+ 						source.Layer),
+ 					false);
+ 
++				pathFinderOverlay?.NewRecording(self, new[] { source }, target);
++
+ 				List<CPos> localPath;
+ 				using (var search = GetLocalPathSearch(
+-					self, new[] { source }, target, customCost, ignoreActor, check, laneBias, gridToSearch, heuristicWeightPercentage))
++					self, new[] { source }, target, customCost, ignoreActor, check, laneBias, gridToSearch, heuristicWeightPercentage,
++					recorder: pathFinderOverlay?.RecordLocalEdges(self)))
+ 					localPath = search.FindPath();
+ 
+ 				if (localPath.Count > 0)
+ 					return localPath;
+ 			}
+ 
++			pathFinderOverlay?.NewRecording(self, new[] { source }, target);
++
+ 			RebuildDirtyGrids();
+ 
+ 			var targetAbstractCell = AbstractCellForLocalCell(target);
+@@ -697,22 +705,24 @@ namespace OpenRA.Mods.Common.Pathfinder
+ 			// Determine an abstract path in both directions, for use in a bidirectional search.
+ 			var estimatedSearchSize = (abstractGraph.Count + 2) / 8;
+ 			using (var forwardAbstractSearch = PathSearch.ToTargetCellOverGraph(
+-				fullGraph.GetConnections, locomotor, source, target, estimatedSearchSize))
++				fullGraph.GetConnections, locomotor, source, target, estimatedSearchSize, pathFinderOverlay?.RecordAbstractEdges(self)))
+ 			{
+ 				if (!forwardAbstractSearch.ExpandToTarget())
+ 					return PathFinder.NoPath;
+ 
+ 				using (var reverseAbstractSearch = PathSearch.ToTargetCellOverGraph(
+-					fullGraph.GetConnections, locomotor, target, source, estimatedSearchSize))
++					fullGraph.GetConnections, locomotor, target, source, estimatedSearchSize, pathFinderOverlay?.RecordAbstractEdges(self)))
+ 				{
+ 					reverseAbstractSearch.ExpandToTarget();
+ 
+ 					using (var fromSrc = GetLocalPathSearch(
+ 						self, new[] { source }, target, customCost, ignoreActor, check, laneBias, null, heuristicWeightPercentage,
+-						heuristic: Heuristic(reverseAbstractSearch, estimatedSearchSize)))
++						heuristic: Heuristic(reverseAbstractSearch, estimatedSearchSize),
++						recorder: pathFinderOverlay?.RecordLocalEdges(self)))
+ 					using (var fromDest = GetLocalPathSearch(
+ 						self, new[] { target }, source, customCost, ignoreActor, check, laneBias, null, heuristicWeightPercentage,
+ 						heuristic: Heuristic(forwardAbstractSearch, estimatedSearchSize),
++						recorder: pathFinderOverlay?.RecordLocalEdges(self),
+ 						inReverse: true))
+ 						return PathSearch.FindBidiPath(fromDest, fromSrc);
+ 				}
+@@ -979,11 +989,12 @@ namespace OpenRA.Mods.Common.Pathfinder
+ 			Actor self, IEnumerable<CPos> srcs, CPos dst, Func<CPos, int> customCost,
+ 			Actor ignoreActor, BlockedByActor check, bool laneBias, Grid? grid, int heuristicWeightPercentage,
+ 			Func<CPos, int> heuristic = null,
+-			bool inReverse = false)
++			bool inReverse = false,
++			PathSearch.IRecorder recorder = null)
+ 		{
+ 			return PathSearch.ToTargetCell(
+ 				world, locomotor, self, srcs, dst, check, heuristicWeightPercentage,
+-				customCost, ignoreActor, laneBias, inReverse, heuristic, grid);
++				customCost, ignoreActor, laneBias, inReverse, heuristic, grid, recorder);
+ 		}
+ 	}
+ }
+diff --git a/OpenRA.Mods.Common/Pathfinder/PathSearch.cs b/OpenRA.Mods.Common/Pathfinder/PathSearch.cs
+index 4ba2e30455..e8459b928b 100644
+--- a/OpenRA.Mods.Common/Pathfinder/PathSearch.cs
++++ b/OpenRA.Mods.Common/Pathfinder/PathSearch.cs
+@@ -20,6 +20,11 @@ namespace OpenRA.Mods.Common.Pathfinder
+ {
+ 	public sealed class PathSearch : IDisposable
+ 	{
++		public interface IRecorder
++		{
++			void Add(CPos source, CPos destination, int costSoFar, int estimatedRemainingCost);
++		}
++
+ 		// PERF: Maintain a pool of layers used for paths searches for each world. These searches are performed often
+ 		// so we wish to avoid the high cost of initializing a new search space every time by reusing the old ones.
+ 		static readonly ConditionalWeakTable<World, CellInfoLayerPool> LayerPoolTable = new ConditionalWeakTable<World, CellInfoLayerPool>();
+@@ -35,10 +40,11 @@ namespace OpenRA.Mods.Common.Pathfinder
+ 			IEnumerable<CPos> froms, Func<CPos, bool> targetPredicate, BlockedByActor check,
+ 			Func<CPos, int> customCost = null,
+ 			Actor ignoreActor = null,
+-			bool laneBias = true)
++			bool laneBias = true,
++			IRecorder recorder = null)
+ 		{
+ 			var graph = new MapPathGraph(LayerPoolForWorld(world), locomotor, self, world, check, customCost, ignoreActor, laneBias, false);
+-			var search = new PathSearch(graph, loc => 0, 0, targetPredicate);
++			var search = new PathSearch(graph, loc => 0, 0, targetPredicate, recorder);
+ 
+ 			foreach (var sl in froms)
+ 				if (world.Map.Contains(sl))
+@@ -55,7 +61,8 @@ namespace OpenRA.Mods.Common.Pathfinder
+ 			bool laneBias = true,
+ 			bool inReverse = false,
+ 			Func<CPos, int> heuristic = null,
+-			Grid? grid = null)
++			Grid? grid = null,
++			IRecorder recorder = null)
+ 		{
+ 			IPathGraph graph;
+ 			if (grid != null)
+@@ -64,7 +71,7 @@ namespace OpenRA.Mods.Common.Pathfinder
+ 				graph = new MapPathGraph(LayerPoolForWorld(world), locomotor, self, world, check, customCost, ignoreActor, laneBias, inReverse);
+ 
+ 			heuristic = heuristic ?? DefaultCostEstimator(locomotor, target);
+-			var search = new PathSearch(graph, heuristic, heuristicWeightPercentage, loc => loc == target);
++			var search = new PathSearch(graph, heuristic, heuristicWeightPercentage, loc => loc == target, recorder);
+ 
+ 			foreach (var sl in froms)
+ 				if (world.Map.Contains(sl))
+@@ -75,10 +82,10 @@ namespace OpenRA.Mods.Common.Pathfinder
+ 
+ 		public static PathSearch ToTargetCellOverGraph(
+ 			Func<CPos, List<GraphConnection>> edges, Locomotor locomotor, CPos from, CPos target,
+-			int estimatedSearchSize = 0)
++			int estimatedSearchSize = 0, IRecorder recorder = null)
+ 		{
+ 			var graph = new SparsePathGraph(edges, estimatedSearchSize);
+-			var search = new PathSearch(graph, DefaultCostEstimator(locomotor, target), 100, loc => loc == target);
++			var search = new PathSearch(graph, DefaultCostEstimator(locomotor, target), 100, loc => loc == target, recorder);
+ 
+ 			search.AddInitialCell(from);
+ 
+@@ -128,6 +135,7 @@ namespace OpenRA.Mods.Common.Pathfinder
+ 		public Func<CPos, bool> TargetPredicate { get; set; }
+ 		readonly Func<CPos, int> heuristic;
+ 		readonly int heuristicWeightPercentage;
++		readonly IRecorder recorder;
+ 		readonly IPriorityQueue<GraphConnection> openQueue;
+ 
+ 		/// <summary>
+@@ -144,12 +152,13 @@ namespace OpenRA.Mods.Common.Pathfinder
+ 		/// The search can skip some areas of the search space, meaning it has less work to do.
+ 		/// </param>
+ 		/// <param name="targetPredicate">Determines if the given cell is the target.</param>
+-		PathSearch(IPathGraph graph, Func<CPos, int> heuristic, int heuristicWeightPercentage, Func<CPos, bool> targetPredicate)
++		PathSearch(IPathGraph graph, Func<CPos, int> heuristic, int heuristicWeightPercentage, Func<CPos, bool> targetPredicate, IRecorder recorder)
+ 		{
+ 			Graph = graph;
+ 			this.heuristic = heuristic;
+ 			this.heuristicWeightPercentage = heuristicWeightPercentage;
+ 			TargetPredicate = targetPredicate;
++			this.recorder = recorder;
+ 			openQueue = new PriorityQueue<GraphConnection>(GraphConnection.ConnectionCostComparer);
+ 		}
+ 
+@@ -219,6 +228,8 @@ namespace OpenRA.Mods.Common.Pathfinder
+ 				else
+ 					estimatedRemainingCostToTarget = heuristic(neighbor) * heuristicWeightPercentage / 100;
+ 
++				recorder?.Add(currentMinNode, neighbor, costSoFarToNeighbor, estimatedRemainingCostToTarget);
++
+ 				var estimatedTotalCostToTarget = costSoFarToNeighbor + estimatedRemainingCostToTarget;
+ 				Graph[neighbor] = new CellInfo(CellStatus.Open, costSoFarToNeighbor, estimatedTotalCostToTarget, currentMinNode);
+ 				openQueue.Add(new GraphConnection(neighbor, estimatedTotalCostToTarget));
+diff --git a/OpenRA.Mods.Common/Traits/World/PathFinder.cs b/OpenRA.Mods.Common/Traits/World/PathFinder.cs
+index d32ca0cb87..7a699fb0ec 100644
+--- a/OpenRA.Mods.Common/Traits/World/PathFinder.cs
++++ b/OpenRA.Mods.Common/Traits/World/PathFinder.cs
+@@ -39,6 +39,7 @@ namespace OpenRA.Mods.Common.Traits
+ 		const int DefaultHeuristicWeightPercentage = 125;
+ 
+ 		readonly World world;
++		PathFinderOverlay pathFinderOverlay;
+ 		Dictionary<Locomotor, HierarchicalPathFinder> hierarchicalPathFindersByLocomotor;
+ 
+ 		public PathFinder(Actor self)
+@@ -55,6 +56,8 @@ namespace OpenRA.Mods.Common.Traits
+ 
+ 		public void WorldLoaded(World w, WorldRenderer wr)
+ 		{
++			pathFinderOverlay = world.WorldActor.TraitOrDefault<PathFinderOverlay>();
++
+ 			// Requires<LocomotorInfo> ensures all Locomotors have been initialized.
+ 			hierarchicalPathFindersByLocomotor = w.WorldActor.TraitsImplementing<Locomotor>().ToDictionary(
+ 				locomotor => locomotor,
+@@ -106,12 +109,12 @@ namespace OpenRA.Mods.Common.Traits
+ 
+ 				// Use a hierarchical path search, which performs a guided bidirectional search.
+ 				return hierarchicalPathFindersByLocomotor[locomotor].FindPath(
+-					self, source, target, check, DefaultHeuristicWeightPercentage, customCost, ignoreActor, laneBias);
++					self, source, target, check, DefaultHeuristicWeightPercentage, customCost, ignoreActor, laneBias, pathFinderOverlay);
+ 			}
+ 
+ 			// Use a hierarchical path search, which performs a guided unidirectional search.
+ 			return hierarchicalPathFindersByLocomotor[locomotor].FindPath(
+-				self, sourcesList, target, check, DefaultHeuristicWeightPercentage, customCost, ignoreActor, laneBias);
++				self, sourcesList, target, check, DefaultHeuristicWeightPercentage, customCost, ignoreActor, laneBias, pathFinderOverlay);
+ 		}
+ 
+ 		/// <summary>
+@@ -129,9 +132,11 @@ namespace OpenRA.Mods.Common.Traits
+ 			Actor ignoreActor = null,
+ 			bool laneBias = true)
+ 		{
++			pathFinderOverlay?.NewRecording(self, sources, null);
++
+ 			// With no pre-specified target location, we can only use a unidirectional search.
+ 			using (var search = PathSearch.ToTargetCellByPredicate(
+-				world, GetActorLocomotor(self), self, sources, targetPredicate, check, customCost, ignoreActor, laneBias))
++				world, GetActorLocomotor(self), self, sources, targetPredicate, check, customCost, ignoreActor, laneBias, pathFinderOverlay?.RecordLocalEdges(self)))
+ 				return search.FindPath();
+ 		}
+ 
+diff --git a/OpenRA.Mods.Common/Traits/World/PathFinderOverlay.cs b/OpenRA.Mods.Common/Traits/World/PathFinderOverlay.cs
+new file mode 100644
+index 0000000000..76aafa73f8
+--- /dev/null
++++ b/OpenRA.Mods.Common/Traits/World/PathFinderOverlay.cs
+@@ -0,0 +1,232 @@
++﻿#region Copyright & License Information
++/*
++ * Copyright 2007-2022 The OpenRA Developers (see AUTHORS)
++ * This file is part of OpenRA, which is free software. It is made
++ * available to you under the terms of the GNU General Public License
++ * as published by the Free Software Foundation, either version 3 of
++ * the License, or (at your option) any later version. For more
++ * information, see COPYING.
++ */
++#endregion
++
++using System;
++using System.Collections;
++using System.Collections.Generic;
++using System.Linq;
++using OpenRA.Graphics;
++using OpenRA.Mods.Common.Commands;
++using OpenRA.Mods.Common.Graphics;
++using OpenRA.Mods.Common.Pathfinder;
++using OpenRA.Primitives;
++using OpenRA.Traits;
++
++namespace OpenRA.Mods.Common.Traits
++{
++	[TraitLocation(SystemActors.World)]
++	[Desc("Renders a visualization overlay showing how the pathfinder searches for paths. Attach this to the world actor.")]
++	public class PathFinderOverlayInfo : TraitInfo, Requires<PathFinderInfo>
++	{
++		public readonly string Font = "TinyBold";
++		public readonly Color TargetLineColor = Color.Red;
++		public readonly Color AbstractColor1 = Color.Lime;
++		public readonly Color AbstractColor2 = Color.PaleGreen;
++		public readonly Color LocalColor1 = Color.Yellow;
++		public readonly Color LocalColor2 = Color.LightYellow;
++		public readonly bool ShowCosts = true;
++
++		public override object Create(ActorInitializer init) { return new PathFinderOverlay(this); }
++	}
++
++	public class PathFinderOverlay : IRenderAnnotations, IWorldLoaded, IChatCommand
++	{
++		const string CommandName = "path-debug";
++		const string CommandDesc = "toggles a visualization of path searching.";
++
++		sealed class Record : PathSearch.IRecorder, IEnumerable<(CPos Source, CPos Destination, int CostSoFar, int EstimatedRemainingCost)>
++		{
++			readonly Dictionary<CPos, (CPos Source, int CostSoFar, int EstimatedRemainingCost)> edges
++				= new Dictionary<CPos, (CPos Source, int CostSoFar, int EstimatedRemainingCost)>();
++
++			public void Add(CPos source, CPos destination, int costSoFar, int estimatedRemainingCost)
++			{
++				edges[destination] = (source, costSoFar, estimatedRemainingCost);
++			}
++
++			public IEnumerator<(CPos Source, CPos Destination, int CostSoFar, int EstimatedRemainingCost)> GetEnumerator()
++			{
++				return edges
++					.Select(kvp => (kvp.Value.Source, kvp.Key, kvp.Value.CostSoFar, kvp.Value.EstimatedRemainingCost))
++					.GetEnumerator();
++			}
++
++			IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
++		}
++
++		readonly PathFinderOverlayInfo info;
++		readonly SpriteFont font;
++		public bool Enabled { get; private set; }
++
++		Actor forActor;
++		CPos[] sourceCells;
++		CPos? targetCell;
++
++		Record abstractEdges1;
++		Record abstractEdges2;
++		Record localEdges1;
++		Record localEdges2;
++
++		public PathFinderOverlay(PathFinderOverlayInfo info)
++		{
++			this.info = info;
++			font = Game.Renderer.Fonts[info.Font];
++		}
++
++		void IWorldLoaded.WorldLoaded(World w, WorldRenderer wr)
++		{
++			var console = w.WorldActor.TraitOrDefault<ChatCommands>();
++			var help = w.WorldActor.TraitOrDefault<HelpCommand>();
++
++			if (console == null || help == null)
++				return;
++
++			console.RegisterCommand(CommandName, this);
++			help.RegisterHelp(CommandName, CommandDesc);
++		}
++
++		void IChatCommand.InvokeCommand(string name, string arg)
++		{
++			if (name == CommandName)
++				Enabled ^= true;
++		}
++
++		public void NewRecording(Actor actor, IEnumerable<CPos> sources, CPos? target)
++		{
++			if (!Enabled)
++			{
++				forActor = null;
++				return;
++			}
++
++			if (!actor.World.Selection.Contains(actor))
++				return;
++
++			abstractEdges1 = null;
++			abstractEdges2 = null;
++			localEdges1 = null;
++			localEdges2 = null;
++			sourceCells = sources.ToArray();
++			targetCell = target;
++			forActor = actor;
++		}
++
++		public PathSearch.IRecorder RecordAbstractEdges(Actor actor)
++		{
++			if (forActor != actor)
++				return null;
++			if (abstractEdges1 == null)
++				return abstractEdges1 = new Record();
++			if (abstractEdges2 == null)
++				return abstractEdges2 = new Record();
++			throw new InvalidOperationException("Maximum two records permitted.");
++		}
++
++		public PathSearch.IRecorder RecordLocalEdges(Actor actor)
++		{
++			if (forActor != actor)
++				return null;
++			if (localEdges1 == null)
++				return localEdges1 = new Record();
++			if (localEdges2 == null)
++				return localEdges2 = new Record();
++			throw new InvalidOperationException("Maximum two records permitted.");
++		}
++
++		IEnumerable<IRenderable> IRenderAnnotations.RenderAnnotations(Actor self, WorldRenderer wr)
++		{
++			if (!Enabled || forActor == null)
++				yield break;
++
++			foreach (var sourceCell in sourceCells)
++				yield return new TargetLineRenderable(new[]
++				{
++					self.World.Map.CenterOfSubCell(sourceCell, SubCell.FullCell),
++					self.World.Map.CenterOfSubCell(targetCell ?? sourceCell, SubCell.FullCell),
++				}, info.TargetLineColor, 8, 8);
++
++			foreach (var line in RenderEdges(self, abstractEdges1, 8, 6, info.AbstractColor1))
++				yield return line;
++
++			foreach (var line in RenderEdges(self, abstractEdges2, 6, 4, info.AbstractColor2))
++				yield return line;
++
++			foreach (var line in RenderEdges(self, localEdges1, 5, 3, info.LocalColor1))
++				yield return line;
++
++			foreach (var line in RenderEdges(self, localEdges2, 4, 2, info.LocalColor2))
++				yield return line;
++
++			if (!info.ShowCosts)
++				yield break;
++
++			const int HorizontalOffset = 320;
++			const int VerticalOffset = 512;
++
++			foreach (var line in RenderCosts(self, abstractEdges1, new WVec(-HorizontalOffset, -VerticalOffset, 0), font, info.AbstractColor1))
++				yield return line;
++
++			foreach (var line in RenderCosts(self, abstractEdges2, new WVec(-HorizontalOffset, VerticalOffset, 0), font, info.AbstractColor2))
++				yield return line;
++
++			foreach (var line in RenderCosts(self, localEdges1, new WVec(HorizontalOffset, -VerticalOffset, 0), font, info.LocalColor1))
++				yield return line;
++
++			foreach (var line in RenderCosts(self, localEdges2, new WVec(HorizontalOffset, VerticalOffset, 0), font, info.LocalColor2))
++				yield return line;
++		}
++
++		static IEnumerable<IRenderable> RenderEdges(Actor self, Record edges, int nodeSize, int edgeSize, Color color)
++		{
++			if (edges == null)
++				yield break;
++
++			var customColor = CustomLayerColor(color);
++			foreach (var (source, destination, _, _) in edges)
++				yield return new TargetLineRenderable(new[]
++				{
++					self.World.Map.CenterOfSubCell(source, SubCell.FullCell) + CustomLayerOffset(source),
++					self.World.Map.CenterOfSubCell(destination, SubCell.FullCell) + CustomLayerOffset(destination),
++				}, destination.Layer == 0 ? color : customColor, edgeSize, nodeSize);
++		}
++
++		static IEnumerable<IRenderable> RenderCosts(Actor self, Record edges, WVec textOffset, SpriteFont font, Color color)
++		{
++			if (edges == null)
++				yield break;
++
++			var customColor = CustomLayerColor(color);
++			foreach (var (_, destination, costSoFar, estimatedRemainingCost) in edges)
++			{
++				var centerPos = self.World.Map.CenterOfSubCell(destination, SubCell.FullCell) +
++					CustomLayerOffset(destination) + textOffset;
++				yield return new TextAnnotationRenderable(font, centerPos, 0,
++					destination.Layer == 0 ? color : customColor,
++					$"{costSoFar}|{estimatedRemainingCost}|{costSoFar + estimatedRemainingCost}");
++			}
++		}
++
++		static Color CustomLayerColor(Color original)
++		{
++			(var a, var h, var s, var v) = original.ToAhsv();
++			return Color.FromAhsv(a, h, s, v * .7f);
++		}
++
++		static WVec CustomLayerOffset(CPos cell)
++		{
++			return cell.Layer == 0
++				? WVec.Zero
++				: new WVec(0, -352, 0);
++		}
++
++		bool IRenderAnnotations.SpatiallyPartitionable => false;
++	}
++}
+diff --git a/mods/cnc/rules/world.yaml b/mods/cnc/rules/world.yaml
+index 3b00d74c3e..f8f41d5c6f 100644
+--- a/mods/cnc/rules/world.yaml
++++ b/mods/cnc/rules/world.yaml
+@@ -153,6 +153,7 @@ World:
+ 	ChatCommands:
+ 	DevCommands:
+ 	DebugVisualizationCommands:
++	PathFinderOverlay:
+ 	HierarchicalPathFinderOverlay:
+ 	PlayerCommands:
+ 	HelpCommand:
+diff --git a/mods/d2k/rules/world.yaml b/mods/d2k/rules/world.yaml
+index ae58232430..eb6c4415c9 100644
+--- a/mods/d2k/rules/world.yaml
++++ b/mods/d2k/rules/world.yaml
+@@ -120,6 +120,7 @@ World:
+ 	ChatCommands:
+ 	DevCommands:
+ 	DebugVisualizationCommands:
++	PathFinderOverlay:
+ 	HierarchicalPathFinderOverlay:
+ 	PlayerCommands:
+ 	HelpCommand:
+diff --git a/mods/ra/rules/world.yaml b/mods/ra/rules/world.yaml
+index 73edffbada..5d42e3d7d6 100644
+--- a/mods/ra/rules/world.yaml
++++ b/mods/ra/rules/world.yaml
+@@ -165,6 +165,7 @@ World:
+ 	ChatCommands:
+ 	DevCommands:
+ 	DebugVisualizationCommands:
++	PathFinderOverlay:
+ 	HierarchicalPathFinderOverlay:
+ 	PlayerCommands:
+ 	HelpCommand:
+diff --git a/mods/ts/rules/world.yaml b/mods/ts/rules/world.yaml
+index 6b5aa7b08e..aed91d0088 100644
+--- a/mods/ts/rules/world.yaml
++++ b/mods/ts/rules/world.yaml
+@@ -235,6 +235,7 @@ World:
+ 	ChatCommands:
+ 	DevCommands:
+ 	DebugVisualizationCommands:
++	PathFinderOverlay:
+ 	HierarchicalPathFinderOverlay:
+ 	PlayerCommands:
+ 	HelpCommand:

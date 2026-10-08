@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "track": "fix",
+  "task": {
+    "pr_number": 3778,
+    "pr_url": "https://github.com/vectordotdev/vector/pull/3778",
+    "commit": "ad77d20302cd77f5f00262a32d75d592a711fa86",
+    "detectability": 4,
+    "szz_confidence": "high",
+    "blamed_line_share": 1.0
+  },
+  "cases": [
+    {
+      "id": "issue:4175",
+      "provenance": "A user reported this defect after the reviewed pull request, and a later fix repaired it.",
+      "summary": "Fix flaky `uptime_metrics` tests for macOS",
+      "description": "https://github.com/timberio/vector/pull/3778#issuecomment-698622017 is still occasionally an issue in macOS CI tests. The interval fix I suggested in that thread seems to have fixed it locally, so I think this probably hints at it being a race condition of some kind.",
+      "location": {
+        "files": [
+          "graphql/subscriptions/uptime_metrics.graphql",
+          "tests/api.rs"
+        ]
+      },
+      "evidence": {
+        "eventual_fix_title": "fix(tests): Fix uptime_metrics GraphQL/API tests",
+        "eventual_fix_problem_statement": "fix(tests): Fix uptime_metrics GraphQL/API tests\n\nCloses #4175 (hopefully.)\r\n\r\nTest with:\r\n\r\n```bash\r\nRUST_TEST_THREADS=X cargo test --test api -- --nocapture\r\n```\r\n\r\nWhere 'X' is the number of threads to test. CI was balking at `1`; my local machine panicked with `2`. If both pass, it probably works.\r\n\r\nSigned-off-by: Lee Benson <lee@leebenson.com>",
+        "eventual_fix_diff": "commit 49f23608ab22a3199fd0a2b71abbd215e29f1146\nAuthor: Lee Benson <lee@leebenson.com>\nDate:   Tue Sep 29 16:42:02 2020 +0100\n\n    fix flaky macOS tests (#4187)\n    \n    Signed-off-by: Lee Benson <lee@leebenson.com>\n\ndiff --git a/graphql/subscriptions/uptime_metrics.graphql b/graphql/subscriptions/uptime_metrics.graphql\nindex 06014185ba..97768f2037 100644\n--- a/graphql/subscriptions/uptime_metrics.graphql\n+++ b/graphql/subscriptions/uptime_metrics.graphql\n@@ -1,5 +1,5 @@\n-subscription UptimeMetricsSubscription($interval: Int!) {\n-  uptimeMetrics(interval: $interval) {\n+subscription UptimeMetricsSubscription {\n+  uptimeMetrics {\n     seconds\n   }\n }\ndiff --git a/tests/api.rs b/tests/api.rs\nindex eb74dff687..6298808821 100644\n--- a/tests/api.rs\n+++ b/tests/api.rs\n@@ -10,18 +10,20 @@ mod tests {\n     use chrono::Utc;\n     use futures::StreamExt;\n     use graphql_client::*;\n-    use std::{sync::Once, time::Duration};\n+    use std::{\n+        sync::Once,\n+        time::{Duration, Instant},\n+    };\n     use tokio::{select, sync::oneshot};\n     use vector::{\n         self,\n         api::{self, client::subscription::SubscriptionClient},\n         config::Config,\n-        heartbeat,\n-        internal_events::{emit, GeneratorEventProcessed},\n+        internal_events::{emit, GeneratorEventProcessed, Heartbeat},\n         test_util::{next_addr, retry_until},\n     };\n \n-    static METRIC_INIT: Once = Once::new();\n+    static METRICS_INIT: Once = Once::new();\n \n     #[derive(GraphQLQuery)]\n     #[graphql(\n@@ -58,10 +60,27 @@ mod tests {\n     struct EventsProcessedMetricsSubscription;\n \n     // Initialize the metrics system. Idempotent.\n-    fn init_metrics() {\n-        METRIC_INIT.call_once(|| {\n+    fn init_metrics() -> oneshot::Sender<()> {\n+        METRICS_INIT.call_once(|| {\n             let _ = vector::metrics::init();\n-        })\n+        });\n+\n+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();\n+        tokio::spawn(async move {\n+            let since = Instant::now();\n+            let mut timer = tokio::time::interval(Duration::from_secs(1));\n+\n+            loop {\n+                select! {\n+                    _ = &mut shutdown_rx => break,\n+                    _ = timer.tick() => {\n+                        emit(Heartbeat { since });\n+                    }\n+                }\n+            }\n+        });\n+\n+        shutdown_tx\n     }\n \n     // Provides a config that enables the API server, assigned to a random port. Implicitly\n@@ -186,15 +205,9 @@ mod tests {\n         assert_matches!(heartbeats.next().await, None);\n     }\n \n-    async fn new_uptime_subscription(\n-        client: &SubscriptionClient,\n-        num_results: usize,\n-        interval: i64,\n-    ) {\n+    async fn new_uptime_subscription(client: &SubscriptionClient) {\n         let request_body =\n-            UptimeMetricsSubscription::build_query(uptime_metrics_subscription::Variables {\n-                interval,\n-            });\n+            UptimeMetricsSubscription::build_query(uptime_metrics_subscription::Variables);\n \n         let subscription = client\n             .start::<UptimeMetricsSubscription>(&request_body)\n@@ -202,11 +215,10 @@ mod tests {\n             .unwrap();\n \n         tokio::pin! {\n-            let uptime = subscription.stream().skip(num_results);\n+            let uptime = subscription.stream().skip(1);\n         }\n \n-        // Uptime should be at least the number of seconds as the results - 1, to account\n-        // for the initial uptime\n+        // Uptime should be above zero\n         assert!(\n             uptime\n                 .take(1)\n@@ -218,7 +230,7 @@ mod tests {\n                 .unwrap()\n                 .uptime_metrics\n                 .seconds\n-                > num_results as f64 - 1.0\n+                > 0.00\n         )\n     }\n \n@@ -331,10 +343,9 @@ mod tests {\n         let bind = config.api.bind.unwrap();\n         let client = new_subscription_client(bind).await;\n \n-        init_metrics();\n-        tokio::spawn(heartbeat::heartbeat());\n+        let _metrics = init_metrics();\n \n-        new_uptime_subscription(&client, 3, 1200).await;\n+        new_uptime_subscription(&client).await;\n     }\n \n     #[tokio::test]\n@@ -345,7 +356,7 @@ mod tests {\n         let bind = config.api.bind.unwrap();\n         let client = new_subscription_client(bind).await;\n \n-        init_metrics();\n+        let _metrics = init_metrics();\n \n         new_events_processed_subscription(&client, 3, 100).await;\n     }\n@@ -358,11 +369,10 @@ mod tests {\n         let bind = config.api.bind.unwrap();\n         let client = new_subscription_client(bind).await;\n \n-        init_metrics();\n-        tokio::spawn(heartbeat::heartbeat());\n+        let _metrics = init_metrics();\n \n         futures::join! {\n-            new_uptime_subscription(&client, 3, 1200),\n+            new_uptime_subscription(&client),\n             new_heartbeat_subscription(&client, 3, 500),\n         };\n     }\n"
+      },
+      "metadata": {
+        "oracle_source": "issue",
+        "issue_number": 4175,
+        "issue_url": "https://github.com/vectordotdev/vector/issues/4175",
+        "issue_type": "",
+        "issue_priority": null,
+        "issue_severity": null,
+        "issue_tags": [],
+        "issue_area_path": "",
+        "issue_resolved_reason": "",
+        "fix_pr": 4187,
+        "fix_pr_url": "https://github.com/vectordotdev/vector/pull/4187",
+        "fix_commit": "49f23608ab22a3199fd0a2b71abbd215e29f1146",
+        "verification": {
+          "root_cause_confirmed": "yes",
+          "source": "published task list"
+        }
+      }
+    }
+  ]
+}

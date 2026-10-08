@@ -1,0 +1,111 @@
+commit b2f3664a32a0119a1acf93756cc8b930b8de860f
+Author: Matthew Soulanille <msoulanille@google.com>
+Date:   Tue Nov 16 11:01:11 2021 -0800
+
+    [wasm] Fix memory leak in node when disposing wasm backend (#5852)
+    
+    Fixes #5851. This is caused by listeners to 'uncaughtException' and 'unhandledRejection' not being cleaned up when the wasm backend is disposed. See the related emscripten issue https://github.com/emscripten-core/emscripten/issues/12740 for more info.
+
+diff --git a/tfjs-backend-wasm/src/cc/BUILD b/tfjs-backend-wasm/src/cc/BUILD
+index 1df5aa80e..26af0c951 100644
+--- a/tfjs-backend-wasm/src/cc/BUILD
++++ b/tfjs-backend-wasm/src/cc/BUILD
+@@ -18,6 +18,10 @@ BASE_LINKOPTS = [
+     "-s EXTRA_EXPORTED_RUNTIME_METHODS='[\"cwrap\"]'",
+     "-s MODULARIZE=1",
+     "-s MALLOC=emmalloc",
++    # TODO(mattsoulanille): Mark these files as dependencies so Bazel rebuilds
++    # when they change. github.com/emscripten-core/emsdk/issues/933
++    "--pre-js ./tfjs-backend-wasm/src/cc/pre.js",
++    "--post-js ./tfjs-backend-wasm/src/cc/post.js",
+ ]
+ 
+ # This build rule generates tfjs-backend-wasm.{js,wasm}.
+diff --git a/tfjs-backend-wasm/src/cc/build_defs.bzl b/tfjs-backend-wasm/src/cc/build_defs.bzl
+index 57b875cef..5a129cb56 100644
+--- a/tfjs-backend-wasm/src/cc/build_defs.bzl
++++ b/tfjs-backend-wasm/src/cc/build_defs.bzl
+@@ -18,19 +18,14 @@ def tfjs_unit_test(name, srcs, deps = [], **kwargs):
+         **kwargs
+     )
+ 
+-def tfjs_cc_library(name, srcs = [], hdrs = [], deps = []):
++def tfjs_cc_library(name, **kwargs):
+     """CC library for TensorFlow.js
+     Args:
+       name: The name of the TensorFlow.js cc library to define.
+-      srcs: The list of source files.
+-      hdrs: The list of header files.
+-      deps: The list of additional libraries to be linked.
+     """
+ 
+     native.cc_library(
+         name = name,
+         linkstatic = True,
+-        srcs = srcs,
+-        hdrs = hdrs,
+-        deps = deps,
++        **kwargs
+     )
+diff --git a/tfjs-backend-wasm/src/cc/post.js b/tfjs-backend-wasm/src/cc/post.js
+new file mode 100644
+index 000000000..8b604df06
+--- /dev/null
++++ b/tfjs-backend-wasm/src/cc/post.js
+@@ -0,0 +1,37 @@
++// This file is not pre-processed or downleveled to es5, so it must be es5
++// compatible.
++
++// Track and remove listeners previously added by emscripten. See pre.js for the
++// other half of the logic.
++
++var listenersAdded;
++if (beforeListeners) {
++  listenersAdded = {
++    uncaughtException: process.listeners('uncaughtException').filter(
++        function(listener) {
++          return !beforeListeners.uncaughtException.indexOf(listener) > -1;
++        }
++    ),
++    unhandledRejection: process.listeners('unhandledRejection').filter(
++        function(listener) {
++          return !beforeListeners.unhandledRejection.indexOf(listener) > -1;
++        }
++    ),
++  };
++}
++
++var actualModule = (WasmBackendModule || WasmBackendModuleThreadedSimd);
++
++// Patch the wasm module's dispose method to also unregister listeners.
++var tmpDispose = actualModule['_dispose'];
++actualModule['_dispose'] = function() {
++  tmpDispose();
++  if (listenersAdded) {
++    listenersAdded.uncaughtException.forEach(function(listener) {
++      process.removeListener('uncaughtException', listener);
++    });
++    listenersAdded.unhandledRejection.forEach(function(listener) {
++      process.removeListener('unhandledRejection', listener);
++    });
++  }
++}
+diff --git a/tfjs-backend-wasm/src/cc/pre.js b/tfjs-backend-wasm/src/cc/pre.js
+new file mode 100644
+index 000000000..3833e69a5
+--- /dev/null
++++ b/tfjs-backend-wasm/src/cc/pre.js
+@@ -0,0 +1,13 @@
++// This file is not pre-processed or downleveled to es5, so it must be es5
++// compatible.
++
++// Keep track of listeners that are added by emscripten so they can later be
++// removed. See post.js for the other half of the logic.
++
++var beforeListeners;
++if (process && process.listeners) {
++  beforeListeners = {
++    uncaughtException: process.listeners('uncaughtException'),
++    unhandledRejection: process.listeners('unhandledRejection'),
++  }
++}

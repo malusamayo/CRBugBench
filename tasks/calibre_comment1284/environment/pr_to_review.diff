@@ -1,0 +1,184 @@
+diff --git a/src/calibre/constants.py b/src/calibre/constants.py
+index aa6f4daa99cc..136a5c8e3b57 100644
+--- a/src/calibre/constants.py
++++ b/src/calibre/constants.py
+@@ -166,6 +166,8 @@ def cache_dir():
+ 
+ # plugins {{{
+ plugins_loc = sys.extensions_location
++site_plugins_loc = getattr(sys, 'site_plugins_location', None)
++
+ from importlib.machinery import ModuleSpec, EXTENSION_SUFFIXES, ExtensionFileLoader
+ from importlib.util import find_spec
+ from importlib import import_module
+diff --git a/src/calibre/customize/__init__.py b/src/calibre/customize/__init__.py
+index bc3d4fef927f..32fd996195d8 100644
+--- a/src/calibre/customize/__init__.py
++++ b/src/calibre/customize/__init__.py
+@@ -33,6 +33,8 @@ class Plugin(object):  # {{{
+                                plugin
+        * ``self.site_customization``: Stores a customization string entered
+                                       by the user.
++       * ``self.system_wide_installed``: Stores if the plugin is installed
++                                         system-wide.
+ 
+     Methods that should be overridden in sub classes:
+ 
+@@ -77,6 +79,10 @@ class Plugin(object):  # {{{
+     #: care.
+     can_be_disabled = True
+ 
++    #: If True, the plugin is installed system-wide and will behave as a
++    #: builtin plugin
++    system_wide_installed = False
++
+     #: The type of this plugin. Used for categorizing plugins in the
+     #: GUI
+     type = _('Base')
+diff --git a/src/calibre/customize/ui.py b/src/calibre/customize/ui.py
+index e1b31a75eaf4..732cd13f15ca 100644
+--- a/src/calibre/customize/ui.py
++++ b/src/calibre/customize/ui.py
+@@ -4,7 +4,7 @@
+ 
+ import os, shutil, traceback, functools, sys
+ from collections import defaultdict
+-from itertools import chain
++from itertools import chain, repeat
+ 
+ from calibre.customize import (CatalogPlugin, FileTypePlugin, PluginNotFound,
+                               MetadataReaderPlugin, MetadataWriterPlugin,
+@@ -21,13 +21,17 @@
+ from calibre.utils.config import (make_config_dir, Config, ConfigProxy,
+                                  plugin_dir, OptionParser)
+ from calibre.ebooks.metadata.sources.base import Source
+-from calibre.constants import DEBUG, numeric_version
++from calibre.constants import DEBUG, numeric_version, site_plugins_loc
+ from polyglot.builtins import iteritems, itervalues, unicode_type
+ 
+ builtin_names = frozenset(p.name for p in builtin_plugins)
+ BLACKLISTED_PLUGINS = frozenset({'Marvin XD', 'iOS reader applications'})
+ 
+ 
++def zip_value(iterable, value):
++    return zip(iterable, repeat(value))
++
++
+ class NameConflict(ValueError):
+     pass
+ 
+@@ -473,7 +477,10 @@ def add_plugin(path_to_zip_file):
+     if plugin.name in builtin_names:
+         raise NameConflict(
+             'A builtin plugin with the name %r already exists' % plugin.name)
+-    plugin = initialize_plugin(plugin, path_to_zip_file)
++    if plugin.name in _list_site_plugins:
++        raise NameConflict(
++            'A system plugin with the name %r already exists' % plugin.name)
++    plugin = initialize_plugin(plugin, path_to_zip_file, False)
+     plugins = config['plugins']
+     zfp = os.path.join(plugin_dir, plugin.name+'.zip')
+     if os.path.exists(zfp):
+@@ -659,9 +666,10 @@ def all_edit_book_tool_plugins():
+ _initialized_plugins = []
+ 
+ 
+-def initialize_plugin(plugin, path_to_zip_file):
++def initialize_plugin(plugin, path_to_zip_file, system_wide_installed):
+     try:
+         p = plugin(path_to_zip_file)
++        p.system_wide_installed = system_wide_installed
+         p.initialize()
+         return p
+     except Exception:
+@@ -676,6 +684,21 @@ def has_external_plugins():
+     return bool(config['plugins'])
+ 
+ 
++def _list_site_plugins():
++    if not site_plugins_loc:
++        return []
++
++    try:
++        plugin_file_names = os.listdir(site_plugins_loc)
++    except FileNotFoundError:
++        return []
++
++    for plugin_file_name in plugin_file_names:
++        plugin_path = os.path.join(site_plugins_loc, plugin_file_name)
++        if os.path.isfile(plugin_path) and plugin_file_name.endswith('.zip'):
++            yield (os.path.splitext(plugin_file_name)[0], plugin_path)
++
++
+ def initialize_plugins(perf=False):
+     global _initialized_plugins
+     _initialized_plugins = []
+@@ -691,21 +714,29 @@ def initialize_plugins(perf=False):
+         from collections import defaultdict
+         import time
+         times = defaultdict(lambda:0)
+-    for zfp in list(external_plugins) + builtin_plugins:
++
++    for zfp, system_wide_installed in chain(
++            zip_value(external_plugins.items(), False),
++            zip_value(_list_site_plugins(), True),
++            zip_value(builtin_plugins, False)
++            ):
+         try:
+             if not isinstance(zfp, type):
+                 # We have a plugin name
+-                pname = zfp
+-                zfp = os.path.join(plugin_dir, zfp+'.zip')
++                pname, path = zfp
++                zfp = os.path.join(plugin_dir, pname+'.zip')
+                 if not os.path.exists(zfp):
+-                    zfp = external_plugins[pname]
++                    zfp = path
+             try:
+                 plugin = load_plugin(zfp) if not isinstance(zfp, type) else zfp
+             except PluginNotFound:
+                 continue
+             if perf:
+                 st = time.time()
+-            plugin = initialize_plugin(plugin, None if isinstance(zfp, type) else zfp)
++            plugin = initialize_plugin(
++                    plugin,
++                    None if isinstance(zfp, type) else zfp, system_wide_installed
++            )
+             if perf:
+                 times[plugin.name] = time.time() - st
+             _initialized_plugins.append(plugin)
+diff --git a/src/calibre/gui2/dialogs/plugin_updater.py b/src/calibre/gui2/dialogs/plugin_updater.py
+index 522cc77d58d1..851c2e98a5d8 100644
+--- a/src/calibre/gui2/dialogs/plugin_updater.py
++++ b/src/calibre/gui2/dialogs/plugin_updater.py
+@@ -56,7 +56,7 @@ def get_plugin_updates_available(raise_error=False):
+ 
+ 
+ def filter_upgradeable_plugins(display_plugin):
+-    return display_plugin.is_upgrade_available()
++    return not display_plugin.prevent_upgrade and display_plugin.is_upgrade_available()
+ 
+ 
+ def filter_not_installed_plugins(display_plugin):
+@@ -195,6 +195,7 @@ def __init__(self, plugin):
+         self.uninstall_plugins = plugin['uninstall'] or []
+         self.has_changelog = plugin['history']
+         self.is_deprecated = plugin['deprecated']
++        self.prevent_upgrade = plugin['system_wide_installed'] or False
+ 
+     def is_disabled(self):
+         if self.plugin is None:
+diff --git a/src/calibre/gui2/preferences/plugins.py b/src/calibre/gui2/preferences/plugins.py
+index c3dc31b40c2d..6e361a6a843b 100644
+--- a/src/calibre/gui2/preferences/plugins.py
++++ b/src/calibre/gui2/preferences/plugins.py
+@@ -211,6 +211,8 @@ def data(self, index, role):
+                     ans += _('\nCustomization: ')+c
+                 if disabled:
+                     ans += _('\n\nThis plugin has been disabled')
++                if plugin.system_wide_installed:
++                    ans += _('\n\nThis plugin is installed system-wide and can not be managed from within calibre')
+                 return (ans)
+             if role == Qt.ItemDataRole.DecorationRole:
+                 return self.disabled_icon if disabled else self.icon

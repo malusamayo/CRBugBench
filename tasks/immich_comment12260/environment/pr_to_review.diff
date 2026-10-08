@@ -1,0 +1,494 @@
+diff --git a/.github/workflows/build-mobile.yml b/.github/workflows/build-mobile.yml
+index 948f67e3d4ebc7..032090633895d8 100644
+--- a/.github/workflows/build-mobile.yml
++++ b/.github/workflows/build-mobile.yml
+@@ -16,10 +16,28 @@ concurrency:
+   cancel-in-progress: true
+ 
+ jobs:
++  pre-job:
++    runs-on: ubuntu-latest
++    outputs:
++      should_run: ${{ steps.found_paths.outputs.mobile == 'true' || steps.should_force.outputs.should_force == 'true' }}
++    steps:
++      - name: Checkout code
++        uses: actions/checkout@v4
++      - id: found_paths
++        uses: dorny/paths-filter@v3
++        with:
++          filters: |
++            mobile:
++              - 'mobile/**'
++      - name: Check if we should force jobs to run
++        id: should_force
++        run: echo "should_force=${{ github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' }}" >> "$GITHUB_OUTPUT"
++
+   build-sign-android:
+     name: Build and sign Android
++    needs: pre-job
+     # Skip when PR from a fork
+-    if: ${{ !github.event.pull_request.head.repo.fork && github.actor != 'dependabot[bot]' }}
++    if: ${{ !github.event.pull_request.head.repo.fork && github.actor != 'dependabot[bot]' && needs.pre-job.outputs.should_skip == 'false' }}
+     runs-on: macos-14
+ 
+     steps:
+diff --git a/.github/workflows/docker.yml b/.github/workflows/docker.yml
+index 2da49a7310a2dd..7784b32f362f11 100644
+--- a/.github/workflows/docker.yml
++++ b/.github/workflows/docker.yml
+@@ -17,47 +17,149 @@ permissions:
+   packages: write
+ 
+ jobs:
+-  build_and_push:
+-    name: Build and Push
++  pre-job:
+     runs-on: ubuntu-latest
++    outputs:
++      should_run_server: ${{ steps.found_paths.outputs.server == 'true' || steps.should_force.outputs.should_force == 'true' }}
++      should_run_ml: ${{ steps.found_paths.outputs.machine-learning == 'true' || steps.should_force.outputs.should_force == 'true' }}
++    steps:
++      - name: Checkout code
++        uses: actions/checkout@v4
++      - id: found_paths
++        uses: dorny/paths-filter@v3
++        with:
++          filters: |
++            server:
++              - 'server/**'
++              - 'openapi/**'
++              - 'web/**'
++            machine-learning:
++              - 'machine-learning/**'
++
++      - name: Check if we should force jobs to run
++        id: should_force
++        run: echo "should_force=${{ github.event_name == 'workflow_dispatch' || github.event_name == 'release' }}" >> "$GITHUB_OUTPUT"
++
++  build_and_push_ml:
++    name: Build and Push ML
++    needs: pre-job
++    if: ${{ needs.pre-job.outputs.should_run_ml == 'true' }}
++    runs-on: ubuntu-latest
++    env:
++      image: immich-machine-learning
++      context: machine-learning
++      file: machine-learning/Dockerfile
+     strategy:
+       # Prevent a failure in one image from stopping the other builds
+       fail-fast: false
+       matrix:
+         include:
+-          - image: immich-machine-learning
+-            context: machine-learning
+-            file: machine-learning/Dockerfile
+-            platforms: linux/amd64,linux/arm64
++          - platforms: linux/amd64,linux/arm64
+             device: cpu
+ 
+-          - image: immich-machine-learning
+-            context: machine-learning
+-            file: machine-learning/Dockerfile
+-            platforms: linux/amd64
++          - platforms: linux/amd64
+             device: cuda
+             suffix: -cuda
+ 
+-          - image: immich-machine-learning
+-            context: machine-learning
+-            file: machine-learning/Dockerfile
+-            platforms: linux/amd64
++          - platforms: linux/amd64
+             device: openvino
+             suffix: -openvino
+ 
+-          - image: immich-machine-learning
+-            context: machine-learning
+-            file: machine-learning/Dockerfile
+-            platforms: linux/arm64
++          - platforms: linux/arm64
+             device: armnn
+             suffix: -armnn
+ 
+-          - image: immich-server
+-            context: .
+-            file: server/Dockerfile
+-            platforms: linux/amd64,linux/arm64
+-            device: cpu
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Set up QEMU
++        uses: docker/setup-qemu-action@v3.2.0
++
++      - name: Set up Docker Buildx
++        uses: docker/setup-buildx-action@v3.6.1
++
++      - name: Login to Docker Hub
++        # Only push to Docker Hub when making a release
++        if: ${{ github.event_name == 'release' }}
++        uses: docker/login-action@v3
++        with:
++          username: ${{ secrets.DOCKERHUB_USERNAME }}
++          password: ${{ secrets.DOCKERHUB_TOKEN }}
++
++      - name: Login to GitHub Container Registry
++        uses: docker/login-action@v3
++        # Skip when PR from a fork
++        if: ${{ !github.event.pull_request.head.repo.fork }}
++        with:
++          registry: ghcr.io
++          username: ${{ github.repository_owner }}
++          password: ${{ secrets.GITHUB_TOKEN }}
++
++      - name: Generate docker image tags
++        id: metadata
++        uses: docker/metadata-action@v5
++        with:
++          flavor: |
++            # Disable latest tag
++            latest=false
++          images: |
++            name=ghcr.io/${{ github.repository_owner }}/${{env.image}}
++            name=altran1502/${{env.image}},enable=${{ github.event_name == 'release' }}
++          tags: |
++            # Tag with branch name
++            type=ref,event=branch,suffix=${{ matrix.suffix }}
++            # Tag with pr-number
++            type=ref,event=pr,suffix=${{ matrix.suffix }}
++            # Tag with git tag on release
++            type=ref,event=tag,suffix=${{ matrix.suffix }}
++            type=raw,value=release,enable=${{ github.event_name == 'release' }},suffix=${{ matrix.suffix }}
++
++      - name: Determine build cache output
++        id: cache-target
++        run: |
++          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
++            # Essentially just ignore the cache output (PR can't write to registry cache)
++            echo "cache-to=type=local,dest=/tmp/discard,ignore-error=true" >> $GITHUB_OUTPUT
++          else
++            echo "cache-to=type=registry,mode=max,ref=ghcr.io/${{ github.repository_owner }}/immich-build-cache:${{ env.image }}" >> $GITHUB_OUTPUT
++          fi
++
++      - name: Build and push image
++        uses: docker/build-push-action@v6.7.0
++        with:
++          context: ${{ env.context }}
++          file: ${{ env.file }}
++          platforms: ${{ matrix.platforms }}
++          # Skip pushing when PR from a fork
++          push: ${{ !github.event.pull_request.head.repo.fork }}
++          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/immich-build-cache:${{env.image}}
++          cache-to: ${{ steps.cache-target.outputs.cache-to }}
++          tags: ${{ steps.metadata.outputs.tags }}
++          labels: ${{ steps.metadata.outputs.labels }}
++          build-args: |
++            DEVICE=${{ matrix.device }}
++            BUILD_ID=${{ github.run_id }}
++            BUILD_IMAGE=${{ github.event_name == 'release' && github.ref_name || steps.metadata.outputs.tags }}
++            BUILD_SOURCE_REF=${{ github.ref_name }}
++            BUILD_SOURCE_COMMIT=${{ github.sha }}
+ 
++
++  build_and_push_server:
++    name: Build and Push Server
++    runs-on: ubuntu-latest
++    needs: pre-job
++    if: ${{ needs.pre-job.outputs.should_run_server == 'true' }}
++    env:
++      image: immich-server
++      context: .
++      file: server/Dockerfile
++    strategy:
++      fail-fast: false
++      matrix:
++        include:
++          - platforms: linux/amd64,linux/arm64
++            device: cpu
+     steps:
+       - name: Checkout
+         uses: actions/checkout@v4
+@@ -93,8 +195,8 @@ jobs:
+             # Disable latest tag
+             latest=false
+           images: |
+-            name=ghcr.io/${{ github.repository_owner }}/${{matrix.image}}
+-            name=altran1502/${{matrix.image}},enable=${{ github.event_name == 'release' }}
++            name=ghcr.io/${{ github.repository_owner }}/${{env.image}}
++            name=altran1502/${{env.image}},enable=${{ github.event_name == 'release' }}
+           tags: |
+             # Tag with branch name
+             type=ref,event=branch,suffix=${{ matrix.suffix }}
+@@ -111,18 +213,18 @@ jobs:
+             # Essentially just ignore the cache output (PR can't write to registry cache)
+             echo "cache-to=type=local,dest=/tmp/discard,ignore-error=true" >> $GITHUB_OUTPUT
+           else
+-            echo "cache-to=type=registry,mode=max,ref=ghcr.io/${{ github.repository_owner }}/immich-build-cache:${{ matrix.image }}" >> $GITHUB_OUTPUT
++            echo "cache-to=type=registry,mode=max,ref=ghcr.io/${{ github.repository_owner }}/immich-build-cache:${{ env.image }}" >> $GITHUB_OUTPUT
+           fi
+ 
+       - name: Build and push image
+         uses: docker/build-push-action@v6.7.0
+         with:
+-          context: ${{ matrix.context }}
+-          file: ${{ matrix.file }}
++          context: ${{ env.context }}
++          file: ${{ env.file }}
+           platforms: ${{ matrix.platforms }}
+           # Skip pushing when PR from a fork
+           push: ${{ !github.event.pull_request.head.repo.fork }}
+-          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/immich-build-cache:${{matrix.image}}
++          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/immich-build-cache:${{env.image}}
+           cache-to: ${{ steps.cache-target.outputs.cache-to }}
+           tags: ${{ steps.metadata.outputs.tags }}
+           labels: ${{ steps.metadata.outputs.labels }}
+diff --git a/.github/workflows/docs-build.yml b/.github/workflows/docs-build.yml
+index 32e9dc399a9f43..682e3c45f008ad 100644
+--- a/.github/workflows/docs-build.yml
++++ b/.github/workflows/docs-build.yml
+@@ -2,12 +2,8 @@ name: Docs build
+ on:
+   push:
+     branches: [main]
+-    paths:
+-      - "docs/**"
+   pull_request:
+     branches: [main]
+-    paths:
+-      - "docs/**"
+   release:
+     types: [published]
+ 
+@@ -16,7 +12,26 @@ concurrency:
+   cancel-in-progress: true
+ 
+ jobs:
++  pre-job:
++    runs-on: ubuntu-latest
++    outputs:
++      should_run: ${{ steps.found_paths.outputs.docs == 'true' || steps.should_force.outputs.should_force == 'true' }}
++    steps:
++      - name: Checkout code
++        uses: actions/checkout@v4
++      - id: found_paths
++        uses: dorny/paths-filter@v3
++        with:
++          filters: |
++            docs:
++              - 'docs/**'
++      - name: Check if we should force jobs to run
++        id: should_force
++        run: echo "should_force=${{ github.event_name == 'release' }}" >> "$GITHUB_OUTPUT"
++
+   build:
++    needs: pre-job
++    if: ${{ needs.pre-job.outputs.should_run == 'true' }}
+     runs-on: ubuntu-latest
+     defaults:
+       run:
+diff --git a/.github/workflows/docs-deploy.yml b/.github/workflows/docs-deploy.yml
+index 62f213eb2aa4a6..a863cf8ed2f9c5 100644
+--- a/.github/workflows/docs-deploy.yml
++++ b/.github/workflows/docs-deploy.yml
+@@ -10,10 +10,28 @@ jobs:
+     runs-on: ubuntu-latest
+     outputs:
+       parameters: ${{ steps.parameters.outputs.result }}
++      artifact: ${{ steps.get-artifact.outputs.result }}
+     steps:
+-      - if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+-        run: echo 'The triggering workflow failed' && exit 1
+-
++      - if: ${{ github.event.workflow_run.conclusion != 'success' }}
++        run: echo 'The triggering workflow did not succeed' && exit 1
++      - name: Get artifact
++        id: get-artifact
++        uses: actions/github-script@v7
++        with:
++          script: |
++            let allArtifacts = await github.rest.actions.listWorkflowRunArtifacts({
++               owner: context.repo.owner,
++               repo: context.repo.repo,
++               run_id: context.payload.workflow_run.id,
++            });
++            let matchArtifact = allArtifacts.data.artifacts.filter((artifact) => {
++              return artifact.name == "docs-build-output"
++            })[0];
++            if (!matchArtifact) {
++              console.log("No artifact found with the name docs-build-output, build job was skipped")
++              return { found: false };
++            }
++            return { found: true, id: matchArtifact.id };
+       - name: Determine deploy parameters
+         id: parameters
+         uses: actions/github-script@v7
+@@ -75,7 +93,7 @@ jobs:
+   deploy:
+     runs-on: ubuntu-latest
+     needs: checks
+-    if: ${{ fromJson(needs.checks.outputs.parameters).shouldDeploy }}
++    if: ${{ fromJson(needs.checks.outputs.artifact).found && fromJson(needs.checks.outputs.parameters).shouldDeploy }}
+     steps:
+       - name: Checkout code
+         uses: actions/checkout@v4
+@@ -98,18 +116,11 @@ jobs:
+         uses: actions/github-script@v7
+         with:
+           script: |
+-            let allArtifacts = await github.rest.actions.listWorkflowRunArtifacts({
+-               owner: context.repo.owner,
+-               repo: context.repo.repo,
+-               run_id: context.payload.workflow_run.id,
+-            });
+-            let matchArtifact = allArtifacts.data.artifacts.filter((artifact) => {
+-              return artifact.name == "docs-build-output"
+-            })[0];
++            let artifact = ${{ needs.checks.outputs.artifact }};
+             let download = await github.rest.actions.downloadArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+-               artifact_id: matchArtifact.id,
++               artifact_id: artifact.id,
+                archive_format: 'zip',
+             });
+             let fs = require('fs');
+diff --git a/.github/workflows/static_analysis.yml b/.github/workflows/static_analysis.yml
+index 27392a12bd389c..1ce44943297fe1 100644
+--- a/.github/workflows/static_analysis.yml
++++ b/.github/workflows/static_analysis.yml
+@@ -10,8 +10,27 @@ concurrency:
+   cancel-in-progress: true
+ 
+ jobs:
++  pre-job:
++    runs-on: ubuntu-latest
++    outputs:
++      should_run: ${{ steps.found_paths.outputs.mobile == 'true' || steps.should_force.outputs.should_force == 'true' }}
++    steps:
++      - name: Checkout code
++        uses: actions/checkout@v4
++      - id: found_paths
++        uses: dorny/paths-filter@v3
++        with:
++          filters: |
++            mobile:
++              - 'mobile/**'
++      - name: Check if we should force jobs to run
++        id: should_force
++        run: echo "should_force=${{ github.event_name == 'release' }}" >> "$GITHUB_OUTPUT"
++
+   mobile-dart-analyze:
+     name: Run Dart Code Analysis
++    needs: pre-job
++    if: ${{ needs.pre-job.outputs.should_skip == 'false' }}
+ 
+     runs-on: ubuntu-latest
+ 
+diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
+index 34a9d984a02150..7b1d44b35422bb 100644
+--- a/.github/workflows/test.yml
++++ b/.github/workflows/test.yml
+@@ -10,8 +10,48 @@ concurrency:
+   cancel-in-progress: true
+ 
+ jobs:
++  pre-job:
++    runs-on: ubuntu-latest
++    outputs:
++      should_run_web: ${{ steps.found_paths.outputs.web == 'true' || steps.should_force.outputs.should_force == 'true' }}
++      should_run_server: ${{ steps.found_paths.outputs.server == 'true' || steps.should_force.outputs.should_force == 'true' }}
++      should_run_cli: ${{ steps.found_paths.outputs.cli == 'true' || steps.should_force.outputs.should_force == 'true' }}
++      should_run_e2e: ${{ steps.found_paths.outputs.e2e == 'true' || steps.should_force.outputs.should_force == 'true' }}
++      should_run_mobile: ${{ steps.found_paths.outputs.mobile == 'true' || steps.should_force.outputs.should_force == 'true' }}
++      should_run_ml: ${{ steps.found_paths.outputs.machine-learning == 'true' || steps.should_force.outputs.should_force == 'true' }}
++    steps:
++      - name: Checkout code
++        uses: actions/checkout@v4
++      - id: found_paths
++        uses: dorny/paths-filter@v3
++        with:
++          filters: |
++            web:
++              - 'web/**'
++              - 'open-api/typescript-sdk/**'
++            server:
++              - 'server/**'
++            cli:
++              - 'cli/**'
++              - 'open-api/typescript-sdk/**'
++            e2e:
++              - 'e2e/**'
++              - 'cli/**'
++              - 'server/**'
++              - 'open-api/typescript-sdk/**'
++            mobile:
++              - 'mobile/**'
++            machine-learning:
++              - 'machine-learning/**'
++
++      - name: Check if we should force jobs to run
++        id: should_force
++        run: echo "should_force=${{ github.event_name == 'workflow_dispatch' }}" >> "$GITHUB_OUTPUT"
++
+   server-unit-tests:
+     name: Server
++    needs: pre-job
++    if: ${{ needs.pre-job.outputs.should_run_server == 'true' }}
+     runs-on: ubuntu-latest
+     defaults:
+       run:
+@@ -47,6 +87,8 @@ jobs:
+ 
+   cli-unit-tests:
+     name: CLI
++    needs: pre-job
++    if: ${{ needs.pre-job.outputs.should_run_cli == 'true' }}
+     runs-on: ubuntu-latest
+     defaults:
+       run:
+@@ -86,6 +128,8 @@ jobs:
+ 
+   cli-unit-tests-win:
+     name: CLI (Windows)
++    needs: pre-job
++    if: ${{ needs.pre-job.outputs.should_run_cli == 'true' }}
+     runs-on: windows-latest
+     defaults:
+       run:
+@@ -118,6 +162,8 @@ jobs:
+ 
+   web-unit-tests:
+     name: Web
++    needs: pre-job
++    if: ${{ needs.pre-job.outputs.should_run_web == 'true' }}
+     runs-on: ubuntu-latest
+     defaults:
+       run:
+@@ -161,6 +207,8 @@ jobs:
+ 
+   e2e-tests:
+     name: End-to-End Tests
++    needs: pre-job
++    if: ${{ needs.pre-job.outputs.should_run_e2e == 'true' }}
+     runs-on: ubuntu-latest
+     defaults:
+       run:
+@@ -221,6 +269,8 @@ jobs:
+ 
+   mobile-unit-tests:
+     name: Mobile
++    needs: pre-job
++    if: ${{ needs.pre-job.outputs.should_run_mobile == 'true' }}
+     runs-on: ubuntu-latest
+     steps:
+       - uses: actions/checkout@v4
+@@ -235,6 +285,8 @@ jobs:
+ 
+   ml-unit-tests:
+     name: Machine Learning
++    needs: pre-job
++    if: ${{ needs.pre-job.outputs.should_run_ml == 'true' }}
+     runs-on: ubuntu-latest
+     defaults:
+       run:

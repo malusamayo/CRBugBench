@@ -1,0 +1,186 @@
+diff --git a/openhands/runtime/action_execution_server.py b/openhands/runtime/action_execution_server.py
+index ba03613dde53..b48a9b55a693 100644
+--- a/openhands/runtime/action_execution_server.py
++++ b/openhands/runtime/action_execution_server.py
+@@ -14,6 +14,7 @@
+ import shutil
+ import tempfile
+ import time
++import traceback
+ from contextlib import asynccontextmanager
+ from pathlib import Path
+ from zipfile import ZipFile
+@@ -383,17 +384,13 @@ async def global_exception_handler(request: Request, exc: Exception):
+         logger.exception('Unhandled exception occurred:')
+         return JSONResponse(
+             status_code=500,
+-            content={
+-                'message': 'An unexpected error occurred. Please try again later.'
+-            },
++            content={'detail': 'An unexpected error occurred. Please try again later.'},
+         )
+ 
+     @app.exception_handler(StarletteHTTPException)
+     async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+         logger.error(f'HTTP exception occurred: {exc.detail}')
+-        return JSONResponse(
+-            status_code=exc.status_code, content={'message': exc.detail}
+-        )
++        return JSONResponse(status_code=exc.status_code, content={'detail': exc.detail})
+ 
+     @app.exception_handler(RequestValidationError)
+     async def validation_exception_handler(
+@@ -402,7 +399,7 @@ async def validation_exception_handler(
+         logger.error(f'Validation error occurred: {exc}')
+         return JSONResponse(
+             status_code=422,
+-            content={'message': 'Invalid request parameters', 'details': exc.errors()},
++            content={'detail': 'Invalid request parameters', 'errors': exc.errors()},
+         )
+ 
+     @app.middleware('http')
+@@ -444,7 +441,10 @@ async def execute_action(action_request: ActionRequest):
+             logger.error(
+                 f'Error processing command: {str(e)}', exc_info=True, stack_info=True
+             )
+-            raise HTTPException(status_code=500, detail=str(e))
++            raise HTTPException(
++                status_code=500,
++                detail=traceback.format_exc(),
++            )
+ 
+     @app.post('/upload_file')
+     async def upload_file(
+diff --git a/openhands/runtime/impl/remote/remote_runtime.py b/openhands/runtime/impl/remote/remote_runtime.py
+index 4226bfef8f15..7703a7f6ee58 100644
+--- a/openhands/runtime/impl/remote/remote_runtime.py
++++ b/openhands/runtime/impl/remote/remote_runtime.py
+@@ -38,9 +38,7 @@
+ from openhands.runtime.builder.remote import RemoteRuntimeBuilder
+ from openhands.runtime.plugins import PluginRequirement
+ from openhands.runtime.utils.command import get_remote_startup_command
+-from openhands.runtime.utils.request import (
+-    send_request,
+-)
++from openhands.runtime.utils.request import RequestHTTPError, send_request
+ from openhands.runtime.utils.runtime_build import build_runtime_image
+ from openhands.utils.async_utils import call_sync_from_async
+ from openhands.utils.tenacity_stop import stop_if_should_exit
+@@ -155,7 +153,7 @@ def _check_existing_runtime(self) -> bool:
+                 status = data.get('status')
+                 if status == 'running' or status == 'paused':
+                     self._parse_runtime_response(response)
+-        except requests.HTTPError as e:
++        except RequestHTTPError as e:
+             if e.response.status_code == 404:
+                 return False
+             self.log('debug', f'Error while looking for remote runtime: {e}')
+@@ -259,7 +257,7 @@ def _start_runtime(self):
+                 'debug',
+                 f'Runtime started. URL: {self.runtime_url}',
+             )
+-        except requests.HTTPError as e:
++        except RequestHTTPError as e:
+             self.log('error', f'Unable to start runtime: {e}')
+             raise RuntimeUnavailableError() from e
+ 
+@@ -349,7 +347,7 @@ def _wait_until_alive_impl(self):
+                     f'{self.runtime_url}/alive',
+                 ):  # will raise exception if we don't get 200 back.
+                     pass
+-            except requests.HTTPError as e:
++            except RequestHTTPError as e:
+                 self.log(
+                     'warning', f"Runtime /alive failed, but pod says it's ready: {e}"
+                 )
+@@ -446,7 +444,7 @@ def _send_request(self, method, url, is_retry=False, **kwargs):
+         except requests.Timeout:
+             self.log('error', 'No response received within the timeout period.')
+             raise
+-        except requests.HTTPError as e:
++        except RequestHTTPError as e:
+             if is_runtime_request and e.response.status_code == 404:
+                 raise RuntimeDisconnectedError(
+                     f'404 error while connecting to {self.runtime_url}'
+diff --git a/openhands/runtime/utils/request.py b/openhands/runtime/utils/request.py
+index 655fe304e5e4..f46387e96dfb 100644
+--- a/openhands/runtime/utils/request.py
++++ b/openhands/runtime/utils/request.py
+@@ -1,53 +1,20 @@
+ from typing import Any
+ 
+ import requests
+-from requests.exceptions import (
+-    ChunkedEncodingError,
+-    ConnectionError,
+-)
+-from urllib3.exceptions import IncompleteRead
+ 
+ 
+-def is_server_error(exception):
+-    return (
+-        isinstance(exception, requests.HTTPError)
+-        and exception.response.status_code >= 500
+-    )
++class RequestHTTPError(requests.HTTPError):
++    """Exception raised when an error occurs in a request with details."""
+ 
++    def __init__(self, *args, detail=None, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.detail = detail
+ 
+-def is_404_error(exception):
+-    return (
+-        isinstance(exception, requests.HTTPError)
+-        and exception.response.status_code == 404
+-    )
+-
+-
+-def is_429_error(exception):
+-    return (
+-        isinstance(exception, requests.HTTPError)
+-        and exception.response.status_code == 429
+-    )
+-
+-
+-def is_503_error(exception):
+-    return (
+-        isinstance(exception, requests.HTTPError)
+-        and exception.response.status_code == 503
+-    )
+-
+-
+-def is_502_error(exception):
+-    return (
+-        isinstance(exception, requests.HTTPError)
+-        and exception.response.status_code == 502
+-    )
+-
+-
+-DEFAULT_RETRY_EXCEPTIONS = [
+-    ConnectionError,
+-    IncompleteRead,
+-    ChunkedEncodingError,
+-]
++    def __str__(self) -> str:
++        s = super().__str__()
++        if self.detail is not None:
++            s += f'\nDetails: {self.detail}'
++        return s
+ 
+ 
+ def send_request(
+@@ -58,5 +25,12 @@ def send_request(
+     **kwargs: Any,
+ ) -> requests.Response:
+     response = session.request(method, url, **kwargs)
+-    response.raise_for_status()
++    try:
++        response.raise_for_status()
++    except requests.HTTPError as e:
++        try:
++            _json = response.json()
++        except requests.JSONDecodeError:
++            raise e
++        raise RequestHTTPError(e, detail=_json.get('detail')) from e
+     return response

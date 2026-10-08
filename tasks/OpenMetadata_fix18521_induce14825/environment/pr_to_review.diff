@@ -1,0 +1,3995 @@
+commit 373cafcda26b17108d0897c54773df97e271447e
+Author: IceS2 <pablo.takara@getcollate.io>
+Date:   Mon Jan 29 06:32:58 2024 +0100
+
+    Fixes  #5448: Implement initial Iceberg Connector using PyIceberg (#14825)
+    
+    * Create the iceberg connection schema
+    
+    * Link the IcebergConnection configuration with the forms on the UI
+    
+    * Add the pyiceberg dependency on the ingestion package
+    
+    * Create the get_connection and test_connection functions
+    
+    * First iteration on the iceberg ingestion logic
+    
+    * Add A more comprehensive implementation of the Iceberg Source
+    
+    * Add UnitTests
+    
+    * Update icebergConnection definition
+    
+    * Update the iceberg souce code based on new schema
+    
+    * Updated icebergConnecgtion schema for simplicity and to be able to configure Converters
+    
+    * Updated setup dependencies to be more flexible
+    
+    * Updated get_owner_ref logic
+    
+    * Fix formatting
+    
+    * Changed the icebergConnection json schema structure to enable the ClassConverters
+    
+    * Add the IcebergCatalog and IcebergFileSystem ClassConverters
+    
+    * Refactor the code to take into account the new jsonSchema structure
+    
+    * Fix formatting
+    
+    * Add Documentation for the Iceberg Connector
+    
+    * Fix Menu order for Iceberg
+    
+    * ui: add Iceberg service icon and constant
+    
+    * Fix DynamoDb Catalog issue due to how PyIceberg instantes it
+    
+    * Changed uri title to URI
+    
+    * Fix ClassConverter for Iceberg
+    
+    * Fix GetSecretValue for password types
+    
+    * Fix formatting
+    
+    * Fix formatting
+    
+    * Add Iceberg Connector Images for the docs
+    
+    * Add pylint disable for Hacky super() call
+    
+    * Add Iceberg.md for the UI docs
+    
+    * Fix pylint complaint
+    
+    * Fix pylint complaint
+    
+    * Fix UnitTests
+    
+    * fix type error and unit tests
+    
+    * update pipeline type checks
+    
+    * Fix Sonar Cloud complaints
+    
+    ---------
+    
+    Co-authored-by: Sachin Chaurasiya <sachinchaurasiyachotey87@gmail.com>
+
+diff --git a/ingestion/setup.py b/ingestion/setup.py
+index 7de2d8cfaf..09775e366f 100644
+--- a/ingestion/setup.py
++++ b/ingestion/setup.py
+@@ -20,16 +20,19 @@ from setuptools import setup
+ # Add here versions required for multiple plugins
+ VERSIONS = {
+     "airflow": "apache-airflow==2.7.3",
++    "adlfs": "adlfs~=2022.11",
+     "avro": "avro~=1.11",
+     "boto3": "boto3>=1.20,<2.0",  # No need to add botocore separately. It's a dep from boto3
+     "geoalchemy2": "GeoAlchemy2~=0.12",
+     "google-cloud-storage": "google-cloud-storage==1.43.0",
++    "gcsfs": "gcsfs~=2022.11",
+     "great-expectations": "great-expectations~=0.18.0",
+     "grpc-tools": "grpcio-tools>=1.47.2",
+     "msal": "msal~=1.2",
+     "neo4j": "neo4j~=5.3.0",
+     "pandas": "pandas<=2,<3",
+     "pyarrow": "pyarrow~=14.0",
++    "pydantic": "pydantic~=1.10",
+     "pydomo": "pydomo~=0.3",
+     "pymysql": "pymysql>=1.0.2",
+     "pyodbc": "pyodbc>=4.0.35,<5",
+@@ -106,7 +109,7 @@ base_requirements = {
+     "jsonschema",
+     "memory-profiler",
+     "mypy_extensions>=0.4.3",
+-    "pydantic~=1.10",
++    VERSIONS["pydantic"],
+     VERSIONS["pymysql"],
+     "python-dateutil>=2.8.1",
+     "python-jose~=3.3",
+@@ -161,12 +164,12 @@ plugins: Dict[str, Set[str]] = {
+     "datalake-azure": {
+         VERSIONS["azure-storage-blob"],
+         VERSIONS["azure-identity"],
+-        "adlfs>=2022.2.0",  # Python 3.7 does only support up to 2022.2.0
++        VERSIONS["adlfs"],  # Python 3.7 does only support up to 2022.2.0
+         *COMMONS["datalake"],
+     },
+     "datalake-gcs": {
+         VERSIONS["google-cloud-storage"],
+-        "gcsfs==2022.11.0",
++        VERSIONS["gcsfs"],
+         *COMMONS["datalake"],
+     },
+     "datalake-s3": {
+@@ -197,6 +200,14 @@ plugins: Dict[str, Set[str]] = {
+         "thrift-sasl~=0.4",
+         "impyla~=0.18.0",
+     },
++    "iceberg": {
++        "pyiceberg",
++        # Forcing the version of a few packages so it plays nicely with other requirements.
++        VERSIONS["pydantic"],
++        VERSIONS["adlfs"],
++        VERSIONS["gcsfs"],
++        VERSIONS["pyarrow"],
++    },
+     "impala": {
+         "presto-types-parser>=0.0.2",
+         "impyla[kerberos]~=0.18.0",
+diff --git a/ingestion/src/metadata/ingestion/source/database/iceberg/catalog/__init__.py b/ingestion/src/metadata/ingestion/source/database/iceberg/catalog/__init__.py
+new file mode 100644
+index 0000000000..3a8885d6c8
+--- /dev/null
++++ b/ingestion/src/metadata/ingestion/source/database/iceberg/catalog/__init__.py
+@@ -0,0 +1,65 @@
++#  Copyright 2021 Collate
++#  Licensed under the Apache License, Version 2.0 (the "License");
++#  you may not use this file except in compliance with the License.
++#  You may obtain a copy of the License at
++#  http://www.apache.org/licenses/LICENSE-2.0
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++
++"""
++Iceberg Catalog Factory.
++"""
++from typing import Dict, Type
++
++from pyiceberg.catalog import Catalog
++
++from metadata.generated.schema.entity.services.connections.database.iceberg.dynamoDbCatalogConnection import (
++    DynamoDbCatalogConnection,
++)
++from metadata.generated.schema.entity.services.connections.database.iceberg.glueCatalogConnection import (
++    GlueCatalogConnection,
++)
++from metadata.generated.schema.entity.services.connections.database.iceberg.hiveCatalogConnection import (
++    HiveCatalogConnection,
++)
++from metadata.generated.schema.entity.services.connections.database.iceberg.icebergCatalog import (
++    IcebergCatalog,
++)
++from metadata.generated.schema.entity.services.connections.database.iceberg.restCatalogConnection import (
++    RestCatalogConnection,
++)
++from metadata.ingestion.source.database.iceberg.catalog.base import IcebergCatalogBase
++from metadata.ingestion.source.database.iceberg.catalog.dynamodb import (
++    IcebergDynamoDbCatalog,
++)
++from metadata.ingestion.source.database.iceberg.catalog.glue import IcebergGlueCatalog
++from metadata.ingestion.source.database.iceberg.catalog.hive import IcebergHiveCatalog
++from metadata.ingestion.source.database.iceberg.catalog.rest import IcebergRestCatalog
++
++
++class IcebergCatalogFactory:
++    """Factory Class to get any PyIceberg implemented Catalog."""
++
++    catalog_type_map: Dict[str, Type[IcebergCatalogBase]] = {
++        RestCatalogConnection.__name__: IcebergRestCatalog,
++        HiveCatalogConnection.__name__: IcebergHiveCatalog,
++        GlueCatalogConnection.__name__: IcebergGlueCatalog,
++        DynamoDbCatalogConnection.__name__: IcebergDynamoDbCatalog,
++    }
++
++    @classmethod
++    def from_connection(cls, catalog: IcebergCatalog) -> Catalog:
++        """Returns a PyIceberg Catalog from the given catalog configuration."""
++        catalog_type = cls.catalog_type_map.get(
++            catalog.connection.__class__.__name__, None
++        )
++
++        if not catalog_type:
++            raise NotImplementedError(
++                f"Iceberg Catalog of type ['{catalog.connection.__class__.__name__}'] Not Implemmented."
++            )
++
++        return catalog_type.get_catalog(catalog)
+diff --git a/ingestion/src/metadata/ingestion/source/database/iceberg/catalog/base.py b/ingestion/src/metadata/ingestion/source/database/iceberg/catalog/base.py
+new file mode 100644
+index 0000000000..ea7f358390
+--- /dev/null
++++ b/ingestion/src/metadata/ingestion/source/database/iceberg/catalog/base.py
+@@ -0,0 +1,40 @@
++#  Copyright 2021 Collate
++#  Licensed under the Apache License, Version 2.0 (the "License");
++#  you may not use this file except in compliance with the License.
++#  You may obtain a copy of the License at
++#  http://www.apache.org/licenses/LICENSE-2.0
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++
++"""
++Iceberg Catalog base module.
++"""
++from abc import ABC, abstractmethod
++from typing import Optional
++
++from pyiceberg.catalog import Catalog
++
++from metadata.generated.schema.entity.services.connections.database.iceberg.icebergCatalog import (
++    IcebergCatalog,
++)
++from metadata.ingestion.source.database.iceberg.fs import (
++    FileSystemConfig,
++    IcebergFileSystemFactory,
++)
++
++
++class IcebergCatalogBase(ABC):
++    @classmethod
++    @abstractmethod
++    def get_catalog(cls, catalog: IcebergCatalog) -> Catalog:
++        """Returns a Catalog for given catalog configuration."""
++
++    @staticmethod
++    def get_fs_parameters(fs_config: Optional[FileSystemConfig]) -> dict:
++        """Gets the FileSystem parameters based on passed configuration."""
++        if not fs_config:
++            return {}
++        return IcebergFileSystemFactory.parse(fs_config)
+diff --git a/ingestion/src/metadata/ingestion/source/database/iceberg/catalog/dynamodb.py b/ingestion/src/metadata/ingestion/source/database/iceberg/catalog/dynamodb.py
+new file mode 100644
+index 0000000000..9b997cb464
+--- /dev/null
++++ b/ingestion/src/metadata/ingestion/source/database/iceberg/catalog/dynamodb.py
+@@ -0,0 +1,102 @@
++#  Copyright 2021 Collate
++#  Licensed under the Apache License, Version 2.0 (the "License");
++#  you may not use this file except in compliance with the License.
++#  You may obtain a copy of the License at
++#  http://www.apache.org/licenses/LICENSE-2.0
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++
++"""
++Iceberg DynamoDB Catalog
++"""
++import boto3
++from pyiceberg.catalog import Catalog
++from pyiceberg.catalog.dynamodb import DynamoDbCatalog
++
++from metadata.generated.schema.entity.services.connections.database.iceberg.dynamoDbCatalogConnection import (
++    DynamoDbCatalogConnection,
++)
++from metadata.generated.schema.entity.services.connections.database.iceberg.icebergCatalog import (
++    IcebergCatalog,
++)
++from metadata.ingestion.source.database.iceberg.catalog.base import IcebergCatalogBase
++
++
++class CustomDynamoDbCatalog(DynamoDbCatalog):
++    """Custom DynamoDb Catalog implementation to override the PyIceberg one.
++    This is needed due to PyIceberg not handling the __init__ method correctly by
++    instantiating the Boto3 Client without the correct configuration and having side
++    effects on it.
++    """
++
++    @staticmethod
++    def get_boto3_client(parameters: dict):
++        """
++        Overrides the boto3 client created by PyIceberg.
++        PyIceberg doesn't handle the Boto3 Session.
++        """
++        boto_session_config_keys = [
++            "aws_access_key_id",
++            "aws_secret_access_key",
++            "aws_session_token",
++            "region_name",
++            "profile_name",
++        ]
++
++        session_config = {
++            k: v for k, v in parameters.items() if k in boto_session_config_keys
++        }
++
++        session = boto3.Session(**session_config)
++        return session.client("dynamodb")
++
++    def __init__(self, name: str, **properties: str):
++        # HACK: Runs Catalog.__init__ without running DynamoDbCatalog.__init__
++        super(DynamoDbCatalog, self).__init__(  # pylint: disable=E1003,I0021
++            name, **properties
++        )
++
++        self.dynamodb = self.get_boto3_client(properties)
++        self.dynamodb_table_name = self.properties.get("table-name", "iceberg")
++
++
++class IcebergDynamoDbCatalog(IcebergCatalogBase):
++    """Responsible for building a PyIceberg DynamoDB Catalog."""
++
++    @classmethod
++    def get_catalog(cls, catalog: IcebergCatalog) -> Catalog:
++        """Returns a DynamoDB Catalog for the given connection and file storage.
++
++        For more information, check the PyIceberg [docs](https://py.iceberg.apache.org/configuration/#dynamodb-catalog)
++        """
++        if not isinstance(catalog.connection, DynamoDbCatalogConnection):
++            raise RuntimeError(
++                "'connection' is not an instance of 'DynamoDbCatalogConnection'"
++            )
++
++        parameters = {"warehouse": catalog.warehouseLocation}
++
++        if catalog.connection.tableName:
++            parameters = {"table-name": catalog.connection.tableName}
++
++        if catalog.connection.awsConfig:
++            aws_config = catalog.connection.awsConfig
++
++            parameters = {
++                **parameters,
++                "aws_secret_key_id": aws_config.awsAccessKeyId,
++                "aws_secret_access_key": aws_config.awsSecretAccessKey
++                if aws_config.awsSecretAccessKey
++                else None,
++                "aws_session_token": aws_config.awsSessionToken,
++                "region_name": aws_config.awsRegion,
++                "profile_name": aws_config.profileName,
++                # Needed because the way PyIceberg instantiates the PyArrowFileIO
++                # is different from how they instantiate the Boto3 Client.
++                **cls.get_fs_parameters(aws_config),
++            }
++
++        return CustomDynamoDbCatalog(catalog.name, **parameters)
+diff --git a/ingestion/src/metadata/ingestion/source/database/iceberg/catalog/glue.py b/ingestion/src/metadata/ingestion/source/database/iceberg/catalog/glue.py
+new file mode 100644
+index 0000000000..d14ca23941
+--- /dev/null
++++ b/ingestion/src/metadata/ingestion/source/database/iceberg/catalog/glue.py
+@@ -0,0 +1,88 @@
++#  Copyright 2021 Collate
++#  Licensed under the Apache License, Version 2.0 (the "License");
++#  you may not use this file except in compliance with the License.
++#  You may obtain a copy of the License at
++#  http://www.apache.org/licenses/LICENSE-2.0
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++
++"""
++Iceberg Glue Catalog
++"""
++import boto3
++from pyiceberg.catalog import Catalog
++from pyiceberg.catalog.glue import GlueCatalog
++
++from metadata.generated.schema.entity.services.connections.database.iceberg.glueCatalogConnection import (
++    GlueCatalogConnection,
++)
++from metadata.generated.schema.entity.services.connections.database.iceberg.icebergCatalog import (
++    IcebergCatalog,
++)
++from metadata.ingestion.source.database.iceberg.catalog.base import IcebergCatalogBase
++
++
++class IcebergGlueCatalog(IcebergCatalogBase):
++    """Responsible for building a PyIceberg Glue Catalog."""
++
++    @staticmethod
++    def override_boto3_glue_client(catalog: GlueCatalog, parameters: dict):
++        """
++        Overrides the boto3 client created by PyIceberg.
++        This is needed because PyIceberg 0.4.0 has a bug
++        where they try to pass the 'aws_access_key_id' as 'aws_secret_key_id' and
++        it breaks.
++        """
++        boto_session_config_keys = [
++            "aws_access_key_id",
++            "aws_secret_access_key",
++            "aws_session_token",
++            "region_name",
++            "profile_name",
++        ]
++
++        session_config = {
++            k: v for k, v in parameters.items() if k in boto_session_config_keys
++        }
++        session = boto3.Session(**session_config)
++        catalog.glue = session.client("glue")
++
++    @classmethod
++    def get_catalog(cls, catalog: IcebergCatalog) -> Catalog:
++        """Returns a Glue Catalog for the given connection and file storage.
++
++        For more information, check the PyIceberg [docs](https://py.iceberg.apache.org/configuration/#glue-catalog)
++        """
++        if not isinstance(catalog.connection, GlueCatalogConnection):
++            raise RuntimeError(
++                "'connection' is not an instance of 'GlueCatalogConnection'"
++            )
++
++        parameters = {"warehouse": catalog.warehouseLocation}
++
++        if catalog.connection.awsConfig:
++            aws_config = catalog.connection.awsConfig
++
++            parameters = {
++                **parameters,
++                "aws_access_key_id": aws_config.awsAccessKeyId,
++                "aws_secret_access_key": aws_config.awsSecretAccessKey.get_secret_value()
++                if aws_config.awsSecretAccessKey
++                else None,
++                "aws_session_token": aws_config.awsSessionToken,
++                "region_name": aws_config.awsRegion,
++                "profile_name": aws_config.profileName,
++                # Needed because the way PyIceberg instantiates the PyArrowFileIO
++                # is different from how they instantiate the Boto3 Client.
++                **cls.get_fs_parameters(aws_config),
++            }
++
++        glue_catalog: GlueCatalog = GlueCatalog(catalog.name, **parameters)
++
++        # HACK: Overriding the Boto3 Glue client due to PyIceberg 0.4.0 Bug.
++        cls.override_boto3_glue_client(glue_catalog, parameters)
++
++        return glue_catalog
+diff --git a/ingestion/src/metadata/ingestion/source/database/iceberg/catalog/hive.py b/ingestion/src/metadata/ingestion/source/database/iceberg/catalog/hive.py
+new file mode 100644
+index 0000000000..12d3a1692d
+--- /dev/null
++++ b/ingestion/src/metadata/ingestion/source/database/iceberg/catalog/hive.py
+@@ -0,0 +1,51 @@
++#  Copyright 2021 Collate
++#  Licensed under the Apache License, Version 2.0 (the "License");
++#  you may not use this file except in compliance with the License.
++#  You may obtain a copy of the License at
++#  http://www.apache.org/licenses/LICENSE-2.0
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++
++"""
++Iceberg Hive Catalog
++"""
++from pyiceberg.catalog import Catalog, load_hive
++
++from metadata.generated.schema.entity.services.connections.database.iceberg.hiveCatalogConnection import (
++    HiveCatalogConnection,
++)
++from metadata.generated.schema.entity.services.connections.database.iceberg.icebergCatalog import (
++    IcebergCatalog,
++)
++from metadata.ingestion.source.database.iceberg.catalog.base import IcebergCatalogBase
++
++
++class IcebergHiveCatalog(IcebergCatalogBase):
++    """Responsible for building a PyIceberg Hive Catalog."""
++
++    @classmethod
++    def get_catalog(cls, catalog: IcebergCatalog) -> Catalog:
++        """Returns a Hive Catalog for the given connection and file storage.
++
++        For more information, check the PyIceberg [docs](https://py.iceberg.apache.org/configuration/#hive-catalog)
++        """
++        if not isinstance(catalog.connection, HiveCatalogConnection):
++            raise RuntimeError(
++                "'connection' is not an instance of 'HiveCatalogConnection'"
++            )
++
++        parameters = {
++            "warehouse": catalog.warehouseLocation,
++            "uri": catalog.connection.uri,
++        }
++
++        if catalog.connection.fileSystem:
++            parameters = {
++                **parameters,
++                **cls.get_fs_parameters(catalog.connection.fileSystem.type),
++            }
++
++        return load_hive(catalog.name, parameters)
+diff --git a/ingestion/src/metadata/ingestion/source/database/iceberg/catalog/rest.py b/ingestion/src/metadata/ingestion/source/database/iceberg/catalog/rest.py
+new file mode 100644
+index 0000000000..c5a453e280
+--- /dev/null
++++ b/ingestion/src/metadata/ingestion/source/database/iceberg/catalog/rest.py
+@@ -0,0 +1,84 @@
++#  Copyright 2021 Collate
++#  Licensed under the Apache License, Version 2.0 (the "License");
++#  you may not use this file except in compliance with the License.
++#  You may obtain a copy of the License at
++#  http://www.apache.org/licenses/LICENSE-2.0
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++
++"""
++Iceberg Rest Catalog
++"""
++from pyiceberg.catalog import Catalog, load_rest
++
++from metadata.generated.schema.entity.services.connections.database.iceberg.icebergCatalog import (
++    IcebergCatalog,
++)
++from metadata.generated.schema.entity.services.connections.database.iceberg.restCatalogConnection import (
++    RestCatalogConnection,
++)
++from metadata.ingestion.source.database.iceberg.catalog.base import IcebergCatalogBase
++
++
++class IcebergRestCatalog(IcebergCatalogBase):
++    """Responsible for building a PyIceberg Rest Catalog."""
++
++    @classmethod
++    def get_catalog(cls, catalog: IcebergCatalog) -> Catalog:
++        """Returns a Rest Catalog for the given connection and file storage.
++
++        For more information, check the PyIceberg [docs](https://py.iceberg.apache.org/configuration/#rest-catalog)
++        """
++        if not isinstance(catalog.connection, RestCatalogConnection):
++            raise RuntimeError(
++                "'connection' is not an instance of 'RestCatalogConnection'"
++            )
++
++        if catalog.connection.credential:
++            client_id = catalog.connection.credential.clientId.get_secret_value()
++            client_secret = (
++                catalog.connection.credential.clientSecret.get_secret_value()
++            )
++
++            credential = f"{client_id}:{client_secret}"
++        else:
++            credential = None
++
++        parameters = {
++            "warehouse": catalog.warehouseLocation,
++            "uri": catalog.connection.uri,
++            "credential": credential,
++            "token": catalog.connection.token.get_secret_value()
++            if catalog.connection.token
++            else None,
++        }
++
++        if catalog.connection.fileSystem:
++            parameters = {
++                **parameters,
++                **cls.get_fs_parameters(catalog.connection.fileSystem.type),
++            }
++
++        if catalog.connection.ssl:
++            parameters = {
++                **parameters,
++                "ssl": {
++                    "client": {
++                        "cert": catalog.connection.ssl.clientCertPath,
++                        "key": catalog.connection.ssl.privateKeyPath,
++                    },
++                    "cabundle": catalog.connection.ssl.caCertPath,
++                },
++            }
++
++        if catalog.connection.sigv4:
++            parameters = {
++                **parameters,
++                "rest.sigv4": True,
++                "rest.signing_region": catalog.connection.sigv4.signingRegion,
++                "rest.signing_name": catalog.connection.sigv4.signingName,
++            }
++        return load_rest(catalog.name, parameters)
+diff --git a/ingestion/src/metadata/ingestion/source/database/iceberg/connection.py b/ingestion/src/metadata/ingestion/source/database/iceberg/connection.py
+new file mode 100644
+index 0000000000..6f315b807a
+--- /dev/null
++++ b/ingestion/src/metadata/ingestion/source/database/iceberg/connection.py
+@@ -0,0 +1,68 @@
++#  Copyright 2021 Collate
++#  Licensed under the Apache License, Version 2.0 (the "License");
++#  you may not use this file except in compliance with the License.
++#  You may obtain a copy of the License at
++#  http://www.apache.org/licenses/LICENSE-2.0
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++
++"""
++Source connection handler
++"""
++
++from typing import Optional
++
++from pyiceberg.catalog import Catalog
++
++from metadata.generated.schema.entity.automations.workflow import (
++    Workflow as AutomationWorkflow,
++)
++from metadata.generated.schema.entity.services.connections.database.icebergConnection import (
++    IcebergConnection,
++)
++from metadata.ingestion.connections.test_connections import test_connection_steps
++from metadata.ingestion.ometa.ometa_api import OpenMetadata
++from metadata.ingestion.source.database.iceberg.catalog import IcebergCatalogFactory
++
++
++def get_connection(connection: IcebergConnection) -> Catalog:
++    """
++    Create connection
++    """
++    return IcebergCatalogFactory.from_connection(
++        connection.catalog,
++    )
++
++
++def test_connection(
++    metadata: OpenMetadata,
++    catalog: Catalog,
++    service_connection: IcebergConnection,
++    automation_workflow: Optional[AutomationWorkflow] = None,
++) -> None:
++    """
++    Test connection. This can be executed either as part
++    of a metadata workflow or during an Automation Workflow
++    """
++
++    def custom_executor_for_namespaces():
++        list(catalog.list_namespaces())
++
++    def custom_executor_for_tables():
++        for namespace in catalog.list_namespaces():
++            return list(catalog.list_tables(namespace))
++
++    test_fn = {
++        "GetNamespaces": custom_executor_for_namespaces,
++        "GetTables": custom_executor_for_tables,
++    }
++
++    test_connection_steps(
++        metadata=metadata,
++        test_fn=test_fn,
++        service_type=service_connection.type.value,
++        automation_workflow=automation_workflow,
++    )
+diff --git a/ingestion/src/metadata/ingestion/source/database/iceberg/fs/__init__.py b/ingestion/src/metadata/ingestion/source/database/iceberg/fs/__init__.py
+new file mode 100644
+index 0000000000..9de62d9de0
+--- /dev/null
++++ b/ingestion/src/metadata/ingestion/source/database/iceberg/fs/__init__.py
+@@ -0,0 +1,52 @@
++#  Copyright 2021 Collate
++#  Licensed under the Apache License, Version 2.0 (the "License");
++#  you may not use this file except in compliance with the License.
++#  You may obtain a copy of the License at
++#  http://www.apache.org/licenses/LICENSE-2.0
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++
++"""
++Iceberg FileSystem Factory module.
++"""
++from __future__ import annotations
++
++from typing import Dict, Optional, Type
++
++from metadata.generated.schema.security.credentials.awsCredentials import AWSCredentials
++from metadata.generated.schema.security.credentials.azureCredentials import (
++    AzureCredentials,
++)
++from metadata.ingestion.source.database.iceberg.fs.azure import AzureFileSystem
++from metadata.ingestion.source.database.iceberg.fs.base import (
++    FileSystemConfig,
++    IcebergFileSystemBase,
++)
++from metadata.ingestion.source.database.iceberg.fs.s3 import S3FileSystem
++
++
++class IcebergFileSystemFactory:
++    """Factory class to return any supported PyIceberg FileSystem."""
++
++    file_system_config_map: Dict[str, Type[IcebergFileSystemBase]] = {
++        AWSCredentials.__name__: S3FileSystem,
++        AzureCredentials.__name__: AzureFileSystem,
++    }
++
++    @classmethod
++    def parse(cls, fs_config: Optional[FileSystemConfig]) -> dict:
++        """Returns the Iceberg FileSystem parameters, depending on specific implementation."""
++        if not fs_config:
++            return {}
++
++        file_system_type = cls.file_system_config_map.get(fs_config.__class__.__name__)
++
++        if not file_system_type:
++            raise NotImplementedError(
++                f"Iceberg File System otype ['{fs_config.__class__.__name__}'] Not Implemented."
++            )
++
++        return file_system_type.get_fs_params(fs_config)
+diff --git a/ingestion/src/metadata/ingestion/source/database/iceberg/fs/azure.py b/ingestion/src/metadata/ingestion/source/database/iceberg/fs/azure.py
+new file mode 100644
+index 0000000000..0fb9c655f8
+--- /dev/null
++++ b/ingestion/src/metadata/ingestion/source/database/iceberg/fs/azure.py
+@@ -0,0 +1,44 @@
++#  Copyright 2021 Collate
++#  Licensed under the Apache License, Version 2.0 (the "License");
++#  you may not use this file except in compliance with the License.
++#  You may obtain a copy of the License at
++#  http://www.apache.org/licenses/LICENSE-2.0
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++
++"""
++Iceberg S3 File System.
++"""
++from __future__ import annotations
++
++from metadata.generated.schema.security.credentials.azureCredentials import (
++    AzureCredentials,
++)
++from metadata.ingestion.source.database.iceberg.fs.base import (
++    FileSystemConfig,
++    IcebergFileSystemBase,
++)
++
++
++class AzureFileSystem(IcebergFileSystemBase):
++    @classmethod
++    def get_fs_params(cls, fs_config: FileSystemConfig) -> dict:
++        """Returns the parameters expected by PyIceberg for Azure Data Lake.
++
++        For more information, check the
++            [PyIceberg documentation](https://py.iceberg.apache.org/configuration/#azure-data-lake).
++        """
++        if not isinstance(fs_config, AzureCredentials):
++            raise RuntimeError(
++                "FileSystem Configuration is not an instance of 'AzureCredentials'."
++            )
++
++        return {
++            "adlfs.account-name": fs_config.accountName,
++            "adlfs.tenant-id": fs_config.tenantId,
++            "adlfs.client-id": fs_config.clientId,
++            "adlfs.client-secret": fs_config.clientSecret.get_secret_value(),
++        }
+diff --git a/ingestion/src/metadata/ingestion/source/database/iceberg/fs/base.py b/ingestion/src/metadata/ingestion/source/database/iceberg/fs/base.py
+new file mode 100644
+index 0000000000..4e9c45341e
+--- /dev/null
++++ b/ingestion/src/metadata/ingestion/source/database/iceberg/fs/base.py
+@@ -0,0 +1,30 @@
++#  Copyright 2021 Collate
++#  Licensed under the Apache License, Version 2.0 (the "License");
++#  you may not use this file except in compliance with the License.
++#  You may obtain a copy of the License at
++#  http://www.apache.org/licenses/LICENSE-2.0
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++
++"""
++Iceberg FileSystem base module.
++"""
++from abc import ABC, abstractmethod
++from typing import Union
++
++from metadata.generated.schema.security.credentials.awsCredentials import AWSCredentials
++from metadata.generated.schema.security.credentials.azureCredentials import (
++    AzureCredentials,
++)
++
++FileSystemConfig = Union[AWSCredentials, AzureCredentials, None]
++
++
++class IcebergFileSystemBase(ABC):
++    @classmethod
++    @abstractmethod
++    def get_fs_params(cls, fs_config: FileSystemConfig) -> dict:
++        """Returns a Catalog for given catalog_config."""
+diff --git a/ingestion/src/metadata/ingestion/source/database/iceberg/fs/s3.py b/ingestion/src/metadata/ingestion/source/database/iceberg/fs/s3.py
+new file mode 100644
+index 0000000000..496f4289b9
+--- /dev/null
++++ b/ingestion/src/metadata/ingestion/source/database/iceberg/fs/s3.py
+@@ -0,0 +1,77 @@
++#  Copyright 2021 Collate
++#  Licensed under the Apache License, Version 2.0 (the "License");
++#  you may not use this file except in compliance with the License.
++#  You may obtain a copy of the License at
++#  http://www.apache.org/licenses/LICENSE-2.0
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++
++"""
++Iceberg S3 File System.
++"""
++from __future__ import annotations
++
++from pyiceberg.io import (
++    S3_ACCESS_KEY_ID,
++    S3_ENDPOINT,
++    S3_REGION,
++    S3_SECRET_ACCESS_KEY,
++    S3_SESSION_TOKEN,
++)
++
++from metadata.generated.schema.security.credentials.awsCredentials import AWSCredentials
++from metadata.ingestion.source.database.iceberg.fs.base import (
++    FileSystemConfig,
++    IcebergFileSystemBase,
++)
++from metadata.utils.logger import ingestion_logger
++
++logger = ingestion_logger()
++
++SUPPORTED_KEYS = [
++    "endPointURL",
++    "awsAccessKeyId",
++    "awsSecretAccessKey",
++    "awsSessionToken",
++    "awsRegion",
++]
++
++
++class S3FileSystem(IcebergFileSystemBase):
++    """Responsible for returning a PyIceberg S3FileSystem compatible configuration."""
++
++    @classmethod
++    def get_fs_params(cls, fs_config: FileSystemConfig) -> dict:
++        """Returns the parameters expected by PyIceberg for AWS S3.
++
++        For more information, check the [PyIceberg documentation](https://py.iceberg.apache.org/configuration/#s3).
++        """
++        if not isinstance(fs_config, AWSCredentials):
++            raise RuntimeError(
++                "FileSystem Configuration is not an instance of 'AWSCredentials'."
++            )
++
++        unused_keys = []
++
++        for key, value in fs_config.dict().items():
++            if key not in SUPPORTED_KEYS and value:
++                unused_keys.append(key)
++
++        if unused_keys:
++            logger.warning(
++                "[%s] Not Supported by the Iceberg Connector. They won't be used.",
++                ",".join(unused_keys),
++            )
++
++        return {
++            S3_ENDPOINT: fs_config.endPointURL,
++            S3_ACCESS_KEY_ID: fs_config.awsAccessKeyId,
++            S3_SECRET_ACCESS_KEY: fs_config.awsSecretAccessKey.get_secret_value()
++            if fs_config.awsSecretAccessKey
++            else None,
++            S3_SESSION_TOKEN: fs_config.awsSessionToken,
++            S3_REGION: fs_config.awsRegion,
++        }
+diff --git a/ingestion/src/metadata/ingestion/source/database/iceberg/helper.py b/ingestion/src/metadata/ingestion/source/database/iceberg/helper.py
+new file mode 100644
+index 0000000000..0d4dc21556
+--- /dev/null
++++ b/ingestion/src/metadata/ingestion/source/database/iceberg/helper.py
+@@ -0,0 +1,124 @@
++#  Copyright 2021 Collate
++#  Licensed under the Apache License, Version 2.0 (the "License");
++#  you may not use this file except in compliance with the License.
++#  You may obtain a copy of the License at
++#  http://www.apache.org/licenses/LICENSE-2.0
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++"""
++Iceberg source helpers.
++"""
++from __future__ import annotations
++
++from itertools import takewhile
++from typing import Optional, Tuple
++
++import pyiceberg.partitioning
++import pyiceberg.table
++import pyiceberg.types
++
++from metadata.generated.schema.entity.data.table import Column, Constraint, DataType
++
++
++def namespace_to_str(namespace: tuple[str]) -> str:
++    """Turns a PyIceberg Namespace into a String.
++
++    The PyIceberg namespaces are returned as tuples and we turn them into a String
++    concatenating the items with a '.' in between.
++    """
++    return ".".join(namespace)
++
++
++def get_table_name_as_str(table: pyiceberg.table.Table) -> str:
++    """Returns the Table Name as Tring from a PyIceberg Table.
++
++    The PyIceberg table name is returned as tuple and we turn them into a String
++    concatenating the items with a '.' in between.
++    """
++    # We are skipping the first item because it is the schema name.
++    return ".".join(table.name()[1:])
++
++
++def get_column_from_partition(
++    columns: Tuple[pyiceberg.types.NestedField, ...],
++    partition: pyiceberg.partitioning.PartitionField,
++) -> str:
++    """Returns the Column Name belonging to a partition."""
++    # A Partition in Iceberg has a Source Column to which a Transformation is applied.
++    # We need to return the Source Column name.
++    return [
++        column.name for column in columns if column.field_id == partition.source_id
++    ][0]
++
++
++def get_owner_from_table(
++    table: pyiceberg.table.Table, property_key: str
++) -> Optional[str]:
++    """Retrives the owner information from given Table Property."""
++    return table.properties.get(property_key)
++
++
++class IcebergColumnParser:
++    """Responsible for containing the logic to parse a column from PyIceberg to OpenMetadata"""
++
++    data_type_map = {
++        # Primitive
++        "BOOLEAN": DataType.BOOLEAN,
++        "INT": DataType.INT,
++        "LONG": DataType.LONG,
++        "FLOAT": DataType.FLOAT,
++        "DOUBLE": DataType.DOUBLE,
++        "DECIMAL": DataType.DECIMAL,
++        "DATE": DataType.DATE,
++        "TIME": DataType.TIME,
++        "TIMESTAMP": DataType.TIMESTAMP,
++        "TIMESTAMPTZ": DataType.TIMESTAMPZ,
++        "STRING": DataType.STRING,
++        "UUID": DataType.UUID,
++        "FIXED": DataType.FIXED,
++        "BINARY": DataType.BINARY,
++        # Nested
++        "STRUCT": DataType.STRUCT,
++        "LIST": DataType.ARRAY,
++        "MAP": DataType.MAP,
++    }
++
++    @classmethod
++    def parse(cls, field: pyiceberg.types.NestedField) -> Column:
++        """Parses a PyIceberg Field into an OpenMetadata Column."""
++        data_type = cls.data_type_map.get(
++            "".join(takewhile(lambda x: x.isalpha(), str(field.field_type))).upper(),
++            DataType.UNKNOWN,
++        )
++
++        column_def = {
++            "name": field.name,
++            "description": field.doc,
++            "dataType": data_type,
++            "dataTypeDisplay": str(field.field_type),
++            "constraint": Constraint.NOT_NULL if field.required else None,
++        }
++
++        if data_type == DataType.ARRAY:
++            array_data_type = cls.data_type_map.get(
++                "".join(
++                    takewhile(lambda x: x.isalpha(), str(field.field_type.element_type))
++                ).upper(),
++                DataType.UNKNOWN,
++            )
++            column_def["arrayDataType"] = array_data_type
++        # Iceberg Binary type has no length. Using a noop 0 value.
++        elif data_type == DataType.BINARY:
++            column_def["dataLength"] = 0
++        elif data_type == DataType.DECIMAL:
++            column_def["precision"] = field.field_type.precision
++            column_def["scale"] = field.field_type.scale
++        elif data_type == DataType.STRUCT:
++            column_def["children"] = [
++                cls.parse(child) for child in field.field_type.fields
++            ]
++
++        return Column(**column_def)
+diff --git a/ingestion/src/metadata/ingestion/source/database/iceberg/metadata.py b/ingestion/src/metadata/ingestion/source/database/iceberg/metadata.py
+new file mode 100644
+index 0000000000..2a99d8914d
+--- /dev/null
++++ b/ingestion/src/metadata/ingestion/source/database/iceberg/metadata.py
+@@ -0,0 +1,311 @@
++#  Copyright 2021 Collate
++#  Licensed under the Apache License, Version 2.0 (the "License");
++#  you may not use this file except in compliance with the License.
++#  You may obtain a copy of the License at
++#  http://www.apache.org/licenses/LICENSE-2.0
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++"""
++Iceberg source methods.
++"""
++import traceback
++from typing import Any, Iterable, Optional, Tuple, Union
++
++import pyiceberg
++import pyiceberg.exceptions
++
++from metadata.generated.schema.api.data.createDatabase import CreateDatabaseRequest
++from metadata.generated.schema.api.data.createDatabaseSchema import (
++    CreateDatabaseSchemaRequest,
++)
++from metadata.generated.schema.api.data.createQuery import CreateQueryRequest
++from metadata.generated.schema.api.data.createStoredProcedure import (
++    CreateStoredProcedureRequest,
++)
++from metadata.generated.schema.api.data.createTable import CreateTableRequest
++from metadata.generated.schema.api.lineage.addLineage import AddLineageRequest
++from metadata.generated.schema.entity.data.database import Database
++from metadata.generated.schema.entity.data.databaseSchema import DatabaseSchema
++from metadata.generated.schema.entity.data.table import Table, TableType
++from metadata.generated.schema.entity.services.connections.database.icebergConnection import (
++    IcebergConnection,
++)
++from metadata.generated.schema.entity.services.ingestionPipelines.status import (
++    StackTraceError,
++)
++from metadata.generated.schema.metadataIngestion.databaseServiceMetadataPipeline import (
++    DatabaseServiceMetadataPipeline,
++)
++from metadata.generated.schema.metadataIngestion.workflow import (
++    Source as WorkflowSource,
++)
++from metadata.generated.schema.type.entityReference import EntityReference
++from metadata.ingestion.api.models import Either
++from metadata.ingestion.api.steps import InvalidSourceException
++from metadata.ingestion.models.ometa_classification import OMetaTagAndClassification
++from metadata.ingestion.ometa.ometa_api import OpenMetadata
++from metadata.ingestion.source.connections import get_connection
++from metadata.ingestion.source.database.database_service import DatabaseServiceSource
++from metadata.ingestion.source.database.iceberg.helper import (
++    get_owner_from_table,
++    get_table_name_as_str,
++    namespace_to_str,
++)
++from metadata.ingestion.source.database.iceberg.models import IcebergTable
++from metadata.utils import fqn
++from metadata.utils.filters import filter_by_schema, filter_by_table
++from metadata.utils.logger import ingestion_logger
++
++logger = ingestion_logger()
++
++
++class IcebergSource(DatabaseServiceSource):
++    """
++    Implements the necessary methods to extract Iceberg metadata.
++    Relies on [PyIceberg](https://py.iceberg.apache.org/).
++    """
++
++    def __init__(self, config: WorkflowSource, metadata: OpenMetadata):
++        super().__init__()
++        self.config = config
++        self.source_config: DatabaseServiceMetadataPipeline = (
++            self.config.sourceConfig.config
++        )
++        self.metadata = metadata
++        self.service_connection = self.config.serviceConnection.__root__.config
++        self.iceberg = get_connection(self.service_connection)
++
++        self.connection_obj = self.iceberg
++        self.test_connection()
++
++    @classmethod
++    def create(cls, config_dict, metadata: OpenMetadata):
++        config: WorkflowSource = WorkflowSource.parse_obj(config_dict)
++        connection: IcebergConnection = config.serviceConnection.__root__.config
++        if not isinstance(connection, IcebergConnection):
++            raise InvalidSourceException(
++                f"Expected GlueConnection, but got {connection}"
++            )
++        return cls(config, metadata)
++
++    def get_database_names(self) -> Iterable[str]:
++        """
++        Prepares the database name to be sent to stage.
++        Filtering happens here.
++        """
++        yield self.service_connection.catalog.databaseName or "default"
++
++    def yield_database(
++        self, database_name: str
++    ) -> Iterable[Either[CreateDatabaseRequest]]:
++        """
++        From topology.
++        Prepare a database request and pass it to the sink.
++
++        Also, update the self.inspector value to the current db.
++        """
++        yield Either(
++            right=CreateDatabaseRequest(
++                name=database_name,
++                service=self.context.database_service,
++            )
++        )
++
++    def get_database_schema_names(self) -> Iterable[str]:
++        """
++        Prepares the database schema name to be sent to stage.
++        Filtering happens here.
++        """
++        for namespace in self.iceberg.list_namespaces():
++            namespace_name = namespace_to_str(namespace)
++            try:
++                schema_fqn = fqn.build(
++                    self.metadata,
++                    entity_type=DatabaseSchema,
++                    service_name=self.context.database_service,
++                    database_name=self.context.database,
++                    schema_name=namespace_name,
++                )
++                if filter_by_schema(
++                    self.config.sourceConfig.config.schemaFilterPattern,
++                    schema_fqn
++                    if self.config.sourceConfig.config.useFqnForFiltering
++                    else namespace_name,
++                ):
++                    self.status.filter(schema_fqn, "Schema Filtered Out")
++                    continue
++                yield namespace_name
++            except Exception as exc:
++                self.status.failed(
++                    StackTraceError(
++                        name=namespace_name,
++                        error=f"Unexpected exception to get the namespace [{namespace_name}]: {exc}",
++                        stackTrace=traceback.format_exc(),
++                    )
++                )
++
++    def yield_database_schema(
++        self, schema_name: str
++    ) -> Iterable[Either[CreateDatabaseSchemaRequest]]:
++        """
++        From topology.
++        Prepare a database request and pass it to the sink.
++        """
++        yield Either(
++            right=CreateDatabaseSchemaRequest(
++                name=schema_name,
++                database=fqn.build(
++                    metadata=self.metadata,
++                    entity_type=Database,
++                    service_name=self.context.database_service,
++                    database_name=self.context.database,
++                ),
++            )
++        )
++
++    def get_tables_name_and_type(self) -> Optional[Iterable[Tuple[str, str]]]:
++        """
++        Prepares the table name to be sent to stage.
++        Filtering happens here.
++        """
++        namespace = self.context.database_schema
++
++        for table_identifier in self.iceberg.list_tables(namespace):
++            try:
++                table = self.iceberg.load_table(table_identifier)
++                table_name = get_table_name_as_str(table)
++                table_fqn = fqn.build(
++                    self.metadata,
++                    entity_type=Table,
++                    service_name=self.context.database_service,
++                    database_name=self.context.database,
++                    schema_name=self.context.database_schema,
++                    table_name=table_name,
++                )
++                if filter_by_table(
++                    self.config.sourceConfig.config.tableFilterPattern,
++                    table_fqn
++                    if self.config.sourceConfig.config.useFqnForFiltering
++                    else table_name,
++                ):
++                    self.status.filter(
++                        table_fqn,
++                        "Table Filtered Out",
++                    )
++                    continue
++
++                self.context.iceberg_table = table
++                yield table_name, TableType.Regular
++            except pyiceberg.exceptions.NoSuchPropertyException:
++                logger.warning(
++                    f"Table [{table_identifier}] does not have the 'table_type' property. Skipped."
++                )
++                continue
++            except pyiceberg.exceptions.NoSuchIcebergTableError:
++                logger.warning(
++                    f"Table [{table_identifier}] is not an Iceberg Table. Skipped."
++                )
++                continue
++            except pyiceberg.exceptions.NoSuchTableError:
++                logger.warning(f"Table [{table_identifier}] not Found. Skipped.")
++                continue
++            except Exception as exc:
++                table_name = ".".join(table_identifier)
++                self.status.failed(
++                    StackTraceError(
++                        name=table_name,
++                        error=f"Unexpected exception to get table [{table_name}]: {exc}",
++                        stackTrace=traceback.format_exc(),
++                    )
++                )
++
++    def get_owner_ref(self, table_name: str) -> Optional[EntityReference]:
++        owner = get_owner_from_table(
++            self.context.iceberg_table, self.service_connection.ownershipProperty
++        )
++        try:
++            if owner:
++                owner_reference = self.metadata.get_reference_by_email(owner)
++                return owner_reference
++        except Exception as err:
++            logger.debug(traceback.format_exc())
++            logger.warning(f"Could not fetch owner data due to {err}")
++        return None
++
++    def yield_table(
++        self, table_name_and_type: Tuple[str, TableType]
++    ) -> Iterable[Either[CreateTableRequest]]:
++        """
++        From topology.
++        Prepare a table request and pass it to the sink.
++
++        Also, update the self.inspector value to the current db.
++        """
++        table_name, table_type = table_name_and_type
++        iceberg_table = self.context.iceberg_table
++        try:
++            owner = self.get_owner_ref(table_name)
++            table = IcebergTable.from_pyiceberg(
++                table_name, table_type, owner, iceberg_table
++            )
++            table_request = CreateTableRequest(
++                name=table.name,
++                tableType=table.tableType,
++                description=table.description,
++                owner=table.owner,
++                columns=table.columns,
++                tablePartition=table.tablePartition,
++                databaseSchema=fqn.build(
++                    metadata=self.metadata,
++                    entity_type=DatabaseSchema,
++                    service_name=self.context.database_service,
++                    database_name=self.context.database,
++                    schema_name=self.context.database_schema,
++                ),
++            )
++            yield Either(right=table_request)
++            self.register_record(table_request=table_request)
++        except Exception as exc:
++            yield Either(
++                left=StackTraceError(
++                    name=table_name,
++                    error=f"Unexpected exception to yield table [{table_name}]: {exc}",
++                    stackTrace=traceback.format_exc(),
++                )
++            )
++
++    def yield_tag(
++        self, schema_name: str
++    ) -> Iterable[Either[OMetaTagAndClassification]]:
++        """
++        From topology. To be run for each schema
++        """
++        yield from []
++
++    def yield_view_lineage(self) -> Iterable[Either[AddLineageRequest]]:
++        """
++        From topology.
++        Parses view definition to get lineage information
++        """
++        yield from []
++
++    def get_stored_procedures(self) -> Iterable[Any]:
++        """Not Implemented"""
++
++    def yield_stored_procedure(
++        self, stored_procedure: Any
++    ) -> Iterable[Either[CreateStoredProcedureRequest]]:
++        """Process the stored procedure information"""
++        yield from []
++
++    def yield_procedure_lineage_and_queries(
++        self,
++    ) -> Iterable[Either[Union[AddLineageRequest, CreateQueryRequest]]]:
++        """Extracts the lineage information from Stored Procedures"""
++        yield from []
++
++    def close(self):
++        """There is no connection to close."""
+diff --git a/ingestion/src/metadata/ingestion/source/database/iceberg/models.py b/ingestion/src/metadata/ingestion/source/database/iceberg/models.py
+new file mode 100644
+index 0000000000..f6d3328bde
+--- /dev/null
++++ b/ingestion/src/metadata/ingestion/source/database/iceberg/models.py
+@@ -0,0 +1,66 @@
++#  Copyright 2021 Collate
++#  Licensed under the Apache License, Version 2.0 (the "License");
++#  you may not use this file except in compliance with the License.
++#  You may obtain a copy of the License at
++#  http://www.apache.org/licenses/LICENSE-2.0
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++"""
++Iceberg source models.
++"""
++from __future__ import annotations
++
++from typing import List, Optional
++
++import pyiceberg.table
++from pydantic import BaseModel
++
++from metadata.generated.schema.entity.data.table import (
++    Column,
++    TablePartition,
++    TableType,
++)
++from metadata.generated.schema.type.entityReference import EntityReference
++from metadata.ingestion.source.database.iceberg.helper import (
++    IcebergColumnParser,
++    get_column_from_partition,
++)
++
++
++class IcebergTable(BaseModel):
++    name: str
++    tableType: TableType
++    description: Optional[str]
++    owner: Optional[EntityReference]
++    columns: List[Column] = []
++    tablePartition: Optional[TablePartition]
++
++    @classmethod
++    def from_pyiceberg(
++        cls,
++        name: str,
++        table_type: TableType,
++        owner: Optional[EntityReference],
++        table: pyiceberg.table.Table,
++    ) -> IcebergTable:
++        """Responsible for parsing the needed information from a PyIceberg Table."""
++        iceberg_columns = table.schema().fields
++
++        return IcebergTable(
++            name=name,
++            tableType=table_type,
++            description=table.properties.get("comment"),
++            owner=owner,
++            columns=[IcebergColumnParser.parse(column) for column in iceberg_columns],
++            tablePartition=TablePartition(
++                columns=[
++                    get_column_from_partition(iceberg_columns, partition)
++                    for partition in table.spec().fields
++                ],
++                intervalType=None,
++                interval=None,
++            ),
++        )
+diff --git a/ingestion/tests/unit/topology/database/test_iceberg.py b/ingestion/tests/unit/topology/database/test_iceberg.py
+new file mode 100644
+index 0000000000..57a293dfa9
+--- /dev/null
++++ b/ingestion/tests/unit/topology/database/test_iceberg.py
+@@ -0,0 +1,808 @@
++#  Copyright 2021 Collate
++#  Licensed under the Apache License, Version 2.0 (the "License");
++#  you may not use this file except in compliance with the License.
++#  You may obtain a copy of the License at
++#  http://www.apache.org/licenses/LICENSE-2.0
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++"""
++Test iceberg source
++"""
++import uuid
++from copy import deepcopy
++from unittest import TestCase
++from unittest.mock import patch
++
++import pyiceberg.exceptions
++from pyiceberg.catalog.hive import HiveCatalog
++from pyiceberg.partitioning import PartitionField
++from pyiceberg.schema import Schema
++from pyiceberg.table import Table as PyIcebergTable
++from pyiceberg.table.metadata import TableMetadataV1
++from pyiceberg.transforms import IdentityTransform
++from pyiceberg.types import (
++    BinaryType,
++    BooleanType,
++    DateType,
++    DecimalType,
++    DoubleType,
++    FixedType,
++    FloatType,
++    IntegerType,
++    ListType,
++    LongType,
++    MapType,
++    NestedField,
++    StringType,
++    StructType,
++    TimestampType,
++    TimestamptzType,
++    TimeType,
++    UUIDType,
++)
++
++from metadata.generated.schema.api.data.createDatabase import CreateDatabaseRequest
++from metadata.generated.schema.api.data.createDatabaseSchema import (
++    CreateDatabaseSchemaRequest,
++)
++from metadata.generated.schema.api.data.createTable import CreateTableRequest
++from metadata.generated.schema.entity.data.table import (
++    Column,
++    Constraint,
++    DataType,
++    TablePartition,
++    TableType,
++)
++from metadata.generated.schema.type.entityReference import EntityReference
++from metadata.ingestion.api.parser import parse_workflow_config_gracefully
++from metadata.ingestion.api.steps import InvalidSourceException
++from metadata.ingestion.ometa.ometa_api import OpenMetadata
++from metadata.ingestion.source.database.iceberg.metadata import IcebergSource
++from metadata.utils import fqn
++
++MOCK_COLUMN_MAP = {
++    "binary": {
++        "iceberg": NestedField(
++            field_id=1,
++            name="binary",
++            field_type=BinaryType(),
++            required=False,
++            doc="Binary",
++        ),
++        "ometa": Column(
++            name="binary",
++            description="Binary",
++            dataType=DataType.BINARY,
++            dataTypeDisplay=str(BinaryType()),
++            dataLength=0,
++        ),
++    },
++    "boolean": {
++        "iceberg": NestedField(
++            field_id=2,
++            name="boolean",
++            field_type=BooleanType(),
++            required=False,
++        ),
++        "ometa": Column(
++            name="boolean",
++            dataType=DataType.BOOLEAN,
++            dataTypeDisplay=str(BooleanType()),
++        ),
++    },
++    "date": {
++        "iceberg": NestedField(
++            field_id=3,
++            name="date",
++            field_type=DateType(),
++            required=True,
++        ),
++        "ometa": Column(
++            name="date",
++            dataType=DataType.DATE,
++            dataTypeDisplay=str(DateType()),
++            constraint=Constraint.NOT_NULL,
++        ),
++    },
++    "decimal": {
++        "iceberg": NestedField(
++            field_id=4,
++            name="decimal",
++            field_type=DecimalType(9, 3),
++            required=False,
++        ),
++        "ometa": Column(
++            name="decimal",
++            dataType=DataType.DECIMAL,
++            dataTypeDisplay=str(DecimalType(9, 3)),
++            precision=9,
++            scale=3,
++        ),
++    },
++    "double": {
++        "iceberg": NestedField(
++            field_id=5,
++            name="double",
++            field_type=DoubleType(),
++            required=False,
++        ),
++        "ometa": Column(
++            name="double",
++            dataType=DataType.DOUBLE,
++            dataTypeDisplay=str(DoubleType()),
++        ),
++    },
++    "fixed": {
++        "iceberg": NestedField(
++            field_id=6,
++            name="fixed",
++            field_type=FixedType(10),
++            required=False,
++        ),
++        "ometa": Column(
++            name="fixed",
++            dataType=DataType.FIXED,
++            dataTypeDisplay=str(FixedType(10)),
++        ),
++    },
++    "float": {
++        "iceberg": NestedField(
++            field_id=7,
++            name="float",
++            field_type=FloatType(),
++            required=False,
++        ),
++        "ometa": Column(
++            name="float",
++            dataType=DataType.FLOAT,
++            dataTypeDisplay=str(FloatType()),
++        ),
++    },
++    "integer": {
++        "iceberg": NestedField(
++            field_id=8,
++            name="integer",
++            field_type=IntegerType(),
++            required=False,
++        ),
++        "ometa": Column(
++            name="integer",
++            dataType=DataType.INT,
++            dataTypeDisplay=str(IntegerType()),
++        ),
++    },
++    "list": {
++        "iceberg": NestedField(
++            field_id=9,
++            name="list",
++            field_type=ListType(
++                element_id=1,
++                element_type=IntegerType(),
++            ),
++            required=False,
++        ),
++        "ometa": Column(
++            name="list",
++            dataType=DataType.ARRAY,
++            dataTypeDisplay=str(
++                ListType(
++                    element_id=1,
++                    element_type=IntegerType(),
++                )
++            ),
++            arrayDataType=DataType.INT,
++        ),
++    },
++    "long": {
++        "iceberg": NestedField(
++            field_id=10,
++            name="long",
++            field_type=LongType(),
++            required=False,
++        ),
++        "ometa": Column(
++            name="long",
++            dataType=DataType.LONG,
++            dataTypeDisplay=str(LongType()),
++        ),
++    },
++    "map": {
++        "iceberg": NestedField(
++            field_id=11,
++            name="map",
++            field_type=MapType(
++                key_id=1,
++                key_type=StringType(),
++                value_id=2,
++                value_type=IntegerType(),
++            ),
++            required=False,
++        ),
++        "ometa": Column(
++            name="map",
++            dataType=DataType.MAP,
++            dataTypeDisplay=str(
++                MapType(
++                    key_id=1,
++                    key_type=StringType(),
++                    value_id=2,
++                    value_type=IntegerType(),
++                )
++            ),
++        ),
++    },
++    "string": {
++        "iceberg": NestedField(
++            field_id=12,
++            name="string",
++            field_type=StringType(),
++            required=False,
++        ),
++        "ometa": Column(
++            name="string",
++            dataType=DataType.STRING,
++            dataTypeDisplay=str(StringType()),
++        ),
++    },
++    "struct": {
++        "iceberg": NestedField(
++            field_id=13,
++            name="struct",
++            field_type=StructType(
++                fields=(
++                    NestedField(
++                        field_id=100,
++                        name="nested1",
++                        field_type=IntegerType(),
++                        required=False,
++                        doc="nested #1",
++                    ),
++                    NestedField(
++                        field_id=101,
++                        name="nested2",
++                        field_type=StringType(),
++                        required=True,
++                    ),
++                )
++            ),
++            required=False,
++        ),
++        "ometa": Column(
++            name="struct",
++            dataType=DataType.STRUCT,
++            dataTypeDisplay=str(
++                StructType(
++                    fields=(
++                        NestedField(
++                            field_id=100,
++                            name="nested1",
++                            field_type=IntegerType(),
++                            required=False,
++                            doc="nested #1",
++                        ),
++                        NestedField(
++                            field_id=101,
++                            name="nested2",
++                            field_type=StringType(),
++                            required=True,
++                        ),
++                    )
++                )
++            ),
++            children=[
++                Column(
++                    name="nested1",
++                    description="nested #1",
++                    dataType=DataType.INT,
++                    dataTypeDisplay=str(IntegerType()),
++                ),
++                Column(
++                    name="nested2",
++                    dataType=DataType.STRING,
++                    dataTypeDisplay=str(StringType()),
++                    constraint=Constraint.NOT_NULL,
++                ),
++            ],
++        ),
++    },
++    "time": {
++        "iceberg": NestedField(
++            field_id=14,
++            name="time",
++            field_type=TimeType(),
++            required=False,
++        ),
++        "ometa": Column(
++            name="time",
++            dataType=DataType.TIME,
++            dataTypeDisplay=str(TimeType()),
++        ),
++    },
++    "timestamp": {
++        "iceberg": NestedField(
++            field_id=15,
++            name="timestamp",
++            field_type=TimestampType(),
++            required=False,
++        ),
++        "ometa": Column(
++            name="timestamp",
++            dataType=DataType.TIMESTAMP,
++            dataTypeDisplay=str(TimestampType()),
++        ),
++    },
++    "timestamptz": {
++        "iceberg": NestedField(
++            field_id=16,
++            name="timestamptz",
++            field_type=TimestamptzType(),
++            required=False,
++        ),
++        "ometa": Column(
++            name="timestamptz",
++            dataType=DataType.TIMESTAMPZ,
++            dataTypeDisplay=str(TimestamptzType()),
++        ),
++    },
++    "uuid": {
++        "iceberg": NestedField(
++            field_id=17,
++            name="uuid",
++            field_type=UUIDType(),
++            required=False,
++        ),
++        "ometa": Column(
++            name="uuid",
++            dataType=DataType.UUID,
++            dataTypeDisplay=str(UUIDType()),
++        ),
++    },
++}
++
++MOCK_HIVE_CONFIG = {
++    "source": {
++        "type": "iceberg",
++        "serviceName": "test_iceberg",
++        "serviceConnection": {
++            "config": {
++                "type": "Iceberg",
++                "catalog": {
++                    "name": "Batata",
++                    "connection": {"uri": "thrift://localhost:9083"},
++                },
++            }
++        },
++        "sourceConfig": {"config": {"type": "DatabaseMetadata"}},
++    },
++    "sink": {"type": "metadata-rest", "config": {}},
++    "workflowConfig": {
++        "openMetadataServerConfig": {
++            "hostPort": "http://localhost:8585/api",
++            "authProvider": "openmetadata",
++            "securityConfig": {"jwtToken": "token"},
++        }
++    },
++}
++
++MOCK_REST_CONFIG = {
++    "source": {
++        "type": "iceberg",
++        "serviceName": "test_iceberg",
++        "serviceConnection": {
++            "config": {
++                "type": "Iceberg",
++                "catalog": {
++                    "name": "Batata",
++                    "connection": {"uri": "http://localhost:8181"},
++                },
++            }
++        },
++        "sourceConfig": {"config": {"type": "DatabaseMetadata"}},
++    },
++    "sink": {"type": "metadata-rest", "config": {}},
++    "workflowConfig": {
++        "openMetadataServerConfig": {
++            "hostPort": "http://localhost:8585/api",
++            "authProvider": "openmetadata",
++            "securityConfig": {"jwtToken": "token"},
++        }
++    },
++}
++
++MOCK_GLUE_CONFIG = {
++    "source": {
++        "type": "iceberg",
++        "serviceName": "test_iceberg",
++        "serviceConnection": {
++            "config": {
++                "type": "Iceberg",
++                "catalog": {
++                    "name": "Batata",
++                    "connection": {
++                        "awsConfig": {
++                            "awsAccessKeyId": "access_key",
++                            "awsSecretAccessKey": "secret",
++                            "awsRegion": "us-east-2",
++                            "awsSessionToken": "token",
++                        },
++                    },
++                },
++            }
++        },
++        "sourceConfig": {"config": {"type": "DatabaseMetadata"}},
++    },
++    "sink": {"type": "metadata-rest", "config": {}},
++    "workflowConfig": {
++        "openMetadataServerConfig": {
++            "hostPort": "http://localhost:8585/api",
++            "authProvider": "openmetadata",
++            "securityConfig": {"jwtToken": "token"},
++        }
++    },
++}
++
++MOCK_DYNAMO_CONFIG = {
++    "source": {
++        "type": "iceberg",
++        "serviceName": "test_iceberg",
++        "serviceConnection": {
++            "config": {
++                "type": "Iceberg",
++                "catalog": {
++                    "name": "Batata",
++                    "connection": {
++                        "tableName": "table",
++                        "awsConfig": {
++                            "awsAccessKeyId": "access_key",
++                            "awsSecretAccessKey": "secret",
++                            "awsRegion": "us-east-2",
++                            "awsSessionToken": "token",
++                        },
++                    },
++                },
++            }
++        },
++        "sourceConfig": {"config": {"type": "DatabaseMetadata"}},
++    },
++    "sink": {"type": "metadata-rest", "config": {}},
++    "workflowConfig": {
++        "openMetadataServerConfig": {
++            "hostPort": "http://localhost:8585/api",
++            "authProvider": "openmetadata",
++            "securityConfig": {"jwtToken": "token"},
++        }
++    },
++}
++
++MOCK_NAMESPACES = [
++    ("namespace1",),
++    ("namespace2", "foo"),
++]
++
++EXPECTED_NAMESPACES_NAMES = [
++    "namespace1",
++    "namespace2.foo",
++]
++
++MOCK_TABLE_LIST = [
++    ("namespace1", "table1"),
++    ("namespace1", "table2", "foo"),
++    ("namespace2", "table3"),
++]
++
++EXPECTED_TABLE_LIST = [
++    ("table1", TableType.Regular),
++    ("table2.foo", TableType.Regular),
++    ("table3", TableType.Regular),
++]
++
++
++class IcebergUnitTest(TestCase):
++    """
++    Validate how we work with the Iceberg connector
++    """
++
++    @patch(
++        "metadata.ingestion.source.database.database_service.DatabaseServiceSource.test_connection"
++    )
++    def __init__(self, methodName, test_connection) -> None:
++        super().__init__(methodName)
++        test_connection.return_value = False
++
++        for config in [
++            MOCK_DYNAMO_CONFIG,
++            MOCK_GLUE_CONFIG,
++            MOCK_REST_CONFIG,
++            MOCK_HIVE_CONFIG,
++        ]:
++            self.config = parse_workflow_config_gracefully(config)
++            self.iceberg = IcebergSource.create(
++                config["source"],
++                OpenMetadata(self.config.workflowConfig.openMetadataServerConfig),
++            )
++
++        self.iceberg.context.database_service = "test_iceberg"
++        self.iceberg.context.database = "default"
++        self.iceberg.context.database_schema = "schema"
++
++    def test_create(self):
++        """
++        An invalid config raises an error
++        """
++        not_looker_source = {
++            "type": "mysql",
++            "serviceName": "mysql_local",
++            "serviceConnection": {
++                "config": {
++                    "type": "Mysql",
++                    "username": "openmetadata_user",
++                    "authType": {"password": "openmetadata_password"},
++                    "hostPort": "localhost:3306",
++                    "databaseSchema": "openmetadata_db",
++                }
++            },
++            "sourceConfig": {
++                "config": {
++                    "type": "DatabaseMetadata",
++                }
++            },
++        }
++
++        self.assertRaises(
++            InvalidSourceException,
++            IcebergSource.create,
++            not_looker_source,
++            self.config.workflowConfig.openMetadataServerConfig,
++        )
++
++    def test_get_database_name(self):
++        """
++        Asserts 'get_database_name' returns:
++            - databaseName when it is set
++            - 'default' when it is not set
++        """
++
++        # Iceberg connector without databaseName set returns 'default'
++        self.assertEqual(next(self.iceberg.get_database_names()), "default")
++
++        # Iceberg connector with databaseName set returns the databaseName
++        iceberg_source_with_database_name = deepcopy(self.iceberg)
++        iceberg_source_with_database_name.service_connection.catalog.databaseName = (
++            "myDatabase"
++        )
++
++        self.assertEqual(
++            next(iceberg_source_with_database_name.get_database_names()), "myDatabase"
++        )
++
++    def test_yield_database(self):
++        """
++        Assert 'yield_database' returns the proper 'CreateDatabaseRequest'
++        """
++
++        database_name = "database"
++
++        expected = CreateDatabaseRequest(
++            name="database", service=self.iceberg.context.database_service
++        )
++        self.assertEqual(
++            next(self.iceberg.yield_database(database_name)).right, expected
++        )
++
++    def test_get_database_schema_names(self):
++        """
++        Mock the Catalog and check the namespaces are transformed as expected,
++        from tuples to strings.
++        """
++        with patch.object(HiveCatalog, "list_namespaces", return_value=MOCK_NAMESPACES):
++            for i, namespace in enumerate(self.iceberg.get_database_schema_names()):
++                self.assertEqual(namespace, EXPECTED_NAMESPACES_NAMES[i])
++
++        def raise_something_bad():
++            raise RuntimeError("Something bad")
++
++        with patch.object(
++            HiveCatalog, "list_namespaces", side_effect=raise_something_bad
++        ):
++            self.assertRaises(Exception, IcebergSource.get_database_schema_names)
++
++    def test_yield_database_schema(self):
++        """
++        Assert 'yield_database_schema' returns the propert 'CreateDatabaseSchemaRequest'
++        """
++        schema_name = "MySchema"
++        fully_qualified_database_name = "FullyQualifiedDatabaseName"
++
++        expected = CreateDatabaseSchemaRequest(
++            name=schema_name,
++            database=fully_qualified_database_name,
++        )
++
++        with patch.object(fqn, "build", return_value=fully_qualified_database_name):
++            self.assertEqual(
++                next(self.iceberg.yield_database_schema(schema_name)).right, expected
++            )
++
++    def test_get_tables_name_and_type(self):
++        """
++        Assert 'get_tables_name_and_type' returns the proper table name and type.
++        """
++
++        # Happy Path scenario
++        class LoadTableMock:
++            data = iter(MOCK_TABLE_LIST)
++
++            def name(self):
++                return next(self.data)
++
++        with patch.object(
++            HiveCatalog, "list_tables", return_value=MOCK_TABLE_LIST
++        ), patch.object(HiveCatalog, "load_table", return_value=LoadTableMock()):
++
++            for i, table in enumerate(self.iceberg.get_tables_name_and_type()):
++                self.assertEqual(table, EXPECTED_TABLE_LIST[i])
++
++        # When pyiceberg.exceptions.NoSuchIcebergTableError is raised
++        # Then nothing is yield.
++        def raise_no_such_iceberg_table():
++            raise pyiceberg.exceptions.NoSuchIcebergTableError()
++
++        with patch.object(
++            HiveCatalog, "list_tables", return_value=MOCK_TABLE_LIST
++        ), patch.object(
++            HiveCatalog, "load_table", side_effect=raise_no_such_iceberg_table
++        ):
++
++            self.assertEqual(len(list(self.iceberg.get_tables_name_and_type())), 0)
++
++        # When pyiceberg.exceptions.NoSuchTableError is raised
++        # Then nothing is yield.
++        def raise_no_such_table():
++            raise pyiceberg.exceptions.NoSuchTableError()
++
++        with patch.object(
++            HiveCatalog, "list_tables", return_value=MOCK_TABLE_LIST
++        ), patch.object(HiveCatalog, "load_table", side_effect=raise_no_such_table):
++
++            self.assertEqual(len(list(self.iceberg.get_tables_name_and_type())), 0)
++
++    def test_get_owner_ref(self):
++        """
++        Asserts 'get_owner_ref' returns:
++            - None if there is no Owner
++            - EntityReference if there is an Owner
++        """
++        table_name = "table"
++
++        # When the Owner is present on the PyIceberg Table
++        # Then EntityReference needs to be searched for
++        ref = EntityReference(id=uuid.uuid4(), type="user")
++
++        iceberg_table_with_owner = {
++            "identifier": (
++                self.iceberg.context.database,
++                self.iceberg.context.database_schema,
++                table_name,
++            ),
++            "metadata": TableMetadataV1.parse_obj(
++                {
++                    "location": "foo",
++                    "last_column_id": 1,
++                    "format_version": 1,
++                    "schema": {},
++                    "partition_spec": [],
++                    "properties": {"owner": "myself"},
++                }
++            ),
++            "metadata_location": "bar",
++            "io": "pyiceberg.io.pyarrow.PyArrowFileIO",
++            "catalog": self.iceberg.connection_obj,
++        }
++
++        self.iceberg.context.iceberg_table = PyIcebergTable(**iceberg_table_with_owner)
++
++        with patch.object(OpenMetadata, "get_reference_by_email", return_value=ref):
++            self.assertEqual(
++                self.iceberg.get_owner_ref(table_name),
++                ref,
++            )
++
++        # When the Owner is not present on the PyIceberg Table
++        # Then None is returned
++        iceberg_table_without_owner = {
++            "identifier": (
++                self.iceberg.context.database,
++                self.iceberg.context.database_schema,
++                table_name,
++            ),
++            "metadata": TableMetadataV1.parse_obj(
++                {
++                    "location": "foo",
++                    "last_column_id": 1,
++                    "format_version": 1,
++                    "schema": {},
++                    "partition_spec": [],
++                    "properties": {},
++                }
++            ),
++            "metadata_location": "bar",
++            "io": "pyiceberg.io.pyarrow.PyArrowFileIO",
++            "catalog": self.iceberg.connection_obj,
++        }
++        self.iceberg.context.iceberg_table = PyIcebergTable(
++            **iceberg_table_without_owner
++        )
++
++        self.assertIsNone(
++            self.iceberg.get_owner_ref(table_name),
++        )
++
++    def test_yield_table(self):
++        table_name = "table_name"
++        table_type = TableType.Regular
++
++        iceberg_table = {
++            "identifier": (
++                self.iceberg.context.database,
++                self.iceberg.context.database_schema,
++                table_name,
++            ),
++            "metadata": TableMetadataV1.parse_obj(
++                {
++                    "location": "foo",
++                    "last_column_id": 1,
++                    "format_version": 1,
++                    "schema": Schema(
++                        fields=(
++                            MOCK_COLUMN_MAP[field]["iceberg"]
++                            for field in MOCK_COLUMN_MAP.keys()
++                        )
++                    ),
++                    "partition_spec": [],
++                    "partition_specs": [
++                        {
++                            "fields": (
++                                PartitionField(
++                                    source_id=1,
++                                    field_id=1000,
++                                    transform=IdentityTransform(),
++                                    name="boolean",
++                                ),
++                            )
++                        }
++                    ],
++                    "properties": {"owner": "myself", "comment": "Table Description"},
++                }
++            ),
++            "metadata_location": "bar",
++            "io": "pyiceberg.io.pyarrow.PyArrowFileIO",
++            "catalog": self.iceberg.connection_obj,
++        }
++
++        fq_database_schema = "FullyQualifiedDatabaseSchema"
++
++        ref = EntityReference(id=uuid.uuid4(), type="user")
++        self.iceberg.context.iceberg_table = PyIcebergTable(**iceberg_table)
++
++        expected = CreateTableRequest(
++            name=table_name,
++            tableType=table_type,
++            description="Table Description",
++            owner=ref,
++            columns=[
++                MOCK_COLUMN_MAP[field]["ometa"] for field in MOCK_COLUMN_MAP.keys()
++            ],
++            tablePartition=TablePartition(columns=["binary"]),
++            databaseSchema=fq_database_schema,
++        )
++
++        with patch.object(
++            OpenMetadata, "get_reference_by_email", return_value=ref
++        ), patch.object(fqn, "build", return_value=fq_database_schema):
++
++            result = next(self.iceberg.yield_table((table_name, table_type))).right
++
++            self.assertEqual(result, expected)
+diff --git a/openmetadata-docs/content/v1.3.x-SNAPSHOT/connectors/database/iceberg/index.md b/openmetadata-docs/content/v1.3.x-SNAPSHOT/connectors/database/iceberg/index.md
+new file mode 100644
+index 0000000000..8dca4500a1
+--- /dev/null
++++ b/openmetadata-docs/content/v1.3.x-SNAPSHOT/connectors/database/iceberg/index.md
+@@ -0,0 +1,215 @@
++---
++title: Iceberg
++slug: /connectors/database/iceberg
++---
++
++# Iceberg
++
++{% multiTablesWrapper %}
++
++| Feature            | Status                       |
++| :----------------- | :--------------------------- |
++| Stage              | BETA                         |
++| Metadata           | {% icon iconName="check" /%} |
++| Query Usage        | {% icon iconName="cross" /%} |
++| Data Profiler      | {% icon iconName="cross" /%} |
++| Data Quality       | {% icon iconName="cross" /%} |
++| Stored Procedures  | {% icon iconName="cross" /%} |
++| Owners             | {% icon iconName="check" /%} |
++| Tags               | {% icon iconName="cross" /%} |
++| DBT                | {% icon iconName="cross" /%} |
++| Supported Versions |  -                           |
++
++| Feature      | Status                       |
++| :----------- | :--------------------------- |
++| Lineage      | {% icon iconName="cross" /%} |
++| Table-level  | {% icon iconName="cross" /%} |
++| Column-level | {% icon iconName="cross" /%} |
++
++{% /multiTablesWrapper %}
++
++In this section, we provide guides and references to use the Iceberg connector.
++
++Configure and schedule Iceberg metadata workflows from the OpenMetadata UI:
++
++- [Requirements](#requirements)
++- [Metadata Ingestion](#metadata-ingestion)
++
++{% partial file="/v1.3/connectors/ingestion-modes-tiles.md" variables={yamlPath: "/connectors/database/iceberg/yaml"} /%}
++
++## Requirements
++
++The requirements actually depend on the Catalog and the FileSystem used. In a nutshell, the used credentials must have access to reading the Catalog and the Metadata File.
++
++### Glue Catalog
++
++Must have `glue:GetDatabases`, and `glue:GetTables` permissions to be able to read the Catalog.
++
++Must also have the `s3:GetObject` permission for the location of the Iceberg tables.
++
++### DynamoDB Catalog
++
++Must have `dynamodb:DescribeTable` and `dynamodb:GetItem` permissions on the Iceberg Catalog table.
++
++Must also have the `s3:GetObject` permission for the location of the Iceberg tables.
++
++### Hive / REST Catalog
++It depends on where and how the Hive / Rest Catalog is setup and where the Iceberg files are stored.
++## Metadata Ingestion
++
++{% partial
++  file="/v1.3/connectors/metadata-ingestion-ui.md"
++  variables={
++    connector: "Iceberg",
++    selectServicePath: "/images/v1.3/connectors/iceberg/select-service.png",
++    addNewServicePath: "/images/v1.3/connectors/iceberg/add-new-service.png",
++    serviceConnectionPath: "/images/v1.3/connectors/iceberg/service-connection.png",
++}
++/%}
++
++{% stepsContainer %}
++{% extraContent parentTagName="stepsContainer" %}
++
++#### Connection Details
++
++**Glue Catalog**
++
++- [**AWS Credentials**](#aws-credentials)
++
++**DynamoDB Catalog**
++- **Table Name**: DynamoDB Table that works as the Iceberg Catalog.
++- [**AWS Credentials**](#aws-credentials)
++
++**Hive Catalog**
++
++- **Uri**: Uri to the Hive Metastore.
++
++**For Example**: 'thrift://localhost:9083'
++
++- [**File System**](#file-system)
++
++**REST Catalog**
++
++- **Uri**: Uri to the REST Catalog.
++
++**For Example**: 'http://rest-catalog/ws'.
++
++- **Credential (Optional)**: OAuth2 credential to be used on the authentication flow.
++    - **Client ID**: OAuth2 Client ID.
++    - **Client Secret**: OAuth2 Client Secret.
++
++- **Token (Optional)**: Bearer Token to use for the 'Authorization' header.
++
++- **SSL (Optional)**:
++    - **CA Certificate Path**: Path to the CA Bundle.
++    - **Client Certificate Path**: Path to the Client Certificate.
++    - **Private Key Path**: Path to the Private Key Certificate.
++
++- **Sigv4 (Optional)**: Needed if signing requests using AWS SigV4 protocol.
++    - **Signing AWS Region**: AWS Region to use when signing a request.
++    - **Signing Name**: Name to use when signing a request.
++
++- [**File System**](#file-system)
++
++**Common**
++
++- **Database Name (Optional)**: Custom Database Name for your Iceberg Service. If it is not set it will be 'default'.
++
++- **Warehouse Location (Optional)**: Custom Warehouse Location. Most Catalogs already have the Warehouse Location defined properly and this shouldn't be needed. In case of a custom implementation you can pass the location here.
++
++
++**For example**: 's3://my-bucket/warehouse/'
++
++- **Ownership Property**: Table property to look for the Owner. It defaults to 'owner'.
++
++The Owner should be the same e-mail set on the OpenMetadata user/group.
++
++**File System**
++- **Local**:
++- [**AWS Credentials**](#aws-credentials)
++- [**Azure Credentials**](#azure-credentials)
++
++#### AWS Credentials
++
++- **AWS Access Key ID** & **AWS Secret Access Key**: When you interact with AWS, you specify your AWS security credentials to verify who you are and whether you have
++permission to access the resources that you are requesting. AWS uses the security credentials to authenticate and
++authorize your requests ([docs](https://docs.aws.amazon.com/IAM/latest/UserGuide/security-creds.html)).
++
++Access keys consist of two parts: An **access key ID** (for example, `AKIAIOSFODNN7EXAMPLE`), and a **secret access key** (for example, `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`).
++
++You must use both the access key ID and secret access key together to authenticate your requests.
++
++You can find further information on how to manage your access keys [here](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html).
++
++- **AWS Region**: Each AWS Region is a separate geographic area in which AWS clusters data centers ([docs](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.RegionsAndAvailabilityZones.html)).
++
++As AWS can have instances in multiple regions, we need to know the region the service you want reach belongs to.
++
++Note that the AWS Region is the only required parameter when configuring a connection. When connecting to the
++services programmatically, there are different ways in which we can extract and use the rest of AWS configurations.
++
++You can find further information about configuring your credentials [here](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html#configuring-credentials).
++
++- **AWS Session Token (optional)**: If you are using temporary credentials to access your services, you will need to inform the AWS Access Key ID
++    and AWS Secrets Access Key. Also, these will include an AWS Session Token.
++
++You can find more information on [Using temporary credentials with AWS resources](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_temp_use-resources.html).
++
++- **Endpoint URL (optional)**: To connect programmatically to an AWS service, you use an endpoint. An *endpoint* is the URL of the
++    entry point for an AWS web service. The AWS SDKs and the AWS Command Line Interface (AWS CLI) automatically use the
++    default endpoint for each service in an AWS Region. But you can specify an alternate endpoint for your API requests.
++
++Find more information on [AWS service endpoints](https://docs.aws.amazon.com/general/latest/gr/rande.html).
++
++- **Profile Name (Not Supported)**: A named profile is a collection of settings and credentials that you can apply to a AWS CLI command.
++    When you specify a profile to run a command, the settings and credentials are used to run that command.
++    Multiple named profiles can be stored in the config and credentials files.
++
++You can inform this field if you'd like to use a profile other than `default`.
++
++Find here more information about [Named profiles for the AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-profiles.html).
++
++- **Assume Role Arn (Not Supported)**: Typically, you use `AssumeRole` within your account or for cross-account access. In this field you'll set the
++    `ARN` (Amazon Resource Name) of the policy of the other account.
++
++A user who wants to access a role in a different account must also have permissions that are delegated from the account
++administrator. The administrator must attach a policy that allows the user to call `AssumeRole` for the `ARN` of the role in the other account.
++
++This is a required field if you'd like to `AssumeRole`.
++
++Find more information on [AssumeRole](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html).
++
++- **Assume Role Session Name (Not Supported)**: An identifier for the assumed role session. Use the role session name to uniquely identify a session when the same role
++    is assumed by different principals or for different reasons.
++
++By default, we'll use the name `OpenMetadataSession`.
++
++Find more information about the [Role Session Name](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html#:~:text=An%20identifier%20for%20the%20assumed%20role%20session.).
++
++- **Assume Role Source Identity (Not Supported)**: The source identity specified by the principal that is calling the `AssumeRole` operation. You can use source identity
++    information in AWS CloudTrail logs to determine who took actions with a role.
++
++Find more information about [Source Identity](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html#:~:text=Required%3A%20No-,SourceIdentity,-The%20source%20identity).
++#### Azure Credentials
++
++- **Client ID** : Client ID of the data storage account
++
++- **Client Secret** : Client Secret of the account
++
++- **Tenant ID** : Tenant ID under which the data storage account falls
++
++- **Account Name** : Account Name of the data Storage
++
++{% /extraContent %}
++
++{% partial file="/v1.3/connectors/test-connection.md" /%}
++
++{% partial file="/v1.3/connectors/database/configure-ingestion.md" /%}
++
++{% partial file="/v1.3/connectors/ingestion-schedule-and-deploy.md" /%}
++
++{% /stepsContainer %}
++
++{% partial file="/v1.3/connectors/troubleshooting.md" /%}
++
++{% partial file="/v1.3/connectors/database/related.md" /%}
+diff --git a/openmetadata-docs/content/v1.3.x-SNAPSHOT/connectors/database/iceberg/yaml.md b/openmetadata-docs/content/v1.3.x-SNAPSHOT/connectors/database/iceberg/yaml.md
+new file mode 100644
+index 0000000000..f51d97506a
+--- /dev/null
++++ b/openmetadata-docs/content/v1.3.x-SNAPSHOT/connectors/database/iceberg/yaml.md
+@@ -0,0 +1,536 @@
++---
++title: Run the Iceberg Connector Externally
++slug: /connectors/database/iceberg/yaml
++---
++
++# Run the Iceberg Connector Externally
++
++{% multiTablesWrapper %}
++
++| Feature            | Status                       |
++| :----------------- | :--------------------------- |
++| Stage              | BETA                         |
++| Metadata           | {% icon iconName="check" /%} |
++| Query Usage        | {% icon iconName="cross" /%} |
++| Data Profiler      | {% icon iconName="cross" /%} |
++| Data Quality       | {% icon iconName="cross" /%} |
++| Stored Procedures  | {% icon iconName="cross" /%} |
++| Owners             | {% icon iconName="check" /%} |
++| Tags               | {% icon iconName="cross" /%} |
++| DBT                | {% icon iconName="cross" /%} |
++| Supported Versions |  -                           |
++
++| Feature      | Status                       |
++| :----------- | :--------------------------- |
++| Lineage      | {% icon iconName="cross" /%} |
++| Table-level  | {% icon iconName="cross" /%} |
++| Column-level | {% icon iconName="cross" /%} |
++
++
++{% /multiTablesWrapper %}
++
++In this section, we provide guides and references to use the Iceberg connector.
++
++Configure and schedule Greenplum metadata and profiler workflows from the OpenMetadata UI:
++
++- [Requirements](#requirements)
++- [Metadata Ingestion](#metadata-ingestion)
++
++{% partial file="/v1.3/connectors/external-ingestion-deployment.md" /%}
++
++## Requirements
++
++{%inlineCallout icon="description" bold="OpenMetadata 0.12 or later" href="/deployment"%}
++To deploy OpenMetadata, check the Deployment guides.
++{%/inlineCallout%}
++
++The requirements actually depend on the Catalog and the FileSystem used. In a nutshell, the used credentials must have access to reading the Catalog and the Metadata File.
++
++### Glue Catalog
++
++Must have `glue:GetDatabases`, and `glue:GetTables` permissions to be able to read the Catalog.
++
++Must also have the `s3:GetObject` permission for the location of the Iceberg tables.
++
++### DynamoDB Catalog
++
++Must have `dynamodb:DescribeTable` and `dynamodb:GetItem` permissions on the Iceberg Catalog table.
++
++Must also have the `s3:GetObject` permission for the location of the Iceberg tables.
++
++### Hive / REST Catalog
++It depends on where and how the Hive / Rest Catalog is setup and where the Iceberg files are stored.
++### Python Requirements
++
++To run the Iceberg ingestion, you will need to install:
++
++```bash
++pip3 install "openmetadata-ingestion[iceberg]"
++```
++
++## Metadata Ingestion
++
++All connectors are defined as JSON Schemas.
++[Here](https://github.com/open-metadata/OpenMetadata/blob/main/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/icebergConnection.json)
++you can find the structure to create a connection to Greenplum.
++
++In order to create and run a Metadata Ingestion workflow, we will follow
++the steps to create a YAML configuration able to connect to the source,
++process the Entities if needed, and reach the OpenMetadata server.
++
++The workflow is modeled around the following
++[JSON Schema](https://github.com/open-metadata/OpenMetadata/blob/main/openmetadata-spec/src/main/resources/json/schema/metadataIngestion/workflow.json)
++
++## 1. Define the YAML Config
++
++### This is a sample config for Iceberg using a Glue Catalog:
++
++{% codePreview %}
++
++{% codeInfoContainer %}
++
++#### Source Configuration - Service Connection
++
++{% codeInfo srNumber=1 %}
++
++* **name**: Enter the catalog name of choice.
++
++{% /codeInfo %}
++
++{% codeInfo srNumber=2 %}
++
++* **awsAccessKeyId**: Enter your secure access key ID for your AWS connection.
++* **awsSecretAccessKey**: Enter the Secret Access Key (the passcode key pair to the key ID from above).
++* **awsSessionToken (optional)**: Enter the Session Access Token (used if using short lived credentials).
++* **awsRegion**: Specify the AWS region used.
++
++{% /codeInfo %}
++
++{% codeInfo srNumber=3 %}
++
++* **databaseName (optional)**: Enter the database name of choice. If not it will be set as 'default'.
++
++{% /codeInfo %}
++
++{% codeInfo srNumber=4 %}
++
++* **ownershipProperty (optional)**: Property to use when searching for the owner. It defaults to 'owner'.
++
++{% /codeInfo %}
++
++{% partial file="/v1.3/connectors/yaml/database/source-config-def.md" /%}
++
++{% partial file="/v1.3/connectors/yaml/ingestion-sink-def.md" /%}
++
++{% partial file="/v1.3/connectors/yaml/workflow-config-def.md" /%}
++
++{% /codeInfoContainer %}
++
++{% codeBlock fileName="filename.yaml" %}
++
++```yaml
++source:
++  type: iceberg
++  serviceName: glue_test
++  serviceConnection:
++    config:
++      type: Iceberg
++      catalog:
++```
++```yaml {% srNumber=1 %}
++        name: my_glue
++```
++```yaml
++        connection:
++```
++```yaml {% srNumber=2 %}
++          awsConfig:
++              awsAccessKeyId: access key id
++              awsSecretAccessKey: access secret key
++              awsRegion: aws region name
++```
++```yaml {% srNumber=3 %}
++        databaseName: my_database_name
++```
++```yaml {% srNumber=4 %}
++      ownershipProperty: custom_owner_property
++```
++
++{% partial file="/v1.3/connectors/yaml/database/source-config.md" /%}
++
++{% partial file="/v1.3/connectors/yaml/ingestion-sink.md" /%}
++
++{% partial file="/v1.3/connectors/yaml/workflow-config.md" /%}
++
++{% /codeBlock %}
++
++{% /codePreview %}
++### This is a sample config for Iceberg using a DynamoDB Catalog:
++
++{% codePreview %}
++
++{% codeInfoContainer %}
++
++#### Source Configuration - Service Connection
++
++{% codeInfo srNumber=1 %}
++
++* **name**: Enter the catalog name of choice.
++
++{% /codeInfo %}
++
++{% codeInfo srNumber=2 %}
++
++* **tableName**: Enter the name of the table where the Iceberg Catalog is stored.
++
++{% /codeInfo %}
++
++{% codeInfo srNumber=3 %}
++
++* **awsAccessKeyId**: Enter your secure access key ID for your AWS connection.
++* **awsSecretAccessKey**: Enter the Secret Access Key (the passcode key pair to the key ID from above).
++* **awsSessionToken (optional)**: Enter the Session Access Token (used if using short lived credentials).
++* **awsRegion**: Specify the AWS region used.
++
++{% /codeInfo %}
++
++{% codeInfo srNumber=4 %}
++
++* **databaseName (optional)**: Enter the database name of choice. If not it will be set as 'default'.
++
++{% /codeInfo %}
++
++{% codeInfo srNumber=5 %}
++
++* **ownershipProperty (optional)**: Property to use when searching for the owner. It defaults to 'owner'.
++
++{% /codeInfo %}
++
++{% partial file="/v1.3/connectors/yaml/database/source-config-def.md" /%}
++
++{% partial file="/v1.3/connectors/yaml/ingestion-sink-def.md" /%}
++
++{% partial file="/v1.3/connectors/yaml/workflow-config-def.md" /%}
++
++{% /codeInfoContainer %}
++
++{% codeBlock fileName="filename.yaml" %}
++
++```yaml
++source:
++  type: iceberg
++  serviceName: glue_test
++  serviceConnection:
++    config:
++      type: Iceberg
++      catalog:
++```
++```yaml {% srNumber=1 %}
++        name: my_dynamo
++```
++```yaml
++        connection:
++```
++```yaml {% srNumber=2 %}
++          tableName: catalog_table
++```
++```yaml {% srNumber=3 %}
++          awsConfig:
++            awsAccessKeyId: access key id
++            awsSecretAccessKey: access secret key
++            awsRegion: aws region name
++```
++```yaml {% srNumber=4 %}
++        databaseName: my_database_name
++```
++```yaml {% srNumber=5 %}
++      ownershipProperty: custom_owner_property
++```
++
++{% partial file="/v1.3/connectors/yaml/database/source-config.md" /%}
++
++{% partial file="/v1.3/connectors/yaml/ingestion-sink.md" /%}
++
++{% partial file="/v1.3/connectors/yaml/workflow-config.md" /%}
++
++{% /codeBlock %}
++
++{% /codePreview %}
++### This is a sample config for Iceberg using a Hive Catalog:
++
++{% codePreview %}
++
++{% codeInfoContainer %}
++
++#### Source Configuration - Service Connection
++
++{% codeInfo srNumber=1 %}
++
++* **name**: Enter the catalog name of choice.
++
++{% /codeInfo %}
++
++{% codeInfo srNumber=2 %}
++
++* **uri**: Enter the uri to the Hive Metastore. Example: 'thrift://localhost:9083'.
++
++{% /codeInfo %}
++
++{% codeInfo srNumber=3 %}
++
++* **fileSystem (Optional)**: Enter the specific configuration given the file system used to store the Iceberg files.
++    * **Local**: No configuration needed
++    * **S3 (Or S3 Compatible)**:
++        * **awsAccessKeyId**: Enter your secure access key ID for your AWS connection.
++        * **awsSecretAccessKey**: Enter the Secret Access Key (the passcode key pair to the key ID from above).
++        * **awsSessionToken (optional)**: Enter the Session Access Token (used if using short lived credentials).
++        * **awsRegion**: Specify the AWS region used.
++        * **endPointURL**: EndPoint URL to use with AWS.
++    * **Azure**:
++        * **clientId** : Client ID of the data storage account
++        * **clientSecret** : Client Secret of the account
++        * **tenantId** : Tenant ID under which the data storage account falls
++        * **accountName** : Account Name of the data Storage
++
++{% /codeInfo %}
++
++{% codeInfo srNumber=4 %}
++
++* **databaseName (optional)**: Enter the database name of choice. If not it will be set as 'default'.
++
++{% /codeInfo %}
++
++{% codeInfo srNumber=5 %}
++
++* **ownershipProperty (optional)**: Property to use when searching for the owner. It defaults to 'owner'.
++
++{% /codeInfo %}
++
++{% partial file="/v1.3/connectors/yaml/database/source-config-def.md" /%}
++
++{% partial file="/v1.3/connectors/yaml/ingestion-sink-def.md" /%}
++
++{% partial file="/v1.3/connectors/yaml/workflow-config-def.md" /%}
++
++{% /codeInfoContainer %}
++
++{% codeBlock fileName="filename.yaml" %}
++
++```yaml
++source:
++  type: iceberg
++  serviceName: glue_test
++  serviceConnection:
++    config:
++      type: Iceberg
++      catalog:
++```
++```yaml {% srNumber=1 %}
++        name: my_hive
++```
++```yaml
++        connection:
++```
++```yaml {% srNumber=2 %}
++          uri: thrift://localhost:9083
++```
++```yaml {% srNumber=3 %}
++          fileSystem:
++            # S3 Compatible
++            awsAccessKeyId: access key id
++            awsSecretAccessKey: access secret key
++            awsRegion: aws region name
++
++            # Azure
++            # clientId: client_id
++            # clientSecret: client_secret
++            # tenantId: tenant_id
++            # accountName: account_name
++```
++```yaml {% srNumber=4 %}
++        databaseName: my_database_name
++```
++```yaml {% srNumber=5 %}
++      ownershipProperty: custom_owner_property
++```
++
++{% partial file="/v1.3/connectors/yaml/database/source-config.md" /%}
++
++{% partial file="/v1.3/connectors/yaml/ingestion-sink.md" /%}
++
++{% partial file="/v1.3/connectors/yaml/workflow-config.md" /%}
++
++{% /codeBlock %}
++
++{% /codePreview %}
++
++### This is a sample config for Iceberg using a REST Catalog:
++
++{% codePreview %}
++
++{% codeInfoContainer %}
++
++#### Source Configuration - Service Connection
++
++{% codeInfo srNumber=1 %}
++
++* **name**: Enter the catalog name of choice.
++
++{% /codeInfo %}
++
++{% codeInfo srNumber=2 %}
++
++* **uri**: Enter the uri to the Rest Catalog. Example: 'http://localhost:8181'.
++
++{% /codeInfo %}
++
++{% codeInfo srNumber=3 %}
++
++* **credential (Optional)**: OAuth2 Credential to use for Authentication flow.
++    * **clientId**: OAuth2 Client ID.
++    * **clientSecret**: OAuth2 Client Secret.
++
++{% /codeInfo %}
++
++{% codeInfo srNumber=4 %}
++
++* **token (Optional)**: Enter the Bearer token for the 'Authorization' header.
++
++{% /codeInfo %}
++
++{% codeInfo srNumber=5 %}
++
++* **ssl (Optional)**: Needed configuration for SSL.
++    * **caCertPath**: CA Certificate Path.
++    * **clientCertPath**: Client Certificate Path.
++    * **privateKeyPath**: Private Key Path.
++
++{% /codeInfo %}
++
++{% codeInfo srNumber=6 %}
++
++* **sigv4 (Optional)**: Used if signing requests using AWS SigV4 protocol.
++    * **signingRegion** : AWS Region used when signing a request.
++    * **signingName** : Name used to sign the request with.
++
++{% /codeInfo %}
++
++{% codeInfo srNumber=7 %}
++
++* **fileSystem (Optional)**: Enter the specific configuration given the file system used to store the Iceberg files.
++    * **Local**: No configuration needed
++    * **S3 (Or S3 Compatible)**:
++        * **awsAccessKeyId**: Enter your secure access key ID for your AWS connection.
++        * **awsSecretAccessKey**: Enter the Secret Access Key (the passcode key pair to the key ID from above).
++        * **awsSessionToken (optional)**: Enter the Session Access Token (used if using short lived credentials).
++        * **awsRegion**: Specify the AWS region used.
++        * **endPointURL**: EndPoint URL to use with AWS.
++    * **Azure**:
++        * **clientId** : Client ID of the data storage account
++        * **clientSecret** : Client Secret of the account
++        * **tenantId** : Tenant ID under which the data storage account falls
++        * **accountName** : Account Name of the data Storage
++
++{% /codeInfo %}
++
++{% codeInfo srNumber=8 %}
++
++* **databaseName (optional)**: Enter the database name of choice. If not it will be set as 'default'.
++
++{% /codeInfo %}
++
++{% codeInfo srNumber=9 %}
++
++* **warehouseLocation (optional)**: Warehouse Location. Used to specify a custom warehouse location if needed.
++
++Most Catalogs should have a working default warehouse location.
++
++{% /codeInfo %}
++
++{% codeInfo srNumber=10 %}
++
++* **ownershipProperty (optional)**: Property to use when searching for the owner. It defaults to 'owner'.
++
++{% /codeInfo %}
++
++{% partial file="/v1.3/connectors/yaml/database/source-config-def.md" /%}
++
++{% partial file="/v1.3/connectors/yaml/ingestion-sink-def.md" /%}
++
++{% partial file="/v1.3/connectors/yaml/workflow-config-def.md" /%}
++
++{% /codeInfoContainer %}
++
++{% codeBlock fileName="filename.yaml" %}
++
++```yaml
++source:
++  type: iceberg
++  serviceName: glue_test
++  serviceConnection:
++    config:
++      type: Iceberg
++      catalog:
++```
++```yaml {% srNumber=1 %}
++        name: my_rest
++```
++```yaml
++        connection:
++```
++```yaml {% srNumber=2 %}
++          uri: http://localhost:8181
++```
++```yaml {% srNumber=3 %}
++          credential:
++            clientId: client_id
++            clientSecret: client_secret
++```
++```yaml {% srNumber=4 %}
++          token: my_bearer_token
++```
++```yaml {% srNumber=5 %}
++          ssl:
++            caCertPath: ./ca_cert.pem
++            clientCertPath: ./client_cert.crt
++            privateKeyPath: ./private.key
++```
++```yaml {% srNumber=6 %}
++          sigv4:
++            signingRegion: us-east-2
++            signingName: signing_name
++```
++```yaml {% srNumber=7 %}
++          fileSystem:
++            # S3 compatible
++            awsAccessKeyId: access key id
++            awsSecretAccessKey: access secret key
++            awsRegion: aws region name
++
++            # Azure
++            # clientId: client_id
++            # clientSecret: client_secret
++            # tenantId: tenant_id
++            # accountName: account_name
++```
++```yaml {% srNumber=8 %}
++        databaseName: my_database_name
++```
++```yaml {% srNumber=9 %}
++        warehouseLocation: warehouse_location
++```
++```yaml {% srNumber=10 %}
++      ownershipProperty: custom_owner_property
++```
++
++{% partial file="/v1.3/connectors/yaml/database/source-config.md" /%}
++
++{% partial file="/v1.3/connectors/yaml/ingestion-sink.md" /%}
++
++{% partial file="/v1.3/connectors/yaml/workflow-config.md" /%}
++
++{% /codeBlock %}
++
++{% /codePreview %}
++
++{% partial file="/v1.3/connectors/yaml/ingestion-cli.md" /%}
+diff --git a/openmetadata-docs/content/v1.3.x-SNAPSHOT/connectors/database/index.md b/openmetadata-docs/content/v1.3.x-SNAPSHOT/connectors/database/index.md
+index c87c0c76f2..462ee7a026 100644
+--- a/openmetadata-docs/content/v1.3.x-SNAPSHOT/connectors/database/index.md
++++ b/openmetadata-docs/content/v1.3.x-SNAPSHOT/connectors/database/index.md
+@@ -21,6 +21,7 @@ This is the supported list of connectors for Database Services:
+ - [Glue](/connectors/database/glue)
+ - [Greenplum](/connectors/database/greenplum)
+ - [Hive](/connectors/database/hive)
++- [Iceberg](/connectors/database/iceberg)
+ - [MariaDB](/connectors/database/mariadb)
+ - [MSSQL](/connectors/database/mssql)
+ - [MySQL](/connectors/database/mysql)
+diff --git a/openmetadata-docs/content/v1.3.x-SNAPSHOT/connectors/index.md b/openmetadata-docs/content/v1.3.x-SNAPSHOT/connectors/index.md
+index 7cf5dfd7e7..4182f70b30 100644
+--- a/openmetadata-docs/content/v1.3.x-SNAPSHOT/connectors/index.md
++++ b/openmetadata-docs/content/v1.3.x-SNAPSHOT/connectors/index.md
+@@ -46,6 +46,7 @@ the following docs to run the Ingestion Framework in any orchestrator externally
+ - [Glue](/connectors/database/glue)
+ - [Greenplum](/connectors/database/greenplum)
+ - [Hive](/connectors/database/hive)
++- [Iceberg](/connectors/database/iceberg)
+ - [Impala](/connectors/database/impala)
+ - [MariaDB](/connectors/database/mariadb)
+ - [MongoDB](/connectors/database/mongodb)
+@@ -113,4 +114,4 @@ the following docs to run the Ingestion Framework in any orchestrator externally
+ 
+ ## Search Services
+ 
+-- [Elasticsearch](/connectors/search/elasticsearch)
+\ No newline at end of file
++- [Elasticsearch](/connectors/search/elasticsearch)
+diff --git a/openmetadata-docs/content/v1.3.x-SNAPSHOT/menu.md b/openmetadata-docs/content/v1.3.x-SNAPSHOT/menu.md
+index 585f8bacc9..557b832bdc 100644
+--- a/openmetadata-docs/content/v1.3.x-SNAPSHOT/menu.md
++++ b/openmetadata-docs/content/v1.3.x-SNAPSHOT/menu.md
+@@ -224,7 +224,7 @@ site_menu:
+     url: /how-to-guides/admin-guide/cli-ingestion-with-basic-auth
+   - category: How-to Guides / Admin Guide / How to Add Custom Logo
+     url: /how-to-guides/admin-guide/how-to-add-custom-logo
+-    
++
+   - category: How-to Guides / Guide for Data Users
+     url: /how-to-guides/guide-for-data-users
+   - category: How-to Guides / Guide for Data Users / Understanding the Basics of OpenMetadata
+@@ -315,7 +315,7 @@ site_menu:
+   - category: How-to Guides / Data Insights / Cost Analysis
+     url: /how-to-guides/data-insights/cost-analysis
+   - category: How-to Guides / Data Insights / Configure the Data Insights Report
+-    url: /how-to-guides/data-insights/email-report 
++    url: /how-to-guides/data-insights/email-report
+   - category: How-to Guides / Data Insights / How to Transform the Data Culture of Your Company
+     url: /how-to-guides/data-insights/data-culture
+ 
+@@ -332,9 +332,9 @@ site_menu:
+   - category: How-to Guides / Data Governance / Glossary / How to Bulk Import a Glossary
+     url: /how-to-guides/data-governance/glossary/import
+   - category: How-to Guides / Data Governance / Glossary / Glossary Approval Workflow
+-    url: /how-to-guides/data-governance/glossary/approval  
++    url: /how-to-guides/data-governance/glossary/approval
+   - category: How-to Guides / Data Governance / Glossary / Glossary Styling
+-    url: /how-to-guides/data-governance/glossary/styling 
++    url: /how-to-guides/data-governance/glossary/styling
+   - category: How-to Guides / Data Governance / Glossary / How to Add Assets to Glossary Terms
+     url: /how-to-guides/data-governance/glossary/assets
+   - category: How-to Guides / Data Governance / Glossary / Best Practices for Glossary
+@@ -397,7 +397,7 @@ site_menu:
+   - category: Connectors / Database / Couchbase
+     url: /connectors/database/couchbase
+   - category: Connectors / Database / Couchbase / Run Externally
+-    url: /connectors/database/couchbase/yaml 
++    url: /connectors/database/couchbase/yaml
+   - category: Connectors / Database / Databricks
+     url: /connectors/database/databricks
+   - category: Connectors / Database / Databricks / Run Externally
+@@ -446,6 +446,10 @@ site_menu:
+     url: /connectors/database/hive/yaml
+   - category: Connectors / Database / Hive / Troubleshooting
+     url: /connectors/database/hive/troubleshooting
++  - category: Connectors / Database / Iceberg
++    url: /connectors/database/iceberg
++  - category: Connectors / Database / Iceberg / Run Externally
++    url: /connectors/database/iceberg/yaml
+   - category: Connectors / Database / Impala
+     url: /connectors/database/impala
+   - category: Connectors / Database / Impala / Run Externally
+@@ -459,7 +463,7 @@ site_menu:
+   - category: Connectors / Database / MongoDB
+     url: /connectors/database/mongodb
+   - category: Connectors / Database / MongoDB / Run Externally
+-    url: /connectors/database/mongodb/yaml 
++    url: /connectors/database/mongodb/yaml
+   - category: Connectors / Database / MSSQL
+     url: /connectors/database/mssql
+   - category: Connectors / Database / MSSQL / Run Externally
+diff --git a/openmetadata-service/src/main/java/org/openmetadata/service/secrets/converter/ClassConverterFactory.java b/openmetadata-service/src/main/java/org/openmetadata/service/secrets/converter/ClassConverterFactory.java
+index fb44824840..c428b4b5ac 100644
+--- a/openmetadata-service/src/main/java/org/openmetadata/service/secrets/converter/ClassConverterFactory.java
++++ b/openmetadata-service/src/main/java/org/openmetadata/service/secrets/converter/ClassConverterFactory.java
+@@ -26,10 +26,12 @@ import org.openmetadata.schema.services.connections.dashboard.SupersetConnection
+ import org.openmetadata.schema.services.connections.dashboard.TableauConnection;
+ import org.openmetadata.schema.services.connections.database.BigQueryConnection;
+ import org.openmetadata.schema.services.connections.database.DatalakeConnection;
++import org.openmetadata.schema.services.connections.database.IcebergConnection;
+ import org.openmetadata.schema.services.connections.database.MysqlConnection;
+ import org.openmetadata.schema.services.connections.database.PostgresConnection;
+ import org.openmetadata.schema.services.connections.database.TrinoConnection;
+ import org.openmetadata.schema.services.connections.database.datalake.GCSConfig;
++import org.openmetadata.schema.services.connections.database.iceberg.IcebergFileSystem;
+ import org.openmetadata.schema.services.connections.pipeline.AirflowConnection;
+ import org.openmetadata.schema.services.connections.search.ElasticSearchConnection;
+ import org.openmetadata.schema.services.connections.storage.GCSConnection;
+@@ -64,6 +66,8 @@ public final class ClassConverterFactory {
+             Map.entry(
+                 TestServiceConnectionRequest.class,
+                 new TestServiceConnectionRequestClassConverter()),
++            Map.entry(IcebergConnection.class, new IcebergConnectionClassConverter()),
++            Map.entry(IcebergFileSystem.class, new IcebergFileSystemClassConverter()),
+             Map.entry(Workflow.class, new WorkflowClassConverter()));
+   }
+ 
+diff --git a/openmetadata-service/src/main/java/org/openmetadata/service/secrets/converter/IcebergConnectionClassConverter.java b/openmetadata-service/src/main/java/org/openmetadata/service/secrets/converter/IcebergConnectionClassConverter.java
+new file mode 100644
+index 0000000000..7ba8bd9886
+--- /dev/null
++++ b/openmetadata-service/src/main/java/org/openmetadata/service/secrets/converter/IcebergConnectionClassConverter.java
+@@ -0,0 +1,54 @@
++/*
++ *  Copyright 2021 Collate
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *  http://www.apache.org/licenses/LICENSE-2.0
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++package org.openmetadata.service.secrets.converter;
++
++import java.util.List;
++import org.openmetadata.schema.services.connections.database.IcebergConnection;
++import org.openmetadata.schema.services.connections.database.iceberg.DynamoDbCatalogConnection;
++import org.openmetadata.schema.services.connections.database.iceberg.GlueCatalogConnection;
++import org.openmetadata.schema.services.connections.database.iceberg.HiveCatalogConnection;
++import org.openmetadata.schema.services.connections.database.iceberg.IcebergCatalog;
++import org.openmetadata.schema.services.connections.database.iceberg.RestCatalogConnection;
++import org.openmetadata.service.util.JsonUtils;
++
++/** Converter class to get an `IcebergConnection` object. */
++public class IcebergConnectionClassConverter extends ClassConverter {
++
++  private static final List<Class<?>> CONNECTION_CLASSES =
++      /** The GlueCatalogConnection has a subschema of the DynamoDbCatalogConnection. */
++      List.of(
++          GlueCatalogConnection.class,
++          DynamoDbCatalogConnection.class,
++          HiveCatalogConnection.class,
++          RestCatalogConnection.class);
++
++  public IcebergConnectionClassConverter() {
++    super(IcebergConnection.class);
++  }
++
++  @Override
++  public Object convert(Object object) {
++    IcebergConnection icebergConnection =
++        (IcebergConnection) JsonUtils.convertValue(object, this.clazz);
++
++    IcebergCatalog icebergCatalog = icebergConnection.getCatalog();
++
++    tryToConvertOrFail(icebergCatalog.getConnection(), CONNECTION_CLASSES)
++        .ifPresent(icebergCatalog::setConnection);
++
++    icebergConnection.setCatalog(icebergCatalog);
++
++    return icebergConnection;
++  }
++}
+diff --git a/openmetadata-service/src/main/java/org/openmetadata/service/secrets/converter/IcebergFileSystemClassConverter.java b/openmetadata-service/src/main/java/org/openmetadata/service/secrets/converter/IcebergFileSystemClassConverter.java
+new file mode 100644
+index 0000000000..a9a78080f1
+--- /dev/null
++++ b/openmetadata-service/src/main/java/org/openmetadata/service/secrets/converter/IcebergFileSystemClassConverter.java
+@@ -0,0 +1,42 @@
++/*
++ *  Copyright 2021 Collate
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *  http://www.apache.org/licenses/LICENSE-2.0
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++package org.openmetadata.service.secrets.converter;
++
++import java.util.List;
++import org.openmetadata.schema.security.credentials.AWSCredentials;
++import org.openmetadata.schema.security.credentials.AzureCredentials;
++import org.openmetadata.schema.services.connections.database.iceberg.IcebergFileSystem;
++import org.openmetadata.service.util.JsonUtils;
++
++/** Converter class to get an `IcebergConnection` object. */
++public class IcebergFileSystemClassConverter extends ClassConverter {
++
++  private static final List<Class<?>> FILE_SYSTEM_CLASSES =
++      List.of(AWSCredentials.class, AzureCredentials.class);
++
++  public IcebergFileSystemClassConverter() {
++    super(IcebergFileSystem.class);
++  }
++
++  @Override
++  public Object convert(Object object) {
++    IcebergFileSystem IcebergFileSystem =
++        (IcebergFileSystem) JsonUtils.convertValue(object, this.clazz);
++
++    tryToConvert(IcebergFileSystem.getType(), FILE_SYSTEM_CLASSES)
++        .ifPresent(IcebergFileSystem::setType);
++
++    return IcebergFileSystem;
++  }
++}
+diff --git a/openmetadata-service/src/main/resources/json/data/testConnections/database/iceberg.json b/openmetadata-service/src/main/resources/json/data/testConnections/database/iceberg.json
+new file mode 100644
+index 0000000000..753afc4eac
+--- /dev/null
++++ b/openmetadata-service/src/main/resources/json/data/testConnections/database/iceberg.json
+@@ -0,0 +1,20 @@
++{
++    "name": "Iceberg",
++    "displayName": "Iceberg Test Connection",
++    "description": "This Test Connection validates the access against the catalog and basic metadata extraction of namespaces and tables.",
++    "steps": [
++      {
++        "name": "GetNamespaces",
++        "description": "List all the namespaces available in the catalog.",
++        "errorMessage": "Failed to fetch namespaces, please validate the catalog configuration",
++        "shortCircuit": true,
++        "mandatory": true
++      },
++      {
++        "name": "GetTables",
++        "description": "From a given namespace, list the tables belonging to that namespace. If no namespace is specified, we'll list the tables of a random namespace.",
++        "errorMessage": "Failed to fetch tables, please validate if the configured credentials have enough access to fetch tables.",
++        "mandatory": true
++      }
++    ]
++  }
+diff --git a/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/iceberg/dynamoDbCatalogConnection.json b/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/iceberg/dynamoDbCatalogConnection.json
+new file mode 100644
+index 0000000000..4a4244eb28
+--- /dev/null
++++ b/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/iceberg/dynamoDbCatalogConnection.json
+@@ -0,0 +1,24 @@
++{
++  "$id": "https://open-metadata.org/schema/entity/services/connections/database/iceberg/dynamoDbCatalogConnection.json",
++  "$schema": "http://json-schema.org/draft-07/schema#",
++  "title": "DynamoDbCatalogConnection",
++  "description": "Iceberg DynamoDB Catalog configuration.",
++  "type": "object",
++  "javaType": "org.openmetadata.schema.services.connections.database.iceberg.DynamoDbCatalogConnection",
++  "properties": {
++    "tableName": {
++      "title": "Table Name",
++      "description": "DynamoDB table name.",
++      "type": "string",
++      "default": "iceberg"
++    },
++    "awsConfig": {
++      "$ref": "../../../../../security/credentials/awsCredentials.json"
++    }
++  },
++  "additionalProperties": false,
++  "required": [
++    "tableName",
++    "awsConfig"
++  ]
++}
+diff --git a/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/iceberg/glueCatalogConnection.json b/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/iceberg/glueCatalogConnection.json
+new file mode 100644
+index 0000000000..2726938de4
+--- /dev/null
++++ b/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/iceberg/glueCatalogConnection.json
+@@ -0,0 +1,17 @@
++{
++  "$id": "https://open-metadata.org/schema/entity/services/connections/database/iceberg/glueCatalogConnection.json",
++  "$schema": "http://json-schema.org/draft-07/schema#",
++  "title": "GlueCatalogConnection",
++  "description": "Iceberg Glue Catalog configuration.",
++  "type": "object",
++  "javaType": "org.openmetadata.schema.services.connections.database.iceberg.GlueCatalogConnection",
++  "properties": {
++    "awsConfig": {
++      "$ref": "../../../../../security/credentials/awsCredentials.json"
++    }
++  },
++  "additionalProperties": false,
++  "required": [
++    "awsConfig"
++  ]
++}
+diff --git a/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/iceberg/hiveCatalogConnection.json b/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/iceberg/hiveCatalogConnection.json
+new file mode 100644
+index 0000000000..98af7ba90f
+--- /dev/null
++++ b/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/iceberg/hiveCatalogConnection.json
+@@ -0,0 +1,23 @@
++{
++  "$id": "https://open-metadata.org/schema/entity/services/connections/database/iceberg/hiveCatalogConnection.json",
++  "$schema": "http://json-schema.org/draft-07/schema#",
++  "title": "HiveCatalogConnection",
++  "description": "Iceberg Hive Catalog configuration.",
++  "type": "object",
++  "javaType": "org.openmetadata.schema.services.connections.database.iceberg.HiveCatalogConnection",
++  "properties": {
++    "uri": {
++      "title": "URI",
++      "description": "Uri to the Hive Metastore. Example: 'thrift://localhost:9083'",
++      "type": "string",
++      "format": "uri"
++    },
++    "fileSystem": {
++      "$ref": "./icebergFileSystem.json"
++    }
++  },
++  "additionalProperties": false,
++  "required": [
++    "uri"
++  ]
++}
+diff --git a/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/iceberg/icebergCatalog.json b/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/iceberg/icebergCatalog.json
+new file mode 100644
+index 0000000000..bd23b79be7
+--- /dev/null
++++ b/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/iceberg/icebergCatalog.json
+@@ -0,0 +1,48 @@
++{
++  "$id": "https://open-metadata.org/schema/entity/services/connections/database/iceberg/icebergCatalog.json",
++  "$schema": "http://json-schema.org/draft-07/schema#",
++  "title": "IcebergCatalog",
++  "description": "Iceberg Catalog configuration.",
++  "type": "object",
++  "javaType": "org.openmetadata.schema.services.connections.database.iceberg.IcebergCatalog",
++  "properties": {
++    "name": {
++      "title": "Name",
++      "description": "Catalog Name.",
++      "type": "string"
++    },
++    "connection": {
++      "title": "Connection",
++      "description": "Catalog connection configuration, depending on your catalog type.",
++      "oneOf": [
++        {
++          "$ref": "./hiveCatalogConnection.json"
++        },
++        {
++          "$ref": "./restCatalogConnection.json"
++        },
++        {
++          "$ref": "./glueCatalogConnection.json"
++        },
++        {
++          "$ref": "./dynamoDbCatalogConnection.json"
++        }
++      ]
++    },
++    "databaseName": {
++      "title": "Database Name",
++      "description": "Custom Database Name for your Iceberg Service. If not set it will be 'default'.",
++      "type": "string"
++    },
++    "warehouseLocation": {
++      "title": "Warehouse Location",
++      "description": "Warehouse Location. Used to specify a custom warehouse location if needed.",
++      "type": "string"
++    }
++  },
++  "additionalProperties": false,
++  "required": [
++    "name",
++    "connection"
++  ]
++}
+diff --git a/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/iceberg/icebergFileSystem.json b/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/iceberg/icebergFileSystem.json
+new file mode 100644
+index 0000000000..7b947d91ac
+--- /dev/null
++++ b/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/iceberg/icebergFileSystem.json
+@@ -0,0 +1,28 @@
++{
++  "$id": "https://open-metadata.org/schema/entity/services/connections/database/iceberg/icebergFileSystem.json",
++  "$schema": "http://json-schema.org/draft-07/schema#",
++  "title": "IcebergFileSystem",
++  "description": "Iceberg File System configuration, based on where the Iceberg Warehouse is located.",
++  "javaType": "org.openmetadata.schema.services.connections.database.iceberg.IcebergFileSystem",
++  "type": "object",
++  "properties": {
++    "type": {
++      "oneOf": [
++        {
++          "title": "Local",
++          "description": "Local File System.",
++          "type": "null"
++        },
++        {
++          "title": "AWS",
++          "$ref": "../../../../../security/credentials/awsCredentials.json"
++        },
++        {
++          "title": "Azure",
++          "$ref": "../../../../../security/credentials/azureCredentials.json"
++        }
++      ]
++    }
++  },
++  "additionalProperties": false
++}
+diff --git a/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/iceberg/restCatalogConnection.json b/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/iceberg/restCatalogConnection.json
+new file mode 100644
+index 0000000000..f48ea55840
+--- /dev/null
++++ b/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/iceberg/restCatalogConnection.json
+@@ -0,0 +1,75 @@
++{
++  "$id": "https://open-metadata.org/schema/entity/services/connections/database/iceberg/restCatalogConnection.json",
++  "$schema": "http://json-schema.org/draft-07/schema#",
++  "title": "RestCatalogConnection",
++  "description": "Iceberg REST Catalog configuration.",
++  "type": "object",
++  "javaType": "org.openmetadata.schema.services.connections.database.iceberg.RestCatalogConnection",
++  "properties": {
++    "uri": {
++      "title": "URI",
++      "description": "Uri to the REST catalog. Example: 'http://rest-catalog/ws/'",
++      "type": "string",
++      "format": "uri"
++    },
++    "credential": {
++      "title": "OAuth2 Credential",
++      "description": "OAuth2 credential to use when initializing the catalog.",
++      "type": "object",
++      "properties": {
++        "clientId": {
++          "title": "Client ID",
++          "description": "OAuth2 Client ID.",
++          "type": "string",
++          "format": "password"
++        },
++        "clientSecret": {
++          "title": "Client Secret",
++          "description": "OAuth2 Client Secret",
++          "type": "string",
++          "format": "password"
++        }
++      },
++      "additionalProperties": false,
++      "required": [
++        "clientId",
++        "clientSecret"
++      ]
++    },
++    "token": {
++      "title": "Token",
++      "description": "Berarer token to use for the 'Authorization' header.",
++      "type": "string",
++      "format": "password"
++    },
++    "ssl": {
++      "title": "SSL",
++      "description": "SSL Configuration details.",
++      "$ref": "../../common/sslCertPaths.json"
++    },
++    "sigv4": {
++      "title": "Sigv4",
++      "description": "Sign requests to the REST Server using AWS SigV4 protocol.",
++      "type": "object",
++      "properties": {
++        "signingRegion": {
++          "title": "Signing AWS Region",
++          "description": "AWS Region to use when SigV4 signs a request.",
++          "type": "string"
++        },
++        "signingName": {
++          "title": "Signing Name",
++          "description": "The service signing name to use when SigV4 signs a request.",
++          "type": "string"
++        }
++      }
++    },
++    "fileSystem": {
++      "$ref": "./icebergFileSystem.json"
++    }
++  },
++  "additionalProperties": false,
++  "required": [
++    "uri"
++  ]
++}
+diff --git a/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/icebergConnection.json b/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/icebergConnection.json
+new file mode 100644
+index 0000000000..7322704cca
+--- /dev/null
++++ b/openmetadata-spec/src/main/resources/json/schema/entity/services/connections/database/icebergConnection.json
+@@ -0,0 +1,43 @@
++{
++  "$id": "https://open-metadata.org/schema/entity/services/connections/database/icebergConnection.json",
++  "$schema": "http://json-schema.org/draft-07/schema#",
++  "title": "IcebergConnection",
++  "description": "Iceberg Catalog Connection Config",
++  "type": "object",
++  "javaType": "org.openmetadata.schema.services.connections.database.IcebergConnection",
++  "definitions": {
++    "icebergType": {
++      "description": "Service type.",
++      "type": "string",
++      "enum": [
++        "Iceberg"
++      ],
++      "default": "Iceberg"
++    }
++  },
++  "properties": {
++    "type": {
++      "title": "Service Type",
++      "description": "Service Type",
++      "$ref": "#/definitions/icebergType",
++      "default": "Iceberg"
++    },
++    "catalog": {
++      "$ref": "./iceberg/icebergCatalog.json"
++    },
++    "ownershipProperty": {
++      "title": "Ownership Property",
++      "description": "Table property to look for the Owner.",
++      "type": "string",
++      "default": "owner"
++    },
++    "supportsMetadataExtraction": {
++      "title": "Supports Metadata Extraction",
++      "$ref": "../connectionBasicType.json#/definitions/supportsMetadataExtraction"
++    }
++  },
++  "additionalProperties": false,
++  "required": [
++    "catalog"
++  ]
++}
+diff --git a/openmetadata-spec/src/main/resources/json/schema/entity/services/databaseService.json b/openmetadata-spec/src/main/resources/json/schema/entity/services/databaseService.json
+index 10dfd6a933..5acfa8c8b0 100644
+--- a/openmetadata-spec/src/main/resources/json/schema/entity/services/databaseService.json
++++ b/openmetadata-spec/src/main/resources/json/schema/entity/services/databaseService.json
+@@ -53,7 +53,8 @@
+         "Doris",
+         "UnityCatalog",
+         "DuckDb",
+-        "SAS"
++        "SAS",
++        "Iceberg"
+       ],
+       "javaEnums": [
+         {
+@@ -172,6 +173,9 @@
+         },
+         {
+           "name": "SAS"
++        },
++        {
++          "name": "Iceberg"
+         }
+       ]
+     },
+@@ -295,6 +299,9 @@
+             },
+             {
+               "$ref": "./connections/database/sasConnection.json"
++            },
++            {
++              "$ref": "./connections/database/icebergConnection.json"
+             }
+           ]
+         }
+diff --git a/openmetadata-ui/src/main/resources/ui/public/locales/en-US/Database/Iceberg.md b/openmetadata-ui/src/main/resources/ui/public/locales/en-US/Database/Iceberg.md
+new file mode 100644
+index 0000000000..cf8f75036a
+--- /dev/null
++++ b/openmetadata-ui/src/main/resources/ui/public/locales/en-US/Database/Iceberg.md
+@@ -0,0 +1,284 @@
++# Iceberg
++
++In this section, we provide guides and references to use the Iceberg connector.
++
++## Requirements
++
++The requirements actually depend on the Catalog and the FileSystem used. In a nutshell, the used credentials must have access to reading the Catalog and the Metadata File.
++
++### Glue Catalog
++
++Must have `glue:GetDatabases`, and `glue:GetTables` permissions to be able to read the Catalog.
++
++Must also have the `s3:GetObject` permission for the location of the Iceberg tables.
++
++### DynamoDB Catalog
++
++Must have `dynamodb:DescribeTable` and `dynamodb:GetItem` permissions on the Iceberg Catalog table.
++
++Must also have the `s3:GetObject` permission for the location of the Iceberg tables.
++
++### Hive / REST Catalog
++It depends on where and how the Hive / Rest Catalog is setup and where the Iceberg files are stored.
++
++## Catalog Details
++
++$$section
++### Name $(id="name")
++Catalog name of choice. It can be the name that you prefer and it will appear as such on the UI.
++
++$$
++
++$$section
++
++### Table Name $(id="tableName")
++
++#### DynamoDB Catalog
++
++When using DynamoDB as the Catalog we must point to the correct table where the Iceberg Catalog is stored. This is what the field is all about.
++If it isn't set, the default value will be 'iceberg'.
++
++$$
++$$section
++
++### URI $(id="uri")
++
++#### Hive Catalog
++
++URI to the Hive Metastore. **It only supports the thrift protocol**
++
++Example: 'thrift://localhost:9083'
++
++#### REST Catalog
++
++URI to the REST Catalog.
++
++Example: 'http://localhost:8181'
++
++$$
++$$section
++
++### Client ID $(id="clientId")
++
++#### REST Catalog
++
++OAuth2 Client ID to use for the Authentication Flow
++
++#### Azure File System
++
++To get the Client ID (also known as application ID), follow these steps:
++
++1. Log into [Microsoft Azure](https://ms.portal.azure.com/#allservices).
++2. Search for `App registrations` and select the `App registrations link`.
++3. Select the `Azure AD` app you're using for this connection.
++4. From the Overview section, copy the `Application (client) ID`.
++
++$$
++$$section
++
++### Client Secret $(id="clientSecret")
++
++#### REST Catalog
++
++OAuth2 Client Secret to use for the Authentication Flow
++
++#### Azure File System
++
++To get the client secret, follow these steps:
++
++1. Log into [Microsoft Azure](https://ms.portal.azure.com/#allservices).
++2. Search for `App registrations` and select the `App registrations link`.
++3. Select the `Azure AD` app you're using for this connection.
++4. Under `Manage`, select `Certificates & secrets`.
++5. Under `Client secrets`, select `New client secret`.
++6. In the `Add a client secret` pop-up window, provide a description for your application secret. Choose when the application should expire, and select `Add`.
++7. From the `Client secrets` section, copy the string in the `Value` column of the newly created application secret.
++
++$$
++$$section
++
++### Token $(id="token")
++
++#### REST Catalog
++Token used to pass as 'Bearer TOKEN' on the 'Authorization' header.
++
++$$
++$$section
++
++### CA Certificate Path  $(id="caCertPath")
++#### REST Catalog
++If using SSL, the Path to the CA Certificate.
++
++$$
++$$section
++
++### Client Certificate  Path  $(id="clientCertPath")
++#### REST Catalog
++If using SSL, the Path to the Client Certificate.
++
++$$
++$$section
++### Private Key Path  $(id="privateKeyPath")
++
++#### REST Catalog
++If using SSL, the Path to the Private Key.
++
++$$
++$$section
++
++### Signing Region $(id="signingRegion")
++
++#### REST Catalog
++The AWS Region, If using the AWS Sigv4 for signing requests.
++
++For Example: 'us-east-1'
++
++$$
++$$section
++
++### Signing Name $(id="signingName")
++
++#### REST Catalog
++The name to sign the requests with, If using the AWS Sigv4 for signing requests.
++
++$$
++
++$$section
++
++### AWS Access Key ID $(id="awsAccessKeyId")
++
++When you interact with AWS, you specify your AWS security credentials to verify who you are and whether you have permission to access the resources that you are requesting. AWS uses the security credentials to authenticate and authorize your requests ([docs](https://docs.aws.amazon.com/IAM/latest/UserGuide/security-creds.html)).
++
++Access keys consist of two parts:
++1. An access key ID (for example, `AKIAIOSFODNN7EXAMPLE`),
++2. And a secret access key (for example, `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`).
++
++You must use both the access key ID and secret access key together to authenticate your requests.
++
++You can find further information on how to manage your access keys [here](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html)
++
++$$
++$$section
++
++### AWS Secret Access Key $(id="awsSecretAccessKey")
++
++Secret access key (for example, `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`).
++
++$$
++$$section
++
++### AWS Region $(id="awsRegion")
++
++Each AWS Region is a separate geographic area in which AWS clusters data centers ([docs](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.RegionsAndAvailabilityZones.html)).
++
++As AWS can have instances in multiple regions, we need to know the region the service you want reach belongs to.
++
++Note that the AWS Region is the only required parameter when configuring a connection. When connecting to the services programmatically, there are different ways in which we can extract and use the rest of AWS configurations. You can find further information about configuring your credentials [here](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html#configuring-credentials).
++
++$$
++$$section
++
++### AWS Session Token $(id="awsSessionToken")
++
++If you are using temporary credentials to access your services, you will need to inform the AWS Access Key ID and AWS Secrets Access Key. Also, these will include an AWS Session Token.
++
++You can find more information on [Using temporary credentials with AWS resources](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_temp_use-resources.html).
++
++$$
++$$section
++
++### Endpoint URL $(id="endPointURL")
++
++**NOT SUPPORTED**
++
++$$
++$$section
++
++### Profile Name $(id="profileName")
++
++**NOT SUPPORTED**
++
++$$
++$$section
++
++### Assume Role ARN $(id="assumeRoleArn")
++
++**NOT SUPPORTED**
++
++$$
++$$section
++
++### Assume Role Session Name $(id="assumeRoleSessionName")
++
++**NOT SUPPORTED**
++
++$$
++$$section
++
++### Assume Role Source Identity $(id="assumeRoleSourceIdentity")
++
++**NOT SUPPORTED**
++
++$$
++
++
++$$section
++
++### Tenant ID $(id="tentantId")
++
++#### Azure File System
++
++To get the tenant ID, follow these steps:
++
++1. Log into [Microsoft Azure](https://ms.portal.azure.com/#allservices).
++2. Search for `App registrations` and select the `App registrations link`.
++3. Select the `Azure AD` app you're using for Power BI.
++4. From the `Overview` section, copy the `Directory (tenant) ID`.
++
++$$
++$$section
++
++### Account Name $(id="accountName")
++
++#### Azure File System
++Here are the step-by-step instructions for finding the account name for an Azure Data Lake Storage account:
++
++1. Sign in to the Azure portal and navigate to the `Storage accounts` page.
++2. Find the Data Lake Storage account you want to access and click on its name.
++3. In the account overview page, locate the `Account name` field. This is the unique identifier for the Data Lake Storage account.
++4. You can use this account name to access and manage the resources associated with the account, such as creating and managing containers and directories.
++
++$$
++
++$$section
++
++### Database Name $(id="databaseName")
++
++In OpenMetadata, the Database Service hierarchy works as follows:
++
++```
++Database Service -> Database -> Schema -> Table
++```
++
++In the case of Iceberg, we won't have a Database as such. If you'd like to see your data in a database named something other than `default`, you can specify the name in this field.
++
++$$
++$$section
++## Ownership Property $(id="ownershipProperty")
++
++Iceberg Tables can store 'Properties' as `key:value` pairs. This defines which property to look for ownership.
++As a default it looks for the 'owner' property.
++
++**In order to be able to match the owner of a table with the OpenMetadata data, it must match the e-mail of a registered user or group**
++
++$$
++
++$$section
++## Warehouse Location $(id="warehouseLocation")
++
++Used to speciify a custom warehouse location if needed.
++
++Most Catalogs should have a working default, so it normally is not needed. In case you have a custom location only.
++
++$$
++
+diff --git a/openmetadata-ui/src/main/resources/ui/src/constants/Services.constant.ts b/openmetadata-ui/src/main/resources/ui/src/constants/Services.constant.ts
+index 16c3d24941..9bc30eed9b 100644
+--- a/openmetadata-ui/src/main/resources/ui/src/constants/Services.constant.ts
++++ b/openmetadata-ui/src/main/resources/ui/src/constants/Services.constant.ts
+@@ -40,6 +40,7 @@ import glue from '../assets/img/service-icon-glue.png';
+ import greenplum from '../assets/img/service-icon-greenplum.png';
+ import hive from '../assets/img/service-icon-hive.png';
+ import ibmdb2 from '../assets/img/service-icon-ibmdb2.png';
++import iceberge from '../assets/img/service-icon-iceberg.png';
+ import impala from '../assets/img/service-icon-impala.png';
+ import kafka from '../assets/img/service-icon-kafka.png';
+ import kinesis from '../assets/img/service-icon-kinesis.png';
+@@ -197,6 +198,7 @@ export const OPEN_SEARCH = openSearch;
+ export const DUCKDB = duckdb;
+ export const PLUS = plus;
+ export const NOSERVICE = noService;
++export const ICEBERGE = iceberge;
+ export const excludedService = [
+   MlModelServiceType.Sklearn,
+   MetadataServiceType.MetadataES,
+@@ -387,6 +389,7 @@ export const BETA_SERVICES = [
+   DatabaseServiceType.Couchbase,
+   SearchServiceType.ElasticSearch,
+   DatabaseServiceType.Greenplum,
++  DatabaseServiceType.Iceberg,
+ ];
+ 
+ export const TEST_CONNECTION_INITIAL_MESSAGE = i18n.t(
+diff --git a/openmetadata-ui/src/main/resources/ui/src/utils/DatabaseServiceUtils.ts b/openmetadata-ui/src/main/resources/ui/src/utils/DatabaseServiceUtils.ts
+index 249b6e6756..95e973ac5c 100644
+--- a/openmetadata-ui/src/main/resources/ui/src/utils/DatabaseServiceUtils.ts
++++ b/openmetadata-ui/src/main/resources/ui/src/utils/DatabaseServiceUtils.ts
+@@ -32,6 +32,7 @@ import dynamoDBConnection from '../jsons/connectionSchemas/connections/database/
+ import glueConnection from '../jsons/connectionSchemas/connections/database/glueConnection.json';
+ import greenplumConnection from '../jsons/connectionSchemas/connections/database/greenplumConnection.json';
+ import hiveConnection from '../jsons/connectionSchemas/connections/database/hiveConnection.json';
++import icebergConnection from '../jsons/connectionSchemas/connections/database/icebergConnection.json';
+ import impalaConnection from '../jsons/connectionSchemas/connections/database/impalaConnection.json';
+ import mariaDBConnection from '../jsons/connectionSchemas/connections/database/mariaDBConnection.json';
+ import mongoDBConnection from '../jsons/connectionSchemas/connections/database/mongoDBConnection.json';
+@@ -242,6 +243,11 @@ export const getDatabaseConfig = (type: DatabaseServiceType) => {
+ 
+       break;
+     }
++    case DatabaseServiceType.Iceberg: {
++      schema = icebergConnection;
++
++      break;
++    }
+     default: {
+       schema = {};
+ 
+diff --git a/openmetadata-ui/src/main/resources/ui/src/utils/IngestionUtils.tsx b/openmetadata-ui/src/main/resources/ui/src/utils/IngestionUtils.tsx
+index f5e0d89fa5..d81fe53878 100644
+--- a/openmetadata-ui/src/main/resources/ui/src/utils/IngestionUtils.tsx
++++ b/openmetadata-ui/src/main/resources/ui/src/utils/IngestionUtils.tsx
+@@ -35,7 +35,7 @@ import {
+ import { ERROR_PLACEHOLDER_TYPE } from '../enums/common.enum';
+ import { ELASTIC_SEARCH_RE_INDEX_PAGE_TABS } from '../enums/ElasticSearch.enum';
+ import { PipelineType } from '../generated/api/services/ingestionPipelines/createIngestionPipeline';
+-import { Connection } from '../generated/entity/services/databaseService';
++import { HiveMetastoreConnection as Connection } from '../generated/entity/services/databaseService';
+ import { IngestionPipeline } from '../generated/entity/services/ingestionPipelines/ingestionPipeline';
+ import { Connection as MetadataConnection } from '../generated/entity/services/metadataService';
+ import { SearchSourceAlias } from '../interface/search.interface';
+@@ -136,15 +136,16 @@ export const getSupportedPipelineTypes = (serviceDetails: ServicesType) => {
+   let pipelineType = [];
+   const config = serviceDetails?.connection?.config as Connection;
+   if (config) {
+-    config.supportsMetadataExtraction &&
++    config?.supportsMetadataExtraction &&
+       pipelineType.push(PipelineType.Metadata);
+-    config.supportsUsageExtraction && pipelineType.push(PipelineType.Usage);
+-    config.supportsLineageExtraction && pipelineType.push(PipelineType.Lineage);
+-    config.supportsProfiler && pipelineType.push(PipelineType.Profiler);
+-    config.supportsDBTExtraction && pipelineType.push(PipelineType.Dbt);
+-    (config as MetadataConnection).supportsDataInsightExtraction &&
++    config?.supportsUsageExtraction && pipelineType.push(PipelineType.Usage);
++    config?.supportsLineageExtraction &&
++      pipelineType.push(PipelineType.Lineage);
++    config?.supportsProfiler && pipelineType.push(PipelineType.Profiler);
++    config?.supportsDBTExtraction && pipelineType.push(PipelineType.Dbt);
++    (config as MetadataConnection)?.supportsDataInsightExtraction &&
+       pipelineType.push(PipelineType.DataInsight);
+-    (config as MetadataConnection).supportsElasticSearchReindexingExtraction &&
++    (config as MetadataConnection)?.supportsElasticSearchReindexingExtraction &&
+       pipelineType.push(PipelineType.ElasticSearchReindex);
+   } else {
+     pipelineType = [
+diff --git a/openmetadata-ui/src/main/resources/ui/src/utils/ServiceUtilClassBase.ts b/openmetadata-ui/src/main/resources/ui/src/utils/ServiceUtilClassBase.ts
+index e3ccef2cba..b6af88398a 100644
+--- a/openmetadata-ui/src/main/resources/ui/src/utils/ServiceUtilClassBase.ts
++++ b/openmetadata-ui/src/main/resources/ui/src/utils/ServiceUtilClassBase.ts
+@@ -43,6 +43,7 @@ import {
+   GREENPLUM,
+   HIVE,
+   IBMDB2,
++  ICEBERGE,
+   IMPALA,
+   KAFKA,
+   KINESIS,
+@@ -255,6 +256,9 @@ class ServiceUtilClassBase {
+       case DatabaseServiceType.Greenplum:
+         return GREENPLUM;
+ 
++      case DatabaseServiceType.Iceberg:
++        return ICEBERGE;
++
+       case MessagingServiceType.Kafka:
+         return KAFKA;
+ 

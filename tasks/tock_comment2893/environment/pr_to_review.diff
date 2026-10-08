@@ -1,0 +1,696 @@
+diff --git a/boards/esp32-c3-devkitM-1/src/main.rs b/boards/esp32-c3-devkitM-1/src/main.rs
+index b3b01c34722..e2dcb9f0ddb 100644
+--- a/boards/esp32-c3-devkitM-1/src/main.rs
++++ b/boards/esp32-c3-devkitM-1/src/main.rs
+@@ -56,7 +56,7 @@ static mut PLATFORM: Option<&'static Esp32C3Board> = None;
+ #[cfg(test)]
+ static mut MAIN_CAP: Option<&dyn kernel::capabilities::MainLoopCapability> = None;
+ // Test access to alarm
+-static mut ALARM: Option<&'static MuxAlarm<'static, esp32::timg::TimG<'static>>> = None;
++static mut ALARM: Option<&'static MuxAlarm<'static, esp32_c3::timg::TimG<'static>>> = None;
+ 
+ /// Dummy buffer that causes the linker to reserve enough space for the stack.
+ #[no_mangle]
+@@ -70,10 +70,10 @@ struct Esp32C3Board {
+     console: &'static capsules::console::Console<'static>,
+     alarm: &'static capsules::alarm::AlarmDriver<
+         'static,
+-        VirtualMuxAlarm<'static, esp32::timg::TimG<'static>>,
++        VirtualMuxAlarm<'static, esp32_c3::timg::TimG<'static>>,
+     >,
+     scheduler: &'static PrioritySched,
+-    scheduler_timer: &'static VirtualSchedulerTimer<esp32::timg::TimG<'static>>,
++    scheduler_timer: &'static VirtualSchedulerTimer<esp32_c3::timg::TimG<'static>>,
+ }
+ 
+ /// Mapping of integer syscalls to objects that implement syscalls.
+@@ -98,7 +98,7 @@ impl KernelResources<esp32_c3::chip::Esp32C3<'static, Esp32C3DefaultPeripherals<
+     type SyscallFilter = ();
+     type ProcessFault = ();
+     type Scheduler = PrioritySched;
+-    type SchedulerTimer = VirtualSchedulerTimer<esp32::timg::TimG<'static>>;
++    type SchedulerTimer = VirtualSchedulerTimer<esp32_c3::timg::TimG<'static>>;
+     type WatchDog = ();
+     type ContextSwitchCallback = ();
+ 
+@@ -131,6 +131,8 @@ unsafe fn setup() -> (
+     &'static esp32_c3::chip::Esp32C3<'static, Esp32C3DefaultPeripherals<'static>>,
+     &'static Esp32C3DefaultPeripherals<'static>,
+ ) {
++    use esp32_c3::sysreg::{CpuFrequency, PllFrequency};
++
+     // only machine mode
+     rv32i::configure_trap_handler(rv32i::PermissionMode::Machine);
+ 
+@@ -139,6 +141,12 @@ unsafe fn setup() -> (
+     peripherals.timg0.disable_wdt();
+     peripherals.rtc_cntl.disable_wdt();
+     peripherals.rtc_cntl.disable_super_wdt();
++    peripherals.sysreg.disable_timg0();
++    peripherals.sysreg.enable_timg0();
++
++    peripherals
++        .sysreg
++        .use_pll_clock_source(PllFrequency::MHz320, CpuFrequency::MHz160);
+ 
+     // initialise capabilities
+     let process_mgmt_cap = create_capability!(capabilities::ProcessManagementCapability);
+@@ -185,7 +193,7 @@ unsafe fn setup() -> (
+     // Create a shared virtualization mux layer on top of a single hardware
+     // alarm.
+     let mux_alarm = static_init!(
+-        MuxAlarm<'static, esp32::timg::TimG>,
++        MuxAlarm<'static, esp32_c3::timg::TimG>,
+         MuxAlarm::new(&peripherals.timg0)
+     );
+     hil::time::Alarm::set_alarm_client(&peripherals.timg0, mux_alarm);
+@@ -194,13 +202,13 @@ unsafe fn setup() -> (
+ 
+     // Alarm
+     let virtual_alarm_user = static_init!(
+-        VirtualMuxAlarm<'static, esp32::timg::TimG>,
++        VirtualMuxAlarm<'static, esp32_c3::timg::TimG>,
+         VirtualMuxAlarm::new(mux_alarm)
+     );
+     virtual_alarm_user.setup();
+ 
+     let alarm = static_init!(
+-        capsules::alarm::AlarmDriver<'static, VirtualMuxAlarm<'static, esp32::timg::TimG>>,
++        capsules::alarm::AlarmDriver<'static, VirtualMuxAlarm<'static, esp32_c3::timg::TimG>>,
+         capsules::alarm::AlarmDriver::new(
+             virtual_alarm_user,
+             board_kernel.create_grant(capsules::alarm::DRIVER_NUM, &memory_allocation_cap)
+@@ -208,14 +216,9 @@ unsafe fn setup() -> (
+     );
+     hil::time::Alarm::set_alarm_client(virtual_alarm_user, alarm);
+ 
+-    // Scheduler Timer
+-    let timer1 = static_init!(
+-        esp32::timg::TimG,
+-        esp32::timg::TimG::new(esp32::timg::TIMG1_BASE)
+-    );
+     let scheduler_timer = static_init!(
+-        VirtualSchedulerTimer<esp32::timg::TimG<'static>>,
+-        VirtualSchedulerTimer::new(timer1)
++        VirtualSchedulerTimer<esp32_c3::timg::TimG<'static>>,
++        VirtualSchedulerTimer::new(&peripherals.timg1)
+     );
+ 
+     let chip = static_init!(
+@@ -260,6 +263,17 @@ unsafe fn setup() -> (
+ 
+     let scheduler = components::sched::priority::PriorityComponent::new(board_kernel).finalize(());
+ 
++    // PROCESS CONSOLE
++    let process_console = components::process_console::ProcessConsoleComponent::new(
++        board_kernel,
++        uart_mux,
++        mux_alarm,
++    )
++    .finalize(components::process_console_component_helper!(
++        esp32_c3::timg::TimG
++    ));
++    let _ = process_console.start();
++
+     let esp32_c3_board = static_init!(
+         Esp32C3Board,
+         Esp32C3Board {
+diff --git a/chips/esp32-c3/src/chip.rs b/chips/esp32-c3/src/chip.rs
+index 2ed0372280b..5e7aa4036e0 100644
+--- a/chips/esp32-c3/src/chip.rs
++++ b/chips/esp32-c3/src/chip.rs
+@@ -13,6 +13,8 @@ use rv32i::syscall::SysCall;
+ 
+ use crate::intc::{Intc, IntcRegisters};
+ use crate::interrupts;
++use crate::sysreg;
++use crate::timg;
+ 
+ pub const INTC_BASE: StaticRef<IntcRegisters> =
+     unsafe { StaticRef::new(0x600C_2000 as *const IntcRegisters) };
+@@ -28,18 +30,22 @@ pub struct Esp32C3<'a, I: InterruptService<()> + 'a> {
+ 
+ pub struct Esp32C3DefaultPeripherals<'a> {
+     pub uart0: esp32::uart::Uart<'a>,
+-    pub timg0: esp32::timg::TimG<'a>,
++    pub timg0: timg::TimG<'a>,
++    pub timg1: timg::TimG<'a>,
+     pub gpio: esp32::gpio::Port<'a>,
+     pub rtc_cntl: esp32::rtc_cntl::RtcCntl,
++    pub sysreg: sysreg::SysReg,
+ }
+ 
+ impl<'a> Esp32C3DefaultPeripherals<'a> {
+     pub fn new() -> Self {
+         Self {
+             uart0: esp32::uart::Uart::new(esp32::uart::UART0_BASE),
+-            timg0: esp32::timg::TimG::new(esp32::timg::TIMG0_BASE),
++            timg0: timg::TimG::new(timg::TIMG0_BASE, timg::ClockSource::Pll),
++            timg1: timg::TimG::new(timg::TIMG0_BASE, timg::ClockSource::Pll),
+             gpio: esp32::gpio::Port::new(),
+             rtc_cntl: esp32::rtc_cntl::RtcCntl::new(esp32::rtc_cntl::RTC_CNTL_BASE),
++            sysreg: sysreg::SysReg::new(),
+         }
+     }
+ }
+@@ -50,6 +56,12 @@ impl<'a> InterruptService<()> for Esp32C3DefaultPeripherals<'a> {
+             interrupts::IRQ_UART0 => {
+                 self.uart0.handle_interrupt();
+             }
++            interrupts::IRQ_TIMER1 => {
++                self.timg0.handle_interrupt();
++            }
++            // interrupts::IRQ_TIMER2 => {
++            //     self.timg1.handle_interrupt();
++            // }
+             interrupts::IRQ_GPIO | interrupts::IRQ_GPIO_NMI => {
+                 self.gpio.handle_interrupt();
+             }
+diff --git a/chips/esp32-c3/src/intc.rs b/chips/esp32-c3/src/intc.rs
+index 4660037bdea..8f7a15c508d 100644
+--- a/chips/esp32-c3/src/intc.rs
++++ b/chips/esp32-c3/src/intc.rs
+@@ -16,13 +16,16 @@ register_structs! {
+         (0x048 => _reserved1),
+         (0x054 => uart0_intr_map: ReadWrite<u32>),
+         (0x058 => _reserved2),
++        (0x080 => timg0_intr_map: ReadWrite<u32>),
++        (0x084 => timg1_intr_map: ReadWrite<u32>),
++        (0x088 => _reserved3),
+         (0x0f8 => status: [ReadWrite<u32>; 2]),
+         (0x100 => clk_en: ReadWrite<u32>),
+         (0x104 => enable: ReadWrite<u32, INT::Register>),
+         (0x108 => type_reg: ReadWrite<u32, INT::Register>),
+         (0x10C => clear: ReadWrite<u32, INT::Register>),
+         (0x110 => eip: ReadWrite<u32, INT::Register>),
+-        (0x114 => _reserved3),
++        (0x114 => _reserved4),
+         (0x118 => priority: [ReadWrite<u32, PRIORITY::Register>; 31]),
+         (0x194 => thresh: ReadWrite<u32, THRESH::Register>),
+         (0x198 => @END),
+@@ -68,6 +71,8 @@ impl Intc {
+     /// In Tock we map them ourselves so we don't need to call into the ROM.
+     pub fn map_interrupts(&self) {
+         self.registers.uart0_intr_map.set(interrupts::IRQ_UART0);
++        self.registers.timg0_intr_map.set(interrupts::IRQ_TIMER1);
++        // self.registers.timg1_intr_map.set(interrupts::IRQ_TIMER2);
+         self.registers
+             .gpio_interrupt_pro_map
+             .set(interrupts::IRQ_GPIO);
+diff --git a/chips/esp32-c3/src/lib.rs b/chips/esp32-c3/src/lib.rs
+index b810851fe63..963afe27bc4 100644
+--- a/chips/esp32-c3/src/lib.rs
++++ b/chips/esp32-c3/src/lib.rs
+@@ -8,3 +8,5 @@
+ pub mod chip;
+ pub mod intc;
+ pub mod interrupts;
++pub mod sysreg;
++pub mod timg;
+diff --git a/chips/esp32-c3/src/sysreg.rs b/chips/esp32-c3/src/sysreg.rs
+new file mode 100644
+index 00000000000..378a4f3d2fb
+--- /dev/null
++++ b/chips/esp32-c3/src/sysreg.rs
+@@ -0,0 +1,104 @@
++//! TimG Group driver.
++
++use kernel::utilities::registers::interfaces::{ReadWriteable, Readable};
++use kernel::utilities::registers::{register_bitfields, register_structs, ReadWrite};
++use kernel::utilities::StaticRef;
++
++pub const SYS_REG_BASE: StaticRef<SysRegRegisters> =
++    unsafe { StaticRef::new(0x600C_0000 as *const SysRegRegisters) };
++
++register_structs! {
++    pub SysRegRegisters {
++        (0x000 => _reserved0),
++        (0x008 => cpu_per_conf: ReadWrite<u32, CPU_PER_CONF::Register>),
++        (0x00c => _reserved1),
++        (0x010 => perip_clk_en0: ReadWrite<u32, PERIP_CLK_EN0::Register>),
++        (0x014 => _reserved3),
++        (0x058 => sysclk_config: ReadWrite<u32, SYSCLK_CONFIG::Register>),
++        (0x05C => _reserved_unimplemented_yet),
++        (0x1000 => @END),
++    }
++}
++
++register_bitfields![u32,
++    PERIP_CLK_EN0 [
++        TIMERGROUP0 OFFSET(13) NUMBITS(1) []
++    ],
++    CPU_PER_CONF [
++        CPUPERIOD_SEL OFFSET(0) NUMBITS(2) [
++            MHz80 = 0,
++            MHz160 = 1,
++        ],
++        PLL_FREQ_SEL OFFSET(2) NUMBITS(1) [
++            MHz320 = 0,
++            MHz480 = 1
++        ],
++        CPU_WAIT_MODE_FORCE_ON OFFSET(3) NUMBITS(1) [],
++        CPU_WAIT_DELAY_NUM OFFSET(4) NUMBITS(4) [],
++    ],
++    SYSCLK_CONFIG [
++        PRE_DIV_CNT OFFSET(0) NUMBITS(10) [],
++        SOC_CLK_SEL OFFSET(10) NUMBITS(2) [
++            Xtal = 0,
++            Pll = 1,
++            Fosc = 2
++        ],
++        CLK_XTAL_FREQ OFFSET(12) NUMBITS(6) [],
++    ]
++];
++
++pub enum PllFrequency {
++    MHz320 = 0,
++    MHz480 = 1,
++}
++
++pub enum CpuFrequency {
++    MHz80 = 0,
++    MHz160 = 1,
++}
++
++pub struct SysReg {
++    registers: StaticRef<SysRegRegisters>,
++}
++
++impl SysReg {
++    pub const fn new() -> Self {
++        SysReg {
++            registers: SYS_REG_BASE,
++        }
++    }
++
++    pub fn use_xtal_clock_source(&self) {
++        self.registers
++            .sysclk_config
++            .modify(SYSCLK_CONFIG::SOC_CLK_SEL::Xtal);
++    }
++
++    pub fn use_pll_clock_source(&self, pll_frequency: PllFrequency, cpu_frequency: CpuFrequency) {
++        self.registers
++            .sysclk_config
++            .modify(SYSCLK_CONFIG::SOC_CLK_SEL::Pll);
++        self.registers.cpu_per_conf.modify(
++            CPU_PER_CONF::PLL_FREQ_SEL.val(pll_frequency as u32)
++                + CPU_PER_CONF::CPUPERIOD_SEL.val(cpu_frequency as u32),
++        );
++    }
++
++    pub fn enable_timg0(&self) {
++        self.registers
++            .perip_clk_en0
++            .modify(PERIP_CLK_EN0::TIMERGROUP0::SET);
++    }
++
++    pub fn disable_timg0(&self) {
++        self.registers
++            .perip_clk_en0
++            .modify(PERIP_CLK_EN0::TIMERGROUP0::CLEAR);
++    }
++
++    pub fn is_enabled_timg0(&self) -> bool {
++        self.registers
++            .perip_clk_en0
++            .is_set(PERIP_CLK_EN0::TIMERGROUP0)
++    }
++}
+diff --git a/chips/esp32-c3/src/timg.rs b/chips/esp32-c3/src/timg.rs
+new file mode 100644
+index 00000000000..f33476f0dd1
+--- /dev/null
++++ b/chips/esp32-c3/src/timg.rs
+@@ -0,0 +1,245 @@
++//! TimG Group driver.
++
++use kernel::hil::time::{self, Alarm, Counter, Ticks, Ticks64, Time};
++use kernel::utilities::cells::OptionalCell;
++use kernel::utilities::registers::interfaces::{ReadWriteable, Readable, Writeable};
++use kernel::utilities::registers::register_bitfields;
++use kernel::utilities::registers::{register_structs, ReadWrite};
++use kernel::utilities::StaticRef;
++use kernel::ErrorCode;
++
++pub const TIMG0_BASE: StaticRef<TimgRegisters> =
++    unsafe { StaticRef::new(0x6001_F000 as *const TimgRegisters) };
++
++pub const TIMG1_BASE: StaticRef<TimgRegisters> =
++    unsafe { StaticRef::new(0x6002_0000 as *const TimgRegisters) };
++
++/// 20MHz `Frequency`
++#[derive(Debug)]
++pub struct Freq20MHz;
++impl time::Frequency for Freq20MHz {
++    fn frequency() -> u32 {
++        20_000_000
++    }
++}
++
++register_structs! {
++    pub TimgRegisters {
++        (0x000 => t0config: ReadWrite<u32, CONFIG::Register>),
++        (0x004 => t0lo: ReadWrite<u32>),
++        (0x008 => t0hi: ReadWrite<u32>),
++        (0x00C => t0update: ReadWrite<u32>),
++        (0x010 => t0alarmlo: ReadWrite<u32>),
++        (0x014 => t0alarmhi: ReadWrite<u32>),
++        (0x018 => t0loadlo: ReadWrite<u32>),
++        (0x01C => t0loadhi: ReadWrite<u32>),
++        (0x020 => t0load: ReadWrite<u32>),
++
++        (0x024 => _reserved0),
++
++        (0x048 => wdtconfig0: ReadWrite<u32, WDTCONFIG0::Register>),
++        (0x04C => wdtconfig1: ReadWrite<u32, WDTCONFIG1::Register>),
++        (0x050 => wdtconfig2: ReadWrite<u32>),
++        (0x054 => wdtconfig3: ReadWrite<u32>),
++        (0x058 => wdtconfig4: ReadWrite<u32>),
++        (0x05C => wdtconfig5: ReadWrite<u32>),
++        (0x060 => wdtfeed: ReadWrite<u32>),
++        (0x064 => wdtwprotect: ReadWrite<u32>),
++
++        (0x068 => rtccalicfg: ReadWrite<u32, RTCCALICFG::Register>),
++        (0x06C => rtccalicfg1: ReadWrite<u32, RTCCALICFG1::Register>),
++
++        (0x070 => int_ena: ReadWrite<u32, INT::Register>),
++        (0x074 => int_raw: ReadWrite<u32, INT::Register>),
++        (0x078 => int_st: ReadWrite<u32, INT::Register>),
++        (0x07C => int_clr: ReadWrite<u32, INT::Register>),
++        (0x080 => @END),
++    }
++}
++
++register_bitfields![u32,
++    CONFIG [
++        USE_XTAL OFFSET(9) NUMBITS(1) [],
++        ALARM_EN OFFSET(10) NUMBITS(1) [],
++        LEVEL_INT_EN OFFSET(11) NUMBITS(1) [],
++        DIVIDER_RST OFFSET(12) NUMBITS(1) [],
++        DIVIDER OFFSET(13) NUMBITS(16) [],
++        AUTORELOAD OFFSET(29) NUMBITS(1) [],
++        INCREASE OFFSET(30) NUMBITS(1) [],
++        EN OFFSET(31) NUMBITS(1) [],
++    ],
++    WDTCONFIG0 [
++        FLASHBOOT_MOD_EN OFFSET(14) NUMBITS(1) [],
++        SYS_RESET_LENGTH OFFSET(15) NUMBITS(3) [],
++        CPU_RESET_LENGTH OFFSET(18) NUMBITS(3) [],
++        LEVEL_INT_EN OFFSET(21) NUMBITS(1) [],
++        EDGE_INT_EN OFFSET(22) NUMBITS(1) [],
++        STG3 OFFSET(23) NUMBITS(2) [],
++        STG2 OFFSET(25) NUMBITS(2) [],
++        STG1 OFFSET(27) NUMBITS(2) [],
++        STG0 OFFSET(29) NUMBITS(2) [],
++        EN OFFSET(31) NUMBITS(1) [],
++    ],
++    WDTCONFIG1 [
++        CLK_PRESCALE OFFSET(16) NUMBITS(16) [],
++    ],
++    RTCCALICFG [
++        START_CYCLING OFFSET(12) NUMBITS(1) [],
++        CLK_SEL OFFSET(13) NUMBITS(2) [],
++        RDY OFFSET(15) NUMBITS(1) [],
++        MAX OFFSET(16) NUMBITS(15) [],
++        START OFFSET(31) NUMBITS(1) [],
++    ],
++    RTCCALICFG1 [
++        VALUE OFFSET(7) NUMBITS(25) [],
++    ],
++    INT [
++        T0 OFFSET(0) NUMBITS(1) [],
++        WDT OFFSET(1) NUMBITS(1) [],
++    ],
++];
++
++#[derive(Copy, Clone)]
++pub enum ClockSource {
++    Pll = 0,
++    Xtal = 1,
++}
++
++pub struct TimG<'a> {
++    registers: StaticRef<TimgRegisters>,
++    clocksource: ClockSource,
++    alarm_client: OptionalCell<&'a dyn time::AlarmClient>,
++}
++
++impl TimG<'_> {
++    pub const fn new(base: StaticRef<TimgRegisters>, clocksource: ClockSource) -> Self {
++        TimG {
++            registers: base,
++            clocksource,
++            alarm_client: OptionalCell::empty(),
++        }
++    }
++
++    pub fn handle_interrupt(&self) {
++        self.registers.int_clr.modify(INT::T0::SET);
++        let _ = self.stop();
++        self.alarm_client.map(|client| {
++            client.alarm();
++        });
++    }
++
++    pub fn disable_wdt(&self) {
++        self.registers
++            .wdtconfig0
++            .modify(WDTCONFIG0::EN::CLEAR + WDTCONFIG0::FLASHBOOT_MOD_EN::CLEAR);
++
++        if self.registers.wdtconfig0.is_set(WDTCONFIG0::EN)
++            || self
++                .registers
++                .wdtconfig0
++                .is_set(WDTCONFIG0::FLASHBOOT_MOD_EN)
++        {
++            panic!("Can't disable TIMG WDT");
++        }
++    }
++}
++
++impl time::Time for TimG<'_> {
++    type Frequency = Freq20MHz;
++    type Ticks = Ticks64;
++
++    fn now(&self) -> Self::Ticks {
++        // a write (of any value) to T0UPDATE stores the
++        // current counter value to T0LO and T0HI
++        self.registers.t0update.set(0xABC);
++        Self::Ticks::from(
++            self.registers.t0lo.get() as u64 + ((self.registers.t0hi.get() as u64) << 32),
++        )
++    }
++}
++
++impl<'a> Counter<'a> for TimG<'a> {
++    fn set_overflow_client(&'a self, _client: &'a dyn time::OverflowClient) {
++        // We have no way to know when this happens
++    }
++
++    fn start(&self) -> Result<(), ErrorCode> {
++        self.registers.t0config.write(CONFIG::EN::SET);
++
++        Ok(())
++    }
++
++    fn stop(&self) -> Result<(), ErrorCode> {
++        self.registers.t0config.write(CONFIG::EN::CLEAR);
++
++        Ok(())
++    }
++
++    fn reset(&self) -> Result<(), ErrorCode> {
++        Err(ErrorCode::FAIL)
++    }
++
++    fn is_running(&self) -> bool {
++        self.registers.t0config.is_set(CONFIG::EN)
++    }
++}
++
++impl<'a> Alarm<'a> for TimG<'a> {
++    fn set_alarm_client(&self, client: &'a dyn time::AlarmClient) {
++        self.alarm_client.set(client);
++    }
++
++    fn set_alarm(&self, reference: Self::Ticks, dt: Self::Ticks) {
++        let now = self.now();
++        let mut expire = reference.wrapping_add(dt);
++        if !now.within_range(reference, expire) {
++            expire = now;
++        }
++
++        self.registers
++            .t0config
++            .modify(CONFIG::ALARM_EN::CLEAR + CONFIG::EN::CLEAR);
++
++        self.registers.t0config.modify(
++            CONFIG::USE_XTAL.val(self.clocksource as u32)
++                + CONFIG::INCREASE::SET
++                + CONFIG::DIVIDER.val(2 * (2 - self.clocksource as u32)),
++        );
++
++        self.registers.t0config.modify(CONFIG::DIVIDER_RST::SET);
++
++        let val = expire.into_u64();
++        let high = (val >> 32) as u32;
++        let low = (val & 0xffffffff) as u32;
++
++        self.registers.t0alarmlo.set(0xFFFF_FFFF);
++        self.registers.t0alarmhi.set(high);
++        self.registers.t0alarmlo.set(low);
++
++        self.registers.int_ena.modify(INT::T0::SET);
++
++        self.registers
++            .t0config
++            .modify(CONFIG::ALARM_EN::SET + CONFIG::EN::SET);
++    }
++
++    fn get_alarm(&self) -> Self::Ticks {
++        Self::Ticks::from(
++            self.registers.t0alarmlo.get() as u64 + ((self.registers.t0alarmhi.get() as u64) << 32),
++        )
++    }
++
++    fn disarm(&self) -> Result<(), ErrorCode> {
++        self.registers.t0config.modify(CONFIG::ALARM_EN::CLEAR);
++
++        Ok(())
++    }
++
++    fn is_armed(&self) -> bool {
++        self.registers.t0config.is_set(CONFIG::ALARM_EN)
++    }
++
++    fn minimum_dt(&self) -> Self::Ticks {
++        Self::Ticks::from(1 as u64)
++    }
++}
+diff --git a/chips/esp32/src/uart.rs b/chips/esp32/src/uart.rs
+index 1e1f0fd199d..35dc1d465c7 100644
+--- a/chips/esp32/src/uart.rs
++++ b/chips/esp32/src/uart.rs
+@@ -211,6 +211,7 @@ pub struct Uart<'a> {
+     tx_index: Cell<usize>,
+ 
+     rx_buffer: TakeCell<'static, [u8]>,
++    rx_index: Cell<usize>,
+     rx_len: Cell<usize>,
+ }
+ 
+@@ -229,6 +230,7 @@ impl<'a> Uart<'a> {
+             tx_len: Cell::new(0),
+             tx_index: Cell::new(0),
+             rx_buffer: TakeCell::empty(),
++            rx_index: Cell::new(0),
+             rx_len: Cell::new(0),
+         }
+     }
+@@ -286,12 +288,6 @@ impl<'a> Uart<'a> {
+         let len = self.tx_len.get();
+ 
+         if idx < len {
+-            // If we are going to transmit anything, we first need to enable the
+-            // TX interrupt. This ensures that we will get an interrupt, where
+-            // we can either call the callback from, or continue transmitting
+-            // bytes.
+-            self.enable_tx_interrupt();
+-
+             // Read from the transmit buffer and send bytes to the UART hardware
+             // until either the buffer is empty or the UART hardware is full.
+             self.tx_buffer.map(|tx_buf| {
+@@ -310,14 +306,36 @@ impl<'a> Uart<'a> {
+         }
+     }
+ 
++    fn rx_progress(&self) {
++        let regs = self.registers;
++        let idx = self.rx_index.get();
++        let len = self.rx_len.get();
++
++        if idx < len {
++            // Read from the UART hardware and write them to the receive buffer
++            // until either the buffer is full or the UART hardware is empty.
++            self.rx_buffer.map(|rx_buf| {
++                let rx_len = len - idx;
++
++                for i in 0..rx_len {
++                    if regs.status.read(STATUS::RXFIFO_CNT) == 0 {
++                        break;
++                    }
++                    let rx_idx = idx + i;
++                    rx_buf[rx_idx] = regs.fifo.read(FIFO::RXFIFO_RD_BYTE) as u8;
++                    self.rx_index.set(rx_idx + 1)
++                }
++            });
++        }
++    }
++
+     pub fn handle_interrupt(&self) {
+         let regs = self.registers;
+         let intrs = regs.int_st.extract();
+ 
+         if intrs.is_set(INT::TXFIFO_EMPTY_INT) {
+-            self.disable_tx_interrupt();
+-
+             if self.tx_index.get() == self.tx_len.get() {
++                self.disable_tx_interrupt();
+                 // We sent everything to the UART hardware, now from an
+                 // interrupt callback we can issue the callback.
+                 self.tx_client.map(|client| {
+@@ -330,6 +348,27 @@ impl<'a> Uart<'a> {
+                 self.tx_progress();
+             }
+         }
++
++        if intrs.is_set(INT::RXFIFO_FULL_INT) || intrs.is_set(INT::RXFIFO_TOUT_INT) {
++            if self.rx_index.get() == self.rx_len.get() {
++                self.disable_rx_interrupt();
++                // We received everything from the UART hardware, now from an
++                // interrupt callback we can issue the callback.
++                self.rx_client.map(|client| {
++                    self.rx_buffer.take().map(|rx_buf| {
++                        client.received_buffer(
++                            rx_buf,
++                            self.rx_len.get(),
++                            Ok(()),
++                            hil::uart::Error::None,
++                        );
++                    });
++                });
++            } else {
++                // We have more to receive, so continue in rx_progress().
++                self.rx_progress();
++            }
++        }
+     }
+ 
+     pub fn transmit_sync(&self, bytes: &[u8]) {
+@@ -371,6 +410,8 @@ impl<'a> hil::uart::Transmit<'a> for Uart<'a> {
+             self.tx_len.set(tx_len);
+             self.tx_index.set(0);
+ 
++            self.enable_tx_interrupt();
++
+             self.tx_progress();
+             Ok(())
+         }
+@@ -400,11 +441,14 @@ impl<'a> hil::uart::Receive<'a> for Uart<'a> {
+             return Err((ErrorCode::SIZE, rx_buffer));
+         }
+ 
+-        self.enable_rx_interrupt();
+-
+         self.rx_buffer.replace(rx_buffer);
++        self.rx_index.set(0);
+         self.rx_len.set(rx_len);
+ 
++        self.enable_rx_interrupt();
++
++        self.rx_progress();
++
+         Ok(())
+     }
+ 

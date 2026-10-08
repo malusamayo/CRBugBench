@@ -1,0 +1,160 @@
+commit fd38fd69e9bf4ef750df4dbb0200abf02cc8c275
+Author: Mohammad AlSaleh <CE.Mohammad.AlSaleh@gmail.com>
+Date:   Tue Mar 25 05:14:18 2025 +0300
+
+    sort: immediately compare whole lines if they parse as numbers
+    
+     Numeric sort can be relatively slow on inputs that are wholly or
+     mostly numbers. This is more clear when comparing with the speed of
+     GeneralNumeric.
+    
+     This change parses whole lines as f64 and stores that info in
+     `LineData`. This is faster than doing the parsing two lines at
+     a time in `compare_by()`.
+    
+     # Benchmarks
+    
+     `shuf -i 1-1000000 -n 1000000 > /tmp/shuffled.txt`
+    
+     % hyperfine --warmup 3 \
+         '/tmp/gnu-sort -n /tmp/shuffled.txt'
+         '/tmp/before_coreutils sort -n /tmp/shuffled.txt'
+         '/tmp/after_coreutils sort -n /tmp/shuffled.txt'
+     Benchmark 1: /tmp/gnu-sort -n /tmp/shuffled.txt
+       Time (mean ± σ):     198.2 ms ±   5.8 ms    [User: 884.6 ms, System: 22.0 ms]
+       Range (min … max):   187.3 ms … 207.4 ms    15 runs
+    
+     Benchmark 2: /tmp/before_coreutils sort -n /tmp/shuffled.txt
+       Time (mean ± σ):     361.3 ms ±   8.7 ms    [User: 1898.7 ms, System: 18.9 ms]
+       Range (min … max):   350.4 ms … 375.3 ms    10 runs
+    
+     Benchmark 3: /tmp/after_coreutils sort -n /tmp/shuffled.txt
+       Time (mean ± σ):     175.1 ms ±   6.7 ms    [User: 536.8 ms, System: 21.6 ms]
+       Range (min … max):   169.3 ms … 197.0 ms    16 runs
+    
+     Summary
+       /tmp/after_coreutils sort -n /tmp/shuffled.txt ran
+         1.13 ± 0.05 times faster than /tmp/gnu-sort -n /tmp/shuffled.txt
+         2.06 ± 0.09 times faster than /tmp/before_coreutils sort -n /tmp/shuffled.txt
+    
+    Signed-off-by: Mohammad AlSaleh <CE.Mohammad.AlSaleh@gmail.com>
+
+diff --git a/src/uu/sort/src/chunks.rs b/src/uu/sort/src/chunks.rs
+index 6f0ba97bf..8f423701a 100644
+--- a/src/uu/sort/src/chunks.rs
++++ b/src/uu/sort/src/chunks.rs
+@@ -42,6 +42,7 @@ pub struct LineData<'a> {
+     pub selections: Vec<&'a str>,
+     pub num_infos: Vec<NumInfo>,
+     pub parsed_floats: Vec<GeneralF64ParseResult>,
++    pub line_num_floats: Vec<Option<f64>>,
+ }
+ 
+ impl Chunk {
+@@ -52,6 +53,7 @@ impl Chunk {
+             contents.line_data.selections.clear();
+             contents.line_data.num_infos.clear();
+             contents.line_data.parsed_floats.clear();
++            contents.line_data.line_num_floats.clear();
+             let lines = unsafe {
+                 // SAFETY: It is safe to (temporarily) transmute to a vector of lines with a longer lifetime,
+                 // because the vector is empty.
+@@ -73,6 +75,7 @@ impl Chunk {
+                 selections,
+                 std::mem::take(&mut contents.line_data.num_infos),
+                 std::mem::take(&mut contents.line_data.parsed_floats),
++                std::mem::take(&mut contents.line_data.line_num_floats),
+             )
+         });
+         RecycledChunk {
+@@ -80,6 +83,7 @@ impl Chunk {
+             selections: recycled_contents.1,
+             num_infos: recycled_contents.2,
+             parsed_floats: recycled_contents.3,
++            line_num_floats: recycled_contents.4,
+             buffer: self.into_owner(),
+         }
+     }
+@@ -97,6 +101,7 @@ pub struct RecycledChunk {
+     selections: Vec<&'static str>,
+     num_infos: Vec<NumInfo>,
+     parsed_floats: Vec<GeneralF64ParseResult>,
++    line_num_floats: Vec<Option<f64>>,
+     buffer: Vec<u8>,
+ }
+ 
+@@ -107,6 +112,7 @@ impl RecycledChunk {
+             selections: Vec::new(),
+             num_infos: Vec::new(),
+             parsed_floats: Vec::new(),
++            line_num_floats: Vec::new(),
+             buffer: vec![0; capacity],
+         }
+     }
+@@ -149,6 +155,7 @@ pub fn read<T: Read>(
+         selections,
+         num_infos,
+         parsed_floats,
++        line_num_floats,
+         mut buffer,
+     } = recycled_chunk;
+     if buffer.len() < carry_over.len() {
+@@ -184,6 +191,7 @@ pub fn read<T: Read>(
+                 selections,
+                 num_infos,
+                 parsed_floats,
++                line_num_floats,
+             };
+             parse_lines(read, &mut lines, &mut line_data, separator, settings);
+             Ok(ChunkContents { lines, line_data })
+@@ -207,6 +215,7 @@ fn parse_lines<'a>(
+     assert!(line_data.selections.is_empty());
+     assert!(line_data.num_infos.is_empty());
+     assert!(line_data.parsed_floats.is_empty());
++    assert!(line_data.line_num_floats.is_empty());
+     let mut token_buffer = vec![];
+     lines.extend(
+         read.split(separator as char)
+diff --git a/src/uu/sort/src/sort.rs b/src/uu/sort/src/sort.rs
+index 31dc81751..87b0fa7b5 100644
+--- a/src/uu/sort/src/sort.rs
++++ b/src/uu/sort/src/sort.rs
+@@ -460,6 +460,13 @@ impl<'a> Line<'a> {
+         if settings.precomputed.needs_tokens {
+             tokenize(line, settings.separator, token_buffer);
+         }
++        if settings.mode == SortMode::Numeric {
++            // exclude inf, nan, scientific notation
++            let line_num_float = (!line.contains(char::is_alphabetic))
++                .then(|| line.parse::<f64>().ok())
++                .flatten();
++            line_data.line_num_floats.push(line_num_float);
++        }
+         for (selector, selection) in settings
+             .selectors
+             .iter()
+@@ -1563,6 +1570,24 @@ fn compare_by<'a>(
+     let mut selection_index = 0;
+     let mut num_info_index = 0;
+     let mut parsed_float_index = 0;
++
++    if let (Some(Some(a_f64)), Some(Some(b_f64))) = (
++        a_line_data.line_num_floats.get(a.index),
++        b_line_data.line_num_floats.get(b.index),
++    ) {
++        // we don't use total_cmp() because it always sorts -0 before 0
++        if let Some(cmp) = a_f64.partial_cmp(b_f64) {
++            // don't trust `Ordering::Equal` if lines are not fully equal
++            if cmp != Ordering::Equal || a.line == b.line {
++                return if global_settings.reverse {
++                    cmp.reverse()
++                } else {
++                    cmp
++                };
++            }
++        }
++    }
++
+     for selector in &global_settings.selectors {
+         let (a_str, b_str) = if selector.needs_selection {
+             let selections = (

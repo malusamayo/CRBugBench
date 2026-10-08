@@ -1,0 +1,1178 @@
+commit dd3bf5271146d676b5a5305c43446632540a6f50
+Author: Shreyas <CuriousCorrelation@gmail.com>
+Date:   Mon Mar 10 22:45:51 2025 +0530
+
+    feat(kernel): isolate type ser/de to platform (#4860)
+
+diff --git a/packages/hoppscotch-agent/src-tauri/tauri.conf.json b/packages/hoppscotch-agent/src-tauri/tauri.conf.json
+index 634fcca0a..f1641a2dc 100644
+--- a/packages/hoppscotch-agent/src-tauri/tauri.conf.json
++++ b/packages/hoppscotch-agent/src-tauri/tauri.conf.json
+@@ -5,7 +5,7 @@
+   "identifier": "io.hoppscotch.agent",
+   "build": {
+     "beforeDevCommand": "pnpm dev",
+-    "devUrl": "http://localhost:1420",
++    "devUrl": "http://127.0.0.1:1420",
+     "beforeBuildCommand": "pnpm build",
+     "frontendDist": "../dist"
+   },
+diff --git a/packages/hoppscotch-agent/vite.config.ts b/packages/hoppscotch-agent/vite.config.ts
+index bcba96100..002646efe 100644
+--- a/packages/hoppscotch-agent/vite.config.ts
++++ b/packages/hoppscotch-agent/vite.config.ts
+@@ -43,7 +43,7 @@ export default defineConfig(async () => ({
+   server: {
+     port: 1420,
+     strictPort: true,
+-    host: host || false,
++    host: '127.0.0.1',
+     hmr: host
+       ? {
+         protocol: "ws",
+diff --git a/packages/hoppscotch-common/src/components/settings/ExtensionSubtitle.vue b/packages/hoppscotch-common/src/components/settings/ExtensionSubtitle.vue
+index ac211eb8e..057528f8e 100644
+--- a/packages/hoppscotch-common/src/components/settings/ExtensionSubtitle.vue
++++ b/packages/hoppscotch-common/src/components/settings/ExtensionSubtitle.vue
+@@ -4,10 +4,10 @@
+     class="flex flex-col items-left my-2 text-secondaryLight"
+   >
+     <div class="text-secondaryLight">
+-      <span v-if="O.isSome(extensionVersion)">
++      <span v-if="extensionVersion">
+         {{
+-          `${t("settings.extension_version")}: v${extensionVersion.value.major}.${
+-            extensionVersion.value.minor
++          `${t("settings.extension_version")}: v${extensionVersion.major}.${
++            extensionVersion.minor
+           }`
+         }}
+       </span>
+@@ -40,16 +40,17 @@
+ <script setup lang="ts">
+ import { computed } from "vue"
+ import { useService } from "dioc/vue"
+-import * as O from "fp-ts/Option"
+ import { useI18n } from "@composables/i18n"
+ import { KernelInterceptorService } from "~/services/kernel-interceptor.service"
+-import { KernelInterceptorExtensionStore } from "~/platform/std/kernel-interceptors/extension/store"
++import { ExtensionKernelInterceptorService } from "~/platform/std/kernel-interceptors/extension"
+ 
+ import IconChrome from "~icons/brands/chrome"
+ import IconFirefox from "~icons/brands/firefox"
+ 
+ const t = useI18n()
+-const store = useService(KernelInterceptorExtensionStore)
++const extensionInterceptorService = useService(
++  ExtensionKernelInterceptorService
++)
+ const interceptorService = useService(KernelInterceptorService)
+ 
+ const isSelected = computed(
+@@ -57,8 +58,10 @@ const isSelected = computed(
+ )
+ 
+ const isNotAvailable = computed(
+-  () => store.getExtensionStatus() !== "available"
++  () => extensionInterceptorService.extensionStatus.value !== "available"
+ )
+ 
+-const extensionVersion = computed(() => store.getExtensionVersion())
++const extensionVersion = computed(
++  () => extensionInterceptorService.extensionVersion.value
++)
+ </script>
+diff --git a/packages/hoppscotch-common/src/helpers/kernel/common/content.ts b/packages/hoppscotch-common/src/helpers/kernel/common/content.ts
+index 1aa54629c..f80b5f4c8 100644
+--- a/packages/hoppscotch-common/src/helpers/kernel/common/content.ts
++++ b/packages/hoppscotch-common/src/helpers/kernel/common/content.ts
+@@ -1,20 +1,12 @@
+ import * as E from "fp-ts/Either"
+ import * as TE from "fp-ts/TaskEither"
+ import * as O from "fp-ts/Option"
+-import * as A from "fp-ts/Array"
+ import { pipe } from "fp-ts/function"
+ 
+ import { parseJSONAs } from "~/helpers/functional/json"
+ import { ContentType, MediaType, content } from "@hoppscotch/kernel"
+ import { EffectiveHoppRESTRequest } from "~/helpers/utils/EffectiveURL"
+ 
+-type FormDataValue = {
+-  kind: "file"
+-  filename: string
+-  contentType: string
+-  data: Uint8Array
+-}
+-
+ const Processors = {
+   json: {
+     process: (body: string): E.Either<Error, ContentType> =>
+@@ -25,78 +17,6 @@ const Processors = {
+       ),
+   },
+ 
+-  multipart: {
+-    processFile: (entry: {
+-      key: string
+-      file: Blob
+-      contentType?: string
+-    }): TE.TaskEither<Error, { key: string; value: FormDataValue[] }> =>
+-      pipe(
+-        TE.tryCatch(
+-          () => entry.file.arrayBuffer(),
+-          () => new Error("File read failed")
+-        ),
+-        TE.map((buffer) => ({
+-          key: entry.key,
+-          value: [
+-            {
+-              kind: "file",
+-              filename:
+-                entry.file instanceof File ? entry.file.name : "unknown",
+-              contentType:
+-                entry.contentType ??
+-                (entry.file instanceof File
+-                  ? entry.file.type
+-                  : "application/octet-stream"),
+-              data: new Uint8Array(buffer),
+-            },
+-          ],
+-        }))
+-      ),
+-
+-    process: (formData: FormData): TE.TaskEither<Error, ContentType> =>
+-      pipe(
+-        TE.tryCatch(
+-          async () => {
+-            const entries = [] as {
+-              key: string
+-              file: Blob
+-              contentType?: string
+-            }[]
+-            // @ts-expect-error: `formData.entries` does exist but isn't visible,
+-            // see `"lib": ["ESNext", "DOM"],` in `tsconfig.json`
+-            for (const [key, value] of formData.entries()) {
+-              if (value instanceof Blob) {
+-                entries.push({
+-                  key,
+-                  file: value,
+-                  contentType: value.type || undefined,
+-                })
+-              }
+-            }
+-            return entries
+-          },
+-          () => new Error("FormData processing failed")
+-        ),
+-        TE.chain((entries) =>
+-          pipe(
+-            entries,
+-            A.traverse(TE.ApplicativePar)(Processors.multipart.processFile),
+-            TE.map(
+-              A.reduce(
+-                new Map<string, FormDataValue[]>(),
+-                (acc, { key, value }) => {
+-                  acc.set(key, value)
+-                  return acc
+-                }
+-              )
+-            )
+-          )
+-        ),
+-        TE.map((entries) => content.multipart(entries))
+-      ),
+-  },
+-
+   binary: {
+     process: (file: Blob): TE.TaskEither<Error, ContentType> =>
+       pipe(
+@@ -169,10 +89,7 @@ export const transformContent = (
+       if (!(effectiveFinalBody instanceof FormData)) {
+         return TE.right(O.none)
+       }
+-      return pipe(
+-        Processors.multipart.process(effectiveFinalBody),
+-        TE.map(O.some)
+-      )
++      return TE.right(O.some(content.multipart(effectiveFinalBody)))
+ 
+     case "application/octet-stream":
+       if (!(effectiveFinalBody instanceof Blob)) {
+diff --git a/packages/hoppscotch-common/src/helpers/network.ts b/packages/hoppscotch-common/src/helpers/network.ts
+index d8808be90..b855d3b81 100644
+--- a/packages/hoppscotch-common/src/helpers/network.ts
++++ b/packages/hoppscotch-common/src/helpers/network.ts
+@@ -22,11 +22,7 @@ export function createRESTNetworkRequestStream(
+ 
+   const req = cloneDeep(request)
+ 
+-  console.info("[helpers/network]: req", req)
+-
+   const execResult = RESTRequest.toRequest(req).then((kernelRequest) => {
+-    console.info("[helpers/network]: kernelRequest", kernelRequest)
+-
+     if (!kernelRequest) {
+       response.next({
+         type: "network_fail",
+diff --git a/packages/hoppscotch-common/src/platform/std/kernel-interceptors/agent/index.ts b/packages/hoppscotch-common/src/platform/std/kernel-interceptors/agent/index.ts
+index 4ed1acbc5..292469b1d 100644
+--- a/packages/hoppscotch-common/src/platform/std/kernel-interceptors/agent/index.ts
++++ b/packages/hoppscotch-common/src/platform/std/kernel-interceptors/agent/index.ts
+@@ -1,6 +1,6 @@
+ import { Service } from "dioc"
+ import { markRaw } from "vue"
+-import { body } from "@hoppscotch/kernel"
++import { body, relayRequestToNativeAdapter } from "@hoppscotch/kernel"
+ import * as E from "fp-ts/Either"
+ import { pipe } from "fp-ts/function"
+ import axios, { CancelTokenSource } from "axios"
+@@ -132,9 +132,8 @@ export class AgentKernelInterceptorService
+           .join(";")
+       }
+ 
+-      console.log("[AGENT]: effectiveRequest", effectiveRequest)
+       const [nonceB16, encryptedReq] = await this.store.encryptRequest(
+-        effectiveRequest,
++        await relayRequestToNativeAdapter(effectiveRequest),
+         reqID
+       )
+ 
+diff --git a/packages/hoppscotch-common/src/platform/std/kernel-interceptors/agent/store.ts b/packages/hoppscotch-common/src/platform/std/kernel-interceptors/agent/store.ts
+index e5e804d7f..dea8d7887 100644
+--- a/packages/hoppscotch-common/src/platform/std/kernel-interceptors/agent/store.ts
++++ b/packages/hoppscotch-common/src/platform/std/kernel-interceptors/agent/store.ts
+@@ -4,7 +4,7 @@ import * as E from "fp-ts/Either"
+ import axios from "axios"
+ import superjson from "superjson"
+ import { Store } from "~/kernel/store"
+-import type { RelayRequest, RelayResponse } from "@hoppscotch/kernel"
++import type { PluginRequest, PluginResponse } from "@hoppscotch/kernel"
+ import { x25519 } from "@noble/curves/ed25519"
+ import { base16 } from "@scure/base"
+ import {
+@@ -156,8 +156,8 @@ export class KernelInterceptorAgentStore extends Service {
+   }
+ 
+   public completeRequest(
+-    request: Omit<RelayRequest, "proxy" | "security">
+-  ): RelayRequest {
++    request: Omit<PluginRequest, "proxy" | "security">
++  ): PluginRequest {
+     const host = new URL(request.url).host
+     const settings = this.getMergedSettings(host)
+     const effective = convertDomainSetting(settings)
+@@ -258,7 +258,7 @@ export class KernelInterceptorAgentStore extends Service {
+   }
+ 
+   public async encryptRequest(
+-    request: RelayRequest,
++    request: PluginRequest,
+     reqID: number
+   ): Promise<[string, ArrayBuffer]> {
+     // eslint-disable-next-line @typescript-eslint/no-unused-vars
+@@ -291,7 +291,7 @@ export class KernelInterceptorAgentStore extends Service {
+   public async decryptResponse(
+     nonceB16: string,
+     encryptedResponse: ArrayBuffer
+-  ): Promise<RelayResponse> {
++  ): Promise<PluginResponse> {
+     const nonce = base16.decode(nonceB16.toUpperCase())
+     const sharedSecretKeyBytes = base16.decode(
+       this.sharedSecretB16.value!.toUpperCase()
+diff --git a/packages/hoppscotch-common/src/platform/std/kernel-interceptors/extension/index.ts b/packages/hoppscotch-common/src/platform/std/kernel-interceptors/extension/index.ts
+index af1648409..7a733e2f2 100644
+--- a/packages/hoppscotch-common/src/platform/std/kernel-interceptors/extension/index.ts
++++ b/packages/hoppscotch-common/src/platform/std/kernel-interceptors/extension/index.ts
+@@ -1,20 +1,56 @@
+-import { computed, markRaw } from "vue"
++import { computed, markRaw, ref } from "vue"
+ import { Service } from "dioc"
+ import type { RelayRequest, RelayResponse } from "@hoppscotch/kernel"
+ import { body } from "@hoppscotch/kernel"
+ import SettingsExtension from "~/components/settings/Extension.vue"
+ import SettingsExtensionSubtitle from "~/components/settings/ExtensionSubtitle.vue"
+-import { KernelInterceptorExtensionStore } from "./store"
+-import type {
+-  KernelInterceptor,
+-  ExecutionResult,
+-  KernelInterceptorError,
+-} from "~/services/kernel-interceptor.service"
+ import * as E from "fp-ts/Either"
+ import { getI18n } from "~/modules/i18n"
+ import { until } from "@vueuse/core"
+ import { preProcessRelayRequest } from "~/helpers/functional/preprocess"
+ import { browserIsChrome, browserIsFirefox } from "~/helpers/utils/userAgent"
++import type {
++  KernelInterceptor,
++  ExecutionResult,
++  KernelInterceptorError,
++} from "~/services/kernel-interceptor.service"
++
++export const defineSubscribableObject = <T extends object>(obj: T) => {
++  const proxyObject = {
++    ...obj,
++    _subscribers: {} as {
++      // eslint-disable-next-line no-unused-vars
++      [key in keyof T]?: ((...args: any[]) => any)[]
++    },
++    subscribe(prop: keyof T, func: (...args: any[]) => any): void {
++      if (Array.isArray(this._subscribers[prop])) {
++        this._subscribers[prop]?.push(func)
++      } else {
++        this._subscribers[prop] = [func]
++      }
++    },
++  }
++
++  type SubscribableProxyObject = typeof proxyObject
++
++  return new Proxy(proxyObject, {
++    set(obj, prop, newVal) {
++      obj[prop as keyof SubscribableProxyObject] = newVal
++
++      const currentSubscribers = obj._subscribers[prop as keyof T]
++
++      if (Array.isArray(currentSubscribers)) {
++        for (const subscriber of currentSubscribers) {
++          subscriber(newVal)
++        }
++      }
++
++      return true
++    },
++  })
++}
++
++export type ExtensionStatus = "available" | "unknown-origin" | "waiting"
+ 
+ export const cancelRunningExtensionRequest = async () => {
+   window.__POSTWOMAN_EXTENSION_HOOK__?.cancelRequest()
+@@ -25,7 +61,8 @@ export class ExtensionKernelInterceptorService
+   implements KernelInterceptor
+ {
+   public static readonly ID = "KERNEL_EXTENSION_INTERCEPTOR_SERVICE"
+-  private readonly store = this.bind(KernelInterceptorExtensionStore)
++
++  private _extensionStatus = ref<ExtensionStatus>("waiting")
+ 
+   public readonly id = "extension"
+   public readonly name = (t: ReturnType<typeof getI18n>) => {
+@@ -34,7 +71,7 @@ export class ExtensionKernelInterceptorService
+     if (this.extensionStatus.value === "available" && version) {
+       return `${t("settings.extensions")}: v${version.major}.${version.minor}`
+     }
+-    return `${t("settings.extensions")}: ${t("settings.extension_ver_not_reported")}`
++    return `${t("settings.extensions")}`
+   }
+ 
+   public readonly selectable = { type: "selectable" as const }
+@@ -71,6 +108,15 @@ export class ExtensionKernelInterceptorService
+     advanced: new Set(["localaccess"]),
+   } as const
+ 
++  public readonly extensionStatus = computed(() => this._extensionStatus.value)
++
++  public readonly extensionVersion = computed(() => {
++    if (this.extensionStatus.value === "available") {
++      return window.__POSTWOMAN_EXTENSION_HOOK__?.getVersion() || null
++    }
++    return null
++  })
++
+   public readonly settingsEntry = markRaw({
+     title: (t: ReturnType<typeof getI18n>) => t("settings.extensions"),
+     component: SettingsExtension,
+@@ -78,14 +124,6 @@ export class ExtensionKernelInterceptorService
+ 
+   public readonly subtitle = markRaw(SettingsExtensionSubtitle)
+ 
+-  public readonly extensionStatus = computed(
+-    () => this.store.getSettings().status
+-  )
+-
+-  public readonly extensionVersion = computed(
+-    () => this.store.getSettings().extensionVersion
+-  )
+-
+   /**
+    * Whether the extension is installed in Chrome or not.
+    */
+@@ -100,10 +138,80 @@ export class ExtensionKernelInterceptorService
+     () => this.extensionStatus.value === "available" && browserIsFirefox()
+   )
+ 
++  override async onServiceInit(): Promise<void> {
++    this.setupExtensionStatusListener()
++  }
++
++  private setupExtensionStatusListener(): void {
++    const extensionPollIntervalId = ref<ReturnType<typeof setInterval>>()
++
++    if (window.__HOPP_EXTENSION_STATUS_PROXY__) {
++      this._extensionStatus.value =
++        window.__HOPP_EXTENSION_STATUS_PROXY__.status
++      window.__HOPP_EXTENSION_STATUS_PROXY__.subscribe(
++        "status",
++        (status: ExtensionStatus) => {
++          this._extensionStatus.value = status
++        }
++      )
++    } else {
++      const statusProxy = defineSubscribableObject({
++        status: "waiting" as ExtensionStatus,
++      })
++
++      window.__HOPP_EXTENSION_STATUS_PROXY__ = statusProxy
++      statusProxy.subscribe(
++        "status",
++        (status: ExtensionStatus) => (this._extensionStatus.value = status)
++      )
++
++      // Check if extension is already available
++      if (this.tryDetectExtension()) {
++        return
++      }
++
++      /**
++       * Keeping identifying extension backward compatible
++       * We are assuming the default version is 0.24 or later. So if the extension exists, its identified immediately,
++       * then we use a poll to find the version, this will get the version for 0.24 and any other version
++       * of the extension, but will have a slight lag.
++       * 0.24 users will get the benefits of 0.24, while the extension won't break for the old users
++       */
++      extensionPollIntervalId.value = setInterval(() => {
++        if (this.tryDetectExtension() && extensionPollIntervalId.value) {
++          clearInterval(extensionPollIntervalId.value)
++        }
++      }, 2000)
++    }
++  }
++
++  public tryDetectExtension(): boolean {
++    if (typeof window.__POSTWOMAN_EXTENSION_HOOK__ !== "undefined") {
++      const version = window.__POSTWOMAN_EXTENSION_HOOK__.getVersion()
++
++      this._extensionStatus.value = "available"
++
++      // When the version is not 0.24 or higher, the extension wont do this. so we have to do it manually
++      if (
++        version.major === 0 &&
++        version.minor <= 23 &&
++        window.__HOPP_EXTENSION_STATUS_PROXY__
++      ) {
++        window.__HOPP_EXTENSION_STATUS_PROXY__.status = "available"
++      }
++      return true
++    }
++    return false
++  }
++
+   private async executeExtensionRequest(
+     request: RelayRequest
+   ): Promise<E.Either<KernelInterceptorError, RelayResponse>> {
+-    await until(() => this.store.getSettings().status).not.toBe("waiting")
++    // Wait for the extension to resolve (not waiting forever)
++    await until(this.extensionStatus).toMatch(
++      (status) => status !== "waiting",
++      { timeout: 1000 }
++    )
+ 
+     if (!window.__POSTWOMAN_EXTENSION_HOOK__) {
+       return E.left({
+@@ -119,12 +227,57 @@ export class ExtensionKernelInterceptorService
+     }
+ 
+     try {
++      let requestData: any = null
++
++      if (request.content) {
++        switch (request.content.kind) {
++          case "json":
++            // For JSON, we need to stringify it before sending it to extension,
++            // see extension source code for more info on this.
++            // Also if it's already a string, we can use it as is, otherwise we stringify.
++            requestData =
++              typeof request.content.content === "string"
++                ? request.content.content
++                : JSON.stringify(request.content.content)
++            break
++
++          case "binary":
++            if (
++              request.content.content instanceof Blob ||
++              request.content.content instanceof File
++            ) {
++              requestData = request.content.content
++            } else if (typeof request.content.content === "string") {
++              try {
++                const base64 =
++                  request.content.content.split(",")[1] ||
++                  request.content.content
++                const binaryString = window.atob(base64)
++                const bytes = new Uint8Array(binaryString.length)
++                for (let i = 0; i < binaryString.length; i++) {
++                  bytes[i] = binaryString.charCodeAt(i)
++                }
++                requestData = new Blob([bytes.buffer])
++              } catch (e) {
++                console.error("Error converting binary data:", e)
++                requestData = request.content.content
++              }
++            } else {
++              requestData = request.content.content
++            }
++            break
++
++          default:
++            requestData = request.content.content
++        }
++      }
++
+       const extensionResponse =
+         await window.__POSTWOMAN_EXTENSION_HOOK__.sendRequest({
+           url: request.url,
+           method: request.method,
+           headers: request.headers,
+-          data: request.content?.content,
++          data: requestData,
+           wantsBinary: true,
+         })
+ 
+@@ -168,6 +321,28 @@ export class ExtensionKernelInterceptorService
+   public execute(
+     request: RelayRequest
+   ): ExecutionResult<KernelInterceptorError> {
++    if (this._extensionStatus.value !== "available") {
++      return {
++        cancel: async () => {
++          // Nothing to cancel if extension is not available
++        },
++        response: Promise.resolve(
++          E.left({
++            humanMessage: {
++              heading: (t: ReturnType<typeof getI18n>) =>
++                t("error.extension.heading"),
++              description: (t: ReturnType<typeof getI18n>) =>
++                t("error.extension.description"),
++            },
++            error: {
++              kind: "extension",
++              message: "Extension not available",
++            },
++          })
++        ),
++      }
++    }
++
+     const extensionExecution = {
+       cancel: async () => {
+         window.__POSTWOMAN_EXTENSION_HOOK__?.cancelRequest()
+diff --git a/packages/hoppscotch-common/src/platform/std/kernel-interceptors/extension/store.ts b/packages/hoppscotch-common/src/platform/std/kernel-interceptors/extension/store.ts
+index 51a6dc530..9e8fe28c2 100644
+--- a/packages/hoppscotch-common/src/platform/std/kernel-interceptors/extension/store.ts
++++ b/packages/hoppscotch-common/src/platform/std/kernel-interceptors/extension/store.ts
+@@ -83,7 +83,10 @@ export class KernelInterceptorExtensionStore extends Service {
+     }
+ 
+     await this.loadSettings()
+-    this.setupExtensionStatusListener()
++
++    if (!this.tryDetectExtension()) {
++      this.setupExtensionStatusListener()
++    }
+ 
+     Store.watch(STORE_NAMESPACE, SETTINGS_KEY).on(
+       "change",
+@@ -123,6 +126,10 @@ export class KernelInterceptorExtensionStore extends Service {
+         this.updateSettings({ status })
+       )
+ 
++      if (this.tryDetectExtension()) {
++        return
++      }
++
+       /**
+        * Keeping identifying extension backward compatible
+        * We are assuming the default version is 0.24 or later. So if the extension exists, its identified immediately,
+@@ -131,26 +138,39 @@ export class KernelInterceptorExtensionStore extends Service {
+        * 0.24 users will get the benefits of 0.24, while the extension won't break for the old users
+        */
+       this.extensionPollIntervalId.value = setInterval(() => {
+-        if (typeof window.__POSTWOMAN_EXTENSION_HOOK__ !== "undefined") {
+-          if (this.extensionPollIntervalId.value)
+-            clearInterval(this.extensionPollIntervalId.value)
+-
+-          const version = window.__POSTWOMAN_EXTENSION_HOOK__.getVersion()
+-          this.updateSettings({ extensionVersion: version })
+-
+-          // When the version is not 0.24 or higher, the extension wont do this. so we have to do it manually
+-          if (
+-            version.major === 0 &&
+-            version.minor <= 23 &&
+-            window.__HOPP_EXTENSION_STATUS_PROXY__
+-          ) {
+-            window.__HOPP_EXTENSION_STATUS_PROXY__.status = "available"
+-          }
++        if (this.tryDetectExtension() && this.extensionPollIntervalId.value) {
++          clearInterval(this.extensionPollIntervalId.value)
+         }
+       }, 2000)
+     }
+   }
+ 
++  public tryDetectExtension(): boolean {
++    if (typeof window.__POSTWOMAN_EXTENSION_HOOK__ !== "undefined") {
++      const version = window.__POSTWOMAN_EXTENSION_HOOK__.getVersion()
++
++      this.settings = {
++        ...this.settings,
++        extensionVersion: version,
++        status: "available",
++      }
++
++      // We don't need to persist right away to thing eventually resolving is good enough
++      this.persistSettings()
++
++      // When the version is not 0.24 or higher, the extension wont do this. so we have to do it manually
++      if (
++        version.major === 0 &&
++        version.minor <= 23 &&
++        window.__HOPP_EXTENSION_STATUS_PROXY__
++      ) {
++        window.__HOPP_EXTENSION_STATUS_PROXY__.status = "available"
++      }
++      return true
++    }
++    return false
++  }
++
+   private async loadSettings(): Promise<void> {
+     const loadResult = await Store.get<StoredData>(
+       STORE_NAMESPACE,
+diff --git a/packages/hoppscotch-common/src/platform/std/kernel-interceptors/native/index.ts b/packages/hoppscotch-common/src/platform/std/kernel-interceptors/native/index.ts
+index cf419c8a6..b356b8993 100644
+--- a/packages/hoppscotch-common/src/platform/std/kernel-interceptors/native/index.ts
++++ b/packages/hoppscotch-common/src/platform/std/kernel-interceptors/native/index.ts
+@@ -83,11 +83,6 @@ export class NativeKernelInterceptorService
+         .join(";")
+     }
+ 
+-    console.info(
+-      "[platform/std/kernel-interceptor/native/index]: effectiveRequest",
+-      effectiveRequest
+-    )
+-
+     const relayExecution = Relay.execute(effectiveRequest)
+ 
+     const response = pipe(relayExecution.response, (promise) =>
+diff --git a/packages/hoppscotch-common/src/platform/std/kernel-interceptors/proxy/index.ts b/packages/hoppscotch-common/src/platform/std/kernel-interceptors/proxy/index.ts
+index 66e3470cf..6be081f46 100644
+--- a/packages/hoppscotch-common/src/platform/std/kernel-interceptors/proxy/index.ts
++++ b/packages/hoppscotch-common/src/platform/std/kernel-interceptors/proxy/index.ts
+@@ -1,6 +1,5 @@
+ import { markRaw } from "vue"
+ import type {
+-  FormDataValue,
+   RelayRequest,
+   ContentType,
+   Method,
+@@ -17,10 +16,14 @@ import type {
+   KernelInterceptorError,
+ } from "~/services/kernel-interceptor.service"
+ import * as E from "fp-ts/Either"
++import * as O from "fp-ts/Option"
+ import { pipe } from "fp-ts/function"
+ import { getI18n } from "~/modules/i18n"
+ import { v4 } from "uuid"
++
+ import { preProcessRelayRequest } from "~/helpers/functional/preprocess"
++import { parseBytesToJSON } from "~/helpers/functional/json"
++import { decodeB64StringToArrayBuffer } from "~/helpers/utils/b64"
+ 
+ type ProxyRequest = {
+   url: string
+@@ -83,32 +86,56 @@ export class ProxyKernelInterceptorService
+     request: RelayRequest,
+     accessToken: string
+   ): ProxyRequest {
+-    let wantsBinary = false
+-    let requestData = ""
++    // NOTE: This should be conditional but for now setting it to true for backwards compat,
++    // see std/interceptor/proxy.ts for more info.
++    const wantsBinary = true
++    let requestData: any = null
++
++    // This is required for backwards compatibility with current proxyscotch impl
+     if (request.content) {
+-      if (request.content.kind === "text" || request.content.kind === "xml") {
+-        requestData = request.content.content
+-      } else if (request.content.kind === "json") {
+-        requestData = JSON.stringify(request.content.content)
+-      } else if (
+-        request.content.kind === "multipart" ||
+-        request.content.kind === "form"
+-      ) {
+-        wantsBinary = true
+-        const formData = new FormData()
+-        request.content.content.forEach(
+-          (values: FormDataValue[], key: string) => {
+-            values.forEach((value: FormDataValue) => {
+-              if (value.kind === "text") {
+-                formData.append(key, value.value)
+-              } else {
+-                const blob = new Blob([value.data], { type: value.contentType })
+-                formData.append(key, blob, value.filename)
++      switch (request.content.kind) {
++        case "json":
++          requestData =
++            typeof request.content.content === "string"
++              ? request.content.content
++              : JSON.stringify(request.content.content)
++          break
++
++        case "binary":
++          if (
++            request.content.content instanceof Blob ||
++            request.content.content instanceof File
++          ) {
++            requestData = request.content.content
++          } else if (typeof request.content.content === "string") {
++            // This is rather rare but just in case
++            try {
++              const base64 =
++                request.content.content.split(",")[1] || request.content.content
++              const binaryString = window.atob(base64)
++              const bytes = new Uint8Array(binaryString.length)
++              for (let i = 0; i < binaryString.length; i++) {
++                bytes[i] = binaryString.charCodeAt(i)
+               }
+-            })
++              requestData = new Blob([bytes.buffer])
++            } catch (e) {
++              console.error("Error converting binary data:", e)
++              requestData = request.content.content
++            }
++          } else {
++            requestData = request.content.content
+           }
+-        )
+-        requestData = formData.toString()
++          break
++
++        case "multipart":
++          // `multipart` has separate handling in `execute`,
++          // where we combine request with request body
++          // so removing that part right now
++          requestData = ""
++          break
++
++        default:
++          requestData = request.content.content
+       }
+     }
+ 
+@@ -137,15 +164,51 @@ export class ProxyKernelInterceptorService
+     const accessToken = settings.accessToken
+     const proxyUrl = settings.proxyUrl
+ 
+-    const proxyRequest = this.constructProxyRequest(
+-      preProcessRelayRequest(request),
+-      accessToken
+-    )
++    const processedRequest = preProcessRelayRequest(request)
++
++    let content: ContentType
++    const multipartKey = `proxyRequestData-${v4()}`
++
++    if (
++      processedRequest.content &&
++      processedRequest.content.kind === "multipart" &&
++      processedRequest.content.content instanceof FormData
++    ) {
++      const modifiedRequest = { ...processedRequest }
+ 
+-    const content: ContentType = {
+-      kind: "json",
+-      content: proxyRequest,
+-      mediaType: MediaType.APPLICATION_JSON,
++      const proxyRequest = this.constructProxyRequest(
++        modifiedRequest,
++        accessToken
++      )
++
++      const formData = processedRequest.content.content as FormData
++      const newFormData = new FormData()
++
++      // @ts-expect-error: `formData.entries` does exist but isn't visible,
++      // see `"lib": ["ESNext", "DOM"],` in `tsconfig.json`
++      for (const [key, value] of formData.entries()) {
++        newFormData.append(key, value)
++      }
++
++      const proxyRequestString = JSON.stringify(proxyRequest)
++      newFormData.append(multipartKey, proxyRequestString)
++
++      content = {
++        kind: "multipart",
++        content: newFormData,
++        mediaType: MediaType.MULTIPART_FORM_DATA,
++      }
++    } else {
++      const proxyRequest = this.constructProxyRequest(
++        processedRequest,
++        accessToken
++      )
++
++      content = {
++        kind: "json",
++        content: proxyRequest,
++        mediaType: MediaType.APPLICATION_JSON,
++      }
+     }
+ 
+     const proxyRelayRequest: RelayRequest = {
+@@ -157,7 +220,7 @@ export class ProxyKernelInterceptorService
+         "content-type": content.mediaType,
+         ...(content.kind === "multipart"
+           ? {
+-              "multipart-part-key": `proxyRequestData-${v4()}`,
++              "multipart-part-key": multipartKey,
+             }
+           : {}),
+       },
+@@ -236,19 +299,9 @@ export class ProxyKernelInterceptorService
+             return { humanMessage, error }
+           }),
+           E.chain((res) => {
+-            const proxyBody =
+-              res.body.mediaType === MediaType.TEXT_PLAIN
+-                ? new Uint8Array(res.body.body)
+-                : null
+-
+-            // NOTE: This will become obsolete if we use native interceptor like error propagation.
+-            const proxyResponse = proxyBody
+-              ? (JSON.parse(
+-                  new TextDecoder().decode(proxyBody)
+-                ) as ProxyResponse)
+-              : null
+-
+-            if (!proxyResponse?.success) {
++            const proxyResponse = parseBytesToJSON<ProxyResponse>(res.body.body)
++
++            if (O.isNone(proxyResponse)) {
+               return E.left({
+                 humanMessage: {
+                   heading: (t) => t("error.network.heading"),
+@@ -265,13 +318,59 @@ export class ProxyKernelInterceptorService
+               })
+             }
+ 
+-            if (proxyResponse.isBinary) {
++            const parsedProxyResponse = proxyResponse.value
++
++            if (!parsedProxyResponse?.success) {
++              return E.left({
++                humanMessage: {
++                  heading: (t) => t("error.network.heading"),
++                  description: (t) =>
++                    t("error.network.description", {
++                      message: "Proxy request failed",
++                      cause: "Proxy server may be unresponsive",
++                    }),
++                },
++                error: {
++                  kind: "network",
++                  message: "Proxy request failed",
++                },
++              })
++            }
++
++            // NOTE: This should be conditional but seems to be hit always,
++            // see std/interceptor/proxy.ts for more info. Also see the above similar note.
++            if (parsedProxyResponse.isBinary) {
++              const decodedData = decodeB64StringToArrayBuffer(
++                parsedProxyResponse.data
++              )
++
++              // NOTE: This is also for backwards compat,
++              // better solution would be to ask for raw bytes from proxyscotch.
++              const jsonResult = parseBytesToJSON(new Uint8Array(decodedData))
++
++              if (O.isSome(jsonResult)) {
++                return E.right({
++                  ...res,
++                  status: parsedProxyResponse.status,
++                  statusText: parsedProxyResponse.statusText,
++                  headers: parsedProxyResponse.headers,
++                  body: {
++                    body: new TextEncoder().encode(
++                      JSON.stringify(jsonResult.value)
++                    ),
++                    mediaType: "application/json",
++                  },
++                })
++              }
+               return E.right({
+                 ...res,
++                status: parsedProxyResponse.status,
++                statusText: parsedProxyResponse.statusText,
++                headers: parsedProxyResponse.headers,
+                 body: {
+-                  body: proxyResponse.data,
++                  body: decodedData,
+                   mediaType:
+-                    proxyResponse.headers["content-type"] ||
++                    parsedProxyResponse.headers["content-type"] ||
+                     "application/octet-stream",
+                 },
+               })
+@@ -279,12 +378,13 @@ export class ProxyKernelInterceptorService
+ 
+             return E.right({
+               ...res,
+-              status: proxyResponse.status,
+-              statusText: proxyResponse.statusText,
+-              headers: proxyResponse.headers,
++              status: parsedProxyResponse.status,
++              statusText: parsedProxyResponse.statusText,
++              headers: parsedProxyResponse.headers,
+               body: {
+-                body: new TextEncoder().encode(proxyResponse.data),
+-                mediaType: "text/plain",
++                body: parsedProxyResponse.data,
++                mediaType:
++                  parsedProxyResponse.headers["content-type"] || "text/plain",
+               },
+             })
+           })
+diff --git a/packages/hoppscotch-desktop/plugin-workspace/relay/src/content.rs b/packages/hoppscotch-desktop/plugin-workspace/relay/src/content.rs
+index 659becbb1..689833ea2 100644
+--- a/packages/hoppscotch-desktop/plugin-workspace/relay/src/content.rs
++++ b/packages/hoppscotch-desktop/plugin-workspace/relay/src/content.rs
+@@ -201,7 +201,7 @@ impl<'a> ContentHandler<'a> {
+         for (key, values) in content {
+             for value in values {
+                 match value {
+-                    FormValue::Text(text) => {
++                    FormValue::Text { value: text } => {
+                         tracing::debug!(key = %key, text_length = text.len(), "Adding form text field");
+                         form.part(key)
+                             .contents(text.as_bytes())
+diff --git a/packages/hoppscotch-desktop/plugin-workspace/relay/src/interop.rs b/packages/hoppscotch-desktop/plugin-workspace/relay/src/interop.rs
+index 0a9e037a3..8c94c2b2f 100644
+--- a/packages/hoppscotch-desktop/plugin-workspace/relay/src/interop.rs
++++ b/packages/hoppscotch-desktop/plugin-workspace/relay/src/interop.rs
+@@ -48,7 +48,10 @@ pub enum MediaType {
+ #[derive(Debug, Serialize, Deserialize, Clone)]
+ #[serde(tag = "kind", rename_all = "camelCase")]
+ pub enum FormValue {
+-    Text(String),
++    #[serde(rename_all = "camelCase")]
++    Text {
++        value: String,
++    },
+     #[serde(rename_all = "camelCase")]
+     File {
+         filename: String,
+diff --git a/packages/hoppscotch-kernel/src/index.ts b/packages/hoppscotch-kernel/src/index.ts
+index 3439142f9..e221b2f6b 100644
+--- a/packages/hoppscotch-kernel/src/index.ts
++++ b/packages/hoppscotch-kernel/src/index.ts
+@@ -84,8 +84,9 @@ export type {
+ export type {
+   RelayRequest,
+   RelayResponse,
++  PluginRequest,
++  PluginResponse,
+   RelayResponseBody,
+-  FormData,
+   FormDataValue,
+   RelayError,
+   RelayV1,
+@@ -104,6 +105,7 @@ export {
+   content,
+   body,
+   MediaType,
++  relayRequestToNativeAdapter
+ } from '@relay/v/1'
+ 
+ export type {
+diff --git a/packages/hoppscotch-kernel/src/relay/impl/desktop/v/1.ts b/packages/hoppscotch-kernel/src/relay/impl/desktop/v/1.ts
+index 85b88b56b..029a9c528 100644
+--- a/packages/hoppscotch-kernel/src/relay/impl/desktop/v/1.ts
++++ b/packages/hoppscotch-kernel/src/relay/impl/desktop/v/1.ts
+@@ -7,13 +7,14 @@ import {
+     type RelayResponse,
+     type RelayError,
+     body,
++    relayRequestToNativeAdapter,
+ } from '@relay/v/1'
+ import * as E from 'fp-ts/Either'
+ 
+ import {
+     execute,
+     cancel,
+-    type Request as PluginRequest,
++    type Request,
+     type RequestResult
+ } from '@hoppscotch/plugin-relay'
+ 
+@@ -135,25 +136,28 @@ export const implementation: VersionedAPI<RelayV1> = {
+                 off: () => {}
+             }
+ 
+-            // SAFETY: Type assertion is safe because:
+-            // 1. The capabilities system prevents requests with unsupported methods from reaching this point
+-            // 2. Content types not supported by the plugin are filtered by capabilities
+-            // 3. Authentication methods are validated through capabilities
+-            // 4. The plugin's Request type is a subset of our Request type
+-            const pluginRequest = {
+-                id: request.id,
+-                url: request.url,
+-                method: request.method,
+-                version: request.version,
+-                headers: request.headers,
+-                params: request.params,
+-                content: request.content,
+-                auth: request.auth,
+-                security: request.security,
+-                proxy: request.proxy,
+-            } as PluginRequest
++            const responsePromise = relayRequestToNativeAdapter(request)
++                .then(request => {
++                    // SAFETY: Type assertion is safe because:
++                    // 1. The capabilities system prevents requests with unsupported methods from reaching this point
++                    // 2. Content types not supported by the plugin are filtered by capabilities
++                    // 3. Authentication methods are validated through capabilities
++                    // 4. The plugin's Request type is a subset of our Request type
++                    const pluginRequest = {
++                        id: request.id,
++                        url: request.url,
++                        method: request.method,
++                        version: request.version,
++                        headers: request.headers,
++                        params: request.params,
++                        content: request.content,
++                        auth: request.auth,
++                        security: request.security,
++                        proxy: request.proxy,
++                    }
+ 
+-            const responsePromise = execute(pluginRequest)
++                    return execute(pluginRequest)
++                })
+                 .then((result: RequestResult): E.Either<RelayError, RelayResponse> => {
+                     if (result.kind === 'success') {
+                         const response: RelayResponse = {
+@@ -170,7 +174,7 @@ export const implementation: VersionedAPI<RelayV1> = {
+                                     end: result.response.meta.timing.end,
+                                 },
+                                 size: result.response.meta.size,
+-                                                        }
++                            }
+                         }
+                         return E.right(response)
+                     }
+diff --git a/packages/hoppscotch-kernel/src/relay/impl/web/v/1.ts b/packages/hoppscotch-kernel/src/relay/impl/web/v/1.ts
+index 0ea81e247..ce2417b58 100644
+--- a/packages/hoppscotch-kernel/src/relay/impl/web/v/1.ts
++++ b/packages/hoppscotch-kernel/src/relay/impl/web/v/1.ts
+@@ -1,6 +1,4 @@
+ import {
+-  type FormData,
+-  type FormDataValue,
+   type RelayError,
+   type RelayEventEmitter,
+   type RelayRequest,
+diff --git a/packages/hoppscotch-kernel/src/relay/v/1.ts b/packages/hoppscotch-kernel/src/relay/v/1.ts
+index a96655991..b2376442a 100644
+--- a/packages/hoppscotch-kernel/src/relay/v/1.ts
++++ b/packages/hoppscotch-kernel/src/relay/v/1.ts
+@@ -1,5 +1,9 @@
++import { Request, Response } from '@hoppscotch/plugin-relay'
+ import type { VersionedAPI } from '@type/versioning'
+ 
++export type PluginRequest = Request
++export type PluginResponse = Response
++
+ import * as E from 'fp-ts/Either'
+ 
+ export type Method =
+@@ -84,8 +88,6 @@ export type FormDataValue =
+     | { kind: "text"; value: string }
+     | { kind: "file"; filename: string; contentType: string; data: Uint8Array }
+ 
+-export type FormData = Map<string, FormDataValue[]>
+-
+ export enum MediaType {
+     TEXT_PLAIN = "text/plain",
+     TEXT_HTML = "text/html",
+@@ -557,6 +559,68 @@ export const content = {
+     })
+ }
+ 
++// Helper function to convert standard `FormData` to `Map<string, FormDataValue[]>`
++// This is mainly a crossplatform thing, once there's an equivalent and easy to impl `FormData` type for Rust,
++// we can consider removing this.
++const makeFormDataSerializable = async (formData: FormData): Promise<Map<string, FormDataValue[]>> => {
++    const result = new Map<string, FormDataValue[]>()
++    // @ts-expect-error: `formData.entries` does exist but isn't visible,
++    // see `"lib": ["ESNext", "DOM"],` in `tsconfig.json`
++    for (const [key, value] of formData.entries()) {
++        if (value instanceof File || value instanceof Blob) {
++            const buffer = await value.arrayBuffer()
++            const fileEntry: FormDataValue = {
++                kind: "file",
++                filename: value instanceof File ? value.name : "unknown",
++                contentType: value.type || "application/octet-stream",
++                data: new Uint8Array(buffer)
++            }
++
++            const existingValues = result.get(key) || []
++            result.set(key, [...existingValues, fileEntry])
++        } else {
++            const textEntry: FormDataValue = {
++                kind: "text",
++                value: value.toString()
++            }
++
++            const existingValues = result.get(key) || []
++            result.set(key, [...existingValues, textEntry])
++        }
++    }
++
++    return result
++}
++
++// Helper function to adapt a relay request to work with the plugin
++export const relayRequestToNativeAdapter = async (request: RelayRequest): Promise<Request> => {
++    const adaptedRequest = { ...request };
++
++    if (adaptedRequest.content?.kind === "multipart" && adaptedRequest.content.content instanceof FormData) {
++        const serializableFormData = await makeFormDataSerializable(adaptedRequest.content.content);
++
++        // Replace with the converted form data
++        // SAFETY: Type assertion is necessary here because the plugin system expects
++        // types similar to Map<string, FormDataValue[]> instead of FormData.
++        // Then convert the `Map` to simpler nested object structure for better compatibility
++        // `Maps` it seems like are serialized differently across platforms and serialization libraries,
++        // while objects tend to maintain more consistent behavior by the sheer ubiquity of it.
++        const convertedContent: Record<string, FormDataValue[]> = {};
++
++        for (const [key, values] of serializableFormData.entries()) {
++            convertedContent[key] = Array.isArray(values) ? values : [values];
++        }
++
++        adaptedRequest.content = {
++            ...adaptedRequest.content,
++            // @ts-expect-error: This is intentional to work around SuperJSON serialization
++            content: convertedContent
++        };
++    }
++
++    return adaptedRequest as Request;
++}
++
+ export const v1: VersionedAPI<RelayV1> = {
+     version: { major: 1, minor: 0, patch: 0 },
+     api: {

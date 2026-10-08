@@ -1,0 +1,711 @@
+diff --git a/openbb_terminal/economy/economy_controller.py b/openbb_terminal/economy/economy_controller.py
+index 13826e6ea163..0115c4394a7a 100644
+--- a/openbb_terminal/economy/economy_controller.py
++++ b/openbb_terminal/economy/economy_controller.py
+@@ -623,7 +623,8 @@ def call_macro(self, other_args: List[str]):
+                             self.DATASETS["macro"].drop(column, axis=1, inplace=True)
+ 
+                     self.DATASETS["macro"] = pd.concat(
+-                        [self.DATASETS["macro"], df], axis=1
++                        [self.DATASETS["macro"], df],
++                        axis=1,
+                     )
+ 
+                     # update units dict
+diff --git a/openbb_terminal/feature_flags.py b/openbb_terminal/feature_flags.py
+index e4c61bc377f3..bddbe419d3cc 100644
+--- a/openbb_terminal/feature_flags.py
++++ b/openbb_terminal/feature_flags.py
+@@ -122,6 +122,38 @@
+ # Toolbar hint
+ TOOLBAR_HINT = load_env_vars("OPENBB_TOOLBAR_HINT", strtobool, True, "featflags")
+ 
++# Toolbar Twitter news
++TOOLBAR_TWEET_NEWS = load_env_vars(
++    "OPENBB_TOOLBAR_TWEET_NEWS", strtobool, False, "featflags"
++)
++
++# Toolbar Twitter news seconds between updates being checked
++TOOLBAR_TWEET_NEWS_SECONDS_BETWEEN_UPDATES = load_env_vars(
++    "OPENBB_TOOLBAR_TWEET_NEWS_SECONDS_BETWEEN_UPDATES", int, 300, "settings"
++)
++
++# Toolbar Twitter news accounts to track
++TOOLBAR_TWEET_NEWS_ACCOUNTS_TO_TRACK = load_env_vars(
++    "OPENBB_TOOLBAR_TWEET_NEWS_ACCOUNTS_TO_TRACK",
++    str,
++    "WatcherGuru,unusual_whales,gurgavin,CBSNews",
++    "settings",
++)
++
++# Toolbar Twitter news keywords to look for
++TOOLBAR_TWEET_NEWS_KEYWORDS = load_env_vars(
++    "OPENBB_TOOLBAR_TWEET_NEWS_KEYWORDS",
++    str,
++    "BREAKING,JUST IN",
++    "settings",
++)
++
++
++# Toolbar Twitter news number of last tweets to read
++TOOLBAR_TWEET_NEWS_NUM_LAST_TWEETS_TO_READ = load_env_vars(
++    "OPENBB_TOOLBAR_TWEET_NEWS_NUM_LAST_TWEETS_TO_READ", int, 3, "settings"
++)
++
+ # Select language to be used
+ USE_LANGUAGE = str(os.getenv("OPENBB_USE_LANGUAGE", "en"))
+ 
+diff --git a/openbb_terminal/helper_funcs.py b/openbb_terminal/helper_funcs.py
+index bb5341fdd700..5b075c169360 100644
+--- a/openbb_terminal/helper_funcs.py
++++ b/openbb_terminal/helper_funcs.py
+@@ -7,7 +7,7 @@
+ from pathlib import Path
+ from typing import List, Union, Optional, Dict, Tuple
+ from functools import lru_cache
+-from datetime import datetime, timedelta
++from datetime import datetime, timedelta, timezone
+ from datetime import date as d
+ import types
+ from collections.abc import Iterable
+@@ -19,6 +19,7 @@
+ import webbrowser
+ import urllib.parse
+ import json
++from dateutil.relativedelta import relativedelta
+ 
+ import pytz
+ import pandas as pd
+@@ -35,12 +36,13 @@
+ from screeninfo import get_monitors
+ import yfinance as yf
+ import numpy as np
++import tweepy
+ 
+ from PIL import Image, ImageDraw
+ 
+ from openbb_terminal.rich_config import console
+-from openbb_terminal import feature_flags as obbff
+ from openbb_terminal import config_terminal as cfg
++from openbb_terminal import feature_flags as obbff
+ from openbb_terminal import config_plot as cfgPlot
+ from openbb_terminal.core.config.paths import (
+     HOME_DIRECTORY,
+@@ -50,6 +52,21 @@
+ )
+ from openbb_terminal.core.config import paths
+ 
++try:
++    twitter_api = tweepy.API(
++        tweepy.OAuth2BearerHandler(
++            cfg.API_TWITTER_BEARER_TOKEN,
++        ),
++        timeout=5,
++    )
++    # A test to ensure that the Twitter API key is correct,
++    # otherwise we disable the Toolbar with Tweet News
++    twitter_api.user_timeline(screen_name="openbb_finance", count=1)
++except tweepy.errors.Unauthorized:
++    # Set toolbar tweet news to False because the Twitter API is not set up correctly
++    obbff.TOOLBAR_TWEET_NEWS = False
++
++
+ logger = logging.getLogger(__name__)
+ 
+ register_matplotlib_converters()
+@@ -65,11 +82,13 @@
+ MENU_QUIT = 1
+ MENU_RESET = 2
+ 
++NEWS_TWEET = ""
++LAST_TWEET_NEWS_UPDATE_CHECK_TIME = datetime.now(pytz.utc) - timedelta(hours=1)
++
+ # Command location path to be shown in the figures depending on watermark flag
+ command_location = ""
+ 
+-
+-# pylint: disable=R0912
++# pylint: disable=R1702,R0912
+ 
+ 
+ # pylint: disable=global-statement
+@@ -1953,6 +1972,100 @@ def str_date_to_timestamp(date: str) -> int:
+     return date_ts
+ 
+ 
++def update_news_from_tweet_to_be_displayed() -> str:
++    """Update news from tweet to be displayed.
++
++    Returns
++    -------
++    str
++        The news from tweet to be displayed
++    """
++    global LAST_TWEET_NEWS_UPDATE_CHECK_TIME
++
++    # Check whether it has passed a certain amount of time since the last news update
++    if (
++        datetime.now(pytz.utc) - LAST_TWEET_NEWS_UPDATE_CHECK_TIME
++    ).seconds > obbff.TOOLBAR_TWEET_NEWS_SECONDS_BETWEEN_UPDATES:
++        # This doesn't depende on the time of the tweet but the time that the check was made
++        LAST_TWEET_NEWS_UPDATE_CHECK_TIME = datetime.now(pytz.utc)
++
++        dhours = 0
++        dminutes = 0
++        # Get timezone that corresponds to the user
++        if obbff.USE_DATETIME and get_user_timezone_or_invalid() != "INVALID":
++            utcnow = pytz.timezone("utc").localize(datetime.utcnow())  # generic time
++            here = utcnow.astimezone(pytz.timezone("Etc/UTC")).replace(tzinfo=None)
++            there = utcnow.astimezone(pytz.timezone(get_user_timezone())).replace(
++                tzinfo=None
++            )
++
++            offset = relativedelta(here, there)
++            dhours = offset.hours
++            dminutes = offset.minutes
++
++        if "," in obbff.TOOLBAR_TWEET_NEWS_ACCOUNTS_TO_TRACK:
++            news_sources_twitter_handles = (
++                obbff.TOOLBAR_TWEET_NEWS_ACCOUNTS_TO_TRACK.split(",")
++            )
++        else:
++            news_sources_twitter_handles = [obbff.TOOLBAR_TWEET_NEWS_ACCOUNTS_TO_TRACK]
++
++        news_tweet_to_use = ""
++        handle_to_use = ""
++        url = ""
++        last_tweet_dt = (datetime.now() - timedelta(hours=1)).replace(
++            tzinfo=timezone.utc
++        )
++        for handle in news_sources_twitter_handles:
++            try:
++                # Get last N tweets from each handle
++                for last_tweet in twitter_api.user_timeline(
++                    screen_name=handle,
++                    count=obbff.TOOLBAR_TWEET_NEWS_NUM_LAST_TWEETS_TO_READ,
++                )[: obbff.TOOLBAR_TWEET_NEWS_NUM_LAST_TWEETS_TO_READ]:
++                    if "," in obbff.TOOLBAR_TWEET_NEWS_KEYWORDS:
++                        keywords = obbff.TOOLBAR_TWEET_NEWS_KEYWORDS.split(",")
++                    else:
++                        keywords = [obbff.TOOLBAR_TWEET_NEWS_KEYWORDS]
++
++                    # Check if the tweet contains a keywords
++                    if bool([key for key in keywords if key in last_tweet.text]):
++                        # Check if the tweet is newer than the last one
++                        # we want to grab the most recent one
++                        if last_tweet.created_at > last_tweet_dt:
++                            handle_to_use = handle
++                            last_tweet_dt = last_tweet.created_at
++
++                            news_tweet_to_use = last_tweet.text
++
++                            # Get url associated with tweet
++                            # Twitter has a weird API where the you just need the id of the tweet
++                            # and the username doesn't matter
++                            url = f"https://twitter.com/x/status/{last_tweet.id_str}"
++
++            # In case the handle provided doesn't exist, we skip it
++            except tweepy.errors.NotFound:
++                pass
++
++        if news_tweet_to_use:
++            global NEWS_TWEET
++
++            tweet_hr = f"{last_tweet_dt.hour}"
++            tweet_min = f"{last_tweet_dt.minute}"
++            # Update time based on timezone specified by user
++            if obbff.USE_DATETIME and get_user_timezone_or_invalid() != "INVALID":
++                if dhours > 0 or dminutes > 0:
++                    tweet_hr = f"{round((int(last_tweet_dt.hour) - dhours) % 60):02}"
++                    tweet_min = (
++                        f"{round((int(last_tweet_dt.minute) - dminutes) % 60):02}"
++                    )
++
++            # Update NEWS_TWEET with the new news tweet found
++            NEWS_TWEET = f"{tweet_hr}:{tweet_min} - @{handle_to_use} - {url}\n\n{news_tweet_to_use}"
++
++    return NEWS_TWEET
++
++
+ def check_start_less_than_end(start_date: str, end_date: str) -> bool:
+     """Check if start_date is equal to end_date.
+ 
+diff --git a/openbb_terminal/miscellaneous/i18n/en.yml b/openbb_terminal/miscellaneous/i18n/en.yml
+index c98a58258a05..4461313bea23 100644
+--- a/openbb_terminal/miscellaneous/i18n/en.yml
++++ b/openbb_terminal/miscellaneous/i18n/en.yml
+@@ -43,7 +43,7 @@ en:
+   featflags/ion: interactive matplotlib mode
+   featflags/watermark: watermark in figures
+   featflags/cmdloc: command location displayed in figures
+-  featflags/tbhint: displays usage hints in a bottom toolbar
++  featflags/tbhint: displays usage hints in the bottom toolbar
+   settings/_info_: Settings through environment variables
+   settings/colors: set your own terminal colors
+   settings/autoscaling: plot autoscaling
+@@ -73,6 +73,12 @@ en:
+   settings/_timezone: Timezone
+   settings/source: specify data source file
+   settings/_data_source: Data sources
++  settings/tbnews: displays tweets news in the bottom toolbar
++  settings/tweetnews: tweak tweet news parameters
++  settings/_tbnu: Time (in seconds) between tweet news updates
++  settings/_tatt: Twitter accounts to track
++  settings/_nttli: Number of tweets to look into from each account
++  settings/_tk: Keywords to look for in tweets
+   _others_: Others
+   stocks: access historical pricing data, options, sector and industry, and overall due diligence
+   crypto: dive into onchain data, tokenomics, circulation supply, nfts and more
+@@ -89,7 +95,7 @@ en:
+   forecast: timeseries forecasting with machine learning
+   portfolio: perform portfolio optimization and look at portfolio performance and attribution
+   dashboards: interactive dashboards using voila and jupyter notebooks
+-  stocks/filings: the most-recent form submissions to the SEC 
++  stocks/filings: the most-recent form submissions to the SEC
+   stocks/search: search a specific stock ticker for analysis
+   stocks/load: load a specific stock ticker and additional info for analysis
+   stocks/_ticker: Stock
+diff --git a/openbb_terminal/miscellaneous/scripts/economy/test_economy.openbb b/openbb_terminal/miscellaneous/scripts/economy/test_economy.openbb
+new file mode 100644
+index 000000000000..77a7c33d896a
+--- /dev/null
++++ b/openbb_terminal/miscellaneous/scripts/economy/test_economy.openbb
+@@ -0,0 +1,86 @@
++economy
++overview
++overview -t indices
++overview -t usbonds
++overview -t glbonds
++overview -t currencies
++futures
++futures -c energy --source Finviz
++futures -c metals --source Finviz
++futures -c meats --source Finviz
++futures -c grains --source Finviz
++futures -c softs --source Finviz
++futures -c energy
++futures -c metals
++futures -c meats
++futures -c grains
++futures -c softs
++futures -c energy -s ticker --reverse --source Finviz
++map
++map -p 1w -t world
++bigmac
++bigmac -c USA,ESP,LVA,DEU,FRA,FIN
++ycrv
++ycrv --source FRED --date 2022-10-03 --raw
++ycrv -c united_states --source Investing
++events
++events --country united_states -i high --cat employment -s 2022-07-07 -e 2022-07-08
++events -c spain --source Investing
++edebt --limit 10
++spread
++spread --group PIIGS --color binary
++spread --countries portugal,spain,italy,united states --maturity 5Y --change=True --color openbb
++rtps
++valuation
++valuation --group sector --sortby MarketCap --reverse
++performance
++performance -g basic_materials -s Month -a
++spectrum
++spectrum --group consumer_defensive
++macro
++macro -p RGDP,CPI
++macro -p URATE -c Netherlands,Germany
++macro -p URATE -c United_States  --start 2008-01-01
++macro -p GDP --countries Portugal,France,United_Kingdom,Spain,Italy,Poland --start 2000-01-10
++treasury
++treasury --maturity 20y --type nominal
++treasury --raw
++treasury --type inflation --start 2020-01-01 --limit 10
++fred T10Y2Y,DFII10 -s 2019-01-01 -e 2022-01-01
++fred -q treasury
++fred -p T10Y2Y,FII10 -s 2005-01-01
++fred T5YIEM,T10YIEM,T20YIEM,T30YIEM
++index -i nasdaq,dowjones,sp500 -s 2005-01-01
++macro -p URATE -c Netherlands,Germany -s 2005-01-01
++index -i sp500 -s 2005-01-01
++plot --y1 T10Y2Y --y2 T5YIEM
++plot --y1 T10Y2Y,T20YIEM
++rtps
++valuation
++performance
++spectrum
++fred DGS2,DGS5
++eval spread = DGS2 - DGS5
++qa
++summary
++normality
++unitroot --fuller_reg c --kps_reg ct
++line
++line --log
++hist
++hist -b 10
++cdf
++bw
++bw --yearly
++acf --lags 5
++qqplot
++rolling
++rolling -w 5
++spread -w 10
++quantile --window 5 --quantile 0.01
++skew --window 5
++kurtosis --window 9
++raw --limit 2 --reverse
++cusum --threshold 10 --drift 10
++decompose
++exit
+diff --git a/openbb_terminal/miscellaneous/styles/user/openbb.richstyle.json b/openbb_terminal/miscellaneous/styles/user/openbb.richstyle.json
+new file mode 100644
+index 000000000000..5d8b5d87e210
+--- /dev/null
++++ b/openbb_terminal/miscellaneous/styles/user/openbb.richstyle.json
+@@ -0,0 +1,9 @@
++{
++    "info": "rgb(224,131,48)",
++    "cmds": "#2A7C6E",
++    "param": "rgb(247,206,70)",
++    "menu": "#427A2E",
++    "src": "rgb(216,90,64)",
++    "unvl": "grey30",
++    "help": "#FAC900"
++}
+diff --git a/openbb_terminal/parent_classes.py b/openbb_terminal/parent_classes.py
+index d67ed9d762e0..491f523aa1a5 100644
+--- a/openbb_terminal/parent_classes.py
++++ b/openbb_terminal/parent_classes.py
+@@ -41,6 +41,7 @@
+     support_message,
+     system_clear,
+     valid_date,
++    update_news_from_tweet_to_be_displayed,
+ )
+ from openbb_terminal.rich_config import console, get_ordered_list_sources
+ from openbb_terminal.stocks import stocks_helper
+@@ -50,6 +51,8 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++# pylint: disable=R0912
++
+ NO_EXPORT = 0
+ EXPORT_ONLY_RAW_DATA_ALLOWED = 1
+ EXPORT_ONLY_FIGURES_ALLOWED = 2
+@@ -871,7 +874,55 @@ def menu(self, custom_path_menu_above: str = ""):
+                 try:
+                     # Get input from user using auto-completion
+                     if session and obbff.USE_PROMPT_TOOLKIT:
+-                        if bool(obbff.TOOLBAR_HINT):
++                        # Check if tweet news is enabled
++                        if obbff.TOOLBAR_TWEET_NEWS:
++                            news_tweet = update_news_from_tweet_to_be_displayed()
++
++                            # Check if there is a valid tweet news to be displayed
++                            if news_tweet:
++                                an_input = session.prompt(
++                                    f"{get_flair()} {self.PATH} $ ",
++                                    completer=self.completer,
++                                    search_ignore_case=True,
++                                    bottom_toolbar=HTML(news_tweet),
++                                    style=Style.from_dict(
++                                        {
++                                            "bottom-toolbar": "#ffffff bg:#333333",
++                                        }
++                                    ),
++                                )
++
++                            else:
++                                # Check if toolbar hint was enabled
++                                if obbff.TOOLBAR_HINT:
++                                    an_input = session.prompt(
++                                        f"{get_flair()} {self.PATH} $ ",
++                                        completer=self.completer,
++                                        search_ignore_case=True,
++                                        bottom_toolbar=HTML(
++                                            '<style bg="ansiblack" fg="ansiwhite">[h]</style> help menu    '
++                                            '<style bg="ansiblack" fg="ansiwhite">[q]</style> return to previous menu'
++                                            '    <style bg="ansiblack" fg="ansiwhite">[e]</style> exit terminal    '
++                                            '<style bg="ansiblack" fg="ansiwhite">[cmd -h]</style> '
++                                            "see usage and available options    "
++                                            f'<style bg="ansiblack" fg="ansiwhite">[about (cmd/menu)]</style> '
++                                            f"{self.path[-1].capitalize()} (cmd/menu) Documentation"
++                                        ),
++                                        style=Style.from_dict(
++                                            {
++                                                "bottom-toolbar": "#ffffff bg:#333333",
++                                            }
++                                        ),
++                                    )
++                                else:
++                                    an_input = session.prompt(
++                                        f"{get_flair()} {self.PATH} $ ",
++                                        completer=self.completer,
++                                        search_ignore_case=True,
++                                    )
++
++                        # Check if toolbar hint was enabled
++                        elif obbff.TOOLBAR_HINT:
+                             an_input = session.prompt(
+                                 f"{get_flair()} {self.PATH} $ ",
+                                 completer=self.completer,
+diff --git a/openbb_terminal/settings_controller.py b/openbb_terminal/settings_controller.py
+index 9b6324f9b176..12ba3155bcfa 100644
+--- a/openbb_terminal/settings_controller.py
++++ b/openbb_terminal/settings_controller.py
+@@ -24,6 +24,7 @@
+     get_user_timezone_or_invalid,
+     replace_user_timezone,
+     set_user_data_folder,
++    check_positive,
+ )
+ from openbb_terminal.menu import session
+ from openbb_terminal.parent_classes import BaseController
+@@ -54,6 +55,8 @@ class SettingsController(BaseController):
+         "source",
+         "flair",
+         "colors",
++        "tbnews",
++        "tweetnews",
+     ]
+     PATH = "/settings/"
+ 
+@@ -132,6 +135,15 @@ def print_help(self):
+         mt.add_raw("\n")
+         mt.add_param("_data_source", obbff.PREFERRED_DATA_SOURCE_FILE)
+         mt.add_raw("\n")
++        mt.add_setting("tbnews", obbff.TOOLBAR_TWEET_NEWS)
++        if obbff.TOOLBAR_TWEET_NEWS:
++            mt.add_raw("\n")
++            mt.add_cmd("tweetnews")
++            mt.add_raw("\n")
++            mt.add_param("_tbnu", obbff.TOOLBAR_TWEET_NEWS_SECONDS_BETWEEN_UPDATES)
++            mt.add_param("_nttli", obbff.TOOLBAR_TWEET_NEWS_NUM_LAST_TWEETS_TO_READ)
++            mt.add_param("_tatt", obbff.TOOLBAR_TWEET_NEWS_ACCOUNTS_TO_TRACK)
++            mt.add_param("_tk", obbff.TOOLBAR_TWEET_NEWS_KEYWORDS)
+         console.print(text=mt.menu_text, menu="Settings")
+ 
+     @log_start_end(log=logger)
+@@ -550,3 +562,93 @@ def call_userdata(self, other_args: List[str]):
+                             success_userdata = True
+ 
+         console.print()
++
++    @log_start_end(log=logger)
++    def call_tbnews(self, _):
++        """Process tbnews command"""
++        if obbff.TOOLBAR_TWEET_NEWS:
++            console.print("Will take effect when running terminal next.")
++        obbff.TOOLBAR_TWEET_NEWS = not obbff.TOOLBAR_TWEET_NEWS
++        set_key(
++            USER_ENV_FILE,
++            "OPENBB_TOOLBAR_TWEET_NEWS",
++            str(obbff.TOOLBAR_TWEET_NEWS),
++        )
++
++    @log_start_end(log=logger)
++    def call_tweetnews(self, other_args: List[str]):
++        """Process tweetnews command"""
++        parser = argparse.ArgumentParser(
++            add_help=False,
++            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
++            prog="tweetnews",
++            description="Tweak tweet news parameters",
++        )
++        parser.add_argument(
++            "-t",
++            "--time",
++            type=check_positive,
++            required=False,
++            dest="time",
++            help="Time (in seconds) between tweet news updates, e.g. 300",
++        )
++        parser.add_argument(
++            "-a",
++            "--accounts",
++            type=str,
++            required=False,
++            dest="accounts",
++            help="Twitter accounts to track news separated by commmas."
++            "For instance: 'WatcherGuru,unusual_whales,gurgavin'",
++        )
++        parser.add_argument(
++            "-k",
++            "--keywords",
++            type=str,
++            required=False,
++            dest="keywords",
++            nargs="+",
++            help="Keywords to look for, separated by commmas."
++            "For instance: 'Just In, Breaking'",
++        )
++        parser.add_argument(
++            "-n",
++            "--number",
++            type=check_positive,
++            required=False,
++            dest="number",
++            help="Number of tweets to look into from each account, e.g. 3",
++        )
++        ns_parser = self.parse_known_args_and_warn(parser, other_args)
++        if ns_parser:
++            if ns_parser.time:
++                obbff.TOOLBAR_TWEET_NEWS_SECONDS_BETWEEN_UPDATES = ns_parser.time
++                set_key(
++                    USER_ENV_FILE,
++                    "OPENBB_TOOLBAR_TWEET_NEWS_SECONDS_BETWEEN_UPDATES",
++                    str(ns_parser.time),
++                )
++
++            if ns_parser.number:
++                obbff.TOOLBAR_TWEET_NEWS_NUM_LAST_TWEETS_TO_READ = ns_parser.number
++                set_key(
++                    USER_ENV_FILE,
++                    "OPENBB_TOOLBAR_TWEET_NEWS_NUM_LAST_TWEETS_TO_READ",
++                    str(ns_parser.number),
++                )
++
++            if ns_parser.accounts:
++                obbff.TOOLBAR_TWEET_NEWS_ACCOUNTS_TO_TRACK = ns_parser.accounts
++                set_key(
++                    USER_ENV_FILE,
++                    "OPENBB_TOOLBAR_TWEET_NEWS_ACCOUNTS_TO_TRACK",
++                    str(ns_parser.accounts),
++                )
++
++            if ns_parser.keywords:
++                obbff.TOOLBAR_TWEET_NEWS_KEYWORDS = " ".join(ns_parser.keywords)
++                set_key(
++                    USER_ENV_FILE,
++                    "OPENBB_TOOLBAR_TWEET_NEWS_KEYWORDS",
++                    str(" ".join(ns_parser.keywords)),
++                )
+diff --git a/openbb_terminal/terminal_controller.py b/openbb_terminal/terminal_controller.py
+index d8a7703dd035..e7c0045766f4 100644
+--- a/openbb_terminal/terminal_controller.py
++++ b/openbb_terminal/terminal_controller.py
+@@ -39,6 +39,7 @@
+ from openbb_terminal.helper_funcs import (
+     check_positive,
+     get_flair,
++    update_news_from_tweet_to_be_displayed,
+     EXPORT_ONLY_RAW_DATA_ALLOWED,
+ )
+ from openbb_terminal.loggers import setup_logging
+@@ -64,6 +65,7 @@
+ # pylint: disable=too-many-public-methods,import-outside-toplevel, too-many-function-args
+ # pylint: disable=too-many-branches,no-member,C0302,too-many-return-statements, inconsistent-return-statements
+ 
++
+ logger = logging.getLogger(__name__)
+ 
+ env_file = str(USER_ENV_FILE)
+@@ -892,10 +894,57 @@ def terminal(jobs_cmds: List[str] = None, test_mode=False):
+ 
+         # Get input command from user
+         else:
+-            # Get input from user using auto-completion
+-            if session and obbff.USE_PROMPT_TOOLKIT:
+-                try:
+-                    if obbff.TOOLBAR_HINT:
++            try:
++                # Get input from user using auto-completion
++                if session and obbff.USE_PROMPT_TOOLKIT:
++                    # Check if tweet news is enabled
++                    if obbff.TOOLBAR_TWEET_NEWS:
++                        news_tweet = update_news_from_tweet_to_be_displayed()
++
++                        # Check if there is a valid tweet news to be displayed
++                        if news_tweet:
++                            an_input = session.prompt(
++                                f"{get_flair()} / $ ",
++                                completer=t_controller.completer,
++                                search_ignore_case=True,
++                                bottom_toolbar=HTML(news_tweet),
++                                style=Style.from_dict(
++                                    {
++                                        "bottom-toolbar": "#ffffff bg:#333333",
++                                    }
++                                ),
++                            )
++
++                        else:
++                            # Check if toolbar hint was enabled
++                            if obbff.TOOLBAR_HINT:
++                                an_input = session.prompt(
++                                    f"{get_flair()} / $ ",
++                                    completer=t_controller.completer,
++                                    search_ignore_case=True,
++                                    bottom_toolbar=HTML(
++                                        '<style bg="ansiblack" fg="ansiwhite">[h]</style> help menu    '
++                                        '<style bg="ansiblack" fg="ansiwhite">[q]</style> return to previous menu'
++                                        '    <style bg="ansiblack" fg="ansiwhite">[e]</style> exit terminal    '
++                                        '<style bg="ansiblack" fg="ansiwhite">[cmd -h]</style> '
++                                        "see usage and available options    "
++                                        '<style bg="ansiblack" fg="ansiwhite">[about (cmd/menu)]</style> '
++                                    ),
++                                    style=Style.from_dict(
++                                        {
++                                            "bottom-toolbar": "#ffffff bg:#333333",
++                                        }
++                                    ),
++                                )
++                            else:
++                                an_input = session.prompt(
++                                    f"{get_flair()} / $ ",
++                                    completer=t_controller.completer,
++                                    search_ignore_case=True,
++                                )
++
++                    # Check if toolbar hint was enabled
++                    elif obbff.TOOLBAR_HINT:
+                         an_input = session.prompt(
+                             f"{get_flair()} / $ ",
+                             completer=t_controller.completer,
+@@ -906,7 +955,7 @@ def terminal(jobs_cmds: List[str] = None, test_mode=False):
+                                 '<style bg="ansiblack" fg="ansiwhite">[e]</style> exit terminal    '
+                                 '<style bg="ansiblack" fg="ansiwhite">[cmd -h]</style> '
+                                 "see usage and available options    "
+-                                '<style bg="ansiblack" fg="ansiwhite">[about]</style> Getting Started Documentation'
++                                '<style bg="ansiblack" fg="ansiwhite">[about (cmd/menu)]</style> '
+                             ),
+                             style=Style.from_dict(
+                                 {
+@@ -920,14 +969,17 @@ def terminal(jobs_cmds: List[str] = None, test_mode=False):
+                             completer=t_controller.completer,
+                             search_ignore_case=True,
+                         )
+-                except (KeyboardInterrupt, EOFError):
+-                    print_goodbye()
+-                    break
+-            elif is_papermill():
+-                pass
+-            else:
++
++                elif is_papermill():
++                    pass
++
+                 # Get input from user without auto-completion
+-                an_input = input(f"{get_flair()} / $ ")
++                else:
++                    an_input = input(f"{get_flair()} / $ ")
++
++            except (KeyboardInterrupt, EOFError):
++                print_goodbye()
++                break
+ 
+         try:
+             # Process the input command
+diff --git a/pyproject.toml b/pyproject.toml
+index 39c3aa79cddf..f25560055e40 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -108,6 +108,7 @@ docstring-parser = {version = "^0.15", optional = true}
+ grpcio = "^1.51.1"
+ jupyterlab-widgets = "^3.0.3"
+ packaging = ">=22.0"
++tweepy = "^4.12.1"
+ 
+ [tool.poetry.dev-dependencies]
+ pytest = "^6.2.2"

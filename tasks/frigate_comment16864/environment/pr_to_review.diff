@@ -1,0 +1,285 @@
+diff --git a/frigate/api/event.py b/frigate/api/event.py
+index bb1bf7395be..9a5578baec7 100644
+--- a/frigate/api/event.py
++++ b/frigate/api/event.py
+@@ -1083,10 +1083,7 @@ def regenerate_description(
+ 
+     camera_config = request.app.frigate_config.cameras[event.camera]
+ 
+-    if (
+-        request.app.frigate_config.semantic_search.enabled
+-        and camera_config.genai.enabled
+-    ):
++    if camera_config.genai.enabled:
+         request.app.event_metadata_updater.publish((event.id, params.source))
+ 
+         return JSONResponse(
+diff --git a/frigate/app.py b/frigate/app.py
+index 400d4bca0f7..9b91439bab3 100644
+--- a/frigate/app.py
++++ b/frigate/app.py
+@@ -93,7 +93,13 @@ def __init__(self, config: FrigateConfig) -> None:
+         self.log_queue: Queue = mp.Queue()
+         self.camera_metrics: dict[str, CameraMetrics] = {}
+         self.embeddings_metrics: DataProcessorMetrics | None = (
+-            DataProcessorMetrics() if config.semantic_search.enabled else None
++            DataProcessorMetrics()
++            if (
++                config.semantic_search.enabled
++                or config.lpr.enabled
++                or config.face_recognition.enabled
++            )
++            else None
+         )
+         self.ptz_metrics: dict[str, PTZMetrics] = {}
+         self.processes: dict[str, int] = {}
+@@ -236,7 +242,11 @@ def init_review_segment_manager(self) -> None:
+         logger.info(f"Review process started: {review_segment_process.pid}")
+ 
+     def init_embeddings_manager(self) -> None:
+-        if not self.config.semantic_search.enabled:
++        if (
++            not self.config.semantic_search.enabled
++            and not self.config.lpr.enabled
++            and not self.config.face_recognition.enabled
++        ):
+             return
+ 
+         embedding_process = util.Process(
+@@ -293,7 +303,11 @@ def check_db_data_migrations(self) -> None:
+             migrate_exports(self.config.ffmpeg, list(self.config.cameras.keys()))
+ 
+     def init_embeddings_client(self) -> None:
+-        if self.config.semantic_search.enabled:
++        if (
++            self.config.semantic_search.enabled
++            or self.config.lpr.enabled
++            or self.config.face_recognition.enabled
++        ):
+             # Create a client for other processes to use
+             self.embeddings = EmbeddingsContext(self.db)
+ 
+diff --git a/frigate/config/config.py b/frigate/config/config.py
+index 39ee31411da..d2ca9a6f50e 100644
+--- a/frigate/config/config.py
++++ b/frigate/config/config.py
+@@ -172,16 +172,6 @@ class RestreamConfig(BaseModel):
+     model_config = ConfigDict(extra="allow")
+ 
+ 
+-def verify_semantic_search_dependent_configs(config: FrigateConfig) -> None:
+-    """Verify that semantic search is enabled if required features are enabled."""
+-    if not config.semantic_search.enabled:
+-        if config.genai.enabled:
+-            raise ValueError("Genai requires semantic search to be enabled.")
+-
+-        if config.face_recognition.enabled:
+-            raise ValueError("Face recognition requires semantic to be enabled.")
+-
+-
+ def verify_config_roles(camera_config: CameraConfig) -> None:
+     """Verify that roles are setup in the config correctly."""
+     assigned_roles = list(
+@@ -647,7 +637,6 @@ def post_validation(self, info: ValidationInfo) -> Self:
+             detector_config.model = model
+             self.detectors[key] = detector_config
+ 
+-        verify_semantic_search_dependent_configs(self)
+         return self
+ 
+     @field_validator("cameras")
+diff --git a/frigate/embeddings/__init__.py b/frigate/embeddings/__init__.py
+index 18673c4e920..f079f9f9e2e 100644
+--- a/frigate/embeddings/__init__.py
++++ b/frigate/embeddings/__init__.py
+@@ -28,8 +28,12 @@
+ 
+ 
+ def manage_embeddings(config: FrigateConfig, metrics: DataProcessorMetrics) -> None:
+-    # Only initialize embeddings if semantic search is enabled
+-    if not config.semantic_search.enabled:
++    # Only initialize embeddings if semantic search or lpr or face rec is enabled
++    if (
++        not config.semantic_search.enabled
++        and not config.lpr.enabled
++        and not config.face_recognition.enabled
++    ):
+         return
+ 
+     stop_event = mp.Event()
+diff --git a/frigate/embeddings/maintainer.py b/frigate/embeddings/maintainer.py
+index a18ca7a7f30..be16256b95f 100644
+--- a/frigate/embeddings/maintainer.py
++++ b/frigate/embeddings/maintainer.py
+@@ -71,11 +71,13 @@ def __init__(
+         super().__init__(name="embeddings_maintainer")
+         self.config = config
+         self.metrics = metrics
+-        self.embeddings = Embeddings(config, db, metrics)
+ 
+-        # Check if we need to re-index events
+-        if config.semantic_search.reindex:
+-            self.embeddings.reindex()
++        if config.semantic_search.enabled:
++            self.embeddings = Embeddings(config, db, metrics)
++
++            # Check if we need to re-index events
++            if config.semantic_search.reindex:
++                self.embeddings.reindex()
+ 
+         # create communication for updating event descriptions
+         self.requestor = InterProcessRequestor()
+@@ -152,30 +154,30 @@ def _process_requests(self) -> None:
+ 
+         def _handle_request(topic: str, data: dict[str, any]) -> str:
+             try:
+-                if topic == EmbeddingsRequestEnum.embed_description.value:
+-                    return serialize(
+-                        self.embeddings.embed_description(
+-                            data["id"], data["description"]
+-                        ),
+-                        pack=False,
+-                    )
+-                elif topic == EmbeddingsRequestEnum.embed_thumbnail.value:
+-                    thumbnail = base64.b64decode(data["thumbnail"])
+-                    return serialize(
+-                        self.embeddings.embed_thumbnail(data["id"], thumbnail),
+-                        pack=False,
+-                    )
+-                elif topic == EmbeddingsRequestEnum.generate_search.value:
+-                    return serialize(
+-                        self.embeddings.embed_description("", data, upsert=False),
+-                        pack=False,
+-                    )
+-                else:
+-                    processors = [self.realtime_processors, self.post_processors]
+-                    for processor_list in processors:
+-                        for processor in processor_list:
+-                            resp = processor.handle_request(topic, data)
+-
++                # First handle the embedding-specific topics when semantic search is enabled
++                if self.config.semantic_search.enabled:
++                    if topic == EmbeddingsRequestEnum.embed_description.value:
++                        return serialize(
++                            self.embeddings.embed_description(
++                                data["id"], data["description"]
++                            ),
++                            pack=False,
++                        )
++                    elif topic == EmbeddingsRequestEnum.embed_thumbnail.value:
++                        thumbnail = base64.b64decode(data["thumbnail"])
++                        return serialize(
++                            self.embeddings.embed_thumbnail(data["id"], thumbnail),
++                            pack=False,
++                        )
++                    elif topic == EmbeddingsRequestEnum.generate_search.value:
++                        return serialize(
++                            self.embeddings.embed_description("", data, upsert=False),
++                            pack=False,
++                        )
++                processors = [self.realtime_processors, self.post_processors]
++                for processor_list in processors:
++                    for processor in processor_list:
++                        resp = processor.handle_request(topic, data)
+                         if resp is not None:
+                             return resp
+             except Exception as e:
+@@ -432,6 +434,9 @@ def _create_thumbnail(self, yuv_frame, box, height=500) -> Optional[bytes]:
+ 
+     def _embed_thumbnail(self, event_id: str, thumbnail: bytes) -> None:
+         """Embed the thumbnail for an event."""
++        if not self.config.semantic_search.enabled:
++            return
++
+         self.embeddings.embed_thumbnail(event_id, thumbnail)
+ 
+     def _embed_description(self, event: Event, thumbnails: list[bytes]) -> None:
+@@ -457,7 +462,8 @@ def _embed_description(self, event: Event, thumbnails: list[bytes]) -> None:
+         )
+ 
+         # Embed the description
+-        self.embeddings.embed_description(event.id, description)
++        if self.config.semantic_search.enabled:
++            self.embeddings.embed_description(event.id, description)
+ 
+         logger.debug(
+             "Generated description for %s (%d images): %s",
+diff --git a/frigate/stats/util.py b/frigate/stats/util.py
+index 3d836868e25..287c384cd21 100644
+--- a/frigate/stats/util.py
++++ b/frigate/stats/util.py
+@@ -282,16 +282,24 @@ def stats_snapshot(
+         }
+     stats["detection_fps"] = round(total_detection_fps, 2)
+ 
+-    if config.semantic_search.enabled:
+-        embeddings_metrics = stats_tracking["embeddings_metrics"]
+-        stats["embeddings"] = {
+-            "image_embedding_speed": round(
+-                embeddings_metrics.image_embeddings_fps.value * 1000, 2
+-            ),
+-            "text_embedding_speed": round(
+-                embeddings_metrics.text_embeddings_sps.value * 1000, 2
+-            ),
+-        }
++    stats["embeddings"] = {}
++
++    # Get metrics if available
++    embeddings_metrics = stats_tracking.get("embeddings_metrics")
++
++    if embeddings_metrics:
++        # Add metrics based on what's enabled
++        if config.semantic_search.enabled:
++            stats["embeddings"].update(
++                {
++                    "image_embedding_speed": round(
++                        embeddings_metrics.image_embeddings_fps.value * 1000, 2
++                    ),
++                    "text_embedding_speed": round(
++                        embeddings_metrics.text_embeddings_sps.value * 1000, 2
++                    ),
++                }
++            )
+ 
+         if config.face_recognition.enabled:
+             stats["embeddings"]["face_recognition_speed"] = round(
+@@ -302,6 +310,7 @@ def stats_snapshot(
+             stats["embeddings"]["plate_recognition_speed"] = round(
+                 embeddings_metrics.alpr_pps.value * 1000, 2
+             )
++
+             if "license_plate" not in config.objects.all_objects:
+                 stats["embeddings"]["yolov9_plate_detection_speed"] = round(
+                     embeddings_metrics.yolov9_lpr_fps.value * 1000, 2
+diff --git a/web/src/pages/System.tsx b/web/src/pages/System.tsx
+index 491149be2ff..05eed5b3ec5 100644
+--- a/web/src/pages/System.tsx
++++ b/web/src/pages/System.tsx
+@@ -28,7 +28,11 @@ function System() {
+   const metrics = useMemo(() => {
+     const metrics = [...allMetrics];
+ 
+-    if (!config?.semantic_search.enabled) {
++    if (
++      !config?.semantic_search.enabled &&
++      !config?.lpr.enabled &&
++      !config?.face_recognition.enabled
++    ) {
+       const index = metrics.indexOf("features");
+       metrics.splice(index, 1);
+     }
+diff --git a/web/src/types/frigateConfig.ts b/web/src/types/frigateConfig.ts
+index d021fde0f97..4ec4de8530d 100644
+--- a/web/src/types/frigateConfig.ts
++++ b/web/src/types/frigateConfig.ts
+@@ -363,6 +363,10 @@ export interface FrigateConfig {
+ 
+   camera_groups: { [groupName: string]: CameraGroupConfig };
+ 
++  lpr: {
++    enabled: boolean;
++  };
++
+   logger: {
+     default: string;
+     logs: Record<string, string>;

@@ -1,0 +1,99 @@
+diff --git a/src/DataProtection/DataProtection/src/SP800_108/ManagedSP800_108_CTR_HMACSHA512.cs b/src/DataProtection/DataProtection/src/SP800_108/ManagedSP800_108_CTR_HMACSHA512.cs
+index eccb36dddf11..432736a0266c 100644
+--- a/src/DataProtection/DataProtection/src/SP800_108/ManagedSP800_108_CTR_HMACSHA512.cs
++++ b/src/DataProtection/DataProtection/src/SP800_108/ManagedSP800_108_CTR_HMACSHA512.cs
+@@ -31,8 +31,32 @@ public static void DeriveKeys(
+ #endif
+ 
+ #if NET10_0_OR_GREATER
++    /// <summary>
++    /// For FIPS enabled scenarios we have no other choice but to enforce a minimum key length of 14 bytes.
++    /// It should not be on the hot-path, but only needed for one-time derivation of keys when e.g. creating context header.
++    /// </summary>
++    /// <remarks>
++    /// NIST SP 800-131A Rev. 2:
++    /// Keys less than 112 bits in length are disallowed for HMAC generation.
++    /// The use of key lengths ≥ 112 bits is acceptable for HMAC generation.
++    /// <see href="https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-131Ar2.pdf"/>
++    /// </remarks>
++    private const int FipsMinimumKeyLengthInBytes = 14;
++
+     public static void DeriveKeys(ReadOnlySpan<byte> kdk, ReadOnlySpan<byte> label, ReadOnlySpan<byte> contextHeader, ReadOnlySpan<byte> contextData, Span<byte> operationSubkey, Span<byte> validationSubkey)
+-        => DeriveKeys(kdk, label, contextHeader, contextData, operationSubkey, validationSubkey, prf: null);
++    {
++        if (kdk.Length < FipsMinimumKeyLengthInBytes)
++        {
++            // The HMACSHA512 constructor internally pads short keys to the block size,
++            // which satisfies the FIPS minimum key length requirement.
++            using var prf = new HMACSHA512(kdk.ToArray());
++            DeriveKeys(kdk, label, contextHeader, contextData, operationSubkey, validationSubkey, prf);
++        }
++        else
++        {
++            DeriveKeys(kdk, label, contextHeader, contextData, operationSubkey, validationSubkey, prf: null);
++        }
++    }
+ #endif
+ 
+     /// <remarks>
+@@ -101,9 +125,17 @@ private static void DeriveKeys(
+                 prfInput[3] = (byte)(i);
+ 
+ #if NET10_0_OR_GREATER
+-                var success = HMACSHA512.TryHashData(kdk, prfInput, prfOutput, out var bytesWritten);
+-                Debug.Assert(success);
+-                Debug.Assert(bytesWritten == prfOutputSizeInBytes);
++                if (prf is not null)
++                {
++                    var prfOutputArray = prf.ComputeHash(prfInputArray ?? prfInput.ToArray());
++                    prfOutputArray.CopyTo(prfOutput);
++                }
++                else
++                {
++                    var success = HMACSHA512.TryHashData(kdk, prfInput, prfOutput, out var bytesWritten);
++                    Debug.Assert(success);
++                    Debug.Assert(bytesWritten == prfOutputSizeInBytes);
++                }
+ #else
+                 var prfOutputArray = prf.ComputeHash(prfInputArray);
+                 var prfOutput = prfOutputArray.AsSpan();
+diff --git a/src/DataProtection/DataProtection/test/Microsoft.AspNetCore.DataProtection.Tests/SP800_108/SP800_108Tests.cs b/src/DataProtection/DataProtection/test/Microsoft.AspNetCore.DataProtection.Tests/SP800_108/SP800_108Tests.cs
+index 3791d254adfb..d5354ba7e2ce 100644
+--- a/src/DataProtection/DataProtection/test/Microsoft.AspNetCore.DataProtection.Tests/SP800_108/SP800_108Tests.cs
++++ b/src/DataProtection/DataProtection/test/Microsoft.AspNetCore.DataProtection.Tests/SP800_108/SP800_108Tests.cs
+@@ -12,6 +12,35 @@ public unsafe class SP800_108Tests
+ {
+     private delegate ISP800_108_CTR_HMACSHA512Provider ProviderFactory(byte* pbKdk, uint cbKdk);
+ 
++    // Regression test for https://github.com/dotnet/aspnetcore/issues/64597
++    // Tests the empty key scenario used by ManagedAuthenticatedEncryptor.CreateContextHeader()
++    // This scenario fails in FIPS mode when using HMACSHA512.TryHashData static method
++    // because FIPS requires minimum key lengths for HMAC operations.
++    [Theory]
++    [InlineData(64, "fHGMWaDLmoncLsEKuKbZo8T+73paNohDeb5O7BSxbC8Gus8d/mUpa/9w2ss65OHlmFw1VZhIXzr5swMYVRndRw==")]  // AES-256 key + HMACSHA256 key
++    [InlineData(96, "iXd0KuWopclbxtWf9dO8fnerBqLJvndOUs74pTcj7Ck8Ctsvz4QttXkCY1DPd4aDbOE/CCU8/bIQtzoU1Xu3ZQ1pV0qEZmzFll+Vpf+q7av7AGEqwh56a+NPt6gxC5CP")]  // AES-256 key + HMACSHA512 key
++    public void DeriveKeys_EmptyKdk_Managed_ShouldSucceed(int numDerivedBytes, string expectedDerivedSubkeyAsBase64)
++    {
++        // Arrange - this mimics CreateContextHeader() behavior
++        byte[] kdk = Array.Empty<byte>();
++        byte[] label = Array.Empty<byte>();
++        byte[] contextHeader = Array.Empty<byte>();
++        byte[] context = Array.Empty<byte>();
++
++        // Act
++        var derivedSubkey = new byte[numDerivedBytes];
++        ManagedSP800_108_CTR_HMACSHA512.DeriveKeys(
++            kdk: kdk,
++            label: label,
++            contextHeader: contextHeader,
++            contextData: context,
++            operationSubkey: derivedSubkey.AsSpan(0, numDerivedBytes / 2),
++            validationSubkey: derivedSubkey.AsSpan(numDerivedBytes / 2));
++
++        // Assert
++        Assert.Equal(expectedDerivedSubkeyAsBase64, Convert.ToBase64String(derivedSubkey));
++    }
++
+     // The 'numBytesRequested' parameters below are chosen to exercise code paths where
+     // this value straddles the digest length of the PRF (which is hardcoded to HMACSHA512).
+     [Theory]

@@ -1,0 +1,180 @@
+commit b5bbabc18a1121908848d836f869a4e98eb63886
+Author: Dalton Caron <dpcaron99@gmail.com>
+Date:   Sat Jan 17 09:08:14 2026 -0800
+
+    install: prevent TOCTOU race attack (#10067)
+    
+    * install: prevent TOCTOU race attack
+    
+    * cspell: add TOCTOU acronym to jargon word list
+
+diff --git a/.vscode/cspell.dictionaries/jargon.wordlist.txt b/.vscode/cspell.dictionaries/jargon.wordlist.txt
+index 2f21572f7..e4987609f 100644
+--- a/.vscode/cspell.dictionaries/jargon.wordlist.txt
++++ b/.vscode/cspell.dictionaries/jargon.wordlist.txt
+@@ -184,6 +184,7 @@ inacc
+ maint
+ proc
+ procs
++TOCTOU
+ 
+ # * constants
+ xffff
+diff --git a/src/uu/install/locales/en-US.ftl b/src/uu/install/locales/en-US.ftl
+index 0261f7320..76265a2b1 100644
+--- a/src/uu/install/locales/en-US.ftl
++++ b/src/uu/install/locales/en-US.ftl
+@@ -30,7 +30,7 @@ install-error-chown-failed = failed to chown { $path }: { $error }
+ install-error-invalid-target = invalid target { $path }: No such file or directory
+ install-error-target-not-dir = target { $path } is not a directory
+ install-error-backup-failed = cannot backup { $from } to { $to }
+-install-error-install-failed = cannot install { $from } to { $to }
++install-error-install-failed = cannot install { $from } to { $to }: { $error }
+ install-error-strip-failed = strip program failed: { $error }
+ install-error-strip-abnormal = strip process terminated abnormally - exit code: { $code }
+ install-error-metadata-failed = metadata error
+diff --git a/src/uu/install/locales/fr-FR.ftl b/src/uu/install/locales/fr-FR.ftl
+index 208712c21..330ceb7b4 100644
+--- a/src/uu/install/locales/fr-FR.ftl
++++ b/src/uu/install/locales/fr-FR.ftl
+@@ -30,7 +30,7 @@ install-error-chown-failed = échec du chown { $path } : { $error }
+ install-error-invalid-target = cible invalide { $path } : Aucun fichier ou répertoire de ce type
+ install-error-target-not-dir = la cible { $path } n'est pas un répertoire
+ install-error-backup-failed = impossible de sauvegarder { $from } vers { $to }
+-install-error-install-failed = impossible d'installer { $from } vers { $to }
++install-error-install-failed = impossible d'installer { $from } vers { $to }: { $error }
+ install-error-strip-failed = échec du programme strip : { $error }
+ install-error-strip-abnormal = le processus strip s'est terminé anormalement - code de sortie : { $code }
+ install-error-metadata-failed = erreur de métadonnées
+diff --git a/src/uu/install/src/install.rs b/src/uu/install/src/install.rs
+index d3e0b3e89..e128470fc 100644
+--- a/src/uu/install/src/install.rs
++++ b/src/uu/install/src/install.rs
+@@ -14,8 +14,8 @@ use filetime::{FileTime, set_file_times};
+ use selinux::SecurityContext;
+ use std::ffi::OsString;
+ use std::fmt::Debug;
+-use std::fs::File;
+ use std::fs::{self, metadata};
++use std::fs::{File, OpenOptions};
+ use std::path::{MAIN_SEPARATOR, Path, PathBuf};
+ use std::process;
+ use thiserror::Error;
+@@ -36,7 +36,7 @@ use uucore::translate;
+ use uucore::{format_usage, show, show_error, show_if_err};
+ 
+ #[cfg(unix)]
+-use std::os::unix::fs::{FileTypeExt, MetadataExt};
++use std::os::unix::fs::MetadataExt;
+ #[cfg(unix)]
+ use std::os::unix::prelude::OsStrExt;
+ 
+@@ -88,8 +88,8 @@ enum InstallError {
+     #[error("{}", translate!("install-error-backup-failed", "from" => .0.quote(), "to" => .1.quote()))]
+     BackupFailed(PathBuf, PathBuf, #[source] std::io::Error),
+ 
+-    #[error("{}", translate!("install-error-install-failed", "from" => .0.quote(), "to" => .1.quote()))]
+-    InstallFailed(PathBuf, PathBuf, #[source] std::io::Error),
++    #[error("{}", translate!("install-error-install-failed", "from" => .0.quote(), "to" => .1.quote(), "error" => .2.clone()))]
++    InstallFailed(PathBuf, PathBuf, String),
+ 
+     #[error("{}", translate!("install-error-strip-failed", "error" => .0.clone()))]
+     StripProgramFailed(String),
+@@ -796,22 +796,6 @@ fn perform_backup(to: &Path, b: &Behavior) -> UResult<Option<PathBuf>> {
+     }
+ }
+ 
+-/// Copy a non-special file using [`fs::copy`].
+-///
+-/// # Parameters
+-/// * `from` - The source file path.
+-/// * `to` - The destination file path.
+-///
+-/// # Returns
+-///
+-/// Returns an empty Result or an error in case of failure.
+-fn copy_normal_file(from: &Path, to: &Path) -> UResult<()> {
+-    if let Err(err) = fs::copy(from, to) {
+-        return Err(InstallError::InstallFailed(from.to_path_buf(), to.to_path_buf(), err).into());
+-    }
+-    Ok(())
+-}
+-
+ /// Copy a file from one path to another. Handles the certain cases of special
+ /// files (e.g character specials).
+ ///
+@@ -838,8 +822,10 @@ fn copy_file(from: &Path, to: &Path) -> UResult<()> {
+         )
+         .into());
+     }
+-    // fs::copy fails if destination is a invalid symlink.
+-    // so lets just remove all existing files at destination before copy.
++
++    // Remove existing file at destination to allow overwriting
++    // Note: create_new() below provides TOCTOU protection; if something
++    // appears at this path between the remove and create, it will fail safely
+     if let Err(e) = fs::remove_file(to) {
+         if e.kind() != std::io::ErrorKind::NotFound {
+             show_error!(
+@@ -849,25 +835,13 @@ fn copy_file(from: &Path, to: &Path) -> UResult<()> {
+         }
+     }
+ 
+-    let ft = match metadata(from) {
+-        Ok(ft) => ft.file_type(),
+-        Err(err) => {
+-            return Err(
+-                InstallError::InstallFailed(from.to_path_buf(), to.to_path_buf(), err).into(),
+-            );
+-        }
+-    };
+-
+-    // Stream-based copying to get around the limitations of std::fs::copy
+-    #[cfg(unix)]
+-    if ft.is_char_device() || ft.is_block_device() || ft.is_fifo() {
+-        let mut handle = File::open(from)?;
+-        let mut dest = File::create(to)?;
+-        copy_stream(&mut handle, &mut dest)?;
+-        return Ok(());
+-    }
++    let mut handle = File::open(from)?;
++    // create_new provides TOCTOU protection
++    let mut dest = OpenOptions::new().write(true).create_new(true).open(to)?;
+ 
+-    copy_normal_file(from, to)?;
++    copy_stream(&mut handle, &mut dest).map_err(|err| {
++        InstallError::InstallFailed(from.to_path_buf(), to.to_path_buf(), err.to_string())
++    })?;
+ 
+     Ok(())
+ }
+diff --git a/tests/by-util/test_install.rs b/tests/by-util/test_install.rs
+index b6a998a02..7a2ccb875 100644
+--- a/tests/by-util/test_install.rs
++++ b/tests/by-util/test_install.rs
+@@ -2545,3 +2545,25 @@ fn test_install_unprivileged_option_u_skips_chown() {
+     assert!(at.file_exists(dst_ok));
+     assert_eq!(at.metadata(dst_ok).uid(), geteuid());
+ }
++
++#[test]
++fn test_install_normal_file_replaces_symlink() {
++    let scene = TestScenario::new(util_name!());
++    let at = &scene.fixtures;
++
++    at.write("source", "new content");
++    at.write("sensitive", "important data");
++
++    // Create symlink at destination
++    at.symlink_file("sensitive", "dest");
++
++    // Install should replace symlink with normal file (not follow it)
++    scene.ucmd().arg("source").arg("dest").succeeds();
++
++    // Verify dest is now a normal file, not a symlink
++    assert!(at.file_exists("dest"));
++    assert_eq!(at.read("dest"), "new content");
++
++    // Verify sensitive file was NOT modified
++    assert_eq!(at.read("sensitive"), "important data");
++}

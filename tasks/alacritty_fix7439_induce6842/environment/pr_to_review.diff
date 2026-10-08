@@ -1,0 +1,1891 @@
+commit db903503df024a3f5066937fbe0272be88226738
+Author: Kirill Chibisov <contact@kchibisov.com>
+Date:   Tue Jul 11 02:22:14 2023 +0000
+
+    Update to the new winit keyboard API
+    
+    The main highlight of this update is that alacritty will now use new
+    keyboard API from the winit, which resolves a lot of issues around
+    key bindings, such as ability to bind dead keys. It also fixes long
+    standing issues with the virtual key code bindings and make bindings
+    in general more predictable. It also makes our default Vi key bindings
+    fully working.
+    
+    Given that alacritty was using `VirtualKey` directly in the bindings
+    from the winit, and winit simply removed the enum, we've added internal
+    conversions to minimize the fallout, but new way to specify the bindings
+    should be more intuitive.
+    
+    Other part of this update fixes some forward compatibility bugs with the
+    Wayland backend, given that wayland-rs 0.30 is fully forward compatible.
+    The update also fixes weird Maximized startup issues on GNOME Wayland,
+    however they were present on any sane compositor.
+    
+    Fixes #6842.
+    Fixes #6455.
+    Fixes #6184.
+    Fixes #5684.
+    Fixes #3574.
+    Fixes #3460.
+    Fixes #1336.
+    Fixes #892.
+    Fixes #458.
+    Fixes #55.
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b348b372..0f12daea 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -17,6 +17,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+ - Warnings for unused configuration file options
+ - Config option `persist` in `hints` config section
+ - Support for dynamically loading conpty.dll on Windows
++- Support for keybindings with dead keys
++- `Back`/`Forward` mouse buttons support in bindings
+ 
+ ### Changed
+ 
+@@ -29,6 +31,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+ - Deprecated config option `key_bindings`, use `keyboard.bindings`
+ - Deprecated config option `mouse_bindings`, use `mouse.bindings`
+ - The default colorscheme is now based on base16 classic dark
++- IME popup now tries to not obscure the current cursor line
++
++### Fixed
++
++- Unconditional query of xdg-portal settings on Wayland
++- `Maximized` startup mode not filling the screen properly on GNOME Wayland
++- `OptionAsAlt` with `OnlyLeft`/`OnlyRight` settings not working properly on macOS
++- Default Vi key bindings for `Last`/`First` actions not working on X11/Wayland
+ 
+ ### Removed
+ 
+diff --git a/alacritty/Cargo.toml b/alacritty/Cargo.toml
+index da39e754..5ab00f2b 100644
+--- a/alacritty/Cargo.toml
++++ b/alacritty/Cargo.toml
+@@ -41,7 +41,7 @@ serde_json = "1"
+ serde_yaml = "0.8"
+ toml = "0.7.1"
+ unicode-width = "0.1"
+-winit = { version = "0.28.2", default-features = false, features = ["serde"] }
++winit = { version = "0.29.0-beta.0", default-features = false, features = ["serde"] }
+ 
+ [build-dependencies]
+ gl_generator = "0.14.0"
+diff --git a/alacritty/src/config/bindings.rs b/alacritty/src/config/bindings.rs
+index 8fd16361..b6cf9e50 100644
+--- a/alacritty/src/config/bindings.rs
++++ b/alacritty/src/config/bindings.rs
+@@ -6,8 +6,10 @@ use bitflags::bitflags;
+ use serde::de::{self, Error as SerdeError, MapAccess, Unexpected, Visitor};
+ use serde::{Deserialize, Deserializer};
+ use toml::Value as SerdeValue;
+-use winit::event::VirtualKeyCode::*;
+-use winit::event::{ModifiersState, MouseButton, VirtualKeyCode};
++use winit::event::MouseButton;
++use winit::keyboard::Key::*;
++use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState};
++use winit::platform::scancode::KeyCodeExtScancode;
+ 
+ use alacritty_config_derive::{ConfigDeserialize, SerdeReplace};
+ 
+@@ -41,7 +43,7 @@ pub struct Binding<T> {
+ }
+ 
+ /// Bindings that are triggered by a keyboard key.
+-pub type KeyBinding = Binding<Key>;
++pub type KeyBinding = Binding<BindingKey>;
+ 
+ /// Bindings that are triggered by a mouse button.
+ pub type MouseBinding = Binding<MouseButton>;
+@@ -309,32 +311,11 @@ pub enum MouseAction {
+ }
+ 
+ macro_rules! bindings {
+-    (
+-        KeyBinding;
+-        $(
+-            $key:ident
+-            $(,$mods:expr)*
+-            $(,+$mode:expr)*
+-            $(,~$notmode:expr)*
+-            ;$action:expr
+-        );*
+-        $(;)*
+-    ) => {{
+-        bindings!(
+-            KeyBinding;
+-            $(
+-                Key::Keycode($key)
+-                $(,$mods)*
+-                $(,+$mode)*
+-                $(,~$notmode)*
+-                ;$action
+-            );*
+-        )
+-    }};
+     (
+         $ty:ident;
+         $(
+             $key:expr
++            $(=>$location:expr)?
+             $(,$mods:expr)*
+             $(,+$mode:expr)*
+             $(,~$notmode:expr)*
+@@ -353,7 +334,7 @@ macro_rules! bindings {
+             $(_notmode.insert($notmode);)*
+ 
+             v.push($ty {
+-                trigger: $key,
++                trigger: trigger!($ty, $key, $($location)?),
+                 mods: _mods,
+                 mode: _mode,
+                 notmode: _notmode,
+@@ -365,199 +346,147 @@ macro_rules! bindings {
+     }};
+ }
+ 
++macro_rules! trigger {
++    (KeyBinding, $key:literal, $location:expr) => {{
++        BindingKey::Keycode { key: Character($key.into()), location: $location }
++    }};
++    (KeyBinding, $key:literal,) => {{
++        BindingKey::Keycode { key: Character($key.into()), location: KeyLocation::Standard }
++    }};
++    (KeyBinding, $key:expr,) => {{
++        BindingKey::Keycode { key: $key, location: KeyLocation::Standard }
++    }};
++    ($ty:ident, $key:expr,) => {{
++        $key
++    }};
++}
++
+ pub fn default_mouse_bindings() -> Vec<MouseBinding> {
+     bindings!(
+         MouseBinding;
+-        MouseButton::Right;                         MouseAction::ExpandSelection;
+-        MouseButton::Right,   ModifiersState::CTRL; MouseAction::ExpandSelection;
+-        MouseButton::Middle, ~BindingMode::VI; Action::PasteSelection;
++        MouseButton::Right;                            MouseAction::ExpandSelection;
++        MouseButton::Right,   ModifiersState::CONTROL; MouseAction::ExpandSelection;
++        MouseButton::Middle, ~BindingMode::VI;         Action::PasteSelection;
+     )
+ }
+ 
+ pub fn default_key_bindings() -> Vec<KeyBinding> {
+     let mut bindings = bindings!(
+         KeyBinding;
+-        Copy;  Action::Copy;
++        Copy; Action::Copy;
+         Copy,  +BindingMode::VI; Action::ClearSelection;
+         Paste, ~BindingMode::VI; Action::Paste;
+-        L, ModifiersState::CTRL; Action::ClearLogNotice;
+-        L,    ModifiersState::CTRL,  ~BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::Esc("\x0c".into());
+-        Tab,  ModifiersState::SHIFT, ~BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::Esc("\x1b[Z".into());
+-        Back, ModifiersState::ALT,   ~BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::Esc("\x1b\x7f".into());
+-        Back, ModifiersState::SHIFT, ~BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::Esc("\x7f".into());
+-        Home,     ModifiersState::SHIFT, ~BindingMode::ALT_SCREEN; Action::ScrollToTop;
+-        End,      ModifiersState::SHIFT, ~BindingMode::ALT_SCREEN; Action::ScrollToBottom;
+-        PageUp,   ModifiersState::SHIFT, ~BindingMode::ALT_SCREEN; Action::ScrollPageUp;
+-        PageDown, ModifiersState::SHIFT, ~BindingMode::ALT_SCREEN; Action::ScrollPageDown;
+-        Home,     ModifiersState::SHIFT, +BindingMode::ALT_SCREEN,
+-            ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[1;2H".into());
+-        End,      ModifiersState::SHIFT, +BindingMode::ALT_SCREEN,
+-            ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[1;2F".into());
+-        PageUp,   ModifiersState::SHIFT, +BindingMode::ALT_SCREEN,
+-            ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[5;2~".into());
+-        PageDown, ModifiersState::SHIFT, +BindingMode::ALT_SCREEN,
+-            ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[6;2~".into());
+-        Home,  +BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::Esc("\x1bOH".into());
+-        Home,  ~BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::Esc("\x1b[H".into());
+-        End,   +BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::Esc("\x1bOF".into());
+-        End,   ~BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::Esc("\x1b[F".into());
+-        Up,    +BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::Esc("\x1bOA".into());
+-        Up,    ~BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::Esc("\x1b[A".into());
+-        Down,  +BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::Esc("\x1bOB".into());
+-        Down,  ~BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::Esc("\x1b[B".into());
+-        Right, +BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::Esc("\x1bOC".into());
+-        Right, ~BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::Esc("\x1b[C".into());
+-        Left,  +BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::Esc("\x1bOD".into());
+-        Left,  ~BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::Esc("\x1b[D".into());
+-        Back,        ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x7f".into());
+-        Insert,      ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[2~".into());
+-        Delete,      ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[3~".into());
+-        PageUp,      ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[5~".into());
+-        PageDown,    ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[6~".into());
+-        F1,          ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1bOP".into());
+-        F2,          ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1bOQ".into());
+-        F3,          ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1bOR".into());
+-        F4,          ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1bOS".into());
+-        F5,          ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[15~".into());
+-        F6,          ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[17~".into());
+-        F7,          ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[18~".into());
+-        F8,          ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[19~".into());
+-        F9,          ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[20~".into());
+-        F10,         ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[21~".into());
+-        F11,         ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[23~".into());
+-        F12,         ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[24~".into());
+-        F13,         ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[25~".into());
+-        F14,         ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[26~".into());
+-        F15,         ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[28~".into());
+-        F16,         ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[29~".into());
+-        F17,         ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[31~".into());
+-        F18,         ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[32~".into());
+-        F19,         ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[33~".into());
+-        F20,         ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[34~".into());
+-        NumpadEnter, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\n".into());
+-        Space, ModifiersState::SHIFT | ModifiersState::CTRL, ~BindingMode::SEARCH;
+-            Action::ToggleViMode;
+-        Space, ModifiersState::SHIFT | ModifiersState::CTRL, +BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::ScrollToBottom;
+-        Escape,                        +BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::ClearSelection;
+-        I,                             +BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::ToggleViMode;
+-        I,                             +BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::ScrollToBottom;
+-        C,      ModifiersState::CTRL,  +BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::ToggleViMode;
+-        Y,      ModifiersState::CTRL,  +BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::ScrollLineUp;
+-        E,      ModifiersState::CTRL,  +BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::ScrollLineDown;
+-        G,                             +BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::ScrollToTop;
+-        G,      ModifiersState::SHIFT, +BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::ScrollToBottom;
+-        B,      ModifiersState::CTRL,  +BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::ScrollPageUp;
+-        F,      ModifiersState::CTRL,  +BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::ScrollPageDown;
+-        U,      ModifiersState::CTRL,  +BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::ScrollHalfPageUp;
+-        D,      ModifiersState::CTRL,  +BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::ScrollHalfPageDown;
+-        Y,                             +BindingMode::VI, ~BindingMode::SEARCH; Action::Copy;
+-        Y,                             +BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::ClearSelection;
+-        Slash,                         +BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::SearchForward;
+-        Slash,  ModifiersState::SHIFT, +BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::SearchBackward;
+-        V,                             +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViAction::ToggleNormalSelection;
+-        V,      ModifiersState::SHIFT, +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViAction::ToggleLineSelection;
+-        V,      ModifiersState::CTRL,  +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViAction::ToggleBlockSelection;
+-        V,      ModifiersState::ALT,   +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViAction::ToggleSemanticSelection;
+-        N,                             +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViAction::SearchNext;
+-        N,      ModifiersState::SHIFT, +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViAction::SearchPrevious;
+-        Return,                        +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViAction::Open;
+-        Z,                             +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViAction::CenterAroundViCursor;
+-        K,                             +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViMotion::Up;
+-        J,                             +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViMotion::Down;
+-        H,                             +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViMotion::Left;
+-        L,                             +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViMotion::Right;
+-        Up,                            +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViMotion::Up;
+-        Down,                          +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViMotion::Down;
+-        Left,                          +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViMotion::Left;
+-        Right,                         +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViMotion::Right;
+-        Key0,                          +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViMotion::First;
+-        Key4,   ModifiersState::SHIFT, +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViMotion::Last;
+-        Key6,   ModifiersState::SHIFT, +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViMotion::FirstOccupied;
+-        H,      ModifiersState::SHIFT, +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViMotion::High;
+-        M,      ModifiersState::SHIFT, +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViMotion::Middle;
+-        L,      ModifiersState::SHIFT, +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViMotion::Low;
+-        B,                             +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViMotion::SemanticLeft;
+-        W,                             +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViMotion::SemanticRight;
+-        E,                             +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViMotion::SemanticRightEnd;
+-        B,      ModifiersState::SHIFT, +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViMotion::WordLeft;
+-        W,      ModifiersState::SHIFT, +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViMotion::WordRight;
+-        E,      ModifiersState::SHIFT, +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViMotion::WordRightEnd;
+-        Key5,   ModifiersState::SHIFT, +BindingMode::VI, ~BindingMode::SEARCH;
+-            ViMotion::Bracket;
+-        Return,                        +BindingMode::SEARCH, +BindingMode::VI;
+-            SearchAction::SearchConfirm;
+-        Escape,                        +BindingMode::SEARCH; SearchAction::SearchCancel;
+-        C,      ModifiersState::CTRL,  +BindingMode::SEARCH; SearchAction::SearchCancel;
+-        U,      ModifiersState::CTRL,  +BindingMode::SEARCH; SearchAction::SearchClear;
+-        W,      ModifiersState::CTRL,  +BindingMode::SEARCH; SearchAction::SearchDeleteWord;
+-        P,      ModifiersState::CTRL,  +BindingMode::SEARCH; SearchAction::SearchHistoryPrevious;
+-        N,      ModifiersState::CTRL,  +BindingMode::SEARCH; SearchAction::SearchHistoryNext;
+-        Up,                            +BindingMode::SEARCH; SearchAction::SearchHistoryPrevious;
+-        Down,                          +BindingMode::SEARCH; SearchAction::SearchHistoryNext;
+-        Return,                        +BindingMode::SEARCH, ~BindingMode::VI;
+-            SearchAction::SearchFocusNext;
+-        Return, ModifiersState::SHIFT, +BindingMode::SEARCH, ~BindingMode::VI;
+-            SearchAction::SearchFocusPrevious;
++        "l",       ModifiersState::CONTROL; Action::ClearLogNotice;
++        "l",       ModifiersState::CONTROL, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x0c".into());
++        Tab,       ModifiersState::SHIFT,   ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[Z".into());
++        Backspace, ModifiersState::ALT,     ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b\x7f".into());
++        Backspace, ModifiersState::SHIFT,   ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x7f".into());
++        Home,      ModifiersState::SHIFT, ~BindingMode::ALT_SCREEN; Action::ScrollToTop;
++        End,       ModifiersState::SHIFT, ~BindingMode::ALT_SCREEN; Action::ScrollToBottom;
++        PageUp,    ModifiersState::SHIFT, ~BindingMode::ALT_SCREEN; Action::ScrollPageUp;
++        PageDown,  ModifiersState::SHIFT, ~BindingMode::ALT_SCREEN; Action::ScrollPageDown;
++        Home,      ModifiersState::SHIFT, +BindingMode::ALT_SCREEN, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[1;2H".into());
++        End,       ModifiersState::SHIFT, +BindingMode::ALT_SCREEN, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[1;2F".into());
++        PageUp,    ModifiersState::SHIFT, +BindingMode::ALT_SCREEN, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[5;2~".into());
++        PageDown,  ModifiersState::SHIFT, +BindingMode::ALT_SCREEN, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[6;2~".into());
++        Home,       +BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1bOH".into());
++        Home,       ~BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[H".into());
++        End,        +BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1bOF".into());
++        End,        ~BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[F".into());
++        ArrowUp,    +BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1bOA".into());
++        ArrowUp,    ~BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[A".into());
++        ArrowDown,  +BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1bOB".into());
++        ArrowDown,  ~BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[B".into());
++        ArrowRight, +BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1bOC".into());
++        ArrowRight, ~BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[C".into());
++        ArrowLeft,  +BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1bOD".into());
++        ArrowLeft,  ~BindingMode::APP_CURSOR, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[D".into());
++        Backspace,  ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x7f".into());
++        Insert,     ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[2~".into());
++        Delete,     ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[3~".into());
++        PageUp,     ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[5~".into());
++        PageDown,   ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[6~".into());
++        F1,         ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1bOP".into());
++        F2,         ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1bOQ".into());
++        F3,         ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1bOR".into());
++        F4,         ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1bOS".into());
++        F5,         ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[15~".into());
++        F6,         ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[17~".into());
++        F7,         ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[18~".into());
++        F8,         ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[19~".into());
++        F9,         ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[20~".into());
++        F10,        ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[21~".into());
++        F11,        ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[23~".into());
++        F12,        ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[24~".into());
++        F13,        ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[25~".into());
++        F14,        ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[26~".into());
++        F15,        ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[28~".into());
++        F16,        ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[29~".into());
++        F17,        ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[31~".into());
++        F18,        ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[32~".into());
++        F19,        ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[33~".into());
++        F20,        ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[34~".into());
++
++        // Vi mode.
++        Space, ModifiersState::SHIFT | ModifiersState::CONTROL, ~BindingMode::SEARCH; Action::ToggleViMode;
++        Space, ModifiersState::SHIFT | ModifiersState::CONTROL, +BindingMode::VI, ~BindingMode::SEARCH; Action::ScrollToBottom;
++        Escape,                             +BindingMode::VI, ~BindingMode::SEARCH; Action::ClearSelection;
++        "i",                                +BindingMode::VI, ~BindingMode::SEARCH; Action::ToggleViMode;
++        "i",                                +BindingMode::VI, ~BindingMode::SEARCH; Action::ScrollToBottom;
++        "c",      ModifiersState::CONTROL,  +BindingMode::VI, ~BindingMode::SEARCH; Action::ToggleViMode;
++        "y",      ModifiersState::CONTROL,  +BindingMode::VI, ~BindingMode::SEARCH; Action::ScrollLineUp;
++        "e",      ModifiersState::CONTROL,  +BindingMode::VI, ~BindingMode::SEARCH; Action::ScrollLineDown;
++        "g",                                +BindingMode::VI, ~BindingMode::SEARCH; Action::ScrollToTop;
++        "g",      ModifiersState::SHIFT,    +BindingMode::VI, ~BindingMode::SEARCH; Action::ScrollToBottom;
++        "b",      ModifiersState::CONTROL,  +BindingMode::VI, ~BindingMode::SEARCH; Action::ScrollPageUp;
++        "f",      ModifiersState::CONTROL,  +BindingMode::VI, ~BindingMode::SEARCH; Action::ScrollPageDown;
++        "u",      ModifiersState::CONTROL,  +BindingMode::VI, ~BindingMode::SEARCH; Action::ScrollHalfPageUp;
++        "d",      ModifiersState::CONTROL,  +BindingMode::VI, ~BindingMode::SEARCH; Action::ScrollHalfPageDown;
++        "y",                                +BindingMode::VI, ~BindingMode::SEARCH; Action::Copy;
++        "y",                                +BindingMode::VI, ~BindingMode::SEARCH; Action::ClearSelection;
++        "/",                                +BindingMode::VI, ~BindingMode::SEARCH; Action::SearchForward;
++        "/",      ModifiersState::SHIFT,    +BindingMode::VI, ~BindingMode::SEARCH; Action::SearchBackward;
++        "v",                                +BindingMode::VI, ~BindingMode::SEARCH; ViAction::ToggleNormalSelection;
++        "v",      ModifiersState::SHIFT,    +BindingMode::VI, ~BindingMode::SEARCH; ViAction::ToggleLineSelection;
++        "v",      ModifiersState::CONTROL,  +BindingMode::VI, ~BindingMode::SEARCH; ViAction::ToggleBlockSelection;
++        "v",      ModifiersState::ALT,      +BindingMode::VI, ~BindingMode::SEARCH; ViAction::ToggleSemanticSelection;
++        "n",                                +BindingMode::VI, ~BindingMode::SEARCH; ViAction::SearchNext;
++        "n",      ModifiersState::SHIFT,    +BindingMode::VI, ~BindingMode::SEARCH; ViAction::SearchPrevious;
++        Enter,                              +BindingMode::VI, ~BindingMode::SEARCH; ViAction::Open;
++        "z",                                +BindingMode::VI, ~BindingMode::SEARCH; ViAction::CenterAroundViCursor;
++        "k",                                +BindingMode::VI, ~BindingMode::SEARCH; ViMotion::Up;
++        "j",                                +BindingMode::VI, ~BindingMode::SEARCH; ViMotion::Down;
++        "h",                                +BindingMode::VI, ~BindingMode::SEARCH; ViMotion::Left;
++        "l",                                +BindingMode::VI, ~BindingMode::SEARCH; ViMotion::Right;
++        ArrowUp,                            +BindingMode::VI, ~BindingMode::SEARCH; ViMotion::Up;
++        ArrowDown,                          +BindingMode::VI, ~BindingMode::SEARCH; ViMotion::Down;
++        ArrowLeft,                          +BindingMode::VI, ~BindingMode::SEARCH; ViMotion::Left;
++        ArrowRight,                         +BindingMode::VI, ~BindingMode::SEARCH; ViMotion::Right;
++        "0",                                +BindingMode::VI, ~BindingMode::SEARCH; ViMotion::First;
++        "4",      ModifiersState::SHIFT,    +BindingMode::VI, ~BindingMode::SEARCH; ViMotion::Last;
++        "6",      ModifiersState::SHIFT,    +BindingMode::VI, ~BindingMode::SEARCH; ViMotion::FirstOccupied;
++        "H",      ModifiersState::SHIFT,    +BindingMode::VI, ~BindingMode::SEARCH; ViMotion::High;
++        "M",      ModifiersState::SHIFT,    +BindingMode::VI, ~BindingMode::SEARCH; ViMotion::Middle;
++        "L",      ModifiersState::SHIFT,    +BindingMode::VI, ~BindingMode::SEARCH; ViMotion::Low;
++        "b",                                +BindingMode::VI, ~BindingMode::SEARCH; ViMotion::SemanticLeft;
++        "w",                                +BindingMode::VI, ~BindingMode::SEARCH; ViMotion::SemanticRight;
++        "e",                                +BindingMode::VI, ~BindingMode::SEARCH; ViMotion::SemanticRightEnd;
++        "b",      ModifiersState::SHIFT,    +BindingMode::VI, ~BindingMode::SEARCH; ViMotion::WordLeft;
++        "w",      ModifiersState::SHIFT,    +BindingMode::VI, ~BindingMode::SEARCH; ViMotion::WordRight;
++        "e",      ModifiersState::SHIFT,    +BindingMode::VI, ~BindingMode::SEARCH; ViMotion::WordRightEnd;
++        "5",      ModifiersState::SHIFT,    +BindingMode::VI, ~BindingMode::SEARCH; ViMotion::Bracket;
++        Enter,                              +BindingMode::VI, +BindingMode::SEARCH; SearchAction::SearchConfirm;
++        // Plain search.
++        Escape,                             +BindingMode::SEARCH; SearchAction::SearchCancel;
++        "c",      ModifiersState::CONTROL,  +BindingMode::SEARCH; SearchAction::SearchCancel;
++        "u",      ModifiersState::CONTROL,  +BindingMode::SEARCH; SearchAction::SearchClear;
++        "w",      ModifiersState::CONTROL,  +BindingMode::SEARCH; SearchAction::SearchDeleteWord;
++        "p",      ModifiersState::CONTROL,  +BindingMode::SEARCH; SearchAction::SearchHistoryPrevious;
++        "n",      ModifiersState::CONTROL,  +BindingMode::SEARCH; SearchAction::SearchHistoryNext;
++        ArrowUp,                            +BindingMode::SEARCH; SearchAction::SearchHistoryPrevious;
++        ArrowDown,                          +BindingMode::SEARCH; SearchAction::SearchHistoryNext;
++        Enter,                              +BindingMode::SEARCH, ~BindingMode::VI; SearchAction::SearchFocusNext;
++        Enter, ModifiersState::SHIFT,       +BindingMode::SEARCH, ~BindingMode::VI; SearchAction::SearchFocusPrevious;
+     );
+ 
+     //   Code     Modifiers
+@@ -576,82 +505,52 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
+         ModifiersState::SHIFT,
+         ModifiersState::ALT,
+         ModifiersState::SHIFT | ModifiersState::ALT,
+-        ModifiersState::CTRL,
+-        ModifiersState::SHIFT | ModifiersState::CTRL,
+-        ModifiersState::ALT | ModifiersState::CTRL,
+-        ModifiersState::SHIFT | ModifiersState::ALT | ModifiersState::CTRL,
++        ModifiersState::CONTROL,
++        ModifiersState::SHIFT | ModifiersState::CONTROL,
++        ModifiersState::ALT | ModifiersState::CONTROL,
++        ModifiersState::SHIFT | ModifiersState::ALT | ModifiersState::CONTROL,
+     ];
+ 
+     for (index, mods) in modifiers.drain(..).enumerate() {
+         let modifiers_code = index + 2;
+         bindings.extend(bindings!(
+             KeyBinding;
+-            Delete, mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[3;{}~", modifiers_code));
+-            Up,     mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[1;{}A", modifiers_code));
+-            Down,   mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[1;{}B", modifiers_code));
+-            Right,  mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[1;{}C", modifiers_code));
+-            Left,   mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[1;{}D", modifiers_code));
+-            F1,     mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[1;{}P", modifiers_code));
+-            F2,     mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[1;{}Q", modifiers_code));
+-            F3,     mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[1;{}R", modifiers_code));
+-            F4,     mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[1;{}S", modifiers_code));
+-            F5,     mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[15;{}~", modifiers_code));
+-            F6,     mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[17;{}~", modifiers_code));
+-            F7,     mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[18;{}~", modifiers_code));
+-            F8,     mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[19;{}~", modifiers_code));
+-            F9,     mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[20;{}~", modifiers_code));
+-            F10,    mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[21;{}~", modifiers_code));
+-            F11,    mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[23;{}~", modifiers_code));
+-            F12,    mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[24;{}~", modifiers_code));
+-            F13,    mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[25;{}~", modifiers_code));
+-            F14,    mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[26;{}~", modifiers_code));
+-            F15,    mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[28;{}~", modifiers_code));
+-            F16,    mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[29;{}~", modifiers_code));
+-            F17,    mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[31;{}~", modifiers_code));
+-            F18,    mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[32;{}~", modifiers_code));
+-            F19,    mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[33;{}~", modifiers_code));
+-            F20,    mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                Action::Esc(format!("\x1b[34;{}~", modifiers_code));
++            Delete,      mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[3;{}~", modifiers_code));
++            ArrowUp,     mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[1;{}A", modifiers_code));
++            ArrowDown,   mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[1;{}B", modifiers_code));
++            ArrowRight,  mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[1;{}C", modifiers_code));
++            ArrowLeft,   mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[1;{}D", modifiers_code));
++            F1,          mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[1;{}P", modifiers_code));
++            F2,          mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[1;{}Q", modifiers_code));
++            F3,          mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[1;{}R", modifiers_code));
++            F4,          mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[1;{}S", modifiers_code));
++            F5,          mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[15;{}~", modifiers_code));
++            F6,          mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[17;{}~", modifiers_code));
++            F7,          mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[18;{}~", modifiers_code));
++            F8,          mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[19;{}~", modifiers_code));
++            F9,          mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[20;{}~", modifiers_code));
++            F10,         mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[21;{}~", modifiers_code));
++            F11,         mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[23;{}~", modifiers_code));
++            F12,         mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[24;{}~", modifiers_code));
++            F13,         mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[25;{}~", modifiers_code));
++            F14,         mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[26;{}~", modifiers_code));
++            F15,         mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[28;{}~", modifiers_code));
++            F16,         mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[29;{}~", modifiers_code));
++            F17,         mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[31;{}~", modifiers_code));
++            F18,         mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[32;{}~", modifiers_code));
++            F19,         mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[33;{}~", modifiers_code));
++            F20,         mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[34;{}~", modifiers_code));
+         ));
+ 
+         // We're adding the following bindings with `Shift` manually above, so skipping them here.
+         if modifiers_code != 2 {
+             bindings.extend(bindings!(
+                 KeyBinding;
+-                Insert,   mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                    Action::Esc(format!("\x1b[2;{}~", modifiers_code));
+-                PageUp,   mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                    Action::Esc(format!("\x1b[5;{}~", modifiers_code));
+-                PageDown, mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                    Action::Esc(format!("\x1b[6;{}~", modifiers_code));
+-                End,      mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                    Action::Esc(format!("\x1b[1;{}F", modifiers_code));
+-                Home,     mods, ~BindingMode::VI, ~BindingMode::SEARCH;
+-                    Action::Esc(format!("\x1b[1;{}H", modifiers_code));
++                Insert,   mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[2;{}~", modifiers_code));
++                PageUp,   mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[5;{}~", modifiers_code));
++                PageDown, mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[6;{}~", modifiers_code));
++                End,      mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[1;{}F", modifiers_code));
++                Home,     mods, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc(format!("\x1b[1;{}H", modifiers_code));
+             ));
+         }
+     }
+@@ -665,21 +564,18 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
+ fn common_keybindings() -> Vec<KeyBinding> {
+     bindings!(
+         KeyBinding;
+-        V,        ModifiersState::CTRL | ModifiersState::SHIFT, ~BindingMode::VI; Action::Paste;
+-        C,        ModifiersState::CTRL | ModifiersState::SHIFT; Action::Copy;
+-        F,        ModifiersState::CTRL | ModifiersState::SHIFT, ~BindingMode::SEARCH;
+-            Action::SearchForward;
+-        B,        ModifiersState::CTRL | ModifiersState::SHIFT, ~BindingMode::SEARCH;
+-            Action::SearchBackward;
+-        C,        ModifiersState::CTRL | ModifiersState::SHIFT,
+-            +BindingMode::VI, ~BindingMode::SEARCH; Action::ClearSelection;
+-        Insert,   ModifiersState::SHIFT, ~BindingMode::VI; Action::PasteSelection;
+-        Key0,     ModifiersState::CTRL;  Action::ResetFontSize;
+-        Equals,   ModifiersState::CTRL;  Action::IncreaseFontSize;
+-        Plus,     ModifiersState::CTRL;  Action::IncreaseFontSize;
+-        NumpadAdd,      ModifiersState::CTRL;  Action::IncreaseFontSize;
+-        Minus,          ModifiersState::CTRL;  Action::DecreaseFontSize;
+-        NumpadSubtract, ModifiersState::CTRL;  Action::DecreaseFontSize;
++        "c",    ModifiersState::CONTROL | ModifiersState::SHIFT, +BindingMode::VI, ~BindingMode::SEARCH; Action::ClearSelection;
++        "v",    ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::VI;                       Action::Paste;
++        "f",    ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH;                   Action::SearchForward;
++        "b",    ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH;                   Action::SearchBackward;
++        Insert, ModifiersState::SHIFT,                           ~BindingMode::VI;                       Action::PasteSelection;
++        "c",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::Copy;
++        "0",    ModifiersState::CONTROL;                                                                 Action::ResetFontSize;
++        "=",    ModifiersState::CONTROL;                                                                 Action::IncreaseFontSize;
++        "+",    ModifiersState::CONTROL;                                                                 Action::IncreaseFontSize;
++        "-",    ModifiersState::CONTROL;                                                                 Action::DecreaseFontSize;
++        "+" => KeyLocation::Numpad, ModifiersState::CONTROL;                                             Action::IncreaseFontSize;
++        "-" => KeyLocation::Numpad, ModifiersState::CONTROL;                                             Action::DecreaseFontSize;
+     )
+ }
+ 
+@@ -692,7 +588,7 @@ pub fn platform_key_bindings() -> Vec<KeyBinding> {
+ pub fn platform_key_bindings() -> Vec<KeyBinding> {
+     let mut bindings = bindings!(
+         KeyBinding;
+-        Return, ModifiersState::ALT; Action::ToggleFullscreen;
++        Enter, ModifiersState::ALT; Action::ToggleFullscreen;
+     );
+     bindings.extend(common_keybindings());
+     bindings
+@@ -702,29 +598,27 @@ pub fn platform_key_bindings() -> Vec<KeyBinding> {
+ pub fn platform_key_bindings() -> Vec<KeyBinding> {
+     bindings!(
+         KeyBinding;
+-        Key0,           ModifiersState::LOGO; Action::ResetFontSize;
+-        Equals,         ModifiersState::LOGO; Action::IncreaseFontSize;
+-        Plus,           ModifiersState::LOGO; Action::IncreaseFontSize;
+-        NumpadAdd,      ModifiersState::LOGO; Action::IncreaseFontSize;
+-        Minus,          ModifiersState::LOGO; Action::DecreaseFontSize;
+-        NumpadSubtract, ModifiersState::LOGO; Action::DecreaseFontSize;
+-        Insert, ModifiersState::SHIFT, ~BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::Esc("\x1b[2;2~".into());
+-        K, ModifiersState::LOGO, ~BindingMode::VI, ~BindingMode::SEARCH;
+-            Action::Esc("\x0c".into());
+-        K, ModifiersState::LOGO, ~BindingMode::VI, ~BindingMode::SEARCH;  Action::ClearHistory;
+-        V, ModifiersState::LOGO, ~BindingMode::VI; Action::Paste;
+-        N, ModifiersState::LOGO; Action::CreateNewWindow;
+-        F, ModifiersState::CTRL | ModifiersState::LOGO; Action::ToggleFullscreen;
+-        C, ModifiersState::LOGO; Action::Copy;
+-        C, ModifiersState::LOGO, +BindingMode::VI, ~BindingMode::SEARCH; Action::ClearSelection;
+-        H, ModifiersState::LOGO; Action::Hide;
+-        H, ModifiersState::LOGO | ModifiersState::ALT; Action::HideOtherApplications;
+-        M, ModifiersState::LOGO; Action::Minimize;
+-        Q, ModifiersState::LOGO; Action::Quit;
+-        W, ModifiersState::LOGO; Action::Quit;
+-        F, ModifiersState::LOGO, ~BindingMode::SEARCH; Action::SearchForward;
+-        B, ModifiersState::LOGO, ~BindingMode::SEARCH; Action::SearchBackward;
++        "c",    ModifiersState::SUPER, +BindingMode::VI, ~BindingMode::SEARCH; Action::ClearSelection;
++        Insert, ModifiersState::SHIFT, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[2;2~".into());
++        "0",    ModifiersState::SUPER;                                         Action::ResetFontSize;
++        "=",    ModifiersState::SUPER;                                         Action::IncreaseFontSize;
++        "+",    ModifiersState::SUPER;                                         Action::IncreaseFontSize;
++        "-",    ModifiersState::SUPER;                                         Action::DecreaseFontSize;
++        "k",    ModifiersState::SUPER, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x0c".into());
++        "k",    ModifiersState::SUPER, ~BindingMode::VI, ~BindingMode::SEARCH; Action::ClearHistory;
++        "v",    ModifiersState::SUPER, ~BindingMode::VI;                       Action::Paste;
++        "n",    ModifiersState::SUPER;                                         Action::CreateNewWindow;
++        "f",    ModifiersState::CONTROL | ModifiersState::SUPER;               Action::ToggleFullscreen;
++        "c",    ModifiersState::SUPER;                                         Action::Copy;
++        "h",    ModifiersState::SUPER;                                         Action::Hide;
++        "h",    ModifiersState::SUPER   | ModifiersState::ALT;                 Action::HideOtherApplications;
++        "m",    ModifiersState::SUPER;                                         Action::Minimize;
++        "q",    ModifiersState::SUPER;                                         Action::Quit;
++        "w",    ModifiersState::SUPER;                                         Action::Quit;
++        "f",    ModifiersState::SUPER, ~BindingMode::SEARCH;                   Action::SearchForward;
++        "b",    ModifiersState::SUPER, ~BindingMode::SEARCH;                   Action::SearchBackward;
++        "+" => KeyLocation::Numpad, ModifiersState::SUPER;                     Action::IncreaseFontSize;
++        "-" => KeyLocation::Numpad, ModifiersState::SUPER;                     Action::DecreaseFontSize;
+     )
+ }
+ 
+@@ -734,23 +628,83 @@ pub fn platform_key_bindings() -> Vec<KeyBinding> {
+     vec![]
+ }
+ 
+-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+-pub enum Key {
+-    Scancode(u32),
+-    Keycode(VirtualKeyCode),
++#[derive(Clone, Debug, Eq, PartialEq, Hash)]
++pub enum BindingKey {
++    Scancode(KeyCode),
++    Keycode { key: Key, location: KeyLocation },
+ }
+ 
+-impl<'a> Deserialize<'a> for Key {
++impl<'a> Deserialize<'a> for BindingKey {
+     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+     where
+         D: Deserializer<'a>,
+     {
+         let value = SerdeValue::deserialize(deserializer)?;
+         match u32::deserialize(value.clone()) {
+-            Ok(scancode) => Ok(Key::Scancode(scancode)),
++            Ok(scancode) => Ok(BindingKey::Scancode(KeyCode::from_scancode(scancode))),
+             Err(_) => {
+-                let keycode = VirtualKeyCode::deserialize(value).map_err(D::Error::custom)?;
+-                Ok(Key::Keycode(keycode))
++                let keycode = String::deserialize(value.clone()).map_err(D::Error::custom)?;
++                let (key, location) = if keycode.chars().count() == 1 {
++                    (Key::Character(keycode.to_lowercase().into()), KeyLocation::Standard)
++                } else {
++                    // Translate legacy winit codes into their modern counterparts.
++                    match keycode.as_str() {
++                        "Up" => (Key::ArrowUp, KeyLocation::Standard),
++                        "Back" => (Key::Backspace, KeyLocation::Standard),
++                        "Down" => (Key::ArrowDown, KeyLocation::Standard),
++                        "Left" => (Key::ArrowLeft, KeyLocation::Standard),
++                        "Right" => (Key::ArrowRight, KeyLocation::Standard),
++                        "At" => (Key::Character("@".into()), KeyLocation::Standard),
++                        "Colon" => (Key::Character(":".into()), KeyLocation::Standard),
++                        "Period" => (Key::Character(".".into()), KeyLocation::Standard),
++                        "Return" => (Key::Enter, KeyLocation::Standard),
++                        "LBracket" => (Key::Character("[".into()), KeyLocation::Standard),
++                        "RBracket" => (Key::Character("]".into()), KeyLocation::Standard),
++                        "Semicolon" => (Key::Character(";".into()), KeyLocation::Standard),
++                        "Backslash" => (Key::Character("\\".into()), KeyLocation::Standard),
++                        "Plus" => (Key::Character("+".into()), KeyLocation::Standard),
++                        "Comma" => (Key::Character(",".into()), KeyLocation::Standard),
++                        "Slash" => (Key::Character("/".into()), KeyLocation::Standard),
++                        "Equals" => (Key::Character("=".into()), KeyLocation::Standard),
++                        "Minus" => (Key::Character("-".into()), KeyLocation::Standard),
++                        "Asterisk" => (Key::Character("*".into()), KeyLocation::Standard),
++                        "Key1" => (Key::Character("1".into()), KeyLocation::Standard),
++                        "Key2" => (Key::Character("2".into()), KeyLocation::Standard),
++                        "Key3" => (Key::Character("3".into()), KeyLocation::Standard),
++                        "Key4" => (Key::Character("4".into()), KeyLocation::Standard),
++                        "Key5" => (Key::Character("5".into()), KeyLocation::Standard),
++                        "Key6" => (Key::Character("6".into()), KeyLocation::Standard),
++                        "Key7" => (Key::Character("7".into()), KeyLocation::Standard),
++                        "Key8" => (Key::Character("8".into()), KeyLocation::Standard),
++                        "Key9" => (Key::Character("9".into()), KeyLocation::Standard),
++                        "Key0" => (Key::Character("0".into()), KeyLocation::Standard),
++
++                        // Special case numpad.
++                        "NumpadEnter" => (Key::Enter, KeyLocation::Numpad),
++                        "NumpadAdd" => (Key::Character("+".into()), KeyLocation::Numpad),
++                        "NumpadComma" => (Key::Character(",".into()), KeyLocation::Numpad),
++                        "NumpadDivide" => (Key::Character("/".into()), KeyLocation::Numpad),
++                        "NumpadEquals" => (Key::Character("=".into()), KeyLocation::Numpad),
++                        "NumpadSubtract" => (Key::Character("-".into()), KeyLocation::Numpad),
++                        "NumpadMultiply" => (Key::Character("*".into()), KeyLocation::Numpad),
++                        "Numpad1" => (Key::Character("1".into()), KeyLocation::Numpad),
++                        "Numpad2" => (Key::Character("2".into()), KeyLocation::Numpad),
++                        "Numpad3" => (Key::Character("3".into()), KeyLocation::Numpad),
++                        "Numpad4" => (Key::Character("4".into()), KeyLocation::Numpad),
++                        "Numpad5" => (Key::Character("5".into()), KeyLocation::Numpad),
++                        "Numpad6" => (Key::Character("6".into()), KeyLocation::Numpad),
++                        "Numpad7" => (Key::Character("7".into()), KeyLocation::Numpad),
++                        "Numpad8" => (Key::Character("8".into()), KeyLocation::Numpad),
++                        "Numpad9" => (Key::Character("9".into()), KeyLocation::Numpad),
++                        "Numpad0" => (Key::Character("0".into()), KeyLocation::Numpad),
++                        _ => (
++                            Key::deserialize(value).map_err(D::Error::custom)?,
++                            KeyLocation::Standard,
++                        ),
++                    }
++                };
++
++                Ok(BindingKey::Keycode { key, location })
+             },
+         }
+     }
+@@ -891,7 +845,7 @@ impl<'a> Deserialize<'a> for MouseButtonWrapper {
+ /// `KeyBinding` or `MouseBinding`.
+ #[derive(PartialEq, Eq)]
+ struct RawBinding {
+-    key: Option<Key>,
++    key: Option<BindingKey>,
+     mouse: Option<MouseButton>,
+     mods: ModifiersState,
+     mode: BindingMode,
+@@ -994,7 +948,7 @@ impl<'a> Deserialize<'a> for RawBinding {
+                 V: MapAccess<'a>,
+             {
+                 let mut mods: Option<ModifiersState> = None;
+-                let mut key: Option<Key> = None;
++                let mut key: Option<BindingKey> = None;
+                 let mut chars: Option<String> = None;
+                 let mut action: Option<Action> = None;
+                 let mut mode: Option<BindingMode> = None;
+@@ -1014,7 +968,11 @@ impl<'a> Deserialize<'a> for RawBinding {
+                             let value = map.next_value::<SerdeValue>()?;
+                             match value.as_integer() {
+                                 Some(scancode) => match u32::try_from(scancode) {
+-                                    Ok(scancode) => key = Some(Key::Scancode(scancode)),
++                                    Ok(scancode) => {
++                                        key = Some(BindingKey::Scancode(KeyCode::from_scancode(
++                                            scancode,
++                                        )))
++                                    },
+                                     Err(_) => {
+                                         return Err(<V::Error as Error>::custom(format!(
+                                             "Invalid key binding, scancode is too big: {}",
+@@ -1023,7 +981,9 @@ impl<'a> Deserialize<'a> for RawBinding {
+                                     },
+                                 },
+                                 None => {
+-                                    key = Some(Key::deserialize(value).map_err(V::Error::custom)?);
++                                    key = Some(
++                                        BindingKey::deserialize(value).map_err(V::Error::custom)?,
++                                    )
+                                 },
+                             }
+                         },
+@@ -1196,10 +1156,10 @@ impl<'a> de::Deserialize<'a> for ModsWrapper {
+                 let mut res = ModifiersState::empty();
+                 for modifier in value.split('|') {
+                     match modifier.trim().to_lowercase().as_str() {
+-                        "command" | "super" => res.insert(ModifiersState::LOGO),
++                        "command" | "super" => res.insert(ModifiersState::SUPER),
+                         "shift" => res.insert(ModifiersState::SHIFT),
+                         "alt" | "option" => res.insert(ModifiersState::ALT),
+-                        "control" => res.insert(ModifiersState::CTRL),
++                        "control" => res.insert(ModifiersState::CONTROL),
+                         "none" => (),
+                         _ => return Err(E::invalid_value(Unexpected::Str(modifier), &self)),
+                     }
+@@ -1217,7 +1177,7 @@ impl<'a> de::Deserialize<'a> for ModsWrapper {
+ mod tests {
+     use super::*;
+ 
+-    use winit::event::ModifiersState;
++    use winit::keyboard::ModifiersState;
+ 
+     type MockBinding = Binding<usize>;
+ 
+@@ -1380,7 +1340,7 @@ mod tests {
+     #[test]
+     fn binding_trigger_mods() {
+         let binding = MockBinding {
+-            mods: ModifiersState::ALT | ModifiersState::LOGO,
++            mods: ModifiersState::ALT | ModifiersState::SUPER,
+             ..MockBinding::default()
+         };
+ 
+diff --git a/alacritty/src/config/mod.rs b/alacritty/src/config/mod.rs
+index 9221050b..883ea99f 100644
+--- a/alacritty/src/config/mod.rs
++++ b/alacritty/src/config/mod.rs
+@@ -26,7 +26,7 @@ mod mouse;
+ 
+ use crate::cli::Options;
+ pub use crate::config::bindings::{
+-    Action, Binding, BindingMode, Key, MouseAction, SearchAction, ViAction,
++    Action, Binding, BindingKey, BindingMode, MouseAction, SearchAction, ViAction,
+ };
+ #[cfg(test)]
+ pub use crate::config::mouse::Mouse;
+diff --git a/alacritty/src/config/ui_config.rs b/alacritty/src/config/ui_config.rs
+index 62721781..a2e8d4e1 100644
+--- a/alacritty/src/config/ui_config.rs
++++ b/alacritty/src/config/ui_config.rs
+@@ -7,7 +7,7 @@ use log::{error, warn};
+ use serde::de::{Error as SerdeError, MapAccess, Visitor};
+ use serde::{self, Deserialize, Deserializer};
+ use unicode_width::UnicodeWidthChar;
+-use winit::event::{ModifiersState, VirtualKeyCode};
++use winit::keyboard::{Key, KeyLocation, ModifiersState};
+ 
+ use alacritty_config_derive::{ConfigDeserialize, SerdeReplace};
+ use alacritty_terminal::config::{Config as TerminalConfig, Program, LOG_TARGET_CONFIG};
+@@ -15,7 +15,7 @@ use alacritty_terminal::term::search::RegexSearch;
+ 
+ use crate::config::bell::BellConfig;
+ use crate::config::bindings::{
+-    self, Action, Binding, Key, KeyBinding, ModeWrapper, ModsWrapper, MouseBinding,
++    self, Action, Binding, BindingKey, KeyBinding, ModeWrapper, ModsWrapper, MouseBinding,
+ };
+ use crate::config::color::Colors;
+ use crate::config::debug::Debug;
+@@ -131,13 +131,13 @@ impl UiConfig {
+         };
+ 
+         for hint in &self.hints.enabled {
+-            let binding = match hint.binding {
++            let binding = match &hint.binding {
+                 Some(binding) => binding,
+                 None => continue,
+             };
+ 
+             let binding = KeyBinding {
+-                trigger: binding.key,
++                trigger: binding.key.clone(),
+                 mods: binding.mods.0,
+                 mode: binding.mode.mode,
+                 notmode: binding.mode.not_mode,
+@@ -208,7 +208,7 @@ pub fn deserialize_bindings<'a, D, T>(
+ ) -> Result<Vec<Binding<T>>, D::Error>
+ where
+     D: Deserializer<'a>,
+-    T: Copy + Eq,
++    T: Clone + Eq,
+     Binding<T>: Deserialize<'a>,
+ {
+     let values = Vec::<toml::Value>::deserialize(deserializer)?;
+@@ -278,8 +278,11 @@ impl Default for Hints {
+                 post_processing: true,
+                 mouse: Some(HintMouse { enabled: true, mods: Default::default() }),
+                 binding: Some(HintBinding {
+-                    key: Key::Keycode(VirtualKeyCode::U),
+-                    mods: ModsWrapper(ModifiersState::SHIFT | ModifiersState::CTRL),
++                    key: BindingKey::Keycode {
++                        key: Key::Character("u".into()),
++                        location: KeyLocation::Standard,
++                    },
++                    mods: ModsWrapper(ModifiersState::SHIFT | ModifiersState::CONTROL),
+                     mode: Default::default(),
+                 }),
+             }],
+@@ -454,10 +457,10 @@ impl<'de> Deserialize<'de> for HintContent {
+ }
+ 
+ /// Binding for triggering a keyboard hint.
+-#[derive(Deserialize, Copy, Clone, Debug, PartialEq, Eq)]
++#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+ #[serde(deny_unknown_fields)]
+ pub struct HintBinding {
+-    pub key: Key,
++    pub key: BindingKey,
+     #[serde(default)]
+     pub mods: ModsWrapper,
+     #[serde(default)]
+diff --git a/alacritty/src/display/hint.rs b/alacritty/src/display/hint.rs
+index 0ff070ec..7e2e4126 100644
+--- a/alacritty/src/display/hint.rs
++++ b/alacritty/src/display/hint.rs
+@@ -2,7 +2,7 @@ use std::cmp::Reverse;
+ use std::collections::HashSet;
+ use std::iter;
+ 
+-use winit::event::ModifiersState;
++use winit::keyboard::ModifiersState;
+ 
+ use alacritty_terminal::grid::{BidirectionalIterator, Dimensions};
+ use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point};
+diff --git a/alacritty/src/display/mod.rs b/alacritty/src/display/mod.rs
+index 98dd04ad..c992e9cc 100644
+--- a/alacritty/src/display/mod.rs
++++ b/alacritty/src/display/mod.rs
+@@ -15,9 +15,10 @@ use glutin::surface::{Rect as DamageRect, Surface, SwapInterval, WindowSurface};
+ 
+ use log::{debug, info};
+ use parking_lot::MutexGuard;
++use raw_window_handle::RawWindowHandle;
+ use serde::{Deserialize, Serialize};
+ use winit::dpi::PhysicalSize;
+-use winit::event::ModifiersState;
++use winit::keyboard::ModifiersState;
+ use winit::window::CursorIcon;
+ 
+ use crossfont::{self, Rasterize, Rasterizer};
+@@ -393,10 +394,7 @@ impl Display {
+         gl_context: NotCurrentContext,
+         config: &UiConfig,
+     ) -> Result<Display, Error> {
+-        #[cfg(any(not(feature = "wayland"), target_os = "macos", windows))]
+-        let is_wayland = false;
+-        #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+-        let is_wayland = window.wayland_surface().is_some();
++        let is_wayland = matches!(window.raw_window_handle(), RawWindowHandle::Wayland(_));
+ 
+         let scale_factor = window.scale_factor as f32;
+         let rasterizer = Rasterizer::new(scale_factor)?;
+@@ -1048,7 +1046,7 @@ impl Display {
+             // highlighted hint could be disrupted by the old preview.
+             dirty = self.hint_mouse_point.map_or(false, |p| p.line != point.line);
+             self.hint_mouse_point = Some(point);
+-            self.window.set_mouse_cursor(CursorIcon::Hand);
++            self.window.set_mouse_cursor(CursorIcon::Pointer);
+         } else if self.highlighted_hint.is_some() {
+             self.hint_mouse_point = None;
+             if term.mode().intersects(TermMode::MOUSE_MODE) && !term.mode().contains(TermMode::VI) {
+diff --git a/alacritty/src/display/window.rs b/alacritty/src/display/window.rs
+index 962f93a1..185e7305 100644
+--- a/alacritty/src/display/window.rs
++++ b/alacritty/src/display/window.rs
+@@ -408,7 +408,14 @@ impl Window {
+         let nspot_x = f64::from(size.padding_x() + point.column.0 as f32 * size.cell_width());
+         let nspot_y = f64::from(size.padding_y() + (point.line + 1) as f32 * size.cell_height());
+ 
+-        self.window.set_ime_position(PhysicalPosition::new(nspot_x, nspot_y));
++        // Exclude the rest of the line since we edit from left to right.
++        let width = size.width as f64 - nspot_x;
++        let height = size.cell_height as f64;
++
++        self.window.set_ime_cursor_area(
++            PhysicalPosition::new(nspot_x, nspot_y),
++            PhysicalSize::new(width, height),
++        );
+     }
+ 
+     /// Disable macOS window shadows.
+diff --git a/alacritty/src/event.rs b/alacritty/src/event.rs
+index 5fac1ced..52222080 100644
+--- a/alacritty/src/event.rs
++++ b/alacritty/src/event.rs
+@@ -19,11 +19,11 @@ use log::{debug, error, info, warn};
+ use wayland_client::{Display as WaylandDisplay, EventQueue};
+ use winit::dpi::PhysicalSize;
+ use winit::event::{
+-    ElementState, Event as WinitEvent, Ime, ModifiersState, MouseButton, StartCause,
++    ElementState, Event as WinitEvent, Ime, Modifiers, MouseButton, StartCause,
+     Touch as TouchEvent, WindowEvent,
+ };
+ use winit::event_loop::{
+-    ControlFlow, DeviceEventFilter, EventLoop, EventLoopProxy, EventLoopWindowTarget,
++    ControlFlow, DeviceEvents, EventLoop, EventLoopProxy, EventLoopWindowTarget,
+ };
+ use winit::platform::run_return::EventLoopExtRunReturn;
+ #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+@@ -191,9 +191,7 @@ pub struct ActionContext<'a, N, T> {
+     pub clipboard: &'a mut Clipboard,
+     pub mouse: &'a mut Mouse,
+     pub touch: &'a mut TouchPurpose,
+-    pub received_count: &'a mut usize,
+-    pub suppress_chars: &'a mut bool,
+-    pub modifiers: &'a mut ModifiersState,
++    pub modifiers: &'a mut Modifiers,
+     pub display: &'a mut Display,
+     pub message_buffer: &'a mut MessageBuffer,
+     pub config: &'a UiConfig,
+@@ -349,17 +347,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
+     }
+ 
+     #[inline]
+-    fn received_count(&mut self) -> &mut usize {
+-        self.received_count
+-    }
+-
+-    #[inline]
+-    fn suppress_chars(&mut self) -> &mut bool {
+-        self.suppress_chars
+-    }
+-
+-    #[inline]
+-    fn modifiers(&mut self) -> &mut ModifiersState {
++    fn modifiers(&mut self) -> &mut Modifiers {
+         self.modifiers
+     }
+ 
+@@ -750,7 +738,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
+     fn expand_selection(&mut self) {
+         let selection_type = match self.mouse().click_state {
+             ClickState::Click => {
+-                if self.modifiers().ctrl() {
++                if self.modifiers().state().control_key() {
+                     SelectionType::Block
+                 } else {
+                     SelectionType::Simple
+@@ -1304,11 +1292,10 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
+ 
+                         self.ctx.display.pending_update.set_dimensions(size);
+                     },
+-                    WindowEvent::KeyboardInput { input, is_synthetic: false, .. } => {
+-                        self.key_input(input);
++                    WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
++                        self.key_input(event);
+                     },
+                     WindowEvent::ModifiersChanged(modifiers) => self.modifiers_input(modifiers),
+-                    WindowEvent::ReceivedCharacter(c) => self.received_char(c),
+                     WindowEvent::MouseInput { state, button, .. } => {
+                         self.ctx.window().set_mouse_visible(true);
+                         self.mouse_input(state, button);
+@@ -1507,7 +1494,7 @@ impl Processor {
+         let mut clipboard = Clipboard::new();
+ 
+         // Disable all device events, since we don't care about them.
+-        event_loop.set_device_event_filter(DeviceEventFilter::Always);
++        event_loop.listen_device_events(DeviceEvents::Never);
+ 
+         let exit_code = event_loop.run_return(move |event, event_loop, control_flow| {
+             if self.config.debug.print_events {
+diff --git a/alacritty/src/input.rs b/alacritty/src/input.rs
+index a9925088..867099a9 100644
+--- a/alacritty/src/input.rs
++++ b/alacritty/src/input.rs
+@@ -17,12 +17,16 @@ use std::time::{Duration, Instant};
+ use log::debug;
+ use winit::dpi::PhysicalPosition;
+ use winit::event::{
+-    ElementState, KeyboardInput, ModifiersState, MouseButton, MouseScrollDelta,
+-    Touch as TouchEvent, TouchPhase,
++    ElementState, KeyEvent, Modifiers, MouseButton, MouseScrollDelta, Touch as TouchEvent,
++    TouchPhase,
+ };
+ use winit::event_loop::EventLoopWindowTarget;
+ #[cfg(target_os = "macos")]
++use winit::keyboard::ModifiersKeyState;
++use winit::keyboard::ModifiersState;
++#[cfg(target_os = "macos")]
+ use winit::platform::macos::{EventLoopWindowTargetExtMacOS, OptionAsAlt};
++use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+ use winit::window::CursorIcon;
+ 
+ use alacritty_terminal::ansi::{ClearMode, Handler};
+@@ -35,7 +39,9 @@ use alacritty_terminal::term::{ClipboardType, Term, TermMode};
+ use alacritty_terminal::vi_mode::ViMotion;
+ 
+ use crate::clipboard::Clipboard;
+-use crate::config::{Action, BindingMode, Key, MouseAction, SearchAction, UiConfig, ViAction};
++use crate::config::{
++    Action, BindingKey, BindingMode, MouseAction, SearchAction, UiConfig, ViAction,
++};
+ use crate::display::hint::HintMatch;
+ use crate::display::window::Window;
+ use crate::display::{Display, SizeInfo};
+@@ -88,9 +94,7 @@ pub trait ActionContext<T: EventListener> {
+     fn mouse_mut(&mut self) -> &mut Mouse;
+     fn mouse(&self) -> &Mouse;
+     fn touch_purpose(&mut self) -> &mut TouchPurpose;
+-    fn received_count(&mut self) -> &mut usize;
+-    fn suppress_chars(&mut self) -> &mut bool;
+-    fn modifiers(&mut self) -> &mut ModifiersState;
++    fn modifiers(&mut self) -> &mut Modifiers;
+     fn scroll(&mut self, _scroll: Scroll) {}
+     fn window(&mut self) -> &mut Window;
+     fn display(&mut self) -> &mut Display;
+@@ -421,7 +425,8 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+         // Don't launch URLs if mouse has moved.
+         self.ctx.mouse_mut().block_hint_launcher = true;
+ 
+-        if (lmb_pressed || rmb_pressed) && (self.ctx.modifiers().shift() || !self.ctx.mouse_mode())
++        if (lmb_pressed || rmb_pressed)
++            && (self.ctx.modifiers().state().shift_key() || !self.ctx.mouse_mode())
+         {
+             self.ctx.update_selection(point, cell_side);
+         } else if cell_changed
+@@ -472,14 +477,14 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+ 
+         // Calculate modifiers value.
+         let mut mods = 0;
+-        let modifiers = self.ctx.modifiers();
+-        if modifiers.shift() {
++        let modifiers = self.ctx.modifiers().state();
++        if modifiers.shift_key() {
+             mods += 4;
+         }
+-        if modifiers.alt() {
++        if modifiers.alt_key() {
+             mods += 8;
+         }
+-        if modifiers.ctrl() {
++        if modifiers.control_key() {
+             mods += 16;
+         }
+ 
+@@ -539,7 +544,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+ 
+     fn on_mouse_press(&mut self, button: MouseButton) {
+         // Handle mouse mode.
+-        if !self.ctx.modifiers().shift() && self.ctx.mouse_mode() {
++        if !self.ctx.modifiers().state().shift_key() && self.ctx.mouse_mode() {
+             self.ctx.mouse_mut().click_state = ClickState::None;
+ 
+             let code = match button {
+@@ -547,7 +552,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+                 MouseButton::Middle => 1,
+                 MouseButton::Right => 2,
+                 // Can't properly report more than three buttons..
+-                MouseButton::Other(_) => return,
++                MouseButton::Back | MouseButton::Forward | MouseButton::Other(_) => return,
+             };
+ 
+             self.mouse_report(code, ElementState::Pressed);
+@@ -591,7 +596,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+                 self.ctx.clear_selection();
+ 
+                 // Start new empty selection.
+-                if self.ctx.modifiers().ctrl() {
++                if self.ctx.modifiers().state().control_key() {
+                     self.ctx.start_selection(SelectionType::Block, point, side);
+                 } else {
+                     self.ctx.start_selection(SelectionType::Simple, point, side);
+@@ -616,13 +621,13 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+     }
+ 
+     fn on_mouse_release(&mut self, button: MouseButton) {
+-        if !self.ctx.modifiers().shift() && self.ctx.mouse_mode() {
++        if !self.ctx.modifiers().state().shift_key() && self.ctx.mouse_mode() {
+             let code = match button {
+                 MouseButton::Left => 0,
+                 MouseButton::Middle => 1,
+                 MouseButton::Right => 2,
+                 // Can't properly report more than three buttons.
+-                MouseButton::Other(_) => return,
++                MouseButton::Back | MouseButton::Forward | MouseButton::Other(_) => return,
+             };
+             self.mouse_report(code, ElementState::Released);
+             return;
+@@ -705,7 +710,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+             .terminal()
+             .mode()
+             .contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
+-            && !self.ctx.modifiers().shift()
++            && !self.ctx.modifiers().state().shift_key()
+         {
+             let multiplier = f64::from(self.ctx.config().terminal_config.scrolling.multiplier);
+ 
+@@ -870,6 +875,25 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+         }
+     }
+ 
++    /// Reset mouse cursor based on modifier and terminal state.
++    #[inline]
++    pub fn reset_mouse_cursor(&mut self) {
++        let mouse_state = self.cursor_state();
++        self.ctx.window().set_mouse_cursor(mouse_state);
++    }
++
++    /// Modifier state change.
++    pub fn modifiers_input(&mut self, modifiers: Modifiers) {
++        *self.ctx.modifiers() = modifiers;
++
++        // Prompt hint highlight update.
++        self.ctx.mouse_mut().hint_highlight_dirty = true;
++
++        // Update mouse state and check for URL change.
++        let mouse_state = self.cursor_state();
++        self.ctx.window().set_mouse_cursor(mouse_state);
++    }
++
+     pub fn mouse_input(&mut self, state: ElementState, button: MouseButton) {
+         match button {
+             MouseButton::Left => self.ctx.mouse_mut().left_button_state = state,
+@@ -879,7 +903,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+         }
+ 
+         // Skip normal mouse events if the message bar has been clicked.
+-        if self.message_bar_cursor_state() == Some(CursorIcon::Hand)
++        if self.message_bar_cursor_state() == Some(CursorIcon::Pointer)
+             && state == ElementState::Pressed
+         {
+             let size = self.ctx.size_info();
+@@ -894,7 +918,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+ 
+             let new_icon = match current_lines.cmp(&new_lines) {
+                 Ordering::Less => CursorIcon::Default,
+-                Ordering::Equal => CursorIcon::Hand,
++                Ordering::Equal => CursorIcon::Pointer,
+                 Ordering::Greater => {
+                     if self.ctx.mouse_mode() {
+                         CursorIcon::Default
+@@ -917,16 +941,43 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+         }
+     }
+ 
++    /// Attempt to find a binding and execute its action.
++    ///
++    /// The provided mode, mods, and key must match what is allowed by a binding
++    /// for its action to be executed.
++    fn process_mouse_bindings(&mut self, button: MouseButton) {
++        let mode = BindingMode::new(self.ctx.terminal().mode(), self.ctx.search_active());
++        let mouse_mode = self.ctx.mouse_mode();
++        let mods = self.ctx.modifiers().state();
++
++        for i in 0..self.ctx.config().mouse_bindings().len() {
++            let mut binding = self.ctx.config().mouse_bindings()[i].clone();
++
++            // Require shift for all modifiers when mouse mode is active.
++            if mouse_mode {
++                binding.mods |= ModifiersState::SHIFT;
++            }
++
++            if binding.is_triggered_by(mode, mods, &button) {
++                binding.action.execute(&mut self.ctx);
++            }
++        }
++    }
++
+     /// Process key input.
+-    pub fn key_input(&mut self, input: KeyboardInput) {
++    pub fn key_input(&mut self, key: KeyEvent) {
+         // IME input will be applied on commit and shouldn't trigger key bindings.
+-        if self.ctx.display().ime.preedit().is_some() {
++        if key.state == ElementState::Released || self.ctx.display().ime.preedit().is_some() {
+             return;
+         }
+ 
++        let text = key.text_with_all_modifiers().unwrap_or_default();
++
+         // All key bindings are disabled while a hint is being selected.
+         if self.ctx.display().hint_state.active() {
+-            *self.ctx.suppress_chars() = false;
++            for character in text.chars() {
++                self.ctx.hint_input(character);
++            }
+             return;
+         }
+ 
+@@ -939,102 +990,68 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+             }
+         }
+ 
+-        // Reset character suppression.
+-        *self.ctx.suppress_chars() = false;
+-
+-        if let ElementState::Pressed = input.state {
+-            *self.ctx.received_count() = 0;
+-            self.process_key_bindings(input);
+-        }
+-    }
+-
+-    /// Modifier state change.
+-    pub fn modifiers_input(&mut self, modifiers: ModifiersState) {
+-        *self.ctx.modifiers() = modifiers;
+-
+-        // Prompt hint highlight update.
+-        self.ctx.mouse_mut().hint_highlight_dirty = true;
+-
+-        // Update mouse state and check for URL change.
+-        let mouse_state = self.cursor_state();
+-        self.ctx.window().set_mouse_cursor(mouse_state);
+-    }
+-
+-    /// Reset mouse cursor based on modifier and terminal state.
+-    #[inline]
+-    pub fn reset_mouse_cursor(&mut self) {
+-        let mouse_state = self.cursor_state();
+-        self.ctx.window().set_mouse_cursor(mouse_state);
+-    }
+-
+-    /// Process a received character.
+-    pub fn received_char(&mut self, c: char) {
+-        let suppress_chars = *self.ctx.suppress_chars();
+-
+-        // Don't insert chars when we have IME running.
+-        if self.ctx.display().ime.preedit().is_some() {
++        // Key bindings suppress the character input.
++        if self.process_key_bindings(&key) {
+             return;
+         }
+ 
+-        // Handle hint selection over anything else.
+-        if self.ctx.display().hint_state.active() && !suppress_chars {
+-            self.ctx.hint_input(c);
++        if self.ctx.search_active() {
++            for character in text.chars() {
++                self.ctx.search_input(character);
++            }
++
+             return;
+         }
+ 
+-        // Pass keys to search and ignore them during `suppress_chars`.
+-        let search_active = self.ctx.search_active();
+-        if suppress_chars || search_active || self.ctx.terminal().mode().contains(TermMode::VI) {
+-            if search_active && !suppress_chars {
+-                self.ctx.search_input(c);
+-            }
+-
++        // Vi mode on its own doesn't have any input, the search input was done before.
++        if self.ctx.terminal().mode().contains(TermMode::VI) || text.is_empty() {
+             return;
+         }
+ 
+         self.ctx.on_terminal_input_start();
+ 
+-        let utf8_len = c.len_utf8();
+-        let mut bytes = vec![0; utf8_len];
+-        c.encode_utf8(&mut bytes[..]);
+-
+-        #[cfg(not(target_os = "macos"))]
+-        let alt_send_esc = true;
+-
+-        // Don't send ESC when `OptionAsAlt` is used. This doesn't handle
+-        // `Only{Left,Right}` variants due to inability to distinguish them.
+-        #[cfg(target_os = "macos")]
+-        let alt_send_esc = self.ctx.config().window.option_as_alt != OptionAsAlt::None;
+-
+-        if alt_send_esc
+-            && *self.ctx.received_count() == 0
+-            && self.ctx.modifiers().alt()
+-            && utf8_len == 1
+-        {
+-            bytes.insert(0, b'\x1b');
++        let mut bytes = Vec::with_capacity(text.len() + 1);
++        if self.alt_send_esc() && text.len() == 1 {
++            bytes.push(b'\x1b');
+         }
++        bytes.extend_from_slice(text.as_bytes());
+ 
+         self.ctx.write_to_pty(bytes);
++    }
++
++    /// Whether we should send `ESC` due to `Alt` being pressed.
++    #[cfg(not(target_os = "macos"))]
++    fn alt_send_esc(&mut self) -> bool {
++        self.ctx.modifiers().state().alt_key()
++    }
+ 
+-        *self.ctx.received_count() += 1;
++    #[cfg(target_os = "macos")]
++    fn alt_send_esc(&mut self) -> bool {
++        let option_as_alt = self.ctx.config().window.option_as_alt;
++        option_as_alt == OptionAsAlt::Both
++            || (option_as_alt == OptionAsAlt::OnlyLeft
++                && self.ctx.modifiers().lalt_state() == ModifiersKeyState::Pressed)
++            || (option_as_alt == OptionAsAlt::OnlyRight
++                && self.ctx.modifiers().ralt_state() == ModifiersKeyState::Pressed)
+     }
+ 
+     /// Attempt to find a binding and execute its action.
+     ///
+     /// The provided mode, mods, and key must match what is allowed by a binding
+     /// for its action to be executed.
+-    fn process_key_bindings(&mut self, input: KeyboardInput) {
++    fn process_key_bindings(&mut self, key: &KeyEvent) -> bool {
+         let mode = BindingMode::new(self.ctx.terminal().mode(), self.ctx.search_active());
+-        let mods = *self.ctx.modifiers();
++        let mods = self.ctx.modifiers().state();
++
++        // Don't suppress char if no bindings were triggered.
+         let mut suppress_chars = None;
+ 
+         for i in 0..self.ctx.config().key_bindings().len() {
+             let binding = &self.ctx.config().key_bindings()[i];
+ 
+-            let key = match (binding.trigger, input.virtual_keycode) {
+-                (Key::Scancode(_), _) => Key::Scancode(input.scancode),
+-                (_, Some(key)) => Key::Keycode(key),
+-                _ => continue,
++            let key = match (&binding.trigger, &key.key_without_modifiers()) {
++                (BindingKey::Scancode(_), _) => BindingKey::Scancode(key.physical_key),
++                (_, code) => BindingKey::Keycode { key: code.clone(), location: key.location },
+             };
+ 
+             if binding.is_triggered_by(mode, mods, &key) {
+@@ -1046,31 +1063,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+             }
+         }
+ 
+-        // Don't suppress char if no bindings were triggered.
+-        *self.ctx.suppress_chars() = suppress_chars.unwrap_or(false);
+-    }
+-
+-    /// Attempt to find a binding and execute its action.
+-    ///
+-    /// The provided mode, mods, and key must match what is allowed by a binding
+-    /// for its action to be executed.
+-    fn process_mouse_bindings(&mut self, button: MouseButton) {
+-        let mode = BindingMode::new(self.ctx.terminal().mode(), self.ctx.search_active());
+-        let mouse_mode = self.ctx.mouse_mode();
+-        let mods = *self.ctx.modifiers();
+-
+-        for i in 0..self.ctx.config().mouse_bindings().len() {
+-            let mut binding = self.ctx.config().mouse_bindings()[i].clone();
+-
+-            // Require shift for all modifiers when mouse mode is active.
+-            if mouse_mode {
+-                binding.mods |= ModifiersState::SHIFT;
+-            }
+-
+-            if binding.is_triggered_by(mode, mods, &button) {
+-                binding.action.execute(&mut self.ctx);
+-            }
+-        }
++        suppress_chars.unwrap_or(false)
+     }
+ 
+     /// Check mouse icon state in relation to the message bar.
+@@ -1092,7 +1085,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+         } else if mouse.y <= terminal_end + size.cell_height() as usize
+             && point.column + message_bar::CLOSE_BUTTON_TEXT.len() >= size.columns()
+         {
+-            Some(CursorIcon::Hand)
++            Some(CursorIcon::Pointer)
+         } else {
+             Some(CursorIcon::Default)
+         }
+@@ -1110,8 +1103,8 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+         if let Some(mouse_state) = self.message_bar_cursor_state() {
+             mouse_state
+         } else if self.ctx.display().highlighted_hint.as_ref().map_or(false, hint_highlighted) {
+-            CursorIcon::Hand
+-        } else if !self.ctx.modifiers().shift() && self.ctx.mouse_mode() {
++            CursorIcon::Pointer
++        } else if !self.ctx.modifiers().state().shift_key() && self.ctx.mouse_mode() {
+             CursorIcon::Default
+         } else {
+             CursorIcon::Text
+@@ -1158,7 +1151,8 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+ mod tests {
+     use super::*;
+ 
+-    use winit::event::{DeviceId, Event as WinitEvent, VirtualKeyCode, WindowEvent};
++    use winit::event::{DeviceId, Event as WinitEvent, WindowEvent};
++    use winit::keyboard::Key;
+     use winit::window::WindowId;
+ 
+     use alacritty_terminal::event::Event as TerminalEvent;
+@@ -1166,7 +1160,7 @@ mod tests {
+     use crate::config::Binding;
+     use crate::message_bar::MessageBuffer;
+ 
+-    const KEY: VirtualKeyCode = VirtualKeyCode::Key0;
++    const KEY: Key<&'static str> = Key::Character("0");
+ 
+     struct MockEventProxy;
+     impl EventListener for MockEventProxy {}
+@@ -1177,9 +1171,7 @@ mod tests {
+         pub mouse: &'a mut Mouse,
+         pub clipboard: &'a mut Clipboard,
+         pub message_buffer: &'a mut MessageBuffer,
+-        pub received_count: usize,
+-        pub suppress_chars: bool,
+-        pub modifiers: ModifiersState,
++        pub modifiers: Modifiers,
+         config: &'a UiConfig,
+     }
+ 
+@@ -1240,15 +1232,7 @@ mod tests {
+             unimplemented!();
+         }
+ 
+-        fn received_count(&mut self) -> &mut usize {
+-            &mut self.received_count
+-        }
+-
+-        fn suppress_chars(&mut self) -> &mut bool {
+-            &mut self.suppress_chars
+-        }
+-
+-        fn modifiers(&mut self) -> &mut ModifiersState {
++        fn modifiers(&mut self) -> &mut Modifiers {
+             &mut self.modifiers
+         }
+ 
+@@ -1324,8 +1308,6 @@ mod tests {
+                     mouse: &mut mouse,
+                     size_info: &size,
+                     clipboard: &mut clipboard,
+-                    received_count: 0,
+-                    suppress_chars: false,
+                     modifiers: Default::default(),
+                     message_buffer: &mut message_buffer,
+                     config: &cfg,
+@@ -1379,7 +1361,6 @@ mod tests {
+                 state: ElementState::Pressed,
+                 button: MouseButton::Left,
+                 device_id: unsafe { DeviceId::dummy() },
+-                modifiers: ModifiersState::default(),
+             },
+             window_id: unsafe { WindowId::dummy() },
+         },
+@@ -1396,7 +1377,6 @@ mod tests {
+                 state: ElementState::Pressed,
+                 button: MouseButton::Right,
+                 device_id: unsafe { DeviceId::dummy() },
+-                modifiers: ModifiersState::default(),
+             },
+             window_id: unsafe { WindowId::dummy() },
+         },
+@@ -1413,7 +1393,6 @@ mod tests {
+                 state: ElementState::Pressed,
+                 button: MouseButton::Middle,
+                 device_id: unsafe { DeviceId::dummy() },
+-                modifiers: ModifiersState::default(),
+             },
+             window_id: unsafe { WindowId::dummy() },
+         },
+@@ -1430,7 +1409,6 @@ mod tests {
+                 state: ElementState::Pressed,
+                 button: MouseButton::Left,
+                 device_id: unsafe { DeviceId::dummy() },
+-                modifiers: ModifiersState::default(),
+             },
+             window_id: unsafe { WindowId::dummy() },
+         },
+@@ -1447,7 +1425,6 @@ mod tests {
+                 state: ElementState::Pressed,
+                 button: MouseButton::Left,
+                 device_id: unsafe { DeviceId::dummy() },
+-                modifiers: ModifiersState::default(),
+             },
+             window_id: unsafe { WindowId::dummy() },
+         },
+@@ -1464,7 +1441,6 @@ mod tests {
+                 state: ElementState::Pressed,
+                 button: MouseButton::Left,
+                 device_id: unsafe { DeviceId::dummy() },
+-                modifiers: ModifiersState::default(),
+             },
+             window_id: unsafe { WindowId::dummy() },
+         },
+@@ -1481,7 +1457,6 @@ mod tests {
+                 state: ElementState::Pressed,
+                 button: MouseButton::Left,
+                 device_id: unsafe { DeviceId::dummy() },
+-                modifiers: ModifiersState::default(),
+             },
+             window_id: unsafe { WindowId::dummy() },
+         },
+@@ -1498,7 +1473,6 @@ mod tests {
+                 state: ElementState::Pressed,
+                 button: MouseButton::Right,
+                 device_id: unsafe { DeviceId::dummy() },
+-                modifiers: ModifiersState::default(),
+             },
+             window_id: unsafe { WindowId::dummy() },
+         },
+@@ -1524,10 +1498,10 @@ mod tests {
+ 
+     test_process_binding! {
+         name: process_binding_nomode_controlmod,
+-        binding: Binding { trigger: KEY, mods: ModifiersState::CTRL, action: Action::from("\x1b[1;5D"), mode: BindingMode::empty(), notmode: BindingMode::empty() },
++        binding: Binding { trigger: KEY, mods: ModifiersState::CONTROL, action: Action::from("\x1b[1;5D"), mode: BindingMode::empty(), notmode: BindingMode::empty() },
+         triggers: true,
+         mode: BindingMode::empty(),
+-        mods: ModifiersState::CTRL,
++        mods: ModifiersState::CONTROL,
+     }
+ 
+     test_process_binding! {
+@@ -1564,9 +1538,9 @@ mod tests {
+ 
+     test_process_binding! {
+         name: process_binding_fail_with_extra_mods,
+-        binding: Binding { trigger: KEY, mods: ModifiersState::LOGO, action: Action::from("arst"), mode: BindingMode::empty(), notmode: BindingMode::empty() },
++        binding: Binding { trigger: KEY, mods: ModifiersState::SUPER, action: Action::from("arst"), mode: BindingMode::empty(), notmode: BindingMode::empty() },
+         triggers: false,
+         mode: BindingMode::empty(),
+-        mods: ModifiersState::ALT | ModifiersState::LOGO,
++        mods: ModifiersState::ALT | ModifiersState::SUPER,
+     }
+ }
+diff --git a/alacritty/src/window_context.rs b/alacritty/src/window_context.rs
+index 502907ad..568f8c22 100644
+--- a/alacritty/src/window_context.rs
++++ b/alacritty/src/window_context.rs
+@@ -21,7 +21,7 @@ use raw_window_handle::HasRawDisplayHandle;
+ use serde_json as json;
+ #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+ use wayland_client::EventQueue;
+-use winit::event::{Event as WinitEvent, ModifiersState, WindowEvent};
++use winit::event::{Event as WinitEvent, Modifiers, WindowEvent};
+ use winit::event_loop::{EventLoopProxy, EventLoopWindowTarget};
+ use winit::window::WindowId;
+ 
+@@ -55,10 +55,8 @@ pub struct WindowContext {
+     event_queue: Vec<WinitEvent<'static, Event>>,
+     terminal: Arc<FairMutex<Term<EventProxy>>>,
+     cursor_blink_timed_out: bool,
+-    modifiers: ModifiersState,
++    modifiers: Modifiers,
+     search_state: SearchState,
+-    received_count: usize,
+-    suppress_chars: bool,
+     notifier: Notifier,
+     font_size: Size,
+     mouse: Mouse,
+@@ -248,9 +246,7 @@ impl WindowContext {
+             config,
+             notifier: Notifier(loop_tx),
+             cursor_blink_timed_out: Default::default(),
+-            suppress_chars: Default::default(),
+             message_buffer: Default::default(),
+-            received_count: Default::default(),
+             search_state: Default::default(),
+             event_queue: Default::default(),
+             ipc_config: Default::default(),
+@@ -423,8 +419,6 @@ impl WindowContext {
+         let context = ActionContext {
+             cursor_blink_timed_out: &mut self.cursor_blink_timed_out,
+             message_buffer: &mut self.message_buffer,
+-            received_count: &mut self.received_count,
+-            suppress_chars: &mut self.suppress_chars,
+             search_state: &mut self.search_state,
+             modifiers: &mut self.modifiers,
+             font_size: &mut self.font_size,
+@@ -471,7 +465,7 @@ impl WindowContext {
+                 &terminal,
+                 &self.config,
+                 &self.mouse,
+-                self.modifiers,
++                self.modifiers.state(),
+             );
+             self.mouse.hint_highlight_dirty = false;
+         }
+diff --git a/alacritty_config/Cargo.toml b/alacritty_config/Cargo.toml
+index b7ed5658..5665790c 100644
+--- a/alacritty_config/Cargo.toml
++++ b/alacritty_config/Cargo.toml
+@@ -14,4 +14,4 @@ serde = "1.0.163"
+ toml = "0.7.1"
+ 
+ [target.'cfg(target_os = "macos")'.dependencies]
+-winit = { version = "0.28.2", default-features = false, features = ["serde"] }
++winit = { version = "0.29.0-beta.0", default-features = false, features = ["serde"] }
+diff --git a/extra/man/alacritty-bindings.5.scd b/extra/man/alacritty-bindings.5.scd
+index 988c1505..ddd4a6ea 100644
+--- a/extra/man/alacritty-bindings.5.scd
++++ b/extra/man/alacritty-bindings.5.scd
+@@ -153,7 +153,7 @@ configuration. See *alacritty*(5) for full configuration format documentation.
+ :  _"Alt"_
+ :  _"Vi|~Search"_
+ :  _"ToggleSemanticSelection"_
+-|  _"Return"_
++|  _"Enter"_
+ :[
+ :  _"Vi|~Search"_
+ :  _"Open"_
+@@ -177,31 +177,31 @@ configuration. See *alacritty*(5) for full configuration format documentation.
+ :[
+ :  _"Vi|~Search"_
+ :  _"Right"_
+-|  _"Up"_
++|  _"ArrowUp"_
+ :[
+ :  _"Vi|~Search"_
+ :  _"Up"_
+-|  _"Down"_
++|  _"ArrowDown"_
+ :[
+ :  _"Vi|~Search"_
+ :  _"Down"_
+-|  _"Left"_
++|  _"ArrowLeft"_
+ :[
+ :  _"Vi|~Search"_
+ :  _"Left"_
+-|  _"Right"_
++|  _"ArrowRight"_
+ :[
+ :  _"Vi|~Search"_
+ :  _"Right"_
+-|  _"Key0"_
++|  _"0"_
+ :[
+ :  _"Vi|~Search"_
+ :  _"First"_
+-|  _"Key4"_
++|  _"4"_
+ :  _"Shift"_
+ :  _"Vi|~Search"_
+ :  _"Last"_
+-|  _"Key6"_
++|  _"6"_
+ :  _"Shift"_
+ :  _"Vi|~Search"_
+ :  _"FirstOccupied"_
+@@ -241,15 +241,15 @@ configuration. See *alacritty*(5) for full configuration format documentation.
+ :  _"Shift"_
+ :  _"Vi|~Search"_
+ :  _"WordRightEnd"_
+-|  _"Key5"_
++|  _"5"_
+ :  _"Shift"_
+ :  _"Vi|~Search"_
+ :  _"Bracket"_
+-|  _"Slash"_
++|  _"/"_
+ :[
+ :  _"Vi|~Search"_
+ :  _"SearchForward"_
+-|  _"Slash"_
++|  _"/"_
+ :  _"Shift"_
+ :  _"Vi|~Search"_
+ :  _"SearchBackward"_
+@@ -269,7 +269,7 @@ configuration. See *alacritty*(5) for full configuration format documentation.
+ :[ *mods*
+ :[ *mode*
+ :[ *action*
+-|  _"Return"_
++|  _"Enter"_
+ :[
+ :  _"Search|Vi"_
+ :  _"SearchConfirm"_
+@@ -297,15 +297,15 @@ configuration. See *alacritty*(5) for full configuration format documentation.
+ :  _"Control"_
+ :  _"Search"_
+ :  _"SearchHistoryNext"_
+-|  _"Up"_
++|  _"ArrowUp"_
+ :[
+ :  _"Search"_
+ :  _"SearchHistoryPrevious"_
+-|  _"Down"_
++|  _"ArrowDown"_
+ :[
+ :  _"Search"_
+ :  _"SearchHistoryNext"_
+-|  _"Return"_
++|  _"Enter"_
+ :[
+ :  _"Search|~Vi"_
+ :  _"SearchFocusNext"_
+@@ -340,15 +340,15 @@ configuration. See *alacritty*(5) for full configuration format documentation.
+ :  _"Shift"_
+ :[
+ :  _"PasteSelection"_
+-|  _"Key0"_
++|  _"0"_
+ :  _"Control"_
+ :[
+ :  _"ResetFontSize"_
+-|  _"Equals"_
++|  _"="_
+ :  _"Control"_
+ :[
+ :  _"IncreaseFontSize"_
+-|  _"Plus"_
++|  _"+"_
+ :  _"Control"_
+ :[
+ :  _"IncreaseFontSize"_
+@@ -356,7 +356,7 @@ configuration. See *alacritty*(5) for full configuration format documentation.
+ :  _"Control"_
+ :[
+ :  _"IncreaseFontSize"_
+-|  _"Minus"_
++|  _"-"_
+ :  _"Control"_
+ :[
+ :  _"DecreaseFontSize"_
+@@ -371,7 +371,7 @@ configuration. See *alacritty*(5) for full configuration format documentation.
+ :[ *mods*
+ :[ *mode*
+ :[ *action*
+-|  _"Return"_
++|  _"Enter"_
+ :  _"Alt"_
+ :[
+ :  _"ToggleFullscreen"_
+@@ -390,15 +390,15 @@ configuration. See *alacritty*(5) for full configuration format documentation.
+ :  _"Command"_
+ :  _"~Vi|~Search"_
+ :  _"ClearHistory"_
+-|  _"Key0"_
++|  _"0"_
+ :  _"Command"_
+ :[
+ :  _"ResetFontSize"_
+-|  _"Equals"_
++|  _"="_
+ :  _"Command"_
+ :[
+ :  _"IncreaseFontSize"_
+-|  _"Plus"_
++|  _"+"_
+ :  _"Command"_
+ :[
+ :  _"IncreaseFontSize"_
+@@ -406,7 +406,7 @@ configuration. See *alacritty*(5) for full configuration format documentation.
+ :  _"Command"_
+ :[
+ :  _"IncreaseFontSize"_
+-|  _"Minus"_
++|  _"-"_
+ :  _"Command"_
+ :[
+ :  _"DecreaseFontSize"_
+diff --git a/extra/man/alacritty.5.scd b/extra/man/alacritty.5.scd
+index 78884e32..f0124dbe 100644
+--- a/extra/man/alacritty.5.scd
++++ b/extra/man/alacritty.5.scd
+@@ -656,11 +656,14 @@ This section documents the *[keyboard]* table of the configuration file.
+ 
+ 	*key* <string>
+ 
+-		Identifier of the binding's key, for example: _"A"_, _"F1"_, or
+-		_"Key0"_.
+-
+-		A full list with available key codes can be found here:++
+-https://docs.rs/winit/\*/winit/event/enum.VirtualKeyCode.html#variants
++		The regular keys like _"A"_, _"0"_, and _"Я"_ can be mapped directly
++		without any special syntax. Full list of named keys like _"F1"_ and the
++		syntax for dead keys can be found here:++
++https://docs.rs/winit/\*/winit/keyboard/enum.Key.html
++
++		Numpad keys are prefixed by _Numpad_: "NumpadEnter" | "NumpadAdd" |
++		"NumpadComma" | "NumpadDivide" | "NumpadEquals" | "NumpadSubtract" |
++		"NumpadMultiply" | "Numpad[0-9]".
+ 
+ 		The _key_ field also supports using scancodes, which are specified as a
+ 		decimal number.

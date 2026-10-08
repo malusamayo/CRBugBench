@@ -1,0 +1,33 @@
+# Code Review Task
+
+You are a maintainer reviewing a pull request to the `yt-dlp/yt-dlp` repository.
+
+**PR title:** Add option `--cookies-from-browser` to load cookies from a browser (#488)
+
+**PR description / commit message:**
+
+Add option `--cookies-from-browser` to load cookies from a browser (#488)
+
+* also adds `--no-cookies-from-browser`
+
+Original PR: https://github.com/ytdl-org/youtube-dl/pull/29201
+Authored by: mbway
+
+## Working environment
+
+The repository is checked out at `/app/yt-dlp` at this PR's **base commit**
+(the state before this PR), with full history up to that commit -- use
+`git log` / `git blame` to understand surrounding code, call sites, and
+conventions. The proposed change is the diff in `/app/pr_to_review.diff`.
+
+## Your task
+
+Perform a thorough, critical code review of this pull request. Look for bugs,
+correctness issues, regressions, security problems, broken edge cases, and
+anything else a maintainer should require changed before merging.
+
+For every issue you find: name the file and specific lines, explain what is
+wrong and why, and suggest a concrete fix. Rank the issues by severity.
+If the PR looks correct, say so.
+
+Write your review to `/app/review.md`.

@@ -1,0 +1,139 @@
+diff --git a/containers/app/Dockerfile b/containers/app/Dockerfile
+index 9d456a627165..6dcbc5b59db3 100644
+--- a/containers/app/Dockerfile
++++ b/containers/app/Dockerfile
+@@ -32,21 +32,32 @@ FROM python:3.12-slim as runtime
+ 
+ WORKDIR /app
+ 
+-ENV RUN_AS_DEVIN=false
+-ENV USE_HOST_NETWORK=false
++ENV RUN_AS_DEVIN=true
++ENV SANDBOX_USER_ID=1000
++ENV USE_HOST_NETWORK=true
+ ENV SSH_HOSTNAME=host.docker.internal
+ ENV WORKSPACE_BASE=/opt/workspace_base
+ ENV OPEN_DEVIN_BUILD_VERSION=$OPEN_DEVIN_BUILD_VERSION
+ RUN mkdir -p $WORKSPACE_BASE
+ 
+ RUN apt-get update -y \
+-    && apt-get install -y curl ssh
++    && apt-get install -y curl ssh sudo
++
++RUN useradd -m -u $SANDBOX_USER_ID -s /bin/bash opendevin && \
++    usermod -aG sudo opendevin && \
++    echo '%sudo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
++RUN chown -R opendevin:opendevin /app
++USER opendevin
+ 
+ ENV VIRTUAL_ENV=/app/.venv \
+     PATH="/app/.venv/bin:$PATH" \
+     PYTHONPATH='/app'
+ 
+ COPY --from=backend-builder ${VIRTUAL_ENV} ${VIRTUAL_ENV}
++# change ownership of the virtual environment to the sandbox user
++USER root
++RUN chown -R opendevin:opendevin ${VIRTUAL_ENV}
++USER opendevin
+ 
+ COPY ./opendevin ./opendevin
+ COPY ./agenthub ./agenthub
+@@ -55,4 +66,17 @@ RUN playwright install --with-deps chromium
+ 
+ COPY --from=frontend-builder /app/dist ./frontend/dist
+ 
+-CMD ["uvicorn", "opendevin.server.listen:app", "--host", "0.0.0.0", "--port", "3000"]
++USER root
++RUN chown -R opendevin:opendevin /app
++# make group permissions the same as user permissions
++RUN chmod -R g=u /app
++USER opendevin
++
++# change ownership of the app directory to the sandbox user
++COPY ./containers/app/entrypoint.sh /app/entrypoint.sh
++
++# run the script as root
++USER root
++RUN chown opendevin:opendevin /app/entrypoint.sh
++RUN chmod 777 /app/entrypoint.sh
++CMD ["/app/entrypoint.sh"]
+diff --git a/containers/app/entrypoint.sh b/containers/app/entrypoint.sh
+new file mode 100755
+index 000000000000..5c69ff228d8c
+--- /dev/null
++++ b/containers/app/entrypoint.sh
+@@ -0,0 +1,21 @@
++#!/bin/bash
++# check user is root
++if [ "$(id -u)" -ne 0 ]; then
++  echo "Please run as root"
++  exit 1
++fi
++
++if [ -z "$SANDBOX_USER_ID" ]; then
++  echo "SANDBOX_USER_ID is not set"
++  exit 1
++fi
++
++# change uid of opendevin user to match the host user
++# but the group id is not changed, so the user can still access everything under /app
++usermod -u $SANDBOX_USER_ID opendevin
++
++# make docker.sock accessible to the user
++chmod 777 /var/run/docker.sock
++
++# switch to the user and start the server
++su opendevin -c "cd /app && uvicorn opendevin.server.listen:app --host 0.0.0.0 --port 3000"
+diff --git a/opendevin/config.py b/opendevin/config.py
+index 7cd60653f5f5..3b584b53121e 100644
+--- a/opendevin/config.py
++++ b/opendevin/config.py
+@@ -48,6 +48,7 @@
+     ConfigType.USE_HOST_NETWORK: 'false',
+     ConfigType.SSH_HOSTNAME: 'localhost',
+     ConfigType.DISABLE_COLOR: 'false',
++    ConfigType.SANDBOX_USER_ID: os.getuid() if hasattr(os, 'getuid') else None,
+ }
+ 
+ config_str = ''
+diff --git a/opendevin/sandbox/docker/ssh_box.py b/opendevin/sandbox/docker/ssh_box.py
+index e21895fa410b..44e610ff48cf 100644
+--- a/opendevin/sandbox/docker/ssh_box.py
++++ b/opendevin/sandbox/docker/ssh_box.py
+@@ -41,7 +41,6 @@
+ elif hasattr(os, 'getuid'):
+     USER_ID = os.getuid()
+ 
+-
+ class DockerSSHBox(Sandbox):
+     instance_id: str
+     container_image: str
+@@ -62,6 +61,7 @@ def __init__(
+         timeout: int = 120,
+         sid: str | None = None,
+     ):
++        logger.info(f'SSHBox is running as {"opendevin" if RUN_AS_DEVIN else "root"} user with USER_ID={USER_ID} in the sandbox')
+         # Initialize docker client. Throws an exception if Docker is not reachable.
+         try:
+             self.docker_client = docker.from_env()
+@@ -150,8 +150,10 @@ def setup_user(self):
+                 workdir=SANDBOX_WORKSPACE_DIR,
+             )
+             if exit_code != 0:
+-                raise Exception(
+-                    f'Failed to chown workspace directory for opendevin in sandbox: {logs}')
++                # This is not a fatal error, just a warning
++                logger.warning(
++                    f'Failed to chown workspace directory for opendevin in sandbox: {logs}. But this should be fine if the {SANDBOX_WORKSPACE_DIR=} is mounted by the app docker container.'
++                )
+         else:
+             exit_code, logs = self.container.exec_run(
+                 # change password for root
+@@ -379,7 +381,6 @@ def restart_docker_container(self):
+                 **network_kwargs,
+                 working_dir=SANDBOX_WORKSPACE_DIR,
+                 name=self.container_name,
+-                hostname='opendevin_sandbox',
+                 detach=True,
+                 volumes={
+                     mount_dir: {

@@ -1,0 +1,40 @@
+# Code Review Task
+
+You are a maintainer reviewing a pull request to the `bisq-network/bisq` repository.
+
+**PR title:** Add missing check if tx was in correct phase
+
+**PR description:**
+
+There have been 1 tx in cycle 17 and 2 txs in cycle 23 which have been confirmed outside of the phase.
+The vote result had excluded it correctly but for the hash calculation for the blind vote monitor the
+phase check was missing which results in an incorrect hash.
+By fixing that the past hashes back to cycle 17 are all invalid. Once all seed nodes are running that
+patch nodes should be in sync again. As it did not affect consensus but only the monitoring it is not
+critical.
+
+We see currently 2 different hashes on seeds. I am not sure why but probably some have filtered those invalid txs already out.
+
+## Working environment
+
+The repository is checked out at `/app/bisq` at this PR's **base commit**
+(the state before this PR), and the proposed change is present two ways:
+
+- applied as **uncommitted modifications** to the working tree (run `git diff`
+  to see it, or use a review tool that inspects the local git diff), and
+- saved as a unified diff at `/app/pr_to_review.diff`.
+
+Use `git log` and `git show HEAD:<path>` (HEAD is the base commit) for
+surrounding history, call sites, and conventions.
+
+## Your task
+
+Perform a thorough, critical code review of this pull request. Look for bugs,
+correctness issues, regressions, security problems, broken edge cases, and
+anything else a maintainer should require changed before merging.
+
+For every issue you find: name the file and specific lines, explain what is
+wrong and why, and suggest a concrete fix. Rank the issues by severity.
+If the PR looks correct, say so.
+
+Write your review to `/app/review.md`.

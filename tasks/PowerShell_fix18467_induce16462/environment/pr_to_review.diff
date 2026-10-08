@@ -1,0 +1,301 @@
+commit a9b14a13fd9349e4df61cba7b46d47fc98f831ee
+Author: Steve Lee <slee@microsoft.com>
+Date:   Tue Jan 4 14:09:27 2022 -0800
+
+    Add `exec` cmdlet for bash compatibility (#16462)
+
+diff --git a/src/System.Management.Automation/engine/ExperimentalFeature/ExperimentalFeature.cs b/src/System.Management.Automation/engine/ExperimentalFeature/ExperimentalFeature.cs
+index bfebfd6d2..d23f5b632 100644
+--- a/src/System.Management.Automation/engine/ExperimentalFeature/ExperimentalFeature.cs
++++ b/src/System.Management.Automation/engine/ExperimentalFeature/ExperimentalFeature.cs
+@@ -26,6 +26,7 @@ namespace System.Management.Automation
+         internal const string PSRemotingSSHTransportErrorHandling = "PSRemotingSSHTransportErrorHandling";
+         internal const string PSCleanBlockFeatureName = "PSCleanBlock";
+         internal const string PSAMSIMethodInvocationLogging = "PSAMSIMethodInvocationLogging";
++        internal const string PSExecFeatureName = "PSExec";
+ 
+         #endregion
+ 
+@@ -138,6 +139,9 @@ namespace System.Management.Automation
+                 new ExperimentalFeature(
+                     name: PSAMSIMethodInvocationLogging,
+                     description: "Provides AMSI notification of .NET method invocations."),
++                new ExperimentalFeature(
++                    name: PSExecFeatureName,
++                    description: "Add 'exec' built-in command on Linux and macOS"),
+             };
+ 
+             EngineExperimentalFeatures = new ReadOnlyCollection<ExperimentalFeature>(engineFeatures);
+diff --git a/src/System.Management.Automation/engine/InitialSessionState.cs b/src/System.Management.Automation/engine/InitialSessionState.cs
+index 05eb87105..ce0fff99f 100644
+--- a/src/System.Management.Automation/engine/InitialSessionState.cs
++++ b/src/System.Management.Automation/engine/InitialSessionState.cs
+@@ -4634,7 +4634,7 @@ end {
+                 const ScopedItemOptions ReadOnly_AllScope = ScopedItemOptions.ReadOnly | ScopedItemOptions.AllScope;
+                 const ScopedItemOptions ReadOnly = ScopedItemOptions.ReadOnly;
+ 
+-                return new SessionStateAliasEntry[] {
++                var builtInAliases = new List<SessionStateAliasEntry> {
+                     new SessionStateAliasEntry("foreach", "ForEach-Object", string.Empty, ReadOnly_AllScope),
+                     new SessionStateAliasEntry("%", "ForEach-Object", string.Empty, ReadOnly_AllScope),
+                     new SessionStateAliasEntry("where", "Where-Object", string.Empty, ReadOnly_AllScope),
+@@ -4801,6 +4801,15 @@ end {
+                     //   - do not use AllScope - this causes errors in profiles that set this somewhat commonly used alias.
+                     new SessionStateAliasEntry("sls", "Select-String"),
+                 };
++
++#if UNIX
++                if (ExperimentalFeature.IsEnabled(ExperimentalFeature.PSExecFeatureName))
++                {
++                    builtInAliases.Add(new SessionStateAliasEntry("exec", "Switch-Process"));
++                }
++#endif
++
++                return builtInAliases.ToArray();
+             }
+         }
+ 
+@@ -5439,6 +5448,13 @@ end {
+                 cmdlets.Add("Get-PSSubsystem", new SessionStateCmdletEntry("Get-PSSubsystem", typeof(Subsystem.GetPSSubsystemCommand), helpFile));
+             }
+ 
++#if UNIX
++            if (ExperimentalFeature.IsEnabled(ExperimentalFeature.PSExecFeatureName))
++            {
++                cmdlets.Add("Switch-Process", new SessionStateCmdletEntry("Switch-Process", typeof(SwitchProcessCommand), helpFile));
++            }
++#endif
++
+             foreach (var val in cmdlets.Values)
+             {
+                 val.SetPSSnapIn(psSnapInInfo);
+diff --git a/src/System.Management.Automation/engine/Modules/SwitchProcessCommand.cs b/src/System.Management.Automation/engine/Modules/SwitchProcessCommand.cs
+new file mode 100644
+index 000000000..298587679
+--- /dev/null
++++ b/src/System.Management.Automation/engine/Modules/SwitchProcessCommand.cs
+@@ -0,0 +1,115 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT License.
++
++#nullable enable
++
++using System;
++using System.Collections.Generic;
++using System.Management.Automation;
++using System.Runtime.InteropServices;
++
++using Dbg = System.Management.Automation.Diagnostics;
++
++#if UNIX
++
++namespace Microsoft.PowerShell.Commands
++{
++    /// <summary>
++    /// Implements a cmdlet that allows use of execv API.
++    /// </summary>
++    [Experimental(ExperimentalFeature.PSExecFeatureName, ExperimentAction.Show)]
++    [Cmdlet(VerbsCommon.Switch, "Process", HelpUri = "https://go.microsoft.com/fwlink/?linkid=2181448")]
++    public sealed class SwitchProcessCommand : PSCmdlet
++    {
++        /// <summary>
++        /// Get or set the command and arguments to replace the current pwsh process.
++        /// </summary>
++        [Parameter(Position = 0, Mandatory = false, ValueFromRemainingArguments = true)]
++        public string[] WithCommand { get; set; } = Array.Empty<string>();
++
++        /// <summary>
++        /// Execute the command and arguments
++        /// </summary>
++        protected override void EndProcessing()
++        {
++            if (WithCommand.Length == 0)
++            {
++                return;
++            }
++
++            // execv requires command to be full path so resolve command to first match
++            var command = this.SessionState.InvokeCommand.GetCommand(WithCommand[0], CommandTypes.Application);
++            if (command is null)
++            {
++                ThrowTerminatingError(
++                    new ErrorRecord(
++                        new CommandNotFoundException(
++                            string.Format(
++                                System.Globalization.CultureInfo.InvariantCulture,
++                                CommandBaseStrings.NativeCommandNotFound,
++                                command
++                            )
++                        ),
++                        "CommandNotFound",
++                        ErrorCategory.InvalidArgument,
++                        WithCommand
++                    )
++                );
++            }
++
++            var execArgs = new string?[WithCommand.Length + 1];
++
++            // execv convention is the first arg is the program name
++            execArgs[0] = command.Name;
++
++            for (int i = 1; i < WithCommand.Length; i++)
++            {
++                execArgs[i] = WithCommand[i];
++            }
++
++            // need null terminator at end
++            execArgs[execArgs.Length - 1] = null;
++
++            int exitCode = Exec(command.Source, execArgs);
++
++            if (exitCode < 0)
++            {
++                ThrowTerminatingError(
++                    new ErrorRecord(
++                        new Exception(
++                            string.Format(
++                                System.Globalization.CultureInfo.InvariantCulture,
++                                CommandBaseStrings.ExecFailed,
++                                Marshal.GetLastPInvokeError(),
++                                string.Join(" ", WithCommand)
++                            )
++                        ),
++                        "ExecutionFailed",
++                        ErrorCategory.InvalidOperation,
++                        WithCommand
++                    )
++                );
++            }
++        }
++
++        /// <summary>
++        /// The `execv` POSIX syscall we use to exec /bin/sh.
++        /// </summary>
++        /// <param name="path">The path to the executable to exec.</param>
++        /// <param name="args">
++        /// The arguments to send through to the executable.
++        /// Array must have its final element be null.
++        /// </param>
++        /// <returns>
++        /// An exit code if exec failed, but if successful the calling process will be overwritten.
++        /// </returns>
++        [DllImport("libc",
++            EntryPoint = "execv",
++            CallingConvention = CallingConvention.Cdecl,
++            CharSet = CharSet.Ansi,
++            SetLastError = true)]
++        private static extern int Exec(string path, string?[] args);
++    }
++}
++
++#endif
+diff --git a/src/System.Management.Automation/resources/CommandBaseStrings.resx b/src/System.Management.Automation/resources/CommandBaseStrings.resx
+index dc2dd4bbb..abb918adb 100644
+--- a/src/System.Management.Automation/resources/CommandBaseStrings.resx
++++ b/src/System.Management.Automation/resources/CommandBaseStrings.resx
+@@ -222,4 +222,10 @@ Reviewed by TArcher on 2010-07-20
+   <data name="UseOfDeprecatedCommandWarning" xml:space="preserve">
+     <value>The {0} is obsolete. {1}</value>
+   </data>
++  <data name="ExecFailed" xml:space="preserve">
++    <value>Exec call failed with errorno {0} for command line: {1}</value>
++  </data>
++  <data name="NativeCommandNotFound" xml:space="preserve">
++    <value>Command '{0}' was not found. The specified command must be an executable.</value>
++  </data>
+ </root>
+diff --git a/test/powershell/Modules/Microsoft.PowerShell.Core/Exec.Tests.ps1 b/test/powershell/Modules/Microsoft.PowerShell.Core/Exec.Tests.ps1
+new file mode 100644
+index 000000000..bd3c87e0f
+--- /dev/null
++++ b/test/powershell/Modules/Microsoft.PowerShell.Core/Exec.Tests.ps1
+@@ -0,0 +1,74 @@
++# Copyright (c) Microsoft Corporation.
++# Licensed under the MIT License.
++
++Describe 'Switch-Process tests for Unix' -Tags 'CI' {
++    BeforeAll {
++        $originalDefaultParameterValues = $PSDefaultParameterValues.Clone()
++        if (-not [ExperimentalFeature]::IsEnabled('PSExec') -or $IsWindows)
++        {
++            $PSDefaultParameterValues['It:Skip'] = $true
++            return
++        }
++    }
++
++    AfterAll {
++        $global:PSDefaultParameterValues = $originalDefaultParameterValues
++    }
++
++    It 'Exec alias should map to Switch-Process' {
++        $alias = Get-Command exec
++        $alias | Should -BeOfType [System.Management.Automation.AliasInfo]
++        $alias.Definition | Should -BeExactly 'Switch-Process'
++    }
++
++    It 'Exec by itself does nothing' {
++        exec | Should -BeNullOrEmpty
++    }
++
++    It 'Exec given a cmdlet should fail' {
++        { exec Get-Command } | Should -Throw -ErrorId 'CommandNotFound,Microsoft.PowerShell.Commands.SwitchProcessCommand'
++    }
++
++    It 'Exec given an exe should work' {
++        $id, $uname = pwsh -noprofile -noexit -outputformat text -command { $pid; exec uname }
++        Get-Process -Id $id -ErrorAction Ignore| Should -BeNullOrEmpty
++        $uname | Should -BeExactly (uname)
++    }
++
++    It 'Exec given an exe and arguments should work' {
++        $id, $uname = pwsh -noprofile -noexit -outputformat text -command { $pid; exec uname -a }
++        Get-Process -Id $id -ErrorAction Ignore| Should -BeNullOrEmpty
++        $uname | Should -BeExactly (uname -a)
++    }
++
++    It 'Exec will replace the process' {
++        $sleep = Get-Command sleep -CommandType Application | Select-Object -First 1
++        $p = Start-Process pwsh -ArgumentList "-noprofile -command exec $($sleep.Source) 90" -PassThru
++        Wait-UntilTrue {
++            ($p | Get-Process).Name -eq 'sleep'
++        } -timeout 60000 -interval 100 | Should -BeTrue
++    }
++}
++
++Describe 'Switch-Process for Windows' {
++    BeforeAll {
++        $originalDefaultParameterValues = $PSDefaultParameterValues.Clone()
++        if (-not $IsWindows)
++        {
++            $PSDefaultParameterValues['It:Skip'] = $true
++            return
++        }
++    }
++
++    AfterAll {
++        $global:PSDefaultParameterValues = $originalDefaultParameterValues
++    }
++
++    It 'Switch-Process should not be available' {
++        Get-Command -Name Switch-Process -ErrorAction Ignore | Should -BeNullOrEmpty
++    }
++
++    It 'Exec alias should not be available' {
++        Get-Alias -Name exec -ErrorAction Ignore | Should -BeNullOrEmpty
++    }
++}
+diff --git a/test/powershell/engine/Help/HelpSystem.Tests.ps1 b/test/powershell/engine/Help/HelpSystem.Tests.ps1
+index 3fbd08223..0590c7877 100644
+--- a/test/powershell/engine/Help/HelpSystem.Tests.ps1
++++ b/test/powershell/engine/Help/HelpSystem.Tests.ps1
+@@ -16,7 +16,8 @@ $script:cmdletsToSkip = @(
+     "Get-ExperimentalFeature",
+     "Enable-ExperimentalFeature",
+     "Disable-ExperimentalFeature",
+-    "Get-PSSubsystem"
++    "Get-PSSubsystem",
++    "Switch-Process"
+ )
+ 
+ function UpdateHelpFromLocalContentPath {

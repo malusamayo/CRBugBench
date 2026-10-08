@@ -1,0 +1,234 @@
+commit 625550df00ee3fad74571a1e9e53c6470ef3497f
+Author: xoviat <xoviat@users.noreply.github.com>
+Date:   Thu Nov 6 08:42:12 2025 -0600
+
+    stm32: add backup sram mod
+
+diff --git a/embassy-stm32/CHANGELOG.md b/embassy-stm32/CHANGELOG.md
+index 2a7a89bc9..f77cf28b1 100644
+--- a/embassy-stm32/CHANGELOG.md
++++ b/embassy-stm32/CHANGELOG.md
+@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ - feat: timer: add ability to set master mode
+ - fix: sdmmc: don't wait for DBCKEND flag on sdmmc_v2 devices as it never fires (Fixes #4723)
+ - fix: usart: fix race condition in ringbuffered usart
++- feat: Add backup_sram::init() for H5 devices to access BKPSRAM
+ - feat: Add I2C MultiMaster (Slave) support for I2C v1
+ - feat: stm32/fdcan: add ability to control automatic recovery from bus off ([#4821](https://github.com/embassy-rs/embassy/pull/4821))
+ - low-power: update rtc api to allow reconfig
+diff --git a/embassy-stm32/build.rs b/embassy-stm32/build.rs
+index eea1acf68..2800c73ac 100644
+--- a/embassy-stm32/build.rs
++++ b/embassy-stm32/build.rs
+@@ -114,6 +114,8 @@ fn main() {
+         }
+     };
+ 
++    let has_bkpsram = memory.iter().any(|m| m.name == "BKPSRAM");
++
+     // ========
+     // Generate singletons
+ 
+@@ -124,6 +126,13 @@ fn main() {
+         singletons.push(p.name.to_string());
+     }
+ 
++    cfgs.declare("backup_sram");
++
++    if has_bkpsram {
++        singletons.push("BKPSRAM".to_string());
++        cfgs.enable("backup_sram")
++    }
++
+     // generate one singleton per peripheral (with many exceptions...)
+     for p in METADATA.peripherals {
+         if let Some(r) = &p.registers {
+@@ -1984,6 +1993,18 @@ fn main() {
+         }
+     ));
+ 
++    // ========
++    // Generate backup sram constants
++    if let Some(m) = memory.iter().find(|m| m.name == "BKPSRAM") {
++        let bkpsram_base = m.address as usize;
++        let bkpsram_size = m.size as usize;
++
++        g.extend(quote!(
++            pub const BKPSRAM_BASE: usize = #bkpsram_base;
++            pub const BKPSRAM_SIZE: usize = #bkpsram_size;
++        ));
++    }
++
+     // ========
+     // Generate flash constants
+ 
+diff --git a/embassy-stm32/src/backup_sram.rs b/embassy-stm32/src/backup_sram.rs
+new file mode 100644
+index 000000000..31b373c6c
+--- /dev/null
++++ b/embassy-stm32/src/backup_sram.rs
+@@ -0,0 +1,28 @@
++//! Battary backed SRAM
++
++use core::slice;
++
++use embassy_hal_internal::Peri;
++
++use crate::_generated::{BKPSRAM_BASE, BKPSRAM_SIZE};
++use crate::peripherals::BKPSRAM;
++
++/// Struct used to initilize backup sram
++pub struct BackupMemory {}
++
++impl BackupMemory {
++    /// Setup battery backed sram
++    ///
++    /// Returns slice to sram and whether the sram was retained
++    pub fn new(_backup_sram: Peri<'static, BKPSRAM>) -> (&'static mut [u8], bool) {
++        // Assert bksram has been enabled in rcc
++        assert!(crate::pac::PWR.bdcr().read().bren() == crate::pac::pwr::vals::Retention::PRESERVED);
++
++        unsafe {
++            (
++                slice::from_raw_parts_mut(BKPSRAM_BASE as *mut u8, BKPSRAM_SIZE),
++                critical_section::with(|_| crate::rcc::BKSRAM_RETAINED),
++            )
++        }
++    }
++}
+diff --git a/embassy-stm32/src/lib.rs b/embassy-stm32/src/lib.rs
+index 85606e7de..e08ab30e6 100644
+--- a/embassy-stm32/src/lib.rs
++++ b/embassy-stm32/src/lib.rs
+@@ -54,6 +54,8 @@ pub mod timer;
+ 
+ #[cfg(adc)]
+ pub mod adc;
++#[cfg(backup_sram)]
++pub mod backup_sram;
+ #[cfg(can)]
+ pub mod can;
+ // FIXME: Cordic driver cause stm32u5a5zj crash
+diff --git a/embassy-stm32/src/rcc/bd.rs b/embassy-stm32/src/rcc/bd.rs
+index 3b2a10581..5b367c043 100644
+--- a/embassy-stm32/src/rcc/bd.rs
++++ b/embassy-stm32/src/rcc/bd.rs
+@@ -1,6 +1,8 @@
+ use core::sync::atomic::{Ordering, compiler_fence};
+ 
+ use crate::pac::common::{RW, Reg};
++#[cfg(backup_sram)]
++use crate::pac::pwr::vals::Retention;
+ pub use crate::pac::rcc::vals::Rtcsel as RtcClockSource;
+ use crate::time::Hertz;
+ 
+@@ -89,6 +91,8 @@ pub struct LsConfig {
+     pub rtc: RtcClockSource,
+     pub lsi: bool,
+     pub lse: Option<LseConfig>,
++    #[cfg(backup_sram)]
++    pub enable_backup_sram: bool,
+ }
+ 
+ impl LsConfig {
+@@ -113,6 +117,8 @@ impl LsConfig {
+                 peripherals_clocked: false,
+             }),
+             lsi: false,
++            #[cfg(backup_sram)]
++            enable_backup_sram: false,
+         }
+     }
+ 
+@@ -121,6 +127,8 @@ impl LsConfig {
+             rtc: RtcClockSource::LSI,
+             lsi: true,
+             lse: None,
++            #[cfg(backup_sram)]
++            enable_backup_sram: false,
+         }
+     }
+ 
+@@ -129,6 +137,8 @@ impl LsConfig {
+             rtc: RtcClockSource::DISABLE,
+             lsi: false,
+             lse: None,
++            #[cfg(backup_sram)]
++            enable_backup_sram: false,
+         }
+     }
+ }
+@@ -193,6 +203,22 @@ impl LsConfig {
+             while !csr.read().lsi1rdy() {}
+         }
+ 
++        // Enable backup regulator for peristent battery backed sram
++        #[cfg(backup_sram)]
++        {
++            unsafe { super::BKSRAM_RETAINED = crate::pac::PWR.bdcr().read().bren() == Retention::PRESERVED };
++
++            crate::pac::PWR.bdcr().modify(|w| {
++                w.set_bren(match self.enable_backup_sram {
++                    true => Retention::PRESERVED,
++                    false => Retention::LOST,
++                });
++            });
++
++            // Wait for backup regulator voltage to stabilize
++            while self.enable_backup_sram && !crate::pac::PWR.bdsr().read().brrdy() {}
++        }
++
+         // backup domain configuration (LSEON, RTCEN, RTCSEL) is kept across resets.
+         // once set, changing it requires a backup domain reset.
+         // first check if the configuration matches what we want.
+diff --git a/embassy-stm32/src/rcc/mod.rs b/embassy-stm32/src/rcc/mod.rs
+index c817dd4b7..01fa3a475 100644
+--- a/embassy-stm32/src/rcc/mod.rs
++++ b/embassy-stm32/src/rcc/mod.rs
+@@ -48,6 +48,9 @@ pub(crate) static mut REFCOUNT_STOP1: u32 = 0;
+ /// May be read without a critical section
+ pub(crate) static mut REFCOUNT_STOP2: u32 = 0;
+ 
++#[cfg(backup_sram)]
++pub(crate) static mut BKSRAM_RETAINED: bool = false;
++
+ #[cfg(not(feature = "_dual-core"))]
+ /// Frozen clock frequencies
+ ///
+diff --git a/examples/stm32h5/src/bin/backup_sram.rs b/examples/stm32h5/src/bin/backup_sram.rs
+new file mode 100644
+index 000000000..f8db1853e
+--- /dev/null
++++ b/examples/stm32h5/src/bin/backup_sram.rs
+@@ -0,0 +1,31 @@
++#![no_std]
++#![no_main]
++
++use defmt::*;
++use embassy_executor::Spawner;
++use embassy_stm32::Config;
++use embassy_stm32::backup_sram::BackupMemory;
++use embassy_time::Timer;
++use {defmt_rtt as _, panic_probe as _};
++
++#[embassy_executor::main]
++async fn main(_spawner: Spawner) {
++    let mut config = Config::default();
++    config.rcc.ls.enable_backup_sram = true;
++
++    let p = embassy_stm32::init(config);
++    info!("Started!");
++
++    let (bytes, status) = BackupMemory::new(p.BKPSRAM);
++
++    match status {
++        false => info!("BKPSRAM just enabled"),
++        true => info!("BKPSRAM already enabled"),
++    }
++
++    loop {
++        info!("byte0: {}", bytes[0]);
++        bytes[0] = bytes[0].wrapping_add(1);
++        Timer::after_millis(500).await;
++    }
++}

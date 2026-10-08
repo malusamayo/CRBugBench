@@ -1,0 +1,221 @@
+commit 76b6fd28bf4fadb6725870a60cfc61701ecd7fdf
+Author: Joshen Lim <joshenlimek@gmail.com>
+Date:   Tue Sep 26 13:30:21 2023 +0800
+
+    Add option to download table as CSV in table dropdown (#17638)
+
+diff --git a/studio/components/layouts/TableEditorLayout/EntityListItem.tsx b/studio/components/layouts/TableEditorLayout/EntityListItem.tsx
+index 2af073982e..f85860b8bf 100644
+--- a/studio/components/layouts/TableEditorLayout/EntityListItem.tsx
++++ b/studio/components/layouts/TableEditorLayout/EntityListItem.tsx
+@@ -1,12 +1,28 @@
++import saveAs from 'file-saver'
++import Papa from 'papaparse'
+ import clsx from 'clsx'
+ import SVG from 'react-inlinesvg'
+ import * as Tooltip from '@radix-ui/react-tooltip'
+ import { ENTITY_TYPE } from 'data/entity-types/entity-type-constants'
+ import { Entity } from 'data/entity-types/entity-type-query'
+ import Link from 'next/link'
+-import { Dropdown, IconEdit, IconCopy, IconLock, IconTrash, IconChevronDown } from 'ui'
++import {
++  Dropdown,
++  IconEdit,
++  IconCopy,
++  IconLock,
++  IconTrash,
++  IconChevronDown,
++  IconDownload,
++} from 'ui'
+ import { BASE_PATH } from 'lib/constants'
+ import { useTableEditorStateSnapshot } from 'state/table-editor'
++import { fetchAllTableRows } from 'data/table-rows/table-rows-query'
++import { useParams } from 'common'
++import { useProjectContext } from '../ProjectLayout/ProjectContext'
++import { getTable } from 'data/tables/table-query'
++import { parseSupaTable } from 'components/grid'
++import { useStore } from 'hooks'
+ 
+ export interface EntityListItemProps {
+   id: number
+@@ -16,7 +32,10 @@ export interface EntityListItemProps {
+ }
+ 
+ const EntityListItem = ({ id, projectRef, item: entity, isLocked }: EntityListItemProps) => {
++  const { ui } = useStore()
++  const { project } = useProjectContext()
+   const snap = useTableEditorStateSnapshot()
++
+   const isActive = Number(id) === entity.id
+   const formatTooltipText = (entityType: string) => {
+     return Object.entries(ENTITY_TYPE)
+@@ -26,6 +45,67 @@ const EntityListItem = ({ id, projectRef, item: entity, isLocked }: EntityListIt
+       ?.join(' ')
+   }
+ 
++  const exportTableAsCSV = async () => {
++    if (!project?.connectionString) return console.error('Connection string is required')
++    const toastId = ui.setNotification({
++      category: 'loading',
++      message: `Exporting ${entity.name} as CSV...`,
++    })
++
++    try {
++      const table = await getTable({
++        id: entity.id,
++        projectRef,
++        connectionString: project.connectionString,
++      })
++      const supaTable =
++        table &&
++        parseSupaTable(
++          {
++            table: table,
++            columns: table.columns ?? [],
++            primaryKeys: table.primary_keys,
++            relationships: table.relationships,
++          },
++          []
++        )
++
++      const rows = await fetchAllTableRows({
++        projectRef,
++        connectionString: project.connectionString,
++        table: supaTable,
++      })
++      const formattedRows = rows.map((row) => {
++        const formattedRow = row
++        Object.keys(row).map((column) => {
++          if (typeof row[column] === 'object' && row[column] !== null)
++            formattedRow[column] = JSON.stringify(formattedRow[column])
++        })
++        return formattedRow
++      })
++
++      if (formattedRows.length > 0) {
++        const csv = Papa.unparse(formattedRows, {
++          columns: supaTable.columns.map((column) => column.name),
++        })
++        const csvData = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
++        saveAs(csvData, `${entity!.name}_rows.csv`)
++      }
++
++      ui.setNotification({
++        id: toastId,
++        category: 'success',
++        message: `Successfully exported ${entity.name} as CSV`,
++      })
++    } catch (error: any) {
++      ui.setNotification({
++        id: toastId,
++        category: 'error',
++        message: `Failed to export table: ${error.message}`,
++      })
++    }
++  }
++
+   return (
+     <div
+       className={clsx(
+@@ -151,6 +231,16 @@ const EntityListItem = ({ id, projectRef, item: entity, isLocked }: EntityListIt
+                   </Dropdown.Item>
+                 </a>
+               </Link>,
++              <Dropdown.Item
++                key="download-table-csv"
++                icon={<IconDownload size="tiny" />}
++                onClick={(e) => {
++                  e.stopPropagation()
++                  exportTableAsCSV()
++                }}
++              >
++                Export as CSV
++              </Dropdown.Item>,
+               <Dropdown.Separator key="separator" />,
+               <Dropdown.Item
+                 key="delete-table"
+diff --git a/studio/data/table-rows/table-rows-query.ts b/studio/data/table-rows/table-rows-query.ts
+index 651fbe0771..edd01930ea 100644
+--- a/studio/data/table-rows/table-rows-query.ts
++++ b/studio/data/table-rows/table-rows-query.ts
+@@ -1,7 +1,12 @@
+ import { QueryKey, UseQueryOptions } from '@tanstack/react-query'
+ import { Filter, Query, Sort, SupaRow, SupaTable } from 'components/grid'
+ import { useCallback } from 'react'
+-import { ExecuteSqlData, useExecuteSqlPrefetch, useExecuteSqlQuery } from '../sql/execute-sql-query'
++import {
++  ExecuteSqlData,
++  executeSql,
++  useExecuteSqlPrefetch,
++  useExecuteSqlQuery,
++} from '../sql/execute-sql-query'
+ import { getPagination } from '../utils/pagination'
+ import { formatFilterValue } from './utils'
+ 
+@@ -13,6 +18,66 @@ type GetTableRowsArgs = {
+   page?: number
+ }
+ 
++// [Joshen] From components/grid/services/row/SqlRowService.ts, we should remove the logic from SqlRowService eventually
++export const fetchAllTableRows = async ({
++  projectRef,
++  connectionString,
++  table,
++  filters = [],
++  sorts = [],
++}: {
++  projectRef: string
++  connectionString?: string
++  table: SupaTable
++  filters?: Filter[]
++  sorts?: Sort[]
++}) => {
++  if (!connectionString) {
++    console.error('Connection string is required')
++    return []
++  }
++
++  const rows: any[] = []
++  const query = new Query()
++
++  let queryChains = query.from(table.name, table.schema ?? undefined).select()
++  filters
++    .filter((filter) => filter.value && filter.value !== '')
++    .forEach((filter) => {
++      const value = formatFilterValue(table, filter)
++      queryChains = queryChains.filter(filter.column, filter.operator, value)
++    })
++  sorts.forEach((sort) => {
++    queryChains = queryChains.order(sort.column, sort.ascending, sort.nullsFirst)
++  })
++
++  // Starting from page 0, fetch 500 records per call
++  let page = -1
++  let from = 0
++  let to = 0
++  let pageData = []
++  const rowsPerPage = 500
++
++  await (async () => {
++    do {
++      page += 1
++      from = page * rowsPerPage
++      to = (page + 1) * rowsPerPage - 1
++      const query = queryChains.range(from, to).toSql()
++
++      try {
++        const { result } = await executeSql({ projectRef, connectionString, sql: query })
++        rows.push(...result)
++        pageData = result
++      } catch (error) {
++        return { data: { rows: [] } }
++      }
++    } while (pageData.length === rowsPerPage)
++  })()
++
++  return rows
++}
++
+ export const getTableRowsSqlQuery = ({
+   table,
+   filters = [],

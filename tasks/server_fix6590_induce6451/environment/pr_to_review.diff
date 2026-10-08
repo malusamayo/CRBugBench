@@ -1,0 +1,495 @@
+commit 76de64263c94c8331586aa898e6462afb214e5b8
+Author: Nik Gilmore <ngilmore@bitwarden.com>
+Date:   Wed Oct 22 16:19:43 2025 -0700
+
+    [PM-22992] Check cipher revision date when handling attachments (#6451)
+    
+    * Add lastKnownRevisionDate to Attachment functions
+    
+    * Add lastKnownRevisionDate to attachment endpoints
+    
+    * Change lastKnownCipherRevisionDate to lastKnownRevisionDate for consistency
+    
+    * Add tests for RevisionDate checks in Attachment endpoints
+    
+    * Improve validation on lastKnownRevisionDate
+    
+    * Harden datetime parsing
+    
+    * Rename ValidateCipherLastKnownRevisionDate - removed 'Async' suffix
+    
+    * Cleanup and address PR feedback
+
+diff --git a/src/Api/Vault/Controllers/CiphersController.cs b/src/Api/Vault/Controllers/CiphersController.cs
+index fe3069d8c..46d833292 100644
+--- a/src/Api/Vault/Controllers/CiphersController.cs
++++ b/src/Api/Vault/Controllers/CiphersController.cs
+@@ -1,6 +1,7 @@
+ ﻿// FIXME: Update this file to be null safe and then delete the line below
+ #nullable disable
+ 
++using System.Globalization;
+ using System.Text.Json;
+ using Azure.Messaging.EventGrid;
+ using Bit.Api.Auth.Models.Request.Accounts;
+@@ -1366,7 +1367,7 @@ public class CiphersController : Controller
+         }
+ 
+         var (attachmentId, uploadUrl) = await _cipherService.CreateAttachmentForDelayedUploadAsync(cipher,
+-            request.Key, request.FileName, request.FileSize, request.AdminRequest, user.Id);
++            request.Key, request.FileName, request.FileSize, request.AdminRequest, user.Id, request.LastKnownRevisionDate);
+         return new AttachmentUploadDataResponseModel
+         {
+             AttachmentId = attachmentId,
+@@ -1419,9 +1420,11 @@ public class CiphersController : Controller
+             throw new NotFoundException();
+         }
+ 
++        // Extract lastKnownRevisionDate from form data if present
++        DateTime? lastKnownRevisionDate = GetLastKnownRevisionDateFromForm();
+         await Request.GetFileAsync(async (stream) =>
+         {
+-            await _cipherService.UploadFileForExistingAttachmentAsync(stream, cipher, attachmentData);
++            await _cipherService.UploadFileForExistingAttachmentAsync(stream, cipher, attachmentData, lastKnownRevisionDate);
+         });
+     }
+ 
+@@ -1440,10 +1443,12 @@ public class CiphersController : Controller
+             throw new NotFoundException();
+         }
+ 
++        // Extract lastKnownRevisionDate from form data if present
++        DateTime? lastKnownRevisionDate = GetLastKnownRevisionDateFromForm();
+         await Request.GetFileAsync(async (stream, fileName, key) =>
+         {
+             await _cipherService.CreateAttachmentAsync(cipher, stream, fileName, key,
+-                    Request.ContentLength.GetValueOrDefault(0), user.Id);
++                    Request.ContentLength.GetValueOrDefault(0), user.Id, false, lastKnownRevisionDate);
+         });
+ 
+         return new CipherResponseModel(
+@@ -1469,10 +1474,13 @@ public class CiphersController : Controller
+             throw new NotFoundException();
+         }
+ 
++        // Extract lastKnownRevisionDate from form data if present
++        DateTime? lastKnownRevisionDate = GetLastKnownRevisionDateFromForm();
++
+         await Request.GetFileAsync(async (stream, fileName, key) =>
+         {
+             await _cipherService.CreateAttachmentAsync(cipher, stream, fileName, key,
+-                    Request.ContentLength.GetValueOrDefault(0), userId, true);
++                    Request.ContentLength.GetValueOrDefault(0), userId, true, lastKnownRevisionDate);
+         });
+ 
+         return new CipherMiniResponseModel(cipher, _globalSettings, cipher.OrganizationUseTotp);
+@@ -1515,10 +1523,13 @@ public class CiphersController : Controller
+             throw new NotFoundException();
+         }
+ 
++        // Extract lastKnownRevisionDate from form data if present
++        DateTime? lastKnownRevisionDate = GetLastKnownRevisionDateFromForm();
++
+         await Request.GetFileAsync(async (stream, fileName, key) =>
+         {
+             await _cipherService.CreateAttachmentShareAsync(cipher, stream, fileName, key,
+-                Request.ContentLength.GetValueOrDefault(0), attachmentId, organizationId);
++                Request.ContentLength.GetValueOrDefault(0), attachmentId, organizationId, lastKnownRevisionDate);
+         });
+     }
+ 
+@@ -1630,4 +1641,19 @@ public class CiphersController : Controller
+     {
+         return await _cipherRepository.GetByIdAsync(cipherId, userId);
+     }
++
++    private DateTime? GetLastKnownRevisionDateFromForm()
++    {
++        DateTime? lastKnownRevisionDate = null;
++        if (Request.Form.TryGetValue("lastKnownRevisionDate", out var dateValue))
++        {
++            if (!DateTime.TryParse(dateValue, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var parsedDate))
++            {
++                throw new BadRequestException("Invalid lastKnownRevisionDate format.");
++            }
++            lastKnownRevisionDate = parsedDate;
++        }
++
++        return lastKnownRevisionDate;
++    }
+ }
+diff --git a/src/Api/Vault/Models/Request/AttachmentRequestModel.cs b/src/Api/Vault/Models/Request/AttachmentRequestModel.cs
+index 96c66c604..eef70bf4e 100644
+--- a/src/Api/Vault/Models/Request/AttachmentRequestModel.cs
++++ b/src/Api/Vault/Models/Request/AttachmentRequestModel.cs
+@@ -9,4 +9,9 @@ public class AttachmentRequestModel
+     public string FileName { get; set; }
+     public long FileSize { get; set; }
+     public bool AdminRequest { get; set; } = false;
++
++    /// <summary>
++    /// The last known revision date of the Cipher that this attachment belongs to.
++    /// </summary>
++    public DateTime? LastKnownRevisionDate { get; set; }
+ }
+diff --git a/src/Core/Vault/Services/ICipherService.cs b/src/Core/Vault/Services/ICipherService.cs
+index ffd79e938..110d4b6ea 100644
+--- a/src/Core/Vault/Services/ICipherService.cs
++++ b/src/Core/Vault/Services/ICipherService.cs
+@@ -13,11 +13,11 @@ public interface ICipherService
+     Task SaveDetailsAsync(CipherDetails cipher, Guid savingUserId, DateTime? lastKnownRevisionDate,
+         IEnumerable<Guid> collectionIds = null, bool skipPermissionCheck = false);
+     Task<(string attachmentId, string uploadUrl)> CreateAttachmentForDelayedUploadAsync(Cipher cipher,
+-        string key, string fileName, long fileSize, bool adminRequest, Guid savingUserId);
++        string key, string fileName, long fileSize, bool adminRequest, Guid savingUserId, DateTime? lastKnownRevisionDate = null);
+     Task CreateAttachmentAsync(Cipher cipher, Stream stream, string fileName, string key,
+-        long requestLength, Guid savingUserId, bool orgAdmin = false);
++        long requestLength, Guid savingUserId, bool orgAdmin = false, DateTime? lastKnownRevisionDate = null);
+     Task CreateAttachmentShareAsync(Cipher cipher, Stream stream, string fileName, string key, long requestLength,
+-        string attachmentId, Guid organizationShareId);
++        string attachmentId, Guid organizationShareId, DateTime? lastKnownRevisionDate = null);
+     Task DeleteAsync(CipherDetails cipherDetails, Guid deletingUserId, bool orgAdmin = false);
+     Task DeleteManyAsync(IEnumerable<Guid> cipherIds, Guid deletingUserId, Guid? organizationId = null, bool orgAdmin = false);
+     Task<DeleteAttachmentResponseData> DeleteAttachmentAsync(Cipher cipher, string attachmentId, Guid deletingUserId, bool orgAdmin = false);
+@@ -34,7 +34,7 @@ public interface ICipherService
+     Task SoftDeleteManyAsync(IEnumerable<Guid> cipherIds, Guid deletingUserId, Guid? organizationId = null, bool orgAdmin = false);
+     Task RestoreAsync(CipherDetails cipherDetails, Guid restoringUserId, bool orgAdmin = false);
+     Task<ICollection<CipherOrganizationDetails>> RestoreManyAsync(IEnumerable<Guid> cipherIds, Guid restoringUserId, Guid? organizationId = null, bool orgAdmin = false);
+-    Task UploadFileForExistingAttachmentAsync(Stream stream, Cipher cipher, CipherAttachment.MetaData attachmentId);
++    Task UploadFileForExistingAttachmentAsync(Stream stream, Cipher cipher, CipherAttachment.MetaData attachmentId, DateTime? lastKnownRevisionDate = null);
+     Task<AttachmentResponseData> GetAttachmentDownloadDataAsync(Cipher cipher, string attachmentId);
+     Task<bool> ValidateCipherAttachmentFile(Cipher cipher, CipherAttachment.MetaData attachmentData);
+     Task ValidateBulkCollectionAssignmentAsync(IEnumerable<Guid> collectionIds, IEnumerable<Guid> cipherIds, Guid userId);
+diff --git a/src/Core/Vault/Services/Implementations/CipherService.cs b/src/Core/Vault/Services/Implementations/CipherService.cs
+index f132588e3..db458a523 100644
+--- a/src/Core/Vault/Services/Implementations/CipherService.cs
++++ b/src/Core/Vault/Services/Implementations/CipherService.cs
+@@ -113,7 +113,7 @@ public class CipherService : ICipherService
+         }
+         else
+         {
+-            ValidateCipherLastKnownRevisionDateAsync(cipher, lastKnownRevisionDate);
++            ValidateCipherLastKnownRevisionDate(cipher, lastKnownRevisionDate);
+             cipher.RevisionDate = DateTime.UtcNow;
+             await _cipherRepository.ReplaceAsync(cipher);
+             await _eventService.LogCipherEventAsync(cipher, Bit.Core.Enums.EventType.Cipher_Updated);
+@@ -168,7 +168,7 @@ public class CipherService : ICipherService
+         }
+         else
+         {
+-            ValidateCipherLastKnownRevisionDateAsync(cipher, lastKnownRevisionDate);
++            ValidateCipherLastKnownRevisionDate(cipher, lastKnownRevisionDate);
+             cipher.RevisionDate = DateTime.UtcNow;
+             await ValidateChangeInCollectionsAsync(cipher, collectionIds, savingUserId);
+             await ValidateViewPasswordUserAsync(cipher);
+@@ -180,8 +180,9 @@ public class CipherService : ICipherService
+         }
+     }
+ 
+-    public async Task UploadFileForExistingAttachmentAsync(Stream stream, Cipher cipher, CipherAttachment.MetaData attachment)
++    public async Task UploadFileForExistingAttachmentAsync(Stream stream, Cipher cipher, CipherAttachment.MetaData attachment, DateTime? lastKnownRevisionDate = null)
+     {
++        ValidateCipherLastKnownRevisionDate(cipher, lastKnownRevisionDate);
+         if (attachment == null)
+         {
+             throw new BadRequestException("Cipher attachment does not exist");
+@@ -196,8 +197,9 @@ public class CipherService : ICipherService
+     }
+ 
+     public async Task<(string attachmentId, string uploadUrl)> CreateAttachmentForDelayedUploadAsync(Cipher cipher,
+-        string key, string fileName, long fileSize, bool adminRequest, Guid savingUserId)
++        string key, string fileName, long fileSize, bool adminRequest, Guid savingUserId, DateTime? lastKnownRevisionDate = null)
+     {
++        ValidateCipherLastKnownRevisionDate(cipher, lastKnownRevisionDate);
+         await ValidateCipherEditForAttachmentAsync(cipher, savingUserId, adminRequest, fileSize);
+ 
+         var attachmentId = Utilities.CoreHelpers.SecureRandomString(32, upper: false, special: false);
+@@ -232,8 +234,9 @@ public class CipherService : ICipherService
+     }
+ 
+     public async Task CreateAttachmentAsync(Cipher cipher, Stream stream, string fileName, string key,
+-        long requestLength, Guid savingUserId, bool orgAdmin = false)
++        long requestLength, Guid savingUserId, bool orgAdmin = false, DateTime? lastKnownRevisionDate = null)
+     {
++        ValidateCipherLastKnownRevisionDate(cipher, lastKnownRevisionDate);
+         await ValidateCipherEditForAttachmentAsync(cipher, savingUserId, orgAdmin, requestLength);
+ 
+         var attachmentId = Utilities.CoreHelpers.SecureRandomString(32, upper: false, special: false);
+@@ -284,10 +287,11 @@ public class CipherService : ICipherService
+     }
+ 
+     public async Task CreateAttachmentShareAsync(Cipher cipher, Stream stream, string fileName, string key,
+-        long requestLength, string attachmentId, Guid organizationId)
++        long requestLength, string attachmentId, Guid organizationId, DateTime? lastKnownRevisionDate = null)
+     {
+         try
+         {
++            ValidateCipherLastKnownRevisionDate(cipher, lastKnownRevisionDate);
+             if (requestLength < 1)
+             {
+                 throw new BadRequestException("No data to attach.");
+@@ -859,7 +863,7 @@ public class CipherService : ICipherService
+         return NormalCipherPermissions.CanRestore(user, cipher, organizationAbility);
+     }
+ 
+-    private void ValidateCipherLastKnownRevisionDateAsync(Cipher cipher, DateTime? lastKnownRevisionDate)
++    private void ValidateCipherLastKnownRevisionDate(Cipher cipher, DateTime? lastKnownRevisionDate)
+     {
+         if (cipher.Id == default || !lastKnownRevisionDate.HasValue)
+         {
+@@ -1007,7 +1011,7 @@ public class CipherService : ICipherService
+             throw new BadRequestException("Not enough storage available for this organization.");
+         }
+ 
+-        ValidateCipherLastKnownRevisionDateAsync(cipher, lastKnownRevisionDate);
++        ValidateCipherLastKnownRevisionDate(cipher, lastKnownRevisionDate);
+     }
+ 
+     private async Task ValidateViewPasswordUserAsync(Cipher cipher)
+diff --git a/test/Core.Test/Vault/Services/CipherServiceTests.cs b/test/Core.Test/Vault/Services/CipherServiceTests.cs
+index 55db5a914..95391f1f4 100644
+--- a/test/Core.Test/Vault/Services/CipherServiceTests.cs
++++ b/test/Core.Test/Vault/Services/CipherServiceTests.cs
+@@ -113,6 +113,242 @@ public class CipherServiceTests
+         await sutProvider.GetDependency<ICipherRepository>().Received(1).ReplaceAsync(cipherDetails);
+     }
+ 
++    [Theory, BitAutoData]
++    public async Task CreateAttachmentAsync_WrongRevisionDate_Throws(SutProvider<CipherService> sutProvider, Cipher cipher, Guid savingUserId)
++    {
++        var lastKnownRevisionDate = cipher.RevisionDate.AddDays(-1);
++        var stream = new MemoryStream();
++        var fileName = "test.txt";
++        var key = "test-key";
++
++        var exception = await Assert.ThrowsAsync<BadRequestException>(
++            () => sutProvider.Sut.CreateAttachmentAsync(cipher, stream, fileName, key, 100, savingUserId, false, lastKnownRevisionDate));
++        Assert.Contains("out of date", exception.Message);
++    }
++
++    [Theory]
++    [BitAutoData("")]
++    [BitAutoData("Correct Time")]
++    public async Task CreateAttachmentAsync_CorrectRevisionDate_DoesNotThrow(string revisionDateString,
++        SutProvider<CipherService> sutProvider, CipherDetails cipher, Guid savingUserId)
++    {
++        var lastKnownRevisionDate = string.IsNullOrEmpty(revisionDateString) ? (DateTime?)null : cipher.RevisionDate;
++        var stream = new MemoryStream(new byte[100]);
++        var fileName = "test.txt";
++        var key = "test-key";
++
++        // Setup cipher with user ownership
++        cipher.UserId = savingUserId;
++        cipher.OrganizationId = null;
++
++        // Mock user storage and premium access
++        var user = new User { Id = savingUserId, MaxStorageGb = 1 };
++        sutProvider.GetDependency<IUserRepository>()
++            .GetByIdAsync(savingUserId)
++            .Returns(user);
++
++        sutProvider.GetDependency<IUserService>()
++            .CanAccessPremium(user)
++            .Returns(true);
++
++        sutProvider.GetDependency<IAttachmentStorageService>()
++            .UploadNewAttachmentAsync(Arg.Any<Stream>(), cipher, Arg.Any<CipherAttachment.MetaData>())
++            .Returns(Task.CompletedTask);
++
++        sutProvider.GetDependency<IAttachmentStorageService>()
++            .ValidateFileAsync(cipher, Arg.Any<CipherAttachment.MetaData>(), Arg.Any<long>())
++            .Returns((true, 100L));
++
++        sutProvider.GetDependency<ICipherRepository>()
++            .UpdateAttachmentAsync(Arg.Any<CipherAttachment>())
++            .Returns(Task.CompletedTask);
++
++        sutProvider.GetDependency<ICipherRepository>()
++            .ReplaceAsync(Arg.Any<CipherDetails>())
++            .Returns(Task.CompletedTask);
++
++        await sutProvider.Sut.CreateAttachmentAsync(cipher, stream, fileName, key, 100, savingUserId, false, lastKnownRevisionDate);
++
++        await sutProvider.GetDependency<IAttachmentStorageService>().Received(1)
++            .UploadNewAttachmentAsync(Arg.Any<Stream>(), cipher, Arg.Any<CipherAttachment.MetaData>());
++    }
++
++    [Theory, BitAutoData]
++    public async Task CreateAttachmentForDelayedUploadAsync_WrongRevisionDate_Throws(SutProvider<CipherService> sutProvider, Cipher cipher, Guid savingUserId)
++    {
++        var lastKnownRevisionDate = cipher.RevisionDate.AddDays(-1);
++        var key = "test-key";
++        var fileName = "test.txt";
++        var fileSize = 100L;
++
++        var exception = await Assert.ThrowsAsync<BadRequestException>(
++            () => sutProvider.Sut.CreateAttachmentForDelayedUploadAsync(cipher, key, fileName, fileSize, false, savingUserId, lastKnownRevisionDate));
++        Assert.Contains("out of date", exception.Message);
++    }
++
++    [Theory]
++    [BitAutoData("")]
++    [BitAutoData("Correct Time")]
++    public async Task CreateAttachmentForDelayedUploadAsync_CorrectRevisionDate_DoesNotThrow(string revisionDateString,
++        SutProvider<CipherService> sutProvider, CipherDetails cipher, Guid savingUserId)
++    {
++        var lastKnownRevisionDate = string.IsNullOrEmpty(revisionDateString) ? (DateTime?)null : cipher.RevisionDate;
++        var key = "test-key";
++        var fileName = "test.txt";
++        var fileSize = 100L;
++
++        // Setup cipher with user ownership
++        cipher.UserId = savingUserId;
++        cipher.OrganizationId = null;
++
++        // Mock user storage and premium access
++        var user = new User { Id = savingUserId, MaxStorageGb = 1 };
++        sutProvider.GetDependency<IUserRepository>()
++            .GetByIdAsync(savingUserId)
++            .Returns(user);
++
++        sutProvider.GetDependency<IUserService>()
++            .CanAccessPremium(user)
++            .Returns(true);
++
++        sutProvider.GetDependency<IAttachmentStorageService>()
++            .GetAttachmentUploadUrlAsync(cipher, Arg.Any<CipherAttachment.MetaData>())
++            .Returns("https://example.com/upload");
++
++        sutProvider.GetDependency<ICipherRepository>()
++            .UpdateAttachmentAsync(Arg.Any<CipherAttachment>())
++            .Returns(Task.CompletedTask);
++
++        var result = await sutProvider.Sut.CreateAttachmentForDelayedUploadAsync(cipher, key, fileName, fileSize, false, savingUserId, lastKnownRevisionDate);
++
++        Assert.NotNull(result.attachmentId);
++        Assert.NotNull(result.uploadUrl);
++    }
++
++    [Theory, BitAutoData]
++    public async Task UploadFileForExistingAttachmentAsync_WrongRevisionDate_Throws(SutProvider<CipherService> sutProvider,
++        Cipher cipher)
++    {
++        var lastKnownRevisionDate = cipher.RevisionDate.AddDays(-1);
++        var stream = new MemoryStream();
++        var attachment = new CipherAttachment.MetaData
++        {
++            AttachmentId = "test-attachment-id",
++            Size = 100,
++            FileName = "test.txt",
++            Key = "test-key"
++        };
++
++        var exception = await Assert.ThrowsAsync<BadRequestException>(
++            () => sutProvider.Sut.UploadFileForExistingAttachmentAsync(stream, cipher, attachment, lastKnownRevisionDate));
++        Assert.Contains("out of date", exception.Message);
++    }
++
++    [Theory]
++    [BitAutoData("")]
++    [BitAutoData("Correct Time")]
++    public async Task UploadFileForExistingAttachmentAsync_CorrectRevisionDate_DoesNotThrow(string revisionDateString,
++        SutProvider<CipherService> sutProvider, CipherDetails cipher)
++    {
++        var lastKnownRevisionDate = string.IsNullOrEmpty(revisionDateString) ? (DateTime?)null : cipher.RevisionDate;
++        var stream = new MemoryStream(new byte[100]);
++        var attachmentId = "test-attachment-id";
++        var attachment = new CipherAttachment.MetaData
++        {
++            AttachmentId = attachmentId,
++            Size = 100,
++            FileName = "test.txt",
++            Key = "test-key"
++        };
++
++        // Set the attachment on the cipher so ValidateCipherAttachmentFile can find it
++        cipher.SetAttachments(new Dictionary<string, CipherAttachment.MetaData>
++        {
++            [attachmentId] = attachment
++        });
++
++        sutProvider.GetDependency<IAttachmentStorageService>()
++            .UploadNewAttachmentAsync(stream, cipher, attachment)
++            .Returns(Task.CompletedTask);
++
++        sutProvider.GetDependency<IAttachmentStorageService>()
++            .ValidateFileAsync(cipher, attachment, Arg.Any<long>())
++            .Returns((true, 100L));
++
++        sutProvider.GetDependency<ICipherRepository>()
++            .UpdateAttachmentAsync(Arg.Any<CipherAttachment>())
++            .Returns(Task.CompletedTask);
++
++        await sutProvider.Sut.UploadFileForExistingAttachmentAsync(stream, cipher, attachment, lastKnownRevisionDate);
++
++        await sutProvider.GetDependency<IAttachmentStorageService>().Received(1)
++            .UploadNewAttachmentAsync(stream, cipher, attachment);
++    }
++
++    [Theory, BitAutoData]
++    public async Task CreateAttachmentShareAsync_WrongRevisionDate_Throws(SutProvider<CipherService> sutProvider,
++        Cipher cipher, Guid organizationId)
++    {
++        var lastKnownRevisionDate = cipher.RevisionDate.AddDays(-1);
++        var stream = new MemoryStream();
++        var fileName = "test.txt";
++        var key = "test-key";
++        var attachmentId = "attachment-id";
++
++        var exception = await Assert.ThrowsAsync<BadRequestException>(
++            () => sutProvider.Sut.CreateAttachmentShareAsync(cipher, stream, fileName, key, 100, attachmentId, organizationId, lastKnownRevisionDate));
++        Assert.Contains("out of date", exception.Message);
++    }
++
++    [Theory]
++    [BitAutoData("")]
++    [BitAutoData("Correct Time")]
++    public async Task CreateAttachmentShareAsync_CorrectRevisionDate_DoesNotThrow(string revisionDateString,
++        SutProvider<CipherService> sutProvider, CipherDetails cipher, Guid organizationId)
++    {
++        var lastKnownRevisionDate = string.IsNullOrEmpty(revisionDateString) ? (DateTime?)null : cipher.RevisionDate;
++        var stream = new MemoryStream(new byte[100]);
++        var fileName = "test.txt";
++        var key = "test-key";
++        var attachmentId = "attachment-id";
++
++        // Setup cipher with existing attachment (no TempMetadata)
++        cipher.OrganizationId = null;
++        cipher.SetAttachments(new Dictionary<string, CipherAttachment.MetaData>
++        {
++            [attachmentId] = new CipherAttachment.MetaData
++            {
++                AttachmentId = attachmentId,
++                Size = 100,
++                FileName = "existing.txt",
++                Key = "existing-key"
++            }
++        });
++
++        // Mock organization
++        var organization = new Organization
++        {
++            Id = organizationId,
++            MaxStorageGb = 1
++        };
++        sutProvider.GetDependency<IOrganizationRepository>()
++            .GetByIdAsync(organizationId)
++            .Returns(organization);
++
++        sutProvider.GetDependency<IAttachmentStorageService>()
++            .UploadShareAttachmentAsync(stream, cipher.Id, organizationId, Arg.Any<CipherAttachment.MetaData>())
++            .Returns(Task.CompletedTask);
++
++        sutProvider.GetDependency<ICipherRepository>()
++            .UpdateAttachmentAsync(Arg.Any<CipherAttachment>())
++            .Returns(Task.CompletedTask);
++
++        await sutProvider.Sut.CreateAttachmentShareAsync(cipher, stream, fileName, key, 100, attachmentId, organizationId, lastKnownRevisionDate);
++
++        await sutProvider.GetDependency<IAttachmentStorageService>().Received(1)
++            .UploadShareAttachmentAsync(stream, cipher.Id, organizationId, Arg.Any<CipherAttachment.MetaData>());
++    }
++
+     [Theory]
+     [BitAutoData]
+     public async Task SaveDetailsAsync_PersonalVault_WithOrganizationDataOwnershipPolicyEnabled_Throws(

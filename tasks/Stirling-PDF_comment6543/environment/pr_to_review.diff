@@ -1,0 +1,2721 @@
+diff --git a/app/proprietary/src/main/java/stirling/software/proprietary/policy/controller/PolicyController.java b/app/proprietary/src/main/java/stirling/software/proprietary/policy/controller/PolicyController.java
+index 0a94eef1fce..9cc4a5296c8 100644
+--- a/app/proprietary/src/main/java/stirling/software/proprietary/policy/controller/PolicyController.java
++++ b/app/proprietary/src/main/java/stirling/software/proprietary/policy/controller/PolicyController.java
+@@ -39,6 +39,8 @@
+ import stirling.software.common.util.TempFileManager;
+ import stirling.software.proprietary.policy.engine.PolicyRunHandle;
+ import stirling.software.proprietary.policy.engine.PolicyRunRegistry;
++import stirling.software.proprietary.policy.engine.PolicyRunner;
++import stirling.software.proprietary.policy.engine.PolicyValidator;
+ import stirling.software.proprietary.policy.model.PipelineDefinition;
+ import stirling.software.proprietary.policy.model.Policy;
+ import stirling.software.proprietary.policy.model.PolicyInputs;
+@@ -47,7 +49,6 @@
+ import stirling.software.proprietary.policy.model.PolicyRunView;
+ import stirling.software.proprietary.policy.progress.PolicyProgressListener;
+ import stirling.software.proprietary.policy.store.PolicyStore;
+-import stirling.software.proprietary.policy.trigger.ManualTrigger;
+ import stirling.software.proprietary.security.config.PremiumEndpoint;
+ 
+ import tools.jackson.core.JacksonException;
+@@ -71,9 +72,10 @@
+ @Tag(name = "Policies", description = "Run tool pipelines on the backend")
+ public class PolicyController {
+ 
+-    private final ManualTrigger manualTrigger;
++    private final PolicyRunner policyRunner;
+     private final PolicyRunRegistry runRegistry;
+     private final PolicyStore policyStore;
++    private final PolicyValidator policyValidator;
+     private final ObjectMapper objectMapper;
+     private final TempFileManager tempFileManager;
+ 
+@@ -95,7 +97,8 @@ public ResponseEntity<JobResponse<Void>> run(
+             throws IOException {
+         PipelineDefinition definition = parseDefinition(json);
+         PolicyInputs inputs = collectInputs(request);
+-        String runId = manualTrigger.fire(definition, inputs, PolicyProgressListener.NOOP).runId();
++        String runId =
++                policyRunner.runAdHoc(definition, inputs, PolicyProgressListener.NOOP).runId();
+         return ResponseEntity.accepted().body(new JobResponse<>(true, runId, null));
+     }
+ 
+@@ -115,7 +118,7 @@ public SseEmitter runStream(
+         SseEmitter emitter = new SseEmitter(streamTimeoutMs);
+         emitter.onError(e -> log.warn("Policy run SSE emitter error", e));
+ 
+-        PolicyRunHandle handle = manualTrigger.fire(definition, inputs, streamListener(emitter));
++        PolicyRunHandle handle = policyRunner.runAdHoc(definition, inputs, streamListener(emitter));
+         // Close the stream with a terminal event once the run finishes. whenComplete runs on the
+         // engine's worker thread after the run is done, so this never races the step events.
+         handle.completion()
+@@ -155,7 +158,13 @@ public ResponseEntity<PolicyRunView> status(@PathVariable String runId) {
+                     "Stores a policy (trigger config + steps + output + metadata). A blank id is"
+                             + " assigned; returns the stored policy with its id.")
+     public ResponseEntity<Policy> savePolicy(@RequestBody String json) {
+-        return ResponseEntity.ok(policyStore.save(parsePolicy(json)));
++        Policy policy = parsePolicy(json);
++        try {
++            policyValidator.validate(policy);
++        } catch (IllegalArgumentException e) {
++            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage());
++        }
++        return ResponseEntity.ok(policyStore.save(policy));
+     }
+ 
+     @GetMapping
+@@ -199,7 +208,7 @@ public ResponseEntity<JobResponse<Void>> runStoredPolicy(
+                                         new ResponseStatusException(
+                                                 HttpStatus.NOT_FOUND, "No policy: " + policyId));
+         PolicyInputs inputs = collectInputs(request);
+-        String runId = manualTrigger.run(policy, inputs, PolicyProgressListener.NOOP).runId();
++        String runId = policyRunner.runWith(policy, inputs, PolicyProgressListener.NOOP).runId();
+         return ResponseEntity.accepted().body(new JobResponse<>(true, runId, null));
+     }
+ 
+diff --git a/app/proprietary/src/main/java/stirling/software/proprietary/policy/engine/PolicyRunner.java b/app/proprietary/src/main/java/stirling/software/proprietary/policy/engine/PolicyRunner.java
+new file mode 100644
+index 00000000000..8685bf0208a
+--- /dev/null
++++ b/app/proprietary/src/main/java/stirling/software/proprietary/policy/engine/PolicyRunner.java
+@@ -0,0 +1,116 @@
++package stirling.software.proprietary.policy.engine;
++
++import java.io.IOException;
++import java.util.List;
++import java.util.function.Consumer;
++
++import org.springframework.stereotype.Service;
++
++import lombok.RequiredArgsConstructor;
++import lombok.extern.slf4j.Slf4j;
++
++import stirling.software.proprietary.policy.input.InputSource;
++import stirling.software.proprietary.policy.input.ResolvedInput;
++import stirling.software.proprietary.policy.model.InputSpec;
++import stirling.software.proprietary.policy.model.PipelineDefinition;
++import stirling.software.proprietary.policy.model.Policy;
++import stirling.software.proprietary.policy.model.PolicyInputs;
++import stirling.software.proprietary.policy.model.PolicyRun;
++import stirling.software.proprietary.policy.model.PolicyRunStatus;
++import stirling.software.proprietary.policy.progress.PolicyProgressListener;
++
++/**
++ * Runs policies, and is the one place that knows how to turn a policy's configured {@link InputSpec
++ * sources} into actual runs. Triggers (schedule, and future webhook/folder-watch) decide
++ * <em>when</em> to run and call {@link #run(Policy)}; they never touch sources themselves. The
++ * controller uses the supplied-input and ad-hoc entry points for on-demand work.
++ *
++ * <p>This is the seam that keeps triggers and sources independent: a trigger depends on the runner,
++ * the runner depends on the {@link InputSource} beans, and a source depends on neither - it just
++ * yields {@link ResolvedInput units of work}, each carrying its own completion hook.
++ */
++@Slf4j
++@Service
++@RequiredArgsConstructor
++public class PolicyRunner {
++
++    private final PolicyEngine policyEngine;
++    private final List<InputSource> inputSources;
++
++    /**
++     * Run a policy by pulling from every source it configures: each source yields zero or more
++     * units of work, and each unit becomes its own run so one failure does not affect the others. A
++     * policy with no sources runs once with no input files (a generator pipeline). Used by
++     * automatic triggers.
++     */
++    public void run(Policy policy) {
++        List<InputSpec> sources = policy.sources();
++        if (sources.isEmpty()) {
++            startRun(policy, PolicyInputs.of(List.of()), unused -> {});
++            return;
++        }
++        for (InputSpec spec : sources) {
++            pullAndRun(policy, spec);
++        }
++    }
++
++    /**
++     * Run a stored policy on files supplied directly by the caller (e.g. a manual run with
++     * uploads), bypassing its configured sources. Returns the run handle so callers can stream
++     * progress.
++     */
++    public PolicyRunHandle runWith(
++            Policy policy, PolicyInputs inputs, PolicyProgressListener listener) {
++        return policyEngine.runPolicy(policy, inputs, listener);
++    }
++
++    /** Run an ad-hoc pipeline with no stored policy (AI/Automate one-offs). */
++    public PolicyRunHandle runAdHoc(
++            PipelineDefinition definition, PolicyInputs inputs, PolicyProgressListener listener) {
++        return policyEngine.submit(definition, inputs, listener);
++    }
++
++    private void pullAndRun(Policy policy, InputSpec spec) {
++        InputSource source = sourceFor(spec);
++        if (source == null) {
++            log.warn(
++                    "No input source for type '{}' (policy {}); skipping",
++                    spec.type(),
++                    policy.id());
++            return;
++        }
++        List<ResolvedInput> work;
++        try {
++            work = source.resolve(spec);
++        } catch (IOException | RuntimeException e) {
++            log.warn(
++                    "Failed to resolve source '{}' for policy {}: {}",
++                    spec.type(),
++                    policy.id(),
++                    e.getMessage());
++            return;
++        }
++        for (ResolvedInput unit : work) {
++            startRun(policy, unit.inputs(), unit.onComplete());
++        }
++    }
++
++    private void startRun(Policy policy, PolicyInputs inputs, Consumer<Boolean> onComplete) {
++        log.info("Running policy {} ({})", policy.id(), policy.name());
++        PolicyRunHandle handle =
++                policyEngine.runPolicy(policy, inputs, PolicyProgressListener.NOOP);
++        handle.completion()
++                .whenComplete((run, throwable) -> onComplete.accept(succeeded(run, throwable)));
++    }
++
++    private static boolean succeeded(PolicyRun run, Throwable throwable) {
++        return throwable == null && run != null && run.getStatus() == PolicyRunStatus.COMPLETED;
++    }
++
++    private InputSource sourceFor(InputSpec spec) {
++        return inputSources.stream()
++                .filter(source -> source.supports(spec))
++                .findFirst()
++                .orElse(null);
++    }
++}
+diff --git a/app/proprietary/src/main/java/stirling/software/proprietary/policy/engine/PolicyValidator.java b/app/proprietary/src/main/java/stirling/software/proprietary/policy/engine/PolicyValidator.java
+new file mode 100644
+index 00000000000..2aa4d98bee7
+--- /dev/null
++++ b/app/proprietary/src/main/java/stirling/software/proprietary/policy/engine/PolicyValidator.java
+@@ -0,0 +1,74 @@
++package stirling.software.proprietary.policy.engine;
++
++import java.util.List;
++
++import org.springframework.stereotype.Service;
++
++import lombok.RequiredArgsConstructor;
++
++import stirling.software.proprietary.policy.input.InputSource;
++import stirling.software.proprietary.policy.model.InputSpec;
++import stirling.software.proprietary.policy.model.OutputSpec;
++import stirling.software.proprietary.policy.model.Policy;
++import stirling.software.proprietary.policy.model.TriggerConfig;
++import stirling.software.proprietary.policy.output.PolicyOutputSink;
++import stirling.software.proprietary.policy.trigger.PolicyTrigger;
++
++/**
++ * Validates a policy's trigger, sources, and output configuration by delegating each facet to the
++ * bean that handles its type. Called when a policy is saved so a misconfigured schedule, missing
++ * folder directory, or unknown type fails fast instead of silently misbehaving at run time.
++ *
++ * <p>The trigger is optional (a {@code null} trigger is a manual-only policy and needs no
++ * validation); every configured source is validated.
++ */
++@Service
++@RequiredArgsConstructor
++public class PolicyValidator {
++
++    private final List<PolicyTrigger> triggers;
++    private final List<InputSource> inputSources;
++    private final List<PolicyOutputSink> outputSinks;
++
++    /**
++     * @throws IllegalArgumentException if any facet's type is unknown or its configuration is
++     *     invalid
++     */
++    public void validate(Policy policy) {
++        if (policy.trigger() != null) {
++            triggerFor(policy.trigger()).validate(policy);
++        }
++        for (InputSpec source : policy.sources()) {
++            inputSourceFor(source).validate(source);
++        }
++        outputSinkFor(policy.output()).validate(policy.output());
++    }
++
++    private PolicyTrigger triggerFor(TriggerConfig config) {
++        return triggers.stream()
++                .filter(trigger -> trigger.type().equals(config.type()))
++                .findFirst()
++                .orElseThrow(
++                        () ->
++                                new IllegalArgumentException(
++                                        "unknown trigger type: " + config.type()));
++    }
++
++    private InputSource inputSourceFor(InputSpec spec) {
++        return inputSources.stream()
++                .filter(source -> source.supports(spec))
++                .findFirst()
++                .orElseThrow(
++                        () ->
++                                new IllegalArgumentException(
++                                        "unknown input source type: " + spec.type()));
++    }
++
++    private PolicyOutputSink outputSinkFor(OutputSpec spec) {
++        return outputSinks.stream()
++                .filter(sink -> sink.supports(spec))
++                .findFirst()
++                .orElseThrow(
++                        () -> new IllegalArgumentException("unknown output type: " + spec.type()));
++    }
++}
+diff --git a/app/proprietary/src/main/java/stirling/software/proprietary/policy/input/FolderInputSource.java b/app/proprietary/src/main/java/stirling/software/proprietary/policy/input/FolderInputSource.java
+new file mode 100644
+index 00000000000..2eacbcdfa17
+--- /dev/null
++++ b/app/proprietary/src/main/java/stirling/software/proprietary/policy/input/FolderInputSource.java
+@@ -0,0 +1,184 @@
++package stirling.software.proprietary.policy.input;
++
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.StandardCopyOption;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++import java.util.stream.Stream;
++
++import org.springframework.core.io.FileSystemResource;
++import org.springframework.core.io.Resource;
++import org.springframework.stereotype.Service;
++
++import lombok.RequiredArgsConstructor;
++import lombok.extern.slf4j.Slf4j;
++
++import stirling.software.common.util.FileReadinessChecker;
++import stirling.software.proprietary.policy.model.InputSpec;
++import stirling.software.proprietary.policy.model.PolicyInputs;
++
++/**
++ * Reads input files from a directory. Each ready file becomes its own unit of work (one run per
++ * file) so a failure on one file does not affect the others.
++ *
++ * <p>Two modes via the {@code mode} option:
++ *
++ * <ul>
++ *   <li>{@code "consume"} (default) - claim each file by moving it into {@code
++ *       .stirling/processing}, then route it to {@code .stirling/done} or {@code .stirling/error}
++ *       when its run finishes. Each file is processed once; right for "process new arrivals" (and
++ *       the basis of watched folders).
++ *   <li>{@code "snapshot"} - read the directory's current files without moving them; every run sees
++ *       the full set again. Right for "always regenerate from a fixed input set".
++ * </ul>
++ *
++ * Readiness is checked first (via {@link FileReadinessChecker}) so files mid-write are skipped.
++ */
++@Slf4j
++@Service
++@RequiredArgsConstructor
++public class FolderInputSource implements InputSource {
++
++    private static final String TYPE = "folder";
++    // Bookkeeping lives under one hidden namespace dir so the watched folder stays tidy.
++    private static final String WORK_SUBDIR = ".stirling";
++    private static final String PROCESSING_SUBDIR = "processing";
++    private static final String DONE_SUBDIR = "done";
++    private static final String ERROR_SUBDIR = "error";
++
++    private final FileReadinessChecker readinessChecker;
++
++    @Override
++    public String type() {
++        return TYPE;
++    }
++
++    @Override
++    public boolean supports(InputSpec spec) {
++        return spec != null && TYPE.equals(spec.type());
++    }
++
++    @Override
++    public void validate(InputSpec spec) {
++        FolderConfig.from(spec.options());
++    }
++
++    @Override
++    public List<Path> watchTargets(InputSpec spec) {
++        return List.of(FolderConfig.from(spec.options()).directory());
++    }
++
++    @Override
++    public List<ResolvedInput> resolve(InputSpec spec) throws IOException {
++        FolderConfig config = FolderConfig.from(spec.options());
++        Path inputDir = config.directory();
++        if (!Files.isDirectory(inputDir)) {
++            log.debug("Folder input dir does not exist: {}", inputDir);
++            return List.of();
++        }
++
++        List<Path> ready = new ArrayList<>();
++        try (Stream<Path> entries = Files.list(inputDir)) {
++            entries.filter(Files::isRegularFile)
++                    .filter(readinessChecker::isReady)
++                    .forEach(ready::add);
++        }
++
++        List<ResolvedInput> work = new ArrayList<>();
++        for (Path file : ready) {
++            if (config.snapshot()) {
++                work.add(ResolvedInput.of(PolicyInputs.of(List.of(fileResource(file)))));
++            } else {
++                Path claimed = claim(inputDir, file);
++                if (claimed == null) {
++                    continue; // another sweep/process grabbed it
++                }
++                work.add(
++                        new ResolvedInput(
++                                PolicyInputs.of(List.of(fileResource(claimed))),
++                                success -> route(inputDir, claimed, success)));
++            }
++        }
++        return work;
++    }
++
++    private Path claim(Path inputDir, Path file) {
++        try {
++            Path processingDir = workDir(inputDir, PROCESSING_SUBDIR);
++            Files.createDirectories(processingDir);
++            Path claimed = uniqueTarget(processingDir, file.getFileName().toString());
++            Files.move(file, claimed, StandardCopyOption.ATOMIC_MOVE);
++            return claimed;
++        } catch (IOException e) {
++            log.debug("Could not claim {}: {}", file, e.getMessage());
++            return null;
++        }
++    }
++
++    private void route(Path inputDir, Path claimed, boolean success) {
++        String subdir = success ? DONE_SUBDIR : ERROR_SUBDIR;
++        try {
++            Path destDir = workDir(inputDir, subdir);
++            Files.createDirectories(destDir);
++            Files.move(
++                    claimed,
++                    uniqueTarget(destDir, claimed.getFileName().toString()),
++                    StandardCopyOption.ATOMIC_MOVE);
++        } catch (IOException e) {
++            log.warn(
++                    "Could not move processed input {} to {}: {}", claimed, subdir, e.getMessage());
++        }
++    }
++
++    /** A bookkeeping subdirectory under the watched folder's {@code .stirling} namespace. */
++    private static Path workDir(Path inputDir, String subdir) {
++        return inputDir.resolve(WORK_SUBDIR).resolve(subdir);
++    }
++
++    private static Resource fileResource(Path path) {
++        String name = path.getFileName().toString();
++        return new FileSystemResource(path.toFile()) {
++            @Override
++            public String getFilename() {
++                return name;
++            }
++        };
++    }
++
++    private static Path uniqueTarget(Path dir, String filename) {
++        Path candidate = dir.resolve(filename);
++        if (!Files.exists(candidate)) {
++            return candidate;
++        }
++        int dot = filename.lastIndexOf('.');
++        String base = dot < 0 ? filename : filename.substring(0, dot);
++        String ext = dot < 0 ? "" : filename.substring(dot);
++        for (int n = 1; ; n++) {
++            Path next = dir.resolve(base + " (" + n + ")" + ext);
++            if (!Files.exists(next)) {
++                return next;
++            }
++        }
++    }
++
++    /** The typed, validated form of a folder source's options: the directory and dedup mode. */
++    record FolderConfig(Path directory, boolean snapshot) {
++
++        private static final String DIRECTORY_OPTION = "directory";
++        private static final String MODE_OPTION = "mode";
++        private static final String MODE_SNAPSHOT = "snapshot";
++
++        static FolderConfig from(Map<String, Object> options) {
++            Object directory = options.get(DIRECTORY_OPTION);
++            if (directory == null || directory.toString().isBlank()) {
++                throw new IllegalArgumentException("folder input requires a 'directory' option");
++            }
++            Object mode = options.get(MODE_OPTION);
++            boolean snapshot = mode != null && MODE_SNAPSHOT.equals(mode.toString());
++            return new FolderConfig(Path.of(directory.toString()), snapshot);
++        }
++    }
++}
+diff --git a/app/proprietary/src/main/java/stirling/software/proprietary/policy/input/InputSource.java b/app/proprietary/src/main/java/stirling/software/proprietary/policy/input/InputSource.java
+new file mode 100644
+index 00000000000..a6f116d02c4
+--- /dev/null
++++ b/app/proprietary/src/main/java/stirling/software/proprietary/policy/input/InputSource.java
+@@ -0,0 +1,49 @@
++package stirling.software.proprietary.policy.input;
++
++import java.io.IOException;
++import java.nio.file.Path;
++import java.util.List;
++
++import stirling.software.proprietary.policy.model.InputSpec;
++
++/**
++ * Resolves one of a policy's {@link InputSpec sources} into the files to run on - answering
++ * <em>where</em> a run's files come from, independent of <em>when</em> it runs. The counterpart of
++ * {@code PolicyOutputSink}: implementations are beans selected by {@link #supports(InputSpec)}, so
++ * a new source kind (folder, S3) is just a new bean.
++ *
++ * <p>Driven by the {@code PolicyRunner}, which a trigger calls when a policy is due; a source is
++ * passive and knows nothing about what triggered the run. A manual run may instead supply files
++ * directly and bypass sources entirely.
++ */
++public interface InputSource {
++
++    /** Stable identifier for this source, matching {@code InputSpec.type()} (e.g. "folder"). */
++    String type();
++
++    /** Whether this source can handle the given spec. */
++    boolean supports(InputSpec spec);
++
++    /**
++     * Check that an input spec is usable, throwing {@link IllegalArgumentException} if not. Called
++     * when a policy is saved so misconfiguration fails fast rather than at run time.
++     */
++    default void validate(InputSpec spec) {}
++
++    /**
++     * Resolve the spec into zero or more units of work, each carrying the files for one run and a
++     * completion hook. Returning an empty list means there is nothing to run right now.
++     */
++    List<ResolvedInput> resolve(InputSpec spec) throws IOException;
++
++    /**
++     * The local filesystem directories this source draws from, if any, for triggers that want to
++     * react to changes there (the folder-watch trigger) rather than poll. Advisory only: it merely
++     * tells a trigger <em>where</em> to watch; resolving the spec into files is still this source's
++     * job via {@link #resolve}. Non-filesystem sources (S3, ...) return an empty list and so are
++     * simply not watchable. Default: nothing to watch.
++     */
++    default List<Path> watchTargets(InputSpec spec) {
++        return List.of();
++    }
++}
+diff --git a/app/proprietary/src/main/java/stirling/software/proprietary/policy/input/ResolvedInput.java b/app/proprietary/src/main/java/stirling/software/proprietary/policy/input/ResolvedInput.java
+new file mode 100644
+index 00000000000..28541343668
+--- /dev/null
++++ b/app/proprietary/src/main/java/stirling/software/proprietary/policy/input/ResolvedInput.java
+@@ -0,0 +1,23 @@
++package stirling.software.proprietary.policy.input;
++
++import java.util.function.Consumer;
++
++import stirling.software.proprietary.policy.model.PolicyInputs;
++
++/**
++ * One unit of work produced by an {@link InputSource}: the files to run plus a completion callback
++ * invoked with the run's success once it finishes (e.g. a folder source routes the input to {@code
++ * .stirling/done} or {@code .stirling/error}). A source may return several of these (e.g. one per
++ * file).
++ */
++public record ResolvedInput(PolicyInputs inputs, Consumer<Boolean> onComplete) {
++
++    public ResolvedInput {
++        onComplete = onComplete == null ? success -> {} : onComplete;
++    }
++
++    /** A unit of work with no completion side effect. */
++    public static ResolvedInput of(PolicyInputs inputs) {
++        return new ResolvedInput(inputs, success -> {});
++    }
++}
+diff --git a/app/proprietary/src/main/java/stirling/software/proprietary/policy/model/InputSpec.java b/app/proprietary/src/main/java/stirling/software/proprietary/policy/model/InputSpec.java
+new file mode 100644
+index 00000000000..d6816c60fc1
+--- /dev/null
++++ b/app/proprietary/src/main/java/stirling/software/proprietary/policy/model/InputSpec.java
+@@ -0,0 +1,26 @@
++package stirling.software.proprietary.policy.model;
++
++import java.util.Map;
++
++/**
++ * One source a policy's input files come from. {@code type} selects an {@code InputSource}
++ * ("folder", and in future "s3", ...); {@code options} carries source-specific configuration (a
++ * directory, a bucket, a dedup mode, ...).
++ *
++ * <p>A policy holds a list of these; a run pulls from every one. An empty list means the policy
++ * runs with no input files (a generator pipeline, or files supplied directly to a manual run).
++ *
++ * <p>Data-driven and parallel to {@link OutputSpec}/{@link TriggerConfig}: a new source kind is a
++ * new {@code type} handled by a new {@code InputSource} bean.
++ */
++public record InputSpec(String type, Map<String, Object> options) {
++
++    public InputSpec {
++        options = options == null ? Map.of() : options;
++    }
++
++    /** Read input files from a directory on disk. */
++    public static InputSpec folder(String directory) {
++        return new InputSpec("folder", Map.of("directory", directory));
++    }
++}
+diff --git a/app/proprietary/src/main/java/stirling/software/proprietary/policy/model/OutputSpec.java b/app/proprietary/src/main/java/stirling/software/proprietary/policy/model/OutputSpec.java
+index 4759810bc8d..3caab8afc15 100644
+--- a/app/proprietary/src/main/java/stirling/software/proprietary/policy/model/OutputSpec.java
++++ b/app/proprietary/src/main/java/stirling/software/proprietary/policy/model/OutputSpec.java
+@@ -18,4 +18,9 @@ public record OutputSpec(String type, Map<String, Object> options) {
+     public static OutputSpec inline() {
+         return new OutputSpec("inline", Map.of());
+     }
++
++    /** Write outputs to a directory on disk. */
++    public static OutputSpec folder(String directory) {
++        return new OutputSpec("folder", Map.of("directory", directory));
++    }
+ }
+diff --git a/app/proprietary/src/main/java/stirling/software/proprietary/policy/model/Policy.java b/app/proprietary/src/main/java/stirling/software/proprietary/policy/model/Policy.java
+index 3a2acaf0c81..14fd35b6366 100644
+--- a/app/proprietary/src/main/java/stirling/software/proprietary/policy/model/Policy.java
++++ b/app/proprietary/src/main/java/stirling/software/proprietary/policy/model/Policy.java
+@@ -3,18 +3,16 @@
+ import java.util.List;
+ 
+ /**
+- * A stored, owned automation: how it is triggered, the ordered tool steps to run, and where its
+- * output goes, plus identity and metadata.
++ * A stored automation: an ordered chain of tool steps, the sources its input files come from, and
++ * an output destination for the results.
+  *
+- * <p>This is the central object of the feature. Everything that runs a chain of tools is a use of a
+- * Policy: a watched folder is a Policy with a folder {@link TriggerConfig} and a folder {@link
+- * OutputSpec}; a scheduled job is a Policy with a schedule trigger; manual/Automate/AI runs execute
+- * a Policy (or an ad-hoc {@link PipelineDefinition}) on demand. The engine itself only ever
+- * executes the {@link PipelineDefinition} this exposes via {@link #toDefinition()} - it is
+- * trigger-agnostic.
++ * <p>Every policy can always be run on demand (manually). It may additionally carry one automatic
++ * {@link TriggerConfig} - usually a schedule - that fires it without a person asking; a {@code
++ * null} trigger means manual-only. A trigger decides <em>when</em> a run happens and a {@link
++ * InputSpec source} decides <em>where</em> its files come from; the two are independent, and a run
++ * pulls from every configured source.
+  *
+- * <p>{@code enabled} gates automatic triggering (a disabled policy is not picked up by its
+- * trigger); it does not block an explicit manual run.
++ * <p>This is the feature's central configuration object - what a user defines and the engine runs.
+  */
+ public record Policy(
+         String id,
+@@ -22,15 +20,28 @@ public record Policy(
+         String owner,
+         boolean enabled,
+         TriggerConfig trigger,
++        List<InputSpec> sources,
+         List<PipelineStep> steps,
+         OutputSpec output) {
+ 
+     public Policy {
+-        trigger = trigger == null ? TriggerConfig.manual() : trigger;
++        sources = sources == null ? List.of() : List.copyOf(sources);
+         steps = steps == null ? List.of() : steps;
+         output = output == null ? OutputSpec.inline() : output;
+     }
+ 
++    /** A policy with no configured sources (a generator, or files supplied directly to a run). */
++    public Policy(
++            String id,
++            String name,
++            String owner,
++            boolean enabled,
++            TriggerConfig trigger,
++            List<PipelineStep> steps,
++            OutputSpec output) {
++        this(id, name, owner, enabled, trigger, List.of(), steps, output);
++    }
++
+     /** The engine-level, trigger-agnostic view of this policy's pipeline. */
+     public PipelineDefinition toDefinition() {
+         return new PipelineDefinition(name, steps, output);
+diff --git a/app/proprietary/src/main/java/stirling/software/proprietary/policy/model/Schedule.java b/app/proprietary/src/main/java/stirling/software/proprietary/policy/model/Schedule.java
+new file mode 100644
+index 00000000000..148534636ea
+--- /dev/null
++++ b/app/proprietary/src/main/java/stirling/software/proprietary/policy/model/Schedule.java
+@@ -0,0 +1,141 @@
++package stirling.software.proprietary.policy.model;
++
++import java.time.DayOfWeek;
++import java.time.LocalTime;
++import java.time.ZonedDateTime;
++import java.util.EnumSet;
++import java.util.Set;
++
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
++import com.fasterxml.jackson.annotation.JsonSubTypes;
++import com.fasterxml.jackson.annotation.JsonTypeInfo;
++
++/**
++ * When a scheduled policy should fire, expressed as intent ("every day at 02:00") rather than a
++ * cron string. A frontend builds one of these from a friendly picker; the schedule trigger asks it
++ * for the next firing after a given moment.
++ *
++ * <p>Sealed so every cadence is an explicit, self-validating shape and adding a new one forces a
++ * new subtype rather than another string convention to learn. The {@code type} discriminator stays
++ * on the wire so the frontend can switch on it without knowing the Java hierarchy.
++ *
++ * <p>Wall-clock kinds ({@link Daily}, {@link Weekly}, {@link Monthly}) are evaluated in the zone of
++ * the {@code after} argument; {@link Every} is a fixed offset and ignores wall-clock time.
++ */
++@JsonTypeInfo(use = JsonTypeInfo.Id.NAME, property = "type")
++@JsonSubTypes({
++    @JsonSubTypes.Type(value = Schedule.Every.class, name = "every"),
++    @JsonSubTypes.Type(value = Schedule.Daily.class, name = "daily"),
++    @JsonSubTypes.Type(value = Schedule.Weekly.class, name = "weekly"),
++    @JsonSubTypes.Type(value = Schedule.Monthly.class, name = "monthly"),
++})
++@JsonIgnoreProperties(ignoreUnknown = true)
++public sealed interface Schedule {
++
++    /** The next firing strictly after {@code after}, evaluated in {@code after}'s zone. */
++    ZonedDateTime nextAfter(ZonedDateTime after);
++
++    /** The granularities a fixed-interval schedule can repeat on. */
++    enum Unit {
++        MINUTES,
++        HOURS,
++        DAYS
++    }
++
++    /**
++     * A fixed cadence repeating from when the policy was last seen: "every 15 minutes", "every 6
++     * hours". Time of day is irrelevant.
++     */
++    record Every(long count, Unit unit) implements Schedule {
++        public Every {
++            if (count <= 0) {
++                throw new IllegalArgumentException("'every' schedule needs a positive count");
++            }
++            if (unit == null) {
++                throw new IllegalArgumentException("'every' schedule needs a unit");
++            }
++        }
++
++        @Override
++        public ZonedDateTime nextAfter(ZonedDateTime after) {
++            return switch (unit) {
++                case MINUTES -> after.plusMinutes(count);
++                case HOURS -> after.plusHours(count);
++                case DAYS -> after.plusDays(count);
++            };
++        }
++    }
++
++    /** Once a day at a wall-clock time: "every day at 02:00". */
++    record Daily(LocalTime at) implements Schedule {
++        public Daily {
++            requireTime(at);
++        }
++
++        @Override
++        public ZonedDateTime nextAfter(ZonedDateTime after) {
++            ZonedDateTime today = after.with(at);
++            return today.isAfter(after) ? today : today.plusDays(1);
++        }
++    }
++
++    /** On chosen weekdays at a wall-clock time: "every Monday and Thursday at 09:00". */
++    record Weekly(Set<DayOfWeek> days, LocalTime at) implements Schedule {
++        public Weekly {
++            if (days == null || days.isEmpty()) {
++                throw new IllegalArgumentException("'weekly' schedule needs at least one day");
++            }
++            requireTime(at);
++            days = EnumSet.copyOf(days);
++        }
++
++        @Override
++        public ZonedDateTime nextAfter(ZonedDateTime after) {
++            // The soonest of the next 7 days that lands on a chosen weekday, at the configured
++            // time.
++            for (int i = 0; i <= 7; i++) {
++                ZonedDateTime candidate = after.plusDays(i).with(at);
++                if (candidate.isAfter(after) && days.contains(candidate.getDayOfWeek())) {
++                    return candidate;
++                }
++            }
++            throw new IllegalStateException("unreachable: a chosen weekday recurs within 8 days");
++        }
++    }
++
++    /**
++     * On a day of the month at a wall-clock time: "the 1st at 00:00". Months too short for the
++     * chosen day (e.g. the 31st in February) are skipped, not clamped.
++     */
++    record Monthly(int dayOfMonth, LocalTime at) implements Schedule {
++        public Monthly {
++            if (dayOfMonth < 1 || dayOfMonth > 31) {
++                throw new IllegalArgumentException("'monthly' day-of-month must be 1-31");
++            }
++            requireTime(at);
++        }
++
++        @Override
++        public ZonedDateTime nextAfter(ZonedDateTime after) {
++            ZonedDateTime firstOfMonth = after.withDayOfMonth(1).with(at);
++            // Scan forward a few years' worth of months to skip ones without the chosen day.
++            for (int i = 0; i < 48; i++) {
++                ZonedDateTime month = firstOfMonth.plusMonths(i);
++                if (month.toLocalDate().lengthOfMonth() >= dayOfMonth) {
++                    ZonedDateTime fire = month.withDayOfMonth(dayOfMonth);
++                    if (fire.isAfter(after)) {
++                        return fire;
++                    }
++                }
++            }
++            throw new IllegalStateException(
++                    "unreachable: a month with the chosen day recurs yearly");
++        }
++    }
++
++    private static void requireTime(LocalTime at) {
++        if (at == null) {
++            throw new IllegalArgumentException("schedule needs a time of day ('at')");
++        }
++    }
++}
+diff --git a/app/proprietary/src/main/java/stirling/software/proprietary/policy/model/TriggerConfig.java b/app/proprietary/src/main/java/stirling/software/proprietary/policy/model/TriggerConfig.java
+index 848c48e4f50..e18347dc3b8 100644
+--- a/app/proprietary/src/main/java/stirling/software/proprietary/policy/model/TriggerConfig.java
++++ b/app/proprietary/src/main/java/stirling/software/proprietary/policy/model/TriggerConfig.java
+@@ -3,23 +3,21 @@
+ import java.util.Map;
+ 
+ /**
+- * How a {@link Policy} is automatically triggered. {@code type} selects a trigger kind ("manual",
+- * "folder", "schedule", "s3"); {@code options} carries type-specific configuration (a folder path,
+- * a cron expression, a bucket, ...).
++ * A {@link Policy}'s optional automatic trigger - what fires it without a person asking. {@code
++ * type} selects a trigger kind ("schedule", and in future "webhook", "folder-watch", ...); {@code
++ * options} carries type-specific configuration (a {@link Schedule}, a webhook secret, ...).
++ *
++ * <p>Manual running is <em>not</em> a trigger kind: every policy can always be run on demand, so a
++ * policy with no automatic trigger simply has a {@code null} {@code TriggerConfig}. A trigger
++ * answers only "when"; where a run's files come from is a separate concern owned by the policy's
++ * {@link InputSpec sources}.
+  *
+  * <p>Data-driven and parallel to {@link OutputSpec}: new trigger kinds are new {@code type} values
+- * handled by a new trigger bean, with no change to the model. {@code "manual"} means there is no
+- * automatic trigger - the policy is only ever run on demand.
++ * handled by a new trigger bean, with no change to the model.
+  */
+ public record TriggerConfig(String type, Map<String, Object> options) {
+ 
+     public TriggerConfig {
+-        type = type == null || type.isBlank() ? "manual" : type;
+         options = options == null ? Map.of() : options;
+     }
+-
+-    /** No automatic trigger; the policy is run on demand only. */
+-    public static TriggerConfig manual() {
+-        return new TriggerConfig("manual", Map.of());
+-    }
+ }
+diff --git a/app/proprietary/src/main/java/stirling/software/proprietary/policy/output/FolderOutputSink.java b/app/proprietary/src/main/java/stirling/software/proprietary/policy/output/FolderOutputSink.java
+new file mode 100644
+index 00000000000..dd4e8677452
+--- /dev/null
++++ b/app/proprietary/src/main/java/stirling/software/proprietary/policy/output/FolderOutputSink.java
+@@ -0,0 +1,125 @@
++package stirling.software.proprietary.policy.output;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.UUID;
++
++import org.apache.commons.io.FilenameUtils;
++import org.springframework.core.io.Resource;
++import org.springframework.http.MediaType;
++import org.springframework.http.MediaTypeFactory;
++import org.springframework.stereotype.Service;
++
++import lombok.extern.slf4j.Slf4j;
++
++import stirling.software.common.model.job.ResultFile;
++import stirling.software.proprietary.policy.model.OutputSpec;
++
++/**
++ * Writes a run's output files to a directory on disk. The destination is the {@code directory}
++ * option of the {@link OutputSpec}.
++ *
++ * <p>Files are streamed to disk (so large outputs are not buffered) and given unique names to avoid
++ * clobbering existing files. The returned {@link ResultFile}s describe what was written (path +
++ * size); they carry a synthetic id because the deliverable is the file on disk, not a {@code
++ * FileStorage} entry, so folder outputs are not downloadable via {@code /files/{id}}.
++ */
++@Slf4j
++@Service
++public class FolderOutputSink implements PolicyOutputSink {
++
++    static final String TYPE = "folder";
++    static final String DIRECTORY_OPTION = "directory";
++
++    @Override
++    public String type() {
++        return TYPE;
++    }
++
++    @Override
++    public boolean supports(OutputSpec spec) {
++        return spec != null && TYPE.equals(spec.type());
++    }
++
++    @Override
++    public void validate(OutputSpec spec) {
++        directoryOf(spec);
++    }
++
++    @Override
++    public List<ResultFile> deliver(String runId, List<Resource> outputs, OutputSpec spec)
++            throws IOException {
++        Path targetDir = directoryOf(spec);
++        Files.createDirectories(targetDir);
++
++        List<ResultFile> results = new ArrayList<>();
++        for (int i = 0; i < outputs.size(); i++) {
++            Resource resource = outputs.get(i);
++            String name = safeName(resource.getFilename(), i);
++            Path target = uniqueTarget(targetDir, name);
++            try (InputStream is = resource.getInputStream()) {
++                Files.copy(is, target);
++            }
++            long size = Files.size(target);
++            String contentType =
++                    MediaTypeFactory.getMediaType(name)
++                            .orElse(MediaType.APPLICATION_OCTET_STREAM)
++                            .toString();
++            results.add(
++                    ResultFile.builder()
++                            .fileId(UUID.randomUUID().toString())
++                            .fileName(target.toString())
++                            .contentType(contentType)
++                            .fileSize(size)
++                            .build());
++            log.debug("Wrote policy run {} output to {}", runId, target);
++        }
++        return results;
++    }
++
++    private static Path directoryOf(OutputSpec spec) {
++        Object directory = spec.options().get(DIRECTORY_OPTION);
++        if (directory == null || directory.toString().isBlank()) {
++            throw new IllegalArgumentException(
++                    "folder output requires a '" + DIRECTORY_OPTION + "' option");
++        }
++        return Path.of(directory.toString());
++    }
++
++    /**
++     * The resource's filename reduced to a bare, traversal-free name: any directory component or
++     * "../" is stripped so a crafted output name cannot escape {@code targetDir}. Falls back to a
++     * synthetic name when the filename is absent or reduces to nothing usable.
++     */
++    private static String safeName(String filename, int index) {
++        if (filename == null || filename.isBlank()) {
++            return "output-" + index;
++        }
++        String name = FilenameUtils.getName(filename);
++        if (name.isBlank() || ".".equals(name) || "..".equals(name)) {
++            return "output-" + index;
++        }
++        return name;
++    }
++
++    /** Resolve a non-colliding path in {@code dir}, appending " (n)" before the extension. */
++    private static Path uniqueTarget(Path dir, String filename) {
++        Path candidate = dir.resolve(filename);
++        if (!Files.exists(candidate)) {
++            return candidate;
++        }
++        String base = FilenameUtils.getBaseName(filename);
++        String ext = FilenameUtils.getExtension(filename);
++        String suffix = ext.isEmpty() ? "" : "." + ext;
++        for (int n = 1; ; n++) {
++            Path next = dir.resolve(base + " (" + n + ")" + suffix);
++            if (!Files.exists(next)) {
++                return next;
++            }
++        }
++    }
++}
+diff --git a/app/proprietary/src/main/java/stirling/software/proprietary/policy/output/PolicyOutputSink.java b/app/proprietary/src/main/java/stirling/software/proprietary/policy/output/PolicyOutputSink.java
+index f6bf478e7fc..c98b55ad661 100644
+--- a/app/proprietary/src/main/java/stirling/software/proprietary/policy/output/PolicyOutputSink.java
++++ b/app/proprietary/src/main/java/stirling/software/proprietary/policy/output/PolicyOutputSink.java
+@@ -23,6 +23,12 @@ public interface PolicyOutputSink {
+     /** Whether this sink can handle the given output spec. */
+     boolean supports(OutputSpec spec);
+ 
++    /**
++     * Check that an output spec is usable, throwing {@link IllegalArgumentException} if not. Called
++     * when a policy is saved so misconfiguration fails fast rather than at run time.
++     */
++    default void validate(OutputSpec spec) {}
++
+     /**
+      * Persist/deliver the output files and return their descriptors.
+      *
+diff --git a/app/proprietary/src/main/java/stirling/software/proprietary/policy/store/InProcessPolicyStore.java b/app/proprietary/src/main/java/stirling/software/proprietary/policy/store/InProcessPolicyStore.java
+index df8fc93394a..2ec94d1ebfe 100644
+--- a/app/proprietary/src/main/java/stirling/software/proprietary/policy/store/InProcessPolicyStore.java
++++ b/app/proprietary/src/main/java/stirling/software/proprietary/policy/store/InProcessPolicyStore.java
+@@ -30,6 +30,7 @@ public Policy save(Policy policy) {
+                         policy.owner(),
+                         policy.enabled(),
+                         policy.trigger(),
++                        policy.sources(),
+                         policy.steps(),
+                         policy.output());
+         policies.put(id, stored);
+@@ -50,6 +51,7 @@ public List<Policy> all() {
+     public List<Policy> findByTriggerType(String triggerType) {
+         return policies.values().stream()
+                 .filter(Policy::enabled)
++                .filter(policy -> policy.trigger() != null)
+                 .filter(policy -> triggerType.equals(policy.trigger().type()))
+                 .toList();
+     }
+diff --git a/app/proprietary/src/main/java/stirling/software/proprietary/policy/store/JpaPolicyStore.java b/app/proprietary/src/main/java/stirling/software/proprietary/policy/store/JpaPolicyStore.java
+index 977e8c9c12f..e4e05ea4c3c 100644
+--- a/app/proprietary/src/main/java/stirling/software/proprietary/policy/store/JpaPolicyStore.java
++++ b/app/proprietary/src/main/java/stirling/software/proprietary/policy/store/JpaPolicyStore.java
+@@ -37,6 +37,7 @@ public Policy save(Policy policy) {
+                         policy.owner(),
+                         policy.enabled(),
+                         policy.trigger(),
++                        policy.sources(),
+                         policy.steps(),
+                         policy.output());
+ 
+@@ -45,7 +46,7 @@ public Policy save(Policy policy) {
+         entity.setName(stored.name());
+         entity.setOwner(stored.owner());
+         entity.setEnabled(stored.enabled());
+-        entity.setTriggerType(stored.trigger().type());
++        entity.setTriggerType(stored.trigger() == null ? null : stored.trigger().type());
+         entity.setPolicyJson(objectMapper.writeValueAsString(stored));
+         repository.save(entity);
+         return stored;
+diff --git a/app/proprietary/src/main/java/stirling/software/proprietary/policy/trigger/FolderWatchTrigger.java b/app/proprietary/src/main/java/stirling/software/proprietary/policy/trigger/FolderWatchTrigger.java
+new file mode 100644
+index 00000000000..e579b96818e
+--- /dev/null
++++ b/app/proprietary/src/main/java/stirling/software/proprietary/policy/trigger/FolderWatchTrigger.java
+@@ -0,0 +1,309 @@
++package stirling.software.proprietary.policy.trigger;
++
++import static java.nio.file.StandardWatchEventKinds.ENTRY_CREATE;
++import static java.nio.file.StandardWatchEventKinds.ENTRY_MODIFY;
++
++import java.io.IOException;
++import java.nio.file.ClosedWatchServiceException;
++import java.nio.file.FileSystems;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.WatchKey;
++import java.nio.file.WatchService;
++import java.util.ArrayList;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.TimeUnit;
++
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.stereotype.Service;
++
++import lombok.RequiredArgsConstructor;
++import lombok.extern.slf4j.Slf4j;
++
++import stirling.software.proprietary.policy.engine.PolicyRunner;
++import stirling.software.proprietary.policy.input.InputSource;
++import stirling.software.proprietary.policy.model.InputSpec;
++import stirling.software.proprietary.policy.model.Policy;
++import stirling.software.proprietary.policy.store.PolicyStore;
++
++/**
++ * Fires policies the moment a file lands in one of their folder sources, instead of polling on a
++ * timer. The trigger only reads that location; turning it into files is still the source's job.
++ *
++ * <p>The watcher is a latency optimisation, not a source of truth, so this pairs an event watch
++ * with a low-frequency <b>reconcile</b> sweep ({@code watchReconcileSeconds}). The reconcile both
++ * (a) re-syncs which directories are watched as policies are created/edited/deleted and folders
++ * appear on disk, and (b) runs every folder-watch policy once, catching files that pre-dated the
++ * watch, events lost to inotify-queue overflow, and changes on filesystems that do not deliver
++ * events at all (NFS, many container bind mounts). Both paths just call {@link PolicyRunner#run};
++ * the {@link InputSource} does the claiming, so a redundant run finds nothing to claim and is
++ * harmless.
++ *
++ * <p>Like {@link ScheduleTrigger}, watch state is per-node and in memory; this assumes a single
++ * node and rebuilds its registrations on restart from the {@link PolicyStore}.
++ */
++@Slf4j
++@Service
++@RequiredArgsConstructor
++public class FolderWatchTrigger implements PolicyTrigger {
++
++    private static final String TYPE = "folder-watch";
++
++    private final PolicyStore policyStore;
++    private final PolicyRunner policyRunner;
++    private final List<InputSource> inputSources;
++
++    @Value("${stirling.policies.watchReconcileSeconds:300}")
++    private long reconcileSeconds;
++
++    /**
++     * How long to keep draining events after the first before acting, so a single file copy (which
++     * emits a burst of create/modify events) coalesces into one run rather than many.
++     */
++    @Value("${stirling.policies.watchQuietPeriodMs:500}")
++    private long quietPeriodMs;
++
++    private final Map<Path, WatchKey> keysByDir = new ConcurrentHashMap<>();
++    private final Map<WatchKey, Path> dirByKey = new ConcurrentHashMap<>();
++
++    private volatile boolean running;
++
++    // Package-visible (not private) so tests can drive syncRegistrations() against a real service.
++    volatile WatchService watchService;
++
++    private volatile ScheduledExecutorService reconciler;
++
++    @Override
++    public String type() {
++        return TYPE;
++    }
++
++    @Override
++    public void validate(Policy policy) {
++        if (watchDirsOf(policy).isEmpty()) {
++            throw new IllegalArgumentException(
++                    "folder-watch trigger requires at least one watchable (folder) input source");
++        }
++    }
++
++    @Override
++    public synchronized void start() {
++        if (watchService != null) {
++            return;
++        }
++        try {
++            watchService = FileSystems.getDefault().newWatchService();
++        } catch (IOException e) {
++            log.error("Could not start folder-watch trigger: {}", e.getMessage(), e);
++            return;
++        }
++        running = true;
++        Thread.ofVirtual().name("policy-folder-watch").start(this::watchLoop);
++        reconciler =
++                Executors.newSingleThreadScheduledExecutor(
++                        Thread.ofVirtual().name("policy-folder-reconcile-", 0).factory());
++        // First reconcile runs immediately so pre-existing files are picked up at startup.
++        reconciler.scheduleAtFixedRate(this::safeReconcile, 0, reconcileSeconds, TimeUnit.SECONDS);
++        log.info("Folder-watch trigger started (reconcile every {}s)", reconcileSeconds);
++    }
++
++    @Override
++    public synchronized void stop() {
++        running = false;
++        if (reconciler != null) {
++            reconciler.shutdownNow();
++            reconciler = null;
++        }
++        if (watchService != null) {
++            try {
++                watchService.close(); // wakes the watch loop with ClosedWatchServiceException
++            } catch (IOException e) {
++                log.debug("Error closing folder watch service: {}", e.getMessage());
++            }
++            watchService = null;
++        }
++        keysByDir.clear();
++        dirByKey.clear();
++    }
++
++    private void watchLoop() {
++        // Capture the service once: stop() may null the field, and a local avoids racing that to an
++        // NPE (close() still wakes take()/poll() on this same instance).
++        WatchService watcher = watchService;
++        if (watcher == null) {
++            return;
++        }
++        while (running) {
++            WatchKey first;
++            try {
++                first = watcher.take();
++            } catch (InterruptedException e) {
++                Thread.currentThread().interrupt();
++                return;
++            } catch (ClosedWatchServiceException e) {
++                return;
++            }
++            runForChangedDirs(drainBurst(watcher, first));
++        }
++    }
++
++    /**
++     * Collect the directories touched by {@code first} and any further events that arrive within
++     * the quiet period, so a burst of file-system events becomes a single set of affected
++     * directories. The event kinds are irrelevant: any event on a watched dir just means "go look".
++     */
++    private Set<Path> drainBurst(WatchService watcher, WatchKey first) {
++        Set<Path> changed = new HashSet<>();
++        WatchKey key = first;
++        while (key != null) {
++            key.pollEvents();
++            Path dir = dirByKey.get(key);
++            if (dir != null) {
++                changed.add(dir);
++            }
++            key.reset();
++            try {
++                key = watcher.poll(quietPeriodMs, TimeUnit.MILLISECONDS);
++            } catch (ClosedWatchServiceException | InterruptedException e) {
++                break;
++            }
++        }
++        return changed;
++    }
++
++    /** Run every folder-watch policy that draws from one of the changed directories. */
++    void runForChangedDirs(Set<Path> changedDirs) {
++        if (changedDirs.isEmpty()) {
++            return;
++        }
++        for (Policy policy : policyStore.findByTriggerType(TYPE)) {
++            List<Path> dirs;
++            try {
++                dirs = watchDirsOf(policy);
++            } catch (RuntimeException e) {
++                log.warn(
++                        "Folder-watch policy {} is misconfigured: {}", policy.id(), e.getMessage());
++                continue;
++            }
++            if (dirs.stream().anyMatch(changedDirs::contains)) {
++                log.debug("Folder-watch policy {} ({}) saw activity", policy.id(), policy.name());
++                policyRunner.run(policy);
++            }
++        }
++    }
++
++    private void safeReconcile() {
++        try {
++            syncRegistrations();
++            runAll();
++        } catch (RuntimeException e) {
++            log.error("Folder-watch reconcile failed: {}", e.getMessage(), e);
++        }
++    }
++
++    /** The reconcile safety net: run every folder-watch policy regardless of watch events. */
++    void runAll() {
++        for (Policy policy : policyStore.findByTriggerType(TYPE)) {
++            try {
++                policyRunner.run(policy);
++            } catch (RuntimeException e) {
++                log.warn(
++                        "Folder-watch reconcile run failed for policy {}: {}",
++                        policy.id(),
++                        e.getMessage());
++            }
++        }
++    }
++
++    /**
++     * Bring the set of watched directories in line with the current folder-watch policies: register
++     * newly required directories that exist on disk, and cancel ones no longer wanted.
++     */
++    synchronized void syncRegistrations() {
++        if (watchService == null) {
++            return;
++        }
++        Set<Path> desired = desiredDirs();
++
++        keysByDir
++                .entrySet()
++                .removeIf(
++                        entry -> {
++                            if (desired.contains(entry.getKey())) {
++                                return false;
++                            }
++                            entry.getValue().cancel();
++                            dirByKey.remove(entry.getValue());
++                            return true;
++                        });
++
++        for (Path dir : desired) {
++            if (keysByDir.containsKey(dir)) {
++                continue;
++            }
++            try {
++                WatchKey key = dir.register(watchService, ENTRY_CREATE, ENTRY_MODIFY);
++                keysByDir.put(dir, key);
++                dirByKey.put(key, dir);
++                log.info("Watching {} for folder-watch policies", dir);
++            } catch (IOException | RuntimeException e) {
++                log.warn("Could not watch {}: {}", dir, e.getMessage());
++            }
++        }
++    }
++
++    /** The directories currently registered with the watch service. Visible for tests. */
++    Set<Path> watchedDirs() {
++        return Set.copyOf(keysByDir.keySet());
++    }
++
++    /** Every existing directory any current folder-watch policy wants watched. */
++    private Set<Path> desiredDirs() {
++        Set<Path> dirs = new HashSet<>();
++        for (Policy policy : policyStore.findByTriggerType(TYPE)) {
++            try {
++                for (Path dir : watchDirsOf(policy)) {
++                    if (Files.isDirectory(dir)) {
++                        dirs.add(dir);
++                    }
++                }
++            } catch (RuntimeException e) {
++                log.warn(
++                        "Folder-watch policy {} is misconfigured: {}", policy.id(), e.getMessage());
++            }
++        }
++        return dirs;
++    }
++
++    /**
++     * The normalised, absolute directories this policy's sources expose to watch. Normalisation
++     * makes registration keys and event-time matching comparable regardless of how the path was
++     * configured.
++     */
++    private List<Path> watchDirsOf(Policy policy) {
++        List<Path> dirs = new ArrayList<>();
++        for (InputSpec spec : policy.sources()) {
++            InputSource source = sourceFor(spec);
++            if (source == null) {
++                continue;
++            }
++            for (Path dir : source.watchTargets(spec)) {
++                dirs.add(dir.toAbsolutePath().normalize());
++            }
++        }
++        return dirs;
++    }
++
++    private InputSource sourceFor(InputSpec spec) {
++        return inputSources.stream()
++                .filter(source -> source.supports(spec))
++                .findFirst()
++                .orElse(null);
++    }
++}
+diff --git a/app/proprietary/src/main/java/stirling/software/proprietary/policy/trigger/ManualTrigger.java b/app/proprietary/src/main/java/stirling/software/proprietary/policy/trigger/ManualTrigger.java
+deleted file mode 100644
+index 2ae24671a82..00000000000
+--- a/app/proprietary/src/main/java/stirling/software/proprietary/policy/trigger/ManualTrigger.java
++++ /dev/null
+@@ -1,41 +0,0 @@
+-package stirling.software.proprietary.policy.trigger;
+-
+-import org.springframework.stereotype.Service;
+-
+-import lombok.RequiredArgsConstructor;
+-
+-import stirling.software.proprietary.policy.engine.PolicyEngine;
+-import stirling.software.proprietary.policy.engine.PolicyRunHandle;
+-import stirling.software.proprietary.policy.model.PipelineDefinition;
+-import stirling.software.proprietary.policy.model.Policy;
+-import stirling.software.proprietary.policy.model.PolicyInputs;
+-import stirling.software.proprietary.policy.progress.PolicyProgressListener;
+-
+-/**
+- * Runs policies on demand, in response to a request (the {@code PolicyController} endpoints, an AI,
+- * or another automation). It is the request-driven trigger: no background lifecycle, it just
+- * forwards to the engine. Any policy can be run manually regardless of its configured trigger type.
+- */
+-@Service
+-@RequiredArgsConstructor
+-public class ManualTrigger implements PolicyTrigger {
+-
+-    private final PolicyEngine policyEngine;
+-
+-    @Override
+-    public String type() {
+-        return "manual";
+-    }
+-
+-    /** Run a stored policy immediately and return its run handle. */
+-    public PolicyRunHandle run(
+-            Policy policy, PolicyInputs inputs, PolicyProgressListener listener) {
+-        return policyEngine.runPolicy(policy, inputs, listener);
+-    }
+-
+-    /** Run an ad-hoc pipeline (no stored policy), e.g. for AI or Automate one-offs. */
+-    public PolicyRunHandle fire(
+-            PipelineDefinition definition, PolicyInputs inputs, PolicyProgressListener listener) {
+-        return policyEngine.submit(definition, inputs, listener);
+-    }
+-}
+diff --git a/app/proprietary/src/main/java/stirling/software/proprietary/policy/trigger/PolicyTrigger.java b/app/proprietary/src/main/java/stirling/software/proprietary/policy/trigger/PolicyTrigger.java
+index c63e5a1da77..1e3718d7ff4 100644
+--- a/app/proprietary/src/main/java/stirling/software/proprietary/policy/trigger/PolicyTrigger.java
++++ b/app/proprietary/src/main/java/stirling/software/proprietary/policy/trigger/PolicyTrigger.java
+@@ -1,22 +1,36 @@
+ package stirling.software.proprietary.policy.trigger;
+ 
++import stirling.software.proprietary.policy.model.Policy;
++
+ /**
+- * Activates policies of one trigger type. A trigger owns a {@link #type()} (matching {@code
+- * TriggerConfig.type()}); when its condition fires it runs the relevant {@code Policy} through the
+- * {@code PolicyEngine}.
++ * An automatic trigger: the thing that decides <em>when</em> a policy runs without a person asking.
++ * A trigger owns a {@link #type()} (matching {@code TriggerConfig.type()}); when its condition
++ * fires it hands the policy to the {@code PolicyRunner}, which pulls the policy's sources and
++ * starts the runs. A trigger never resolves sources itself.
++ *
++ * <p>Triggers are background, configuration-driven beans (schedule, and in future webhook or
++ * folder-watch): on {@link #start()} they begin watching/scheduling for the policies returned by
++ * {@code PolicyStore.findByTriggerType(type())}, and stop on {@link #stop()}. New trigger kinds are
++ * new beans of this type; the runner and the {@code Policy} model do not change.
+  *
+- * <p>Background triggers (folder watcher, schedule) are driven by configuration: on {@link
+- * #start()} they begin watching/scheduling for the policies returned by {@code
+- * PolicyStore.findByTriggerType(type())}, and stop on {@link #stop()}. Request-driven triggers
+- * (manual) have no background lifecycle and run a policy directly in response to a call. New
+- * trigger kinds are new beans of this type; the engine and the {@code Policy} model do not change.
++ * <p>Manual running is not a trigger - every policy can always be run on demand via the {@code
++ * PolicyRunner} regardless of whether it has a trigger.
+  */
+ public interface PolicyTrigger {
+ 
+     /** Stable identifier for this trigger kind, matching {@code TriggerConfig.type()}. */
+     String type();
+ 
+-    /** Begin activating policies of this type (e.g. start a folder watcher). No-op for manual. */
++    /**
++     * Check that this trigger is usable for the given policy, throwing {@link
++     * IllegalArgumentException} if not. Called when a policy is saved so misconfiguration fails
++     * fast rather than at fire time. Receives the whole {@link Policy} (not just its {@code
++     * TriggerConfig}) so a trigger whose firing depends on the policy's sources (folder-watch) can
++     * assert that relationship; most triggers only inspect {@code policy.trigger()}.
++     */
++    default void validate(Policy policy) {}
++
++    /** Begin activating policies of this type (e.g. start the schedule sweep). */
+     default void start() {}
+ 
+     /** Stop activating and release any resources. */
+diff --git a/app/proprietary/src/main/java/stirling/software/proprietary/policy/trigger/PolicyTriggerManager.java b/app/proprietary/src/main/java/stirling/software/proprietary/policy/trigger/PolicyTriggerManager.java
+new file mode 100644
+index 00000000000..1e87dcd4da7
+--- /dev/null
++++ b/app/proprietary/src/main/java/stirling/software/proprietary/policy/trigger/PolicyTriggerManager.java
+@@ -0,0 +1,56 @@
++package stirling.software.proprietary.policy.trigger;
++
++import java.util.List;
++
++import org.springframework.context.SmartLifecycle;
++import org.springframework.stereotype.Service;
++
++import lombok.RequiredArgsConstructor;
++import lombok.extern.slf4j.Slf4j;
++
++/**
++ * Starts and stops every {@link PolicyTrigger} with the application lifecycle. Background triggers
++ * (schedule, and future folder/S3) begin watching on {@link #start()} and release resources on
++ * {@link #stop()}; request-driven triggers (manual) are no-ops.
++ *
++ * <p>This is the single activation point for triggers - a new background trigger only has to be a
++ * {@link PolicyTrigger} bean.
++ */
++@Slf4j
++@Service
++@RequiredArgsConstructor
++public class PolicyTriggerManager implements SmartLifecycle {
++
++    private final List<PolicyTrigger> triggers;
++
++    private volatile boolean running;
++
++    @Override
++    public void start() {
++        for (PolicyTrigger trigger : triggers) {
++            try {
++                trigger.start();
++            } catch (RuntimeException e) {
++                log.error("Failed to start trigger '{}': {}", trigger.type(), e.getMessage(), e);
++            }
++        }
++        running = true;
++    }
++
++    @Override
++    public void stop() {
++        for (PolicyTrigger trigger : triggers) {
++            try {
++                trigger.stop();
++            } catch (RuntimeException e) {
++                log.error("Failed to stop trigger '{}': {}", trigger.type(), e.getMessage(), e);
++            }
++        }
++        running = false;
++    }
++
++    @Override
++    public boolean isRunning() {
++        return running;
++    }
++}
+diff --git a/app/proprietary/src/main/java/stirling/software/proprietary/policy/trigger/ScheduleTrigger.java b/app/proprietary/src/main/java/stirling/software/proprietary/policy/trigger/ScheduleTrigger.java
+new file mode 100644
+index 00000000000..7a1df80e4da
+--- /dev/null
++++ b/app/proprietary/src/main/java/stirling/software/proprietary/policy/trigger/ScheduleTrigger.java
+@@ -0,0 +1,159 @@
++package stirling.software.proprietary.policy.trigger;
++
++import java.time.Instant;
++import java.time.ZoneId;
++import java.time.ZoneOffset;
++import java.time.ZonedDateTime;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.TimeUnit;
++
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.stereotype.Service;
++
++import lombok.RequiredArgsConstructor;
++import lombok.extern.slf4j.Slf4j;
++
++import stirling.software.proprietary.policy.engine.PolicyRunner;
++import stirling.software.proprietary.policy.model.Policy;
++import stirling.software.proprietary.policy.model.Schedule;
++import stirling.software.proprietary.policy.store.PolicyStore;
++
++import tools.jackson.databind.ObjectMapper;
++
++/**
++ * Fires policies on a {@link Schedule}. On {@link #start()} it sweeps on a fixed interval; each
++ * sweep finds the enabled "schedule" policies and runs any whose next firing has come due since it
++ * last fired.
++ *
++ * <p>The trigger only decides <em>when</em>: once a policy is due it hands it to the {@link
++ * PolicyRunner}, which pulls from the policy's configured sources and starts the runs. The trigger
++ * knows nothing about folders, buckets, or how many runs a sweep produces.
++ *
++ * <p>Caveat: last-fire times are tracked <b>in memory</b>, so this assumes a single node and resets
++ * on restart; cluster-wide coordination (leader election) is a follow-up.
++ */
++@Slf4j
++@Service
++@RequiredArgsConstructor
++public class ScheduleTrigger implements PolicyTrigger {
++
++    private static final String TYPE = "schedule";
++
++    private final PolicyStore policyStore;
++    private final PolicyRunner policyRunner;
++    private final ObjectMapper objectMapper;
++
++    @Value("${stirling.policies.scheduleSweepSeconds:60}")
++    private long sweepSeconds;
++
++    private final Map<String, Instant> lastFiredByPolicy = new ConcurrentHashMap<>();
++    private volatile ScheduledExecutorService scheduler;
++
++    @Override
++    public String type() {
++        return TYPE;
++    }
++
++    @Override
++    public void validate(Policy policy) {
++        ScheduleConfig.from(objectMapper, policy.trigger().options());
++    }
++
++    @Override
++    public synchronized void start() {
++        if (scheduler != null) {
++            return;
++        }
++        scheduler =
++                Executors.newSingleThreadScheduledExecutor(
++                        Thread.ofVirtual().name("policy-schedule-", 0).factory());
++        scheduler.scheduleAtFixedRate(
++                this::safeSweep, sweepSeconds, sweepSeconds, TimeUnit.SECONDS);
++        log.info("Schedule trigger started (sweep every {}s)", sweepSeconds);
++    }
++
++    @Override
++    public synchronized void stop() {
++        if (scheduler != null) {
++            scheduler.shutdownNow();
++            scheduler = null;
++        }
++    }
++
++    private void safeSweep() {
++        try {
++            sweep(Instant.now());
++        } catch (RuntimeException e) {
++            log.error("Schedule sweep failed: {}", e.getMessage(), e);
++        }
++    }
++
++    /** Fire every scheduled policy that is due as of {@code now}. Package-visible for testing. */
++    void sweep(Instant now) {
++        for (Policy policy : policyStore.findByTriggerType(TYPE)) {
++            ScheduleConfig config;
++            try {
++                config = ScheduleConfig.from(objectMapper, policy.trigger().options());
++            } catch (IllegalArgumentException e) {
++                log.warn("Scheduled policy {} is misconfigured: {}", policy.id(), e.getMessage());
++                continue;
++            }
++
++            // First time we see a policy, baseline its last-fire to now so it does not fire
++            // immediately; subsequent sweeps fire it once its next firing has passed.
++            Instant last = lastFiredByPolicy.computeIfAbsent(policy.id(), id -> now);
++            ZonedDateTime next = config.schedule().nextAfter(last.atZone(config.zone()));
++            if (!next.toInstant().isAfter(now)) {
++                lastFiredByPolicy.put(policy.id(), now);
++                log.info("Scheduled policy {} ({}) is due", policy.id(), policy.name());
++                policyRunner.run(policy);
++            }
++        }
++    }
++
++    /**
++     * The typed, validated form of a schedule trigger's options: the {@link Schedule} and the zone
++     * its wall-clock kinds are evaluated in (default UTC). Construction fails for a missing/invalid
++     * schedule or zone.
++     */
++    record ScheduleConfig(Schedule schedule, ZoneId zone) {
++
++        private static final String SCHEDULE_OPTION = "schedule";
++        private static final String ZONE_OPTION = "zone";
++
++        static ScheduleConfig from(ObjectMapper mapper, Map<String, Object> options) {
++            Object scheduleNode = options.get(SCHEDULE_OPTION);
++            if (scheduleNode == null) {
++                throw new IllegalArgumentException("schedule trigger requires a 'schedule'");
++            }
++            Schedule schedule;
++            try {
++                schedule = mapper.convertValue(scheduleNode, Schedule.class);
++            } catch (RuntimeException e) {
++                throw new IllegalArgumentException("invalid schedule: " + rootMessage(e), e);
++            }
++
++            ZoneId zone = ZoneOffset.UTC;
++            Object zoneNode = options.get(ZONE_OPTION);
++            if (zoneNode != null && !zoneNode.toString().isBlank()) {
++                try {
++                    zone = ZoneId.of(zoneNode.toString());
++                } catch (RuntimeException e) {
++                    throw new IllegalArgumentException("invalid zone '" + zoneNode + "'");
++                }
++            }
++            return new ScheduleConfig(schedule, zone);
++        }
++
++        private static String rootMessage(Throwable t) {
++            Throwable cause = t;
++            while (cause.getCause() != null) {
++                cause = cause.getCause();
++            }
++            return cause.getMessage();
++        }
++    }
++}
+diff --git a/app/proprietary/src/test/java/stirling/software/proprietary/policy/engine/PolicyEngineTest.java b/app/proprietary/src/test/java/stirling/software/proprietary/policy/engine/PolicyEngineTest.java
+index bf6442b4236..3314f4a8f65 100644
+--- a/app/proprietary/src/test/java/stirling/software/proprietary/policy/engine/PolicyEngineTest.java
++++ b/app/proprietary/src/test/java/stirling/software/proprietary/policy/engine/PolicyEngineTest.java
+@@ -50,7 +50,6 @@
+ import stirling.software.proprietary.policy.model.PolicyInputs;
+ import stirling.software.proprietary.policy.model.PolicyRun;
+ import stirling.software.proprietary.policy.model.PolicyRunStatus;
+-import stirling.software.proprietary.policy.model.TriggerConfig;
+ import stirling.software.proprietary.policy.output.InlineOutputSink;
+ import stirling.software.proprietary.policy.progress.PolicyProgressListener;
+ 
+@@ -190,7 +189,7 @@ void runPolicyExecutesThePolicysPipeline() throws Exception {
+                         "rotate",
+                         "owner",
+                         true,
+-                        TriggerConfig.manual(),
++                        null,
+                         List.of(new PipelineStep(ROTATE, Map.of())),
+                         OutputSpec.inline());
+ 
+diff --git a/app/proprietary/src/test/java/stirling/software/proprietary/policy/engine/PolicyRunnerTest.java b/app/proprietary/src/test/java/stirling/software/proprietary/policy/engine/PolicyRunnerTest.java
+new file mode 100644
+index 00000000000..2cefb1b27ca
+--- /dev/null
++++ b/app/proprietary/src/test/java/stirling/software/proprietary/policy/engine/PolicyRunnerTest.java
+@@ -0,0 +1,159 @@
++package stirling.software.proprietary.policy.engine;
++
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertSame;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyNoInteractions;
++import static org.mockito.Mockito.when;
++
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.atomic.AtomicBoolean;
++
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.extension.ExtendWith;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.junit.jupiter.MockitoExtension;
++
++import stirling.software.proprietary.policy.input.InputSource;
++import stirling.software.proprietary.policy.input.ResolvedInput;
++import stirling.software.proprietary.policy.model.InputSpec;
++import stirling.software.proprietary.policy.model.OutputSpec;
++import stirling.software.proprietary.policy.model.PipelineStep;
++import stirling.software.proprietary.policy.model.Policy;
++import stirling.software.proprietary.policy.model.PolicyInputs;
++import stirling.software.proprietary.policy.model.PolicyRun;
++import stirling.software.proprietary.policy.model.PolicyRunStatus;
++import stirling.software.proprietary.policy.progress.PolicyProgressListener;
++
++/**
++ * Tests for {@link PolicyRunner}: the one place that turns a policy's sources into runs. Verifies
++ * it pulls every source, runs one job per unit of work, feeds each unit's completion hook the run
++ * outcome, and that a generator (no sources) still runs once.
++ */
++@ExtendWith(MockitoExtension.class)
++class PolicyRunnerTest {
++
++    @Mock private PolicyEngine policyEngine;
++    @Mock private InputSource folderSource;
++
++    private PolicyRunner runner;
++
++    @BeforeEach
++    void setUp() {
++        runner = new PolicyRunner(policyEngine, List.of(folderSource));
++    }
++
++    @Test
++    void runsOnceWithNoFilesWhenThePolicyHasNoSources() {
++        Policy policy = policy(List.of());
++        when(policyEngine.runPolicy(eq(policy), any(), any()))
++                .thenReturn(new PolicyRunHandle("r", new CompletableFuture<>()));
++
++        runner.run(policy);
++
++        ArgumentCaptor<PolicyInputs> inputs = ArgumentCaptor.forClass(PolicyInputs.class);
++        verify(policyEngine).runPolicy(eq(policy), inputs.capture(), any());
++        assertTrue(inputs.getValue().primary().isEmpty());
++    }
++
++    @Test
++    void pullsEverySourceAndRunsOnePerUnitOfWork() throws Exception {
++        InputSpec spec = InputSpec.folder("/in");
++        Policy policy = policy(List.of(spec));
++        when(folderSource.supports(spec)).thenReturn(true);
++        when(folderSource.resolve(spec))
++                .thenReturn(
++                        List.of(
++                                ResolvedInput.of(PolicyInputs.of(List.of())),
++                                ResolvedInput.of(PolicyInputs.of(List.of()))));
++        when(policyEngine.runPolicy(any(), any(), any()))
++                .thenReturn(new PolicyRunHandle("r", new CompletableFuture<>()));
++
++        runner.run(policy);
++
++        verify(policyEngine, times(2)).runPolicy(eq(policy), any(), any());
++    }
++
++    @Test
++    void feedsEachUnitsCompletionHookTheRunOutcome() throws Exception {
++        InputSpec spec = InputSpec.folder("/in");
++        Policy policy = policy(List.of(spec));
++        AtomicBoolean outcome = new AtomicBoolean(false);
++        ResolvedInput unit = new ResolvedInput(PolicyInputs.of(List.of()), outcome::set);
++        when(folderSource.supports(spec)).thenReturn(true);
++        when(folderSource.resolve(spec)).thenReturn(List.of(unit));
++        CompletableFuture<PolicyRun> completion = new CompletableFuture<>();
++        when(policyEngine.runPolicy(any(), any(), any()))
++                .thenReturn(new PolicyRunHandle("r", completion));
++
++        runner.run(policy);
++
++        PolicyRun run = mock(PolicyRun.class);
++        when(run.getStatus()).thenReturn(PolicyRunStatus.COMPLETED);
++        completion.complete(run);
++
++        assertTrue(outcome.get());
++    }
++
++    @Test
++    void reportsFailureToTheCompletionHookWhenTheRunDoesNotComplete() throws Exception {
++        InputSpec spec = InputSpec.folder("/in");
++        Policy policy = policy(List.of(spec));
++        AtomicBoolean outcome = new AtomicBoolean(true);
++        ResolvedInput unit = new ResolvedInput(PolicyInputs.of(List.of()), outcome::set);
++        when(folderSource.supports(spec)).thenReturn(true);
++        when(folderSource.resolve(spec)).thenReturn(List.of(unit));
++        CompletableFuture<PolicyRun> completion = new CompletableFuture<>();
++        when(policyEngine.runPolicy(any(), any(), any()))
++                .thenReturn(new PolicyRunHandle("r", completion));
++
++        runner.run(policy);
++        completion.completeExceptionally(new RuntimeException("boom"));
++
++        assertFalse(outcome.get());
++    }
++
++    @Test
++    void skipsSourcesWithNoMatchingBean() {
++        InputSpec spec = new InputSpec("s3", Map.of());
++        Policy policy = policy(List.of(spec));
++        when(folderSource.supports(spec)).thenReturn(false);
++
++        runner.run(policy);
++
++        verifyNoInteractions(policyEngine);
++    }
++
++    @Test
++    void runWithSuppliedInputsBypassesSources() {
++        Policy policy = policy(List.of(InputSpec.folder("/in")));
++        PolicyInputs inputs = PolicyInputs.of(List.of());
++        PolicyRunHandle handle = new PolicyRunHandle("r", new CompletableFuture<>());
++        when(policyEngine.runPolicy(policy, inputs, PolicyProgressListener.NOOP))
++                .thenReturn(handle);
++
++        assertSame(handle, runner.runWith(policy, inputs, PolicyProgressListener.NOOP));
++        verifyNoInteractions(folderSource);
++    }
++
++    private static Policy policy(List<InputSpec> sources) {
++        return new Policy(
++                "p1",
++                "p",
++                "owner",
++                true,
++                null,
++                sources,
++                List.of(new PipelineStep("/api/v1/misc/compress-pdf", Map.of())),
++                OutputSpec.inline());
++    }
++}
+diff --git a/app/proprietary/src/test/java/stirling/software/proprietary/policy/engine/PolicyValidatorTest.java b/app/proprietary/src/test/java/stirling/software/proprietary/policy/engine/PolicyValidatorTest.java
+new file mode 100644
+index 00000000000..edaa5865115
+--- /dev/null
++++ b/app/proprietary/src/test/java/stirling/software/proprietary/policy/engine/PolicyValidatorTest.java
+@@ -0,0 +1,114 @@
++package stirling.software.proprietary.policy.engine;
++
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.doThrow;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++import java.util.List;
++import java.util.Map;
++
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.extension.ExtendWith;
++import org.mockito.Mock;
++import org.mockito.junit.jupiter.MockitoExtension;
++
++import stirling.software.proprietary.policy.input.InputSource;
++import stirling.software.proprietary.policy.model.InputSpec;
++import stirling.software.proprietary.policy.model.OutputSpec;
++import stirling.software.proprietary.policy.model.Policy;
++import stirling.software.proprietary.policy.model.TriggerConfig;
++import stirling.software.proprietary.policy.output.PolicyOutputSink;
++import stirling.software.proprietary.policy.trigger.PolicyTrigger;
++
++/** Tests for {@link PolicyValidator}: routes each facet to its handler and surfaces failures. */
++@ExtendWith(MockitoExtension.class)
++class PolicyValidatorTest {
++
++    @Mock private PolicyTrigger trigger;
++    @Mock private InputSource inputSource;
++    @Mock private PolicyOutputSink outputSink;
++
++    private PolicyValidator validator;
++
++    @BeforeEach
++    void setUp() {
++        validator =
++                new PolicyValidator(List.of(trigger), List.of(inputSource), List.of(outputSink));
++    }
++
++    @Test
++    void delegatesEachFacetToItsHandler() {
++        when(trigger.type()).thenReturn("schedule");
++        when(inputSource.supports(any())).thenReturn(true);
++        when(outputSink.supports(any())).thenReturn(true);
++        Policy policy = policy("schedule");
++
++        validator.validate(policy);
++
++        verify(trigger).validate(policy);
++        verify(inputSource).validate(policy.sources().get(0));
++        verify(outputSink).validate(policy.output());
++    }
++
++    @Test
++    void skipsTriggerValidationForAManualOnlyPolicy() {
++        when(inputSource.supports(any())).thenReturn(true);
++        when(outputSink.supports(any())).thenReturn(true);
++
++        validator.validate(manualOnly());
++
++        verify(trigger, never()).validate(any());
++    }
++
++    @Test
++    void surfacesAnInvalidConfigFromAHandler() {
++        when(trigger.type()).thenReturn("schedule");
++        doThrow(new IllegalArgumentException("invalid schedule")).when(trigger).validate(any());
++
++        IllegalArgumentException ex =
++                assertThrows(
++                        IllegalArgumentException.class,
++                        () -> validator.validate(policy("schedule")));
++        assertTrue(ex.getMessage().contains("schedule"));
++    }
++
++    @Test
++    void rejectsAnUnknownTriggerType() {
++        when(trigger.type()).thenReturn("schedule");
++
++        IllegalArgumentException ex =
++                assertThrows(
++                        IllegalArgumentException.class,
++                        () -> validator.validate(policy("mystery")));
++        assertTrue(ex.getMessage().contains("unknown trigger type"));
++    }
++
++    private static Policy policy(String triggerType) {
++        return new Policy(
++                "p1",
++                "p",
++                "owner",
++                true,
++                new TriggerConfig(triggerType, Map.of()),
++                List.of(InputSpec.folder("/in")),
++                List.of(),
++                OutputSpec.inline());
++    }
++
++    private static Policy manualOnly() {
++        return new Policy(
++                "p1",
++                "p",
++                "owner",
++                true,
++                null,
++                List.of(InputSpec.folder("/in")),
++                List.of(),
++                OutputSpec.inline());
++    }
++}
+diff --git a/app/proprietary/src/test/java/stirling/software/proprietary/policy/input/FolderInputSourceTest.java b/app/proprietary/src/test/java/stirling/software/proprietary/policy/input/FolderInputSourceTest.java
+new file mode 100644
+index 00000000000..30c4bd95e2d
+--- /dev/null
++++ b/app/proprietary/src/test/java/stirling/software/proprietary/policy/input/FolderInputSourceTest.java
+@@ -0,0 +1,120 @@
++package stirling.software.proprietary.policy.input;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.lenient;
++
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.List;
++import java.util.Map;
++
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.extension.ExtendWith;
++import org.junit.jupiter.api.io.TempDir;
++import org.mockito.Mock;
++import org.mockito.junit.jupiter.MockitoExtension;
++
++import stirling.software.common.util.FileReadinessChecker;
++import stirling.software.proprietary.policy.model.InputSpec;
++
++/** Tests for {@link FolderInputSource}: consume (claim + route) and snapshot (read-only) modes. */
++@ExtendWith(MockitoExtension.class)
++class FolderInputSourceTest {
++
++    @Mock private FileReadinessChecker readinessChecker;
++
++    @TempDir Path tempDir;
++
++    private FolderInputSource source;
++
++    @BeforeEach
++    void setUp() {
++        source = new FolderInputSource(readinessChecker);
++        // Lenient: the missing-dir / nonexistent-dir cases return before any readiness check.
++        lenient().when(readinessChecker.isReady(any())).thenReturn(true);
++    }
++
++    @Test
++    void consumeClaimsFilesAndRoutesToDoneOnSuccess() throws IOException {
++        Path inputDir = Files.createDirectories(tempDir.resolve("in"));
++        Files.writeString(inputDir.resolve("doc.pdf"), "data");
++
++        List<ResolvedInput> work = source.resolve(InputSpec.folder(inputDir.toString()));
++
++        assertEquals(1, work.size());
++        assertEquals(1, work.get(0).inputs().primary().size());
++        // Claimed out of the input dir.
++        assertFalse(Files.exists(inputDir.resolve("doc.pdf")));
++        assertTrue(
++                Files.exists(
++                        inputDir.resolve(".stirling").resolve("processing").resolve("doc.pdf")));
++
++        work.get(0).onComplete().accept(true);
++        assertTrue(Files.exists(inputDir.resolve(".stirling").resolve("done").resolve("doc.pdf")));
++        assertFalse(
++                Files.exists(
++                        inputDir.resolve(".stirling").resolve("processing").resolve("doc.pdf")));
++    }
++
++    @Test
++    void consumeRoutesToErrorOnFailure() throws IOException {
++        Path inputDir = Files.createDirectories(tempDir.resolve("in"));
++        Files.writeString(inputDir.resolve("doc.pdf"), "data");
++
++        List<ResolvedInput> work = source.resolve(InputSpec.folder(inputDir.toString()));
++        work.get(0).onComplete().accept(false);
++
++        assertTrue(Files.exists(inputDir.resolve(".stirling").resolve("error").resolve("doc.pdf")));
++    }
++
++    @Test
++    void snapshotReadsWithoutClaiming() throws IOException {
++        Path inputDir = Files.createDirectories(tempDir.resolve("in"));
++        Files.writeString(inputDir.resolve("doc.pdf"), "data");
++
++        List<ResolvedInput> work =
++                source.resolve(
++                        new InputSpec(
++                                "folder",
++                                Map.of("directory", inputDir.toString(), "mode", "snapshot")));
++
++        assertEquals(1, work.size());
++        // Not moved, and completing the run is a no-op.
++        assertTrue(Files.exists(inputDir.resolve("doc.pdf")));
++        work.get(0).onComplete().accept(true);
++        assertTrue(Files.exists(inputDir.resolve("doc.pdf")));
++    }
++
++    @Test
++    void missingDirectoryOptionFails() {
++        assertThrows(
++                IllegalArgumentException.class,
++                () -> source.resolve(new InputSpec("folder", Map.of())));
++    }
++
++    @Test
++    void nonexistentDirectoryYieldsNoWork() throws IOException {
++        List<ResolvedInput> work =
++                source.resolve(InputSpec.folder(tempDir.resolve("nope").toString()));
++        assertTrue(work.isEmpty());
++    }
++
++    @Test
++    void validateRejectsMissingDirectory() {
++        assertThrows(
++                IllegalArgumentException.class,
++                () -> source.validate(new InputSpec("folder", Map.of())));
++    }
++
++    @Test
++    void watchTargetsIsTheConfiguredDirectory() {
++        Path inputDir = tempDir.resolve("in");
++        assertEquals(List.of(inputDir), source.watchTargets(InputSpec.folder(inputDir.toString())));
++    }
++}
+diff --git a/app/proprietary/src/test/java/stirling/software/proprietary/policy/output/FolderOutputSinkTest.java b/app/proprietary/src/test/java/stirling/software/proprietary/policy/output/FolderOutputSinkTest.java
+new file mode 100644
+index 00000000000..7ec58bda027
+--- /dev/null
++++ b/app/proprietary/src/test/java/stirling/software/proprietary/policy/output/FolderOutputSinkTest.java
+@@ -0,0 +1,85 @@
++package stirling.software.proprietary.policy.output;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.List;
++import java.util.Map;
++
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++import org.springframework.core.io.ByteArrayResource;
++import org.springframework.core.io.Resource;
++
++import stirling.software.common.model.job.ResultFile;
++import stirling.software.proprietary.policy.model.OutputSpec;
++
++/** Tests for {@link FolderOutputSink}: outputs are written to the configured directory on disk. */
++class FolderOutputSinkTest {
++
++    private final FolderOutputSink sink = new FolderOutputSink();
++
++    @TempDir Path tempDir;
++
++    @Test
++    void writesEachOutputToTheDirectory() throws IOException {
++        Path out = tempDir.resolve("out");
++        List<Resource> outputs = List.of(named("a.pdf", "aaa"), named("b.pdf", "bb"));
++
++        List<ResultFile> results =
++                sink.deliver("run-1", outputs, OutputSpec.folder(out.toString()));
++
++        assertEquals(2, results.size());
++        assertTrue(Files.exists(out.resolve("a.pdf")));
++        assertEquals("aaa", Files.readString(out.resolve("a.pdf")));
++        assertEquals("bb", Files.readString(out.resolve("b.pdf")));
++    }
++
++    @Test
++    void collidingNamesGetAUniqueSuffix() throws IOException {
++        Path out = tempDir.resolve("out");
++        List<Resource> outputs = List.of(named("a.pdf", "first"), named("a.pdf", "second"));
++
++        sink.deliver("run-1", outputs, OutputSpec.folder(out.toString()));
++
++        assertTrue(Files.exists(out.resolve("a.pdf")));
++        assertTrue(Files.exists(out.resolve("a (1).pdf")));
++    }
++
++    @Test
++    void missingDirectoryOptionIsRejected() {
++        OutputSpec noDir = new OutputSpec("folder", Map.of());
++        assertThrows(IllegalArgumentException.class, () -> sink.validate(noDir));
++        assertThrows(
++                IllegalArgumentException.class,
++                () -> sink.deliver("run-1", List.of(named("a.pdf", "x")), noDir));
++    }
++
++    @Test
++    void filenamesWithPathTraversalAreConfinedToTheDirectory() throws IOException {
++        Path out = tempDir.resolve("out");
++        List<Resource> outputs =
++                List.of(named("../escape.pdf", "x"), named("nested/deep.pdf", "y"));
++
++        sink.deliver("run-1", outputs, OutputSpec.folder(out.toString()));
++
++        // Each name is reduced to its bare form inside the target dir; nothing escapes.
++        assertTrue(Files.exists(out.resolve("escape.pdf")));
++        assertTrue(Files.exists(out.resolve("deep.pdf")));
++        assertFalse(Files.exists(tempDir.resolve("escape.pdf")));
++    }
++
++    private static ByteArrayResource named(String filename, String content) {
++        return new ByteArrayResource(content.getBytes()) {
++            @Override
++            public String getFilename() {
++                return filename;
++            }
++        };
++    }
++}
+diff --git a/app/proprietary/src/test/java/stirling/software/proprietary/policy/store/InProcessPolicyStoreTest.java b/app/proprietary/src/test/java/stirling/software/proprietary/policy/store/InProcessPolicyStoreTest.java
+index 2e970191820..60f14be20dc 100644
+--- a/app/proprietary/src/test/java/stirling/software/proprietary/policy/store/InProcessPolicyStoreTest.java
++++ b/app/proprietary/src/test/java/stirling/software/proprietary/policy/store/InProcessPolicyStoreTest.java
+@@ -28,7 +28,7 @@ void setUp() {
+ 
+     @Test
+     void savedPolicyGetsAnIdAndIsRetrievable() {
+-        Policy saved = store.save(policy(null, "compress", "manual", true));
++        Policy saved = store.save(policy(null, "compress", null, true));
+ 
+         assertNotNull(saved.id());
+         assertFalse(saved.id().isBlank());
+@@ -37,7 +37,7 @@ void savedPolicyGetsAnIdAndIsRetrievable() {
+ 
+     @Test
+     void savingWithAnExistingIdUpdatesInPlace() {
+-        Policy created = store.save(policy(null, "before", "manual", true));
++        Policy created = store.save(policy(null, "before", null, true));
+ 
+         store.save(
+                 new Policy(
+@@ -45,7 +45,7 @@ void savingWithAnExistingIdUpdatesInPlace() {
+                         "after",
+                         "owner",
+                         true,
+-                        TriggerConfig.manual(),
++                        null,
+                         List.of(),
+                         OutputSpec.inline()));
+ 
+@@ -55,19 +55,20 @@ void savingWithAnExistingIdUpdatesInPlace() {
+ 
+     @Test
+     void findByTriggerTypeReturnsOnlyEnabledMatches() {
+-        store.save(policy(null, "watch", "folder", true));
+-        store.save(policy(null, "watch-disabled", "folder", false));
+         store.save(policy(null, "nightly", "schedule", true));
++        store.save(policy(null, "nightly-disabled", "schedule", false));
++        store.save(policy(null, "hooked", "webhook", true));
++        store.save(policy(null, "on-demand", null, true)); // manual-only: no trigger
+ 
+-        List<Policy> folder = store.findByTriggerType("folder");
++        List<Policy> scheduled = store.findByTriggerType("schedule");
+ 
+-        assertEquals(1, folder.size());
+-        assertEquals("watch", folder.get(0).name());
++        assertEquals(1, scheduled.size());
++        assertEquals("nightly", scheduled.get(0).name());
+     }
+ 
+     @Test
+     void deleteRemovesThePolicy() {
+-        Policy saved = store.save(policy(null, "p", "manual", true));
++        Policy saved = store.save(policy(null, "p", null, true));
+ 
+         assertTrue(store.delete(saved.id()));
+         assertTrue(store.get(saved.id()).isEmpty());
+@@ -75,12 +76,14 @@ void deleteRemovesThePolicy() {
+     }
+ 
+     private static Policy policy(String id, String name, String triggerType, boolean enabled) {
++        TriggerConfig trigger =
++                triggerType == null ? null : new TriggerConfig(triggerType, Map.of());
+         return new Policy(
+                 id,
+                 name,
+                 "owner",
+                 enabled,
+-                new TriggerConfig(triggerType, Map.of()),
++                trigger,
+                 List.of(new PipelineStep("/api/v1/misc/compress-pdf", Map.of())),
+                 OutputSpec.inline());
+     }
+diff --git a/app/proprietary/src/test/java/stirling/software/proprietary/policy/store/JpaPolicyStoreTest.java b/app/proprietary/src/test/java/stirling/software/proprietary/policy/store/JpaPolicyStoreTest.java
+index 2a8212e2d5c..2bdbc08a790 100644
+--- a/app/proprietary/src/test/java/stirling/software/proprietary/policy/store/JpaPolicyStoreTest.java
++++ b/app/proprietary/src/test/java/stirling/software/proprietary/policy/store/JpaPolicyStoreTest.java
+@@ -18,6 +18,7 @@
+ import org.mockito.Mock;
+ import org.mockito.junit.jupiter.MockitoExtension;
+ 
++import stirling.software.proprietary.policy.model.InputSpec;
+ import stirling.software.proprietary.policy.model.OutputSpec;
+ import stirling.software.proprietary.policy.model.PipelineStep;
+ import stirling.software.proprietary.policy.model.Policy;
+@@ -53,7 +54,8 @@ void saveAssignsAnIdAndPersistsThePolicyAsJson() {
+                                 "compress incoming",
+                                 "alice",
+                                 true,
+-                                new TriggerConfig("folder", Map.of("path", "/in")),
++                                new TriggerConfig("schedule", Map.of()),
++                                List.of(InputSpec.folder("/in")),
+                                 List.of(new PipelineStep("/api/v1/misc/compress-pdf", Map.of())),
+                                 OutputSpec.inline()));
+ 
+@@ -62,7 +64,7 @@ void saveAssignsAnIdAndPersistsThePolicyAsJson() {
+         verify(repository).save(captor.capture());
+         PolicyEntity entity = captor.getValue();
+         assertEquals(saved.id(), entity.getId());
+-        assertEquals("folder", entity.getTriggerType());
++        assertEquals("schedule", entity.getTriggerType());
+         assertTrue(entity.isEnabled());
+         // The stored JSON round-trips back to an equal policy.
+         assertEquals(saved, objectMapper.readValue(entity.getPolicyJson(), Policy.class));
+@@ -76,7 +78,7 @@ void getDeserializesThePolicyFromJson() {
+                         "rotate",
+                         "alice",
+                         true,
+-                        TriggerConfig.manual(),
++                        null, // manual-only: no automatic trigger
+                         List.of(
+                                 new PipelineStep(
+                                         "/api/v1/general/rotate-pdf", Map.of("angle", 90))),
+@@ -94,16 +96,16 @@ void findByTriggerTypeUsesTheEnabledQuery() {
+                         "watch",
+                         "alice",
+                         true,
+-                        new TriggerConfig("folder", Map.of()),
++                        new TriggerConfig("schedule", Map.of()),
+                         List.of(new PipelineStep("/api/v1/misc/compress-pdf", Map.of())),
+                         OutputSpec.inline());
+-        when(repository.findByTriggerTypeAndEnabledTrue("folder"))
++        when(repository.findByTriggerTypeAndEnabledTrue("schedule"))
+                 .thenReturn(List.of(entityFor(policy)));
+ 
+-        List<Policy> folder = store.findByTriggerType("folder");
++        List<Policy> scheduled = store.findByTriggerType("schedule");
+ 
+-        assertEquals(1, folder.size());
+-        assertEquals("p1", folder.get(0).id());
++        assertEquals(1, scheduled.size());
++        assertEquals("p1", scheduled.get(0).id());
+     }
+ 
+     @Test
+@@ -122,7 +124,7 @@ private PolicyEntity entityFor(Policy policy) {
+         entity.setName(policy.name());
+         entity.setOwner(policy.owner());
+         entity.setEnabled(policy.enabled());
+-        entity.setTriggerType(policy.trigger().type());
++        entity.setTriggerType(policy.trigger() == null ? null : policy.trigger().type());
+         entity.setPolicyJson(objectMapper.writeValueAsString(policy));
+         return entity;
+     }
+diff --git a/app/proprietary/src/test/java/stirling/software/proprietary/policy/trigger/FolderWatchTriggerTest.java b/app/proprietary/src/test/java/stirling/software/proprietary/policy/trigger/FolderWatchTriggerTest.java
+new file mode 100644
+index 00000000000..ba3dd17678e
+--- /dev/null
++++ b/app/proprietary/src/test/java/stirling/software/proprietary/policy/trigger/FolderWatchTriggerTest.java
+@@ -0,0 +1,172 @@
++package stirling.software.proprietary.policy.trigger;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.lenient;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyNoInteractions;
++import static org.mockito.Mockito.when;
++
++import java.nio.file.FileSystems;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.WatchService;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.extension.ExtendWith;
++import org.junit.jupiter.api.io.TempDir;
++import org.mockito.Mock;
++import org.mockito.junit.jupiter.MockitoExtension;
++
++import stirling.software.proprietary.policy.engine.PolicyRunner;
++import stirling.software.proprietary.policy.input.InputSource;
++import stirling.software.proprietary.policy.model.InputSpec;
++import stirling.software.proprietary.policy.model.OutputSpec;
++import stirling.software.proprietary.policy.model.PipelineStep;
++import stirling.software.proprietary.policy.model.Policy;
++import stirling.software.proprietary.policy.model.TriggerConfig;
++import stirling.software.proprietary.policy.store.PolicyStore;
++
++/**
++ * Tests for {@link FolderWatchTrigger}'s dispatch logic via the package-visible {@code
++ * runForChangedDirs}/{@code runAll}, plus its cross-facet validation. The OS watch loop and
++ * scheduled reconcile are thin glue around these and are not exercised here (a real {@code
++ * WatchService} is timing-dependent), mirroring how {@link ScheduleTriggerTest} drives {@code
++ * sweep} directly. The folder source is stubbed to mirror {@code FolderInputSource.watchTargets}.
++ */
++@ExtendWith(MockitoExtension.class)
++class FolderWatchTriggerTest {
++
++    @Mock private PolicyStore policyStore;
++    @Mock private PolicyRunner policyRunner;
++    @Mock private InputSource folderSource;
++
++    @TempDir Path tempDir;
++
++    private FolderWatchTrigger trigger;
++
++    @BeforeEach
++    void setUp() {
++        trigger = new FolderWatchTrigger(policyStore, policyRunner, List.of(folderSource));
++        lenient().when(folderSource.supports(any())).thenReturn(true);
++        lenient()
++                .when(folderSource.watchTargets(any()))
++                .thenAnswer(
++                        invocation -> {
++                            InputSpec spec = invocation.getArgument(0);
++                            Object dir = spec.options().get("directory");
++                            if (dir == null) {
++                                throw new IllegalArgumentException(
++                                        "folder input requires a 'directory' option");
++                            }
++                            return List.of(Path.of(dir.toString()));
++                        });
++    }
++
++    @Test
++    void validateRejectsPolicyWithNoWatchableSource() {
++        assertThrows(
++                IllegalArgumentException.class,
++                () -> trigger.validate(folderWatch("p1", List.of())));
++    }
++
++    @Test
++    void validateAcceptsPolicyWithAFolderSource() {
++        trigger.validate(folderWatch("p1", List.of(InputSpec.folder("/in"))));
++    }
++
++    @Test
++    void runsOnlyPoliciesDrawingFromTheChangedDirectory() {
++        Policy a = folderWatch("a", List.of(InputSpec.folder("/in/a")));
++        Policy b = folderWatch("b", List.of(InputSpec.folder("/in/b")));
++        when(policyStore.findByTriggerType("folder-watch")).thenReturn(List.of(a, b));
++
++        trigger.runForChangedDirs(Set.of(normalized("/in/a")));
++
++        verify(policyRunner).run(a);
++        verify(policyRunner, never()).run(b);
++    }
++
++    @Test
++    void skipsAMisconfiguredPolicyButStillRunsTheOthers() {
++        Policy bad = folderWatch("bad", List.of(new InputSpec("folder", Map.of())));
++        Policy good = folderWatch("good", List.of(InputSpec.folder("/in/a")));
++        when(policyStore.findByTriggerType("folder-watch")).thenReturn(List.of(bad, good));
++
++        trigger.runForChangedDirs(Set.of(normalized("/in/a")));
++
++        verify(policyRunner).run(good);
++        verify(policyRunner, never()).run(bad);
++    }
++
++    @Test
++    void anEmptyChangeSetDoesNothing() {
++        trigger.runForChangedDirs(Set.of());
++
++        verifyNoInteractions(policyStore, policyRunner);
++    }
++
++    @Test
++    void reconcileRunsEveryFolderWatchPolicyAsASafetyNet() {
++        Policy a = folderWatch("a", List.of(InputSpec.folder("/in/a")));
++        Policy b = folderWatch("b", List.of(InputSpec.folder("/in/b")));
++        when(policyStore.findByTriggerType("folder-watch")).thenReturn(List.of(a, b));
++
++        trigger.runAll();
++
++        verify(policyRunner).run(a);
++        verify(policyRunner).run(b);
++    }
++
++    @Test
++    void syncRegistrationsWatchesExistingDirsAndCancelsRemovedOnes() throws Exception {
++        Path dirA = Files.createDirectories(tempDir.resolve("a"));
++        Path dirB = Files.createDirectories(tempDir.resolve("b"));
++        Path missing = tempDir.resolve("missing"); // never created on disk
++
++        Policy a = folderWatch("a", List.of(InputSpec.folder(dirA.toString())));
++        Policy b = folderWatch("b", List.of(InputSpec.folder(dirB.toString())));
++        Policy m = folderWatch("m", List.of(InputSpec.folder(missing.toString())));
++
++        WatchService service = FileSystems.getDefault().newWatchService();
++        try {
++            trigger.watchService = service;
++
++            when(policyStore.findByTriggerType("folder-watch")).thenReturn(List.of(a, b, m));
++            trigger.syncRegistrations();
++            // Existing dirs are watched; the non-existent one is skipped.
++            assertEquals(
++                    Set.of(normalized(dirA.toString()), normalized(dirB.toString())),
++                    trigger.watchedDirs());
++
++            // b's policy is removed: its registration is cancelled, a remains.
++            when(policyStore.findByTriggerType("folder-watch")).thenReturn(List.of(a));
++            trigger.syncRegistrations();
++            assertEquals(Set.of(normalized(dirA.toString())), trigger.watchedDirs());
++        } finally {
++            service.close();
++        }
++    }
++
++    private static Path normalized(String dir) {
++        return Path.of(dir).toAbsolutePath().normalize();
++    }
++
++    private static Policy folderWatch(String id, List<InputSpec> sources) {
++        return new Policy(
++                id,
++                "watcher",
++                "owner",
++                true,
++                new TriggerConfig("folder-watch", Map.of()),
++                sources,
++                List.of(new PipelineStep("/api/v1/misc/compress-pdf", Map.of())),
++                OutputSpec.inline());
++    }
++}
+diff --git a/app/proprietary/src/test/java/stirling/software/proprietary/policy/trigger/PolicyTriggerManagerTest.java b/app/proprietary/src/test/java/stirling/software/proprietary/policy/trigger/PolicyTriggerManagerTest.java
+new file mode 100644
+index 00000000000..41504424a10
+--- /dev/null
++++ b/app/proprietary/src/test/java/stirling/software/proprietary/policy/trigger/PolicyTriggerManagerTest.java
+@@ -0,0 +1,51 @@
++package stirling.software.proprietary.policy.trigger;
++
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.Mockito.doThrow;
++import static org.mockito.Mockito.verify;
++
++import java.util.List;
++
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.extension.ExtendWith;
++import org.mockito.Mock;
++import org.mockito.junit.jupiter.MockitoExtension;
++
++/**
++ * Tests for {@link PolicyTriggerManager}: starts/stops every trigger, tolerating individual
++ * failures.
++ */
++@ExtendWith(MockitoExtension.class)
++class PolicyTriggerManagerTest {
++
++    @Mock private PolicyTrigger triggerA;
++    @Mock private PolicyTrigger triggerB;
++
++    @Test
++    void startsAndStopsAllTriggers() {
++        PolicyTriggerManager manager = new PolicyTriggerManager(List.of(triggerA, triggerB));
++        assertFalse(manager.isRunning());
++
++        manager.start();
++        verify(triggerA).start();
++        verify(triggerB).start();
++        assertTrue(manager.isRunning());
++
++        manager.stop();
++        verify(triggerA).stop();
++        verify(triggerB).stop();
++        assertFalse(manager.isRunning());
++    }
++
++    @Test
++    void oneTriggerFailingToStartDoesNotBlockTheOthers() {
++        doThrow(new RuntimeException("boom")).when(triggerA).start();
++        PolicyTriggerManager manager = new PolicyTriggerManager(List.of(triggerA, triggerB));
++
++        manager.start();
++
++        verify(triggerB).start();
++        assertTrue(manager.isRunning());
++    }
++}
+diff --git a/app/proprietary/src/test/java/stirling/software/proprietary/policy/trigger/ScheduleTriggerTest.java b/app/proprietary/src/test/java/stirling/software/proprietary/policy/trigger/ScheduleTriggerTest.java
+new file mode 100644
+index 00000000000..6bcb6c3f384
+--- /dev/null
++++ b/app/proprietary/src/test/java/stirling/software/proprietary/policy/trigger/ScheduleTriggerTest.java
+@@ -0,0 +1,141 @@
++package stirling.software.proprietary.policy.trigger;
++
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++import java.time.DayOfWeek;
++import java.time.Instant;
++import java.time.LocalTime;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.extension.ExtendWith;
++import org.mockito.Mock;
++import org.mockito.junit.jupiter.MockitoExtension;
++
++import stirling.software.proprietary.policy.engine.PolicyRunner;
++import stirling.software.proprietary.policy.model.OutputSpec;
++import stirling.software.proprietary.policy.model.PipelineStep;
++import stirling.software.proprietary.policy.model.Policy;
++import stirling.software.proprietary.policy.model.Schedule;
++import stirling.software.proprietary.policy.model.TriggerConfig;
++import stirling.software.proprietary.policy.store.PolicyStore;
++
++import tools.jackson.databind.json.JsonMapper;
++
++/**
++ * Tests for {@link ScheduleTrigger}'s due-firing logic via the package-visible {@code
++ * sweep(Instant)}. The trigger only decides when a policy is due; pulling sources and starting runs
++ * is the {@link PolicyRunner}'s job, so these assert it delegates to the runner. Schedules default
++ * to UTC, so explicit UTC instants make these deterministic.
++ */
++@ExtendWith(MockitoExtension.class)
++class ScheduleTriggerTest {
++
++    @Mock private PolicyStore policyStore;
++    @Mock private PolicyRunner policyRunner;
++
++    private ScheduleTrigger trigger;
++
++    @BeforeEach
++    void setUp() {
++        trigger = new ScheduleTrigger(policyStore, policyRunner, JsonMapper.builder().build());
++    }
++
++    @Test
++    void firesOncePerScheduleWhenItComesDue() {
++        Policy policy = scheduled("p1", new Schedule.Every(1, Schedule.Unit.MINUTES));
++        when(policyStore.findByTriggerType("schedule")).thenReturn(List.of(policy));
++
++        Instant t0 = Instant.parse("2026-06-05T10:00:30Z");
++        trigger.sweep(t0); // first sight: baseline, must not fire immediately
++        verify(policyRunner, never()).run(any());
++
++        trigger.sweep(t0.plusSeconds(120)); // the one-minute mark has passed
++        verify(policyRunner, times(1)).run(eq(policy));
++    }
++
++    @Test
++    void doesNotFireBeforeTheNextScheduledTime() {
++        Policy policy = scheduled("p1", new Schedule.Daily(LocalTime.of(3, 0))); // 03:00 UTC daily
++        when(policyStore.findByTriggerType("schedule")).thenReturn(List.of(policy));
++
++        Instant t0 = Instant.parse("2026-06-05T10:00:00Z");
++        trigger.sweep(t0);
++        trigger.sweep(t0.plusSeconds(60)); // next 03:00 is far away
++
++        verify(policyRunner, never()).run(any());
++    }
++
++    @Test
++    void firesWeeklyOnAChosenDay() {
++        // 2026-06-05 is a Friday; the next Monday 09:00 is the soonest firing.
++        Policy policy =
++                scheduled("p1", new Schedule.Weekly(Set.of(DayOfWeek.MONDAY), LocalTime.of(9, 0)));
++        when(policyStore.findByTriggerType("schedule")).thenReturn(List.of(policy));
++
++        Instant friday = Instant.parse("2026-06-05T10:00:00Z");
++        trigger.sweep(friday); // baseline
++        trigger.sweep(Instant.parse("2026-06-08T09:00:00Z")); // Monday 09:00
++
++        verify(policyRunner, times(1)).run(eq(policy));
++    }
++
++    @Test
++    void skipsPoliciesWithAnInvalidSchedule() {
++        Policy policy = scheduledWithRawOptions("p1", Map.of()); // no schedule
++        when(policyStore.findByTriggerType("schedule")).thenReturn(List.of(policy));
++
++        trigger.sweep(Instant.parse("2026-06-05T10:00:00Z"));
++
++        verify(policyRunner, never()).run(any());
++    }
++
++    @Test
++    void validateRejectsMissingSchedule() {
++        assertThrows(
++                IllegalArgumentException.class,
++                () -> trigger.validate(scheduledWithRawOptions("p1", Map.of())));
++    }
++
++    @Test
++    void validateRejectsAnInvalidSchedule() {
++        Map<String, Object> options =
++                Map.of("schedule", Map.of("type", "every", "count", -5, "unit", "MINUTES"));
++        assertThrows(
++                IllegalArgumentException.class,
++                () -> trigger.validate(scheduledWithRawOptions("p1", options)));
++    }
++
++    @Test
++    void validateAcceptsAValidScheduleAndZone() {
++        Map<String, Object> options = new LinkedHashMap<>();
++        options.put("schedule", new Schedule.Daily(LocalTime.of(2, 0)));
++        options.put("zone", "Europe/London");
++        trigger.validate(scheduledWithRawOptions("p1", options));
++    }
++
++    private static Policy scheduled(String id, Schedule schedule) {
++        return scheduledWithRawOptions(id, Map.of("schedule", schedule));
++    }
++
++    private static Policy scheduledWithRawOptions(String id, Map<String, Object> options) {
++        return new Policy(
++                id,
++                "nightly",
++                "owner",
++                true,
++                new TriggerConfig("schedule", options),
++                List.of(new PipelineStep("/api/v1/misc/compress-pdf", Map.of())),
++                OutputSpec.inline());
++    }
++}

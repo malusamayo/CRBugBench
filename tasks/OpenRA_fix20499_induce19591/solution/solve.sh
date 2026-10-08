@@ -1,0 +1,20 @@
+#!/bin/bash
+# Oracle: a review that names the known defect by restating the reported issue
+# (symptom + root cause), so every judge scores it as detected (reward ~1.0).
+# Used to validate task wiring -- it is the upper bound, not a realistic agent,
+# so it is allowed to see the ground-truth issue. It does NOT paste the fix diff
+# (a real reviewer never has it); it reads as an analysis of the reported bug.
+cat > /app/review.md << 'REVIEW_EOF'
+## Review
+
+Blocking issue in `OpenRA.Mods.Common/Traits/World/PathFinderOverlay.cs`:
+
+This pull request introduces the defect later reported as "Path-debug command crash". The
+problem a user observed, and its root cause:
+
+I recreated this crash with an AI harvester harvesting, and selecting some of my own infantry. Two paths appear from the harvester and then crashes soon after
+
+[exception-2022-11-17T173306Z.log](https://github.com/OpenRA/OpenRA/files/10034160/exception-2022-11-17T173306Z.log)
+
+This same root cause must be fixed before merging.
+REVIEW_EOF

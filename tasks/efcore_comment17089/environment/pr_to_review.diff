@@ -1,0 +1,1073 @@
+diff --git a/src/EFCore.InMemory/Extensions/InMemoryServiceCollectionExtensions.cs b/src/EFCore.InMemory/Extensions/InMemoryServiceCollectionExtensions.cs
+index f5d0ab4580b..31d09640a14 100644
+--- a/src/EFCore.InMemory/Extensions/InMemoryServiceCollectionExtensions.cs
++++ b/src/EFCore.InMemory/Extensions/InMemoryServiceCollectionExtensions.cs
+@@ -68,8 +68,7 @@ public static IServiceCollection AddEntityFrameworkInMemoryDatabase([NotNull] th
+                         .TryAddSingleton<IInMemorySingletonOptions, InMemorySingletonOptions>()
+                         .TryAddSingleton<IInMemoryStoreCache, InMemoryStoreCache>()
+                         .TryAddSingleton<IInMemoryTableFactory, InMemoryTableFactory>()
+-                        .TryAddScoped<IInMemoryDatabase, InMemoryDatabase>()
+-                        .TryAddScoped<IInMemoryMaterializerFactory, InMemoryMaterializerFactory>());
++                        .TryAddScoped<IInMemoryDatabase, InMemoryDatabase>());
+ 
+             builder.TryAddCoreServices();
+ 
+diff --git a/src/EFCore.InMemory/Query/Internal/CustomShaperCompilingExpressionVisitor.cs b/src/EFCore.InMemory/Query/Internal/CustomShaperCompilingExpressionVisitor.cs
+index 723bc0999f9..98d528bc0ba 100644
+--- a/src/EFCore.InMemory/Query/Internal/CustomShaperCompilingExpressionVisitor.cs
++++ b/src/EFCore.InMemory/Query/Internal/CustomShaperCompilingExpressionVisitor.cs
+@@ -3,7 +3,6 @@
+ 
+ using System;
+ using System.Collections.Generic;
+-using System.Diagnostics;
+ using System.Linq;
+ using System.Linq.Expressions;
+ using System.Reflection;
+@@ -28,6 +27,10 @@ private static readonly MethodInfo _includeReferenceMethodInfo
+                 = typeof(CustomShaperCompilingExpressionVisitor).GetTypeInfo()
+                     .GetDeclaredMethod(nameof(IncludeReference));
+ 
++            private static readonly MethodInfo _includeCollectionMethodInfo
++                = typeof(CustomShaperCompilingExpressionVisitor).GetTypeInfo()
++                    .GetDeclaredMethod(nameof(IncludeCollection));
++
+             private static void IncludeReference<TEntity, TIncludingEntity, TIncludedEntity>(
+                 QueryContext queryContext,
+                 TEntity entity,
+@@ -64,6 +67,36 @@ private static void IncludeReference<TEntity, TIncludingEntity, TIncludedEntity>
+                 }
+             }
+ 
++            private static void IncludeCollection<TEntity, TIncludingEntity, TIncludedEntity>(
++                QueryContext queryContext,
++                TEntity entity,
++                IEnumerable<TIncludedEntity> relatedEntities,
++                INavigation navigation,
++                INavigation inverseNavigation,
++                Action<TIncludingEntity, TIncludedEntity> fixup,
++                bool trackingQuery)
++                where TIncludingEntity : TEntity
++            {
++                if (entity is TIncludingEntity includingEntity)
++                {
++                    navigation.GetCollectionAccessor().GetOrCreate(includingEntity, forMaterialization: true);
++
++                    foreach (var relatedEntity in relatedEntities)
++                    {
++                        fixup(includingEntity, relatedEntity);
++                    }
++
++                    if (trackingQuery)
++                    {
++                        queryContext.StateManager.TryGetEntry(includingEntity).SetIsLoaded(navigation);
++                    }
++                    else
++                    {
++                        SetIsLoadedNoTracking(includingEntity, navigation);
++                    }
++                }
++            }
++
+             private static void SetIsLoadedNoTracking(object entity, INavigation navigation)
+                 => ((ILazyLoader)(navigation
+                             .DeclaringEntityType
+@@ -76,10 +109,6 @@ protected override Expression VisitExtension(Expression extensionExpression)
+             {
+                 if (extensionExpression is IncludeExpression includeExpression)
+                 {
+-                    Debug.Assert(
+-                        !includeExpression.Navigation.IsCollection(),
+-                        "Only reference include should be present in tree");
+-
+                     var entityClrType = includeExpression.EntityExpression.Type;
+                     var includingClrType = includeExpression.Navigation.DeclaringEntityType.ClrType;
+                     var inverseNavigation = includeExpression.Navigation.FindInverse();
+@@ -90,6 +119,22 @@ protected override Expression VisitExtension(Expression extensionExpression)
+                         includingClrType = entityClrType;
+                     }
+ 
++                    if (includeExpression.Navigation.IsCollection())
++                    {
++                        return Expression.Call(
++                            _includeCollectionMethodInfo.MakeGenericMethod(entityClrType, includingClrType, relatedEntityClrType),
++                            QueryCompilationContext.QueryContextParameter,
++                            // We don't need to visit entityExpression since it is supposed to be a parameterExpression only
++                            includeExpression.EntityExpression,
++                            includeExpression.NavigationExpression,
++                            Expression.Constant(includeExpression.Navigation),
++                            Expression.Constant(inverseNavigation, typeof(INavigation)),
++                            Expression.Constant(
++                                GenerateFixup(
++                                    includingClrType, relatedEntityClrType, includeExpression.Navigation, inverseNavigation).Compile()),
++                            Expression.Constant(_tracking));
++                    }
++
+                     return Expression.Call(
+                         _includeReferenceMethodInfo.MakeGenericMethod(entityClrType, includingClrType, relatedEntityClrType),
+                         QueryCompilationContext.QueryContextParameter,
+diff --git a/src/EFCore.InMemory/Query/Internal/IInMemoryMaterializerFactory.cs b/src/EFCore.InMemory/Query/Internal/IInMemoryMaterializerFactory.cs
+deleted file mode 100644
+index b5f9b04d92c..00000000000
+--- a/src/EFCore.InMemory/Query/Internal/IInMemoryMaterializerFactory.cs
++++ /dev/null
+@@ -1,28 +0,0 @@
+-// Copyright (c) .NET Foundation. All rights reserved.
+-// Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
+-
+-using System;
+-using System.Linq.Expressions;
+-using JetBrains.Annotations;
+-using Microsoft.EntityFrameworkCore.Metadata;
+-using Microsoft.EntityFrameworkCore.Storage;
+-
+-namespace Microsoft.EntityFrameworkCore.InMemory.Query.Internal
+-{
+-    /// <summary>
+-    ///     This is an internal API that supports the Entity Framework Core infrastructure and not subject to
+-    ///     the same compatibility standards as public APIs. It may be changed or removed without notice in
+-    ///     any release. You should only use it directly in your code with extreme caution and knowing that
+-    ///     doing so can result in application failures when updating to a new Entity Framework Core release.
+-    /// </summary>
+-    public interface IInMemoryMaterializerFactory
+-    {
+-        /// <summary>
+-        ///     This is an internal API that supports the Entity Framework Core infrastructure and not subject to
+-        ///     the same compatibility standards as public APIs. It may be changed or removed without notice in
+-        ///     any release. You should only use it directly in your code with extreme caution and knowing that
+-        ///     doing so can result in application failures when updating to a new Entity Framework Core release.
+-        /// </summary>
+-        Expression<Func<IEntityType, MaterializationContext, object>> CreateMaterializer([NotNull] IEntityType entityType);
+-    }
+-}
+diff --git a/src/EFCore.InMemory/Query/Internal/InMemoryMaterializerFactory.cs b/src/EFCore.InMemory/Query/Internal/InMemoryMaterializerFactory.cs
+deleted file mode 100644
+index cde3370bb2f..00000000000
+--- a/src/EFCore.InMemory/Query/Internal/InMemoryMaterializerFactory.cs
++++ /dev/null
+@@ -1,106 +0,0 @@
+-// Copyright (c) .NET Foundation. All rights reserved.
+-// Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
+-
+-using System;
+-using System.Linq;
+-using System.Linq.Expressions;
+-using JetBrains.Annotations;
+-using Microsoft.EntityFrameworkCore.Metadata;
+-using Microsoft.EntityFrameworkCore.Query;
+-using Microsoft.EntityFrameworkCore.Storage;
+-using Microsoft.EntityFrameworkCore.Utilities;
+-
+-namespace Microsoft.EntityFrameworkCore.InMemory.Query.Internal
+-{
+-    /// <summary>
+-    ///     This is an internal API that supports the Entity Framework Core infrastructure and not subject to
+-    ///     the same compatibility standards as public APIs. It may be changed or removed without notice in
+-    ///     any release. You should only use it directly in your code with extreme caution and knowing that
+-    ///     doing so can result in application failures when updating to a new Entity Framework Core release.
+-    /// </summary>
+-    public class InMemoryMaterializerFactory : IInMemoryMaterializerFactory
+-    {
+-        private readonly IEntityMaterializerSource _entityMaterializerSource;
+-
+-        /// <summary>
+-        ///     This is an internal API that supports the Entity Framework Core infrastructure and not subject to
+-        ///     the same compatibility standards as public APIs. It may be changed or removed without notice in
+-        ///     any release. You should only use it directly in your code with extreme caution and knowing that
+-        ///     doing so can result in application failures when updating to a new Entity Framework Core release.
+-        /// </summary>
+-        public InMemoryMaterializerFactory([NotNull] IEntityMaterializerSource entityMaterializerSource)
+-        {
+-            Check.NotNull(entityMaterializerSource, nameof(entityMaterializerSource));
+-
+-            _entityMaterializerSource = entityMaterializerSource;
+-        }
+-
+-        /// <summary>
+-        ///     This is an internal API that supports the Entity Framework Core infrastructure and not subject to
+-        ///     the same compatibility standards as public APIs. It may be changed or removed without notice in
+-        ///     any release. You should only use it directly in your code with extreme caution and knowing that
+-        ///     doing so can result in application failures when updating to a new Entity Framework Core release.
+-        /// </summary>
+-        public virtual Expression<Func<IEntityType, MaterializationContext, object>> CreateMaterializer(IEntityType entityType)
+-        {
+-            Check.NotNull(entityType, nameof(entityType));
+-
+-            var entityTypeParameter
+-                = Expression.Parameter(typeof(IEntityType), "entityType");
+-
+-            var materializationContextParameter
+-                = Expression.Parameter(typeof(MaterializationContext), "materializationContext");
+-
+-            var concreteEntityTypes
+-                = entityType.GetDerivedTypesInclusive().Where(et => !et.IsAbstract()).ToList();
+-
+-            if (concreteEntityTypes.Count == 1)
+-            {
+-                return Expression.Lambda<Func<IEntityType, MaterializationContext, object>>(
+-                    _entityMaterializerSource
+-                        .CreateMaterializeExpression(
+-                            concreteEntityTypes[0], "instance", materializationContextParameter),
+-                    entityTypeParameter,
+-                    materializationContextParameter);
+-            }
+-
+-            var returnLabelTarget = Expression.Label(typeof(object));
+-
+-            var blockExpressions
+-                = new Expression[]
+-                {
+-                    Expression.IfThen(
+-                        Expression.Equal(
+-                            entityTypeParameter,
+-                            Expression.Constant(concreteEntityTypes[0])),
+-                        Expression.Return(
+-                            returnLabelTarget,
+-                            _entityMaterializerSource
+-                                .CreateMaterializeExpression(
+-                                    concreteEntityTypes[0], "instance", materializationContextParameter))),
+-                    Expression.Label(
+-                        returnLabelTarget,
+-                        Expression.Default(returnLabelTarget.Type))
+-                };
+-
+-            foreach (var concreteEntityType in concreteEntityTypes.Skip(1))
+-            {
+-                blockExpressions[0]
+-                    = Expression.IfThenElse(
+-                        Expression.Equal(
+-                            entityTypeParameter,
+-                            Expression.Constant(concreteEntityType)),
+-                        Expression.Return(
+-                            returnLabelTarget,
+-                            _entityMaterializerSource
+-                                .CreateMaterializeExpression(concreteEntityType, "instance", materializationContextParameter)),
+-                        blockExpressions[0]);
+-            }
+-
+-            return Expression.Lambda<Func<IEntityType, MaterializationContext, object>>(
+-                Expression.Block(blockExpressions),
+-                entityTypeParameter,
+-                materializationContextParameter);
+-        }
+-    }
+-}
+diff --git a/src/EFCore.InMemory/Query/Internal/InMemoryProjectionBindingExpressionVisitor.cs b/src/EFCore.InMemory/Query/Internal/InMemoryProjectionBindingExpressionVisitor.cs
+index eb3f795c16a..b1af3877ac0 100644
+--- a/src/EFCore.InMemory/Query/Internal/InMemoryProjectionBindingExpressionVisitor.cs
++++ b/src/EFCore.InMemory/Query/Internal/InMemoryProjectionBindingExpressionVisitor.cs
+@@ -83,11 +83,14 @@ public override Expression Visit(Expression expression)
+                             return expression;
+ 
+                         case MaterializeCollectionNavigationExpression materializeCollectionNavigationExpression:
+-                            //return _selectExpression.AddCollectionProjection(
+-                            //    _queryableMethodTranslatingExpressionVisitor.TranslateSubquery(
+-                            //    materializeCollectionNavigationExpression.Subquery),
+-                            //    materializeCollectionNavigationExpression.Navigation, null);
+-                            throw new NotImplementedException();
++
++                            var translated = _queryableMethodTranslatingExpressionVisitor.TranslateSubquery(
++                                materializeCollectionNavigationExpression.Subquery);
++
++                            return new ProjectionBindingExpression(
++                                _queryExpression,
++                                _queryExpression.AddToProjection(translated),
++                                typeof(IEnumerable<>).MakeGenericType(materializeCollectionNavigationExpression.Navigation.GetTargetType().ClrType));
+ 
+                         case MethodCallExpression methodCallExpression:
+                         {
+diff --git a/src/EFCore.InMemory/Query/Internal/InMemoryQueryExpression.cs b/src/EFCore.InMemory/Query/Internal/InMemoryQueryExpression.cs
+index cc4efb75aa0..98c08b195f1 100644
+--- a/src/EFCore.InMemory/Query/Internal/InMemoryQueryExpression.cs
++++ b/src/EFCore.InMemory/Query/Internal/InMemoryQueryExpression.cs
+@@ -7,7 +7,6 @@
+ using System.Linq;
+ using System.Linq.Expressions;
+ using System.Reflection;
+-using JetBrains.Annotations;
+ using Microsoft.EntityFrameworkCore.Metadata;
+ using Microsoft.EntityFrameworkCore.Metadata.Internal;
+ using Microsoft.EntityFrameworkCore.Query;
+diff --git a/src/EFCore.InMemory/Query/Internal/InMemoryShapedQueryExpressionVisitor.cs b/src/EFCore.InMemory/Query/Internal/InMemoryShapedQueryCompilingExpressionVisitor.cs
+similarity index 100%
+rename from src/EFCore.InMemory/Query/Internal/InMemoryShapedQueryExpressionVisitor.cs
+rename to src/EFCore.InMemory/Query/Internal/InMemoryShapedQueryCompilingExpressionVisitor.cs
+diff --git a/src/EFCore/Internal/ConcurrencyDetector.cs b/src/EFCore/Internal/ConcurrencyDetector.cs
+index 701168db061..6ed6650d80b 100644
+--- a/src/EFCore/Internal/ConcurrencyDetector.cs
++++ b/src/EFCore/Internal/ConcurrencyDetector.cs
+@@ -29,6 +29,8 @@ public class ConcurrencyDetector : IConcurrencyDetector
+     {
+         private readonly IDisposable _disposer;
+         private int _inCriticalSection;
++        private int _threadId;
++        private int _refCount;
+ 
+         /// <summary>
+         ///     This is an internal API that supports the Entity Framework Core infrastructure and not subject to
+@@ -46,11 +48,20 @@ public class ConcurrencyDetector : IConcurrencyDetector
+         /// </summary>
+         public virtual IDisposable EnterCriticalSection()
+         {
++            var threadId = Thread.CurrentThread.ManagedThreadId;
+             if (Interlocked.CompareExchange(ref _inCriticalSection, 1, 0) == 1)
+             {
+-                throw new InvalidOperationException(CoreStrings.ConcurrentMethodInvocation);
++                if (threadId != _threadId)
++                {
++                    throw new InvalidOperationException(CoreStrings.ConcurrentMethodInvocation);
++                }
++            }
++            else
++            {
++                _threadId = threadId;
+             }
+ 
++            _refCount++;
+             return _disposer;
+         }
+ 
+@@ -58,7 +69,10 @@ private void ExitCriticalSection()
+         {
+             Debug.Assert(_inCriticalSection == 1, "Expected to be in a critical section");
+ 
+-            _inCriticalSection = 0;
++            if (--_refCount == 0)
++            {
++                _inCriticalSection = 0;
++            }
+         }
+ 
+         private readonly struct Disposer : IDisposable
+diff --git a/test/EFCore.InMemory.FunctionalTests/InMemoryComplianceTest.cs b/test/EFCore.InMemory.FunctionalTests/InMemoryComplianceTest.cs
+index 4624cbf7854..94b8e5aa506 100644
+--- a/test/EFCore.InMemory.FunctionalTests/InMemoryComplianceTest.cs
++++ b/test/EFCore.InMemory.FunctionalTests/InMemoryComplianceTest.cs
+@@ -15,7 +15,6 @@ public class InMemoryComplianceTest : ComplianceTestBase
+             typeof(FunkyDataQueryTestBase<>),
+             typeof(OptimisticConcurrencyTestBase<>),
+             typeof(StoreGeneratedTestBase<>),
+-            typeof(LoadTestBase<>),                        // issue #16963
+             typeof(MusicStoreTestBase<>),                  // issue #16963
+             typeof(ConferencePlannerTestBase<>),           // issue #16963
+             typeof(GraphUpdatesTestBase<>),                // issue #16963
+diff --git a/test/EFCore.InMemory.FunctionalTests/LoadInMemoryTest.cs b/test/EFCore.InMemory.FunctionalTests/LoadInMemoryTest.cs
+index 2ad32198b72..00b9aaca5b0 100644
+--- a/test/EFCore.InMemory.FunctionalTests/LoadInMemoryTest.cs
++++ b/test/EFCore.InMemory.FunctionalTests/LoadInMemoryTest.cs
+@@ -5,8 +5,7 @@
+ 
+ namespace Microsoft.EntityFrameworkCore
+ {
+-    //issue #16963
+-    internal class LoadInMemoryTest : LoadTestBase<LoadInMemoryTest.LoadInMemoryFixture>
++    public class LoadInMemoryTest : LoadTestBase<LoadInMemoryTest.LoadInMemoryFixture>
+     {
+         public LoadInMemoryTest(LoadInMemoryFixture fixture)
+             : base(fixture)
+diff --git a/test/EFCore.InMemory.FunctionalTests/Query/CompiledQueryInMemoryTest.cs b/test/EFCore.InMemory.FunctionalTests/Query/CompiledQueryInMemoryTest.cs
+index f3d5c75504f..ba2e428aa12 100644
+--- a/test/EFCore.InMemory.FunctionalTests/Query/CompiledQueryInMemoryTest.cs
++++ b/test/EFCore.InMemory.FunctionalTests/Query/CompiledQueryInMemoryTest.cs
+@@ -14,18 +14,6 @@ public CompiledQueryInMemoryTest(NorthwindQueryInMemoryFixture<NoopModelCustomiz
+         {
+         }
+ 
+-        [ConditionalFact(Skip = "See issue#16963")]
+-        public override void Query_ending_with_include()
+-        {
+-            base.Query_ending_with_include();
+-        }
+-
+-        [ConditionalFact(Skip = "See issue#16963")]
+-        public override void Query_with_single_parameter_with_include()
+-        {
+-            base.Query_ending_with_include();
+-        }
+-
+         [ConditionalFact(Skip = "See issue#13857")]
+         public override void DbQuery_query()
+         {
+diff --git a/test/EFCore.InMemory.FunctionalTests/Query/IncludeInMemoryTest.cs b/test/EFCore.InMemory.FunctionalTests/Query/IncludeInMemoryTest.cs
+index 27889debacc..09261eb963c 100644
+--- a/test/EFCore.InMemory.FunctionalTests/Query/IncludeInMemoryTest.cs
++++ b/test/EFCore.InMemory.FunctionalTests/Query/IncludeInMemoryTest.cs
+@@ -1,8 +1,6 @@
+ // Copyright (c) .NET Foundation. All rights reserved.
+ // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
+ 
+-using System.Threading.Tasks;
+-using Xunit;
+ using Xunit.Abstractions;
+ 
+ namespace Microsoft.EntityFrameworkCore.Query
+@@ -14,479 +12,5 @@ public IncludeInMemoryTest(IncludeInMemoryFixture fixture, ITestOutputHelper tes
+         {
+             //TestLoggerFactory.TestOutputHelper = testOutputHelper;
+         }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_reference_and_collection_order_by(bool useString)
+-        {
+-            base.Include_reference_and_collection_order_by(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_references_then_include_collection(bool useString)
+-        {
+-            base.Include_references_then_include_collection(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Then_include_collection_order_by_collection_column(bool useString)
+-        {
+-            base.Then_include_collection_order_by_collection_column(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_when_result_operator(bool useString)
+-        {
+-            base.Include_when_result_operator(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection(bool useString)
+-        {
+-            base.Include_collection(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_then_reference(bool useString)
+-        {
+-            base.Include_collection_then_reference(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_with_last(bool useString)
+-        {
+-            base.Include_collection_with_last(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_with_last_no_orderby(bool useString)
+-        {
+-            base.Include_collection_with_last_no_orderby(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_skip_no_order_by(bool useString)
+-        {
+-            base.Include_collection_skip_no_order_by(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_take_no_order_by(bool useString)
+-        {
+-            base.Include_collection_take_no_order_by(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_skip_take_no_order_by(bool useString)
+-        {
+-            base.Include_collection_skip_take_no_order_by(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_alias_generation(bool useString)
+-        {
+-            base.Include_collection_alias_generation(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_and_reference(bool useString)
+-        {
+-            base.Include_collection_and_reference(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_as_no_tracking(bool useString)
+-        {
+-            base.Include_collection_as_no_tracking(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_as_no_tracking2(bool useString)
+-        {
+-            base.Include_collection_as_no_tracking2(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_dependent_already_tracked(bool useString)
+-        {
+-            base.Include_collection_dependent_already_tracked(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_dependent_already_tracked_as_no_tracking(bool useString)
+-        {
+-            base.Include_collection_dependent_already_tracked_as_no_tracking(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_on_additional_from_clause(bool useString)
+-        {
+-            base.Include_collection_on_additional_from_clause(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_on_additional_from_clause_no_tracking(bool useString)
+-        {
+-            base.Include_collection_on_additional_from_clause_no_tracking(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_on_additional_from_clause_with_filter(bool useString)
+-        {
+-            base.Include_collection_on_additional_from_clause_with_filter(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_on_additional_from_clause2(bool useString)
+-        {
+-            base.Include_collection_on_additional_from_clause2(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_on_join_clause_with_filter(bool useString)
+-        {
+-            base.Include_collection_on_join_clause_with_filter(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_on_join_clause_with_order_by_and_filter(bool useString)
+-        {
+-            base.Include_collection_on_join_clause_with_order_by_and_filter(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_on_group_join_clause_with_filter(bool useString)
+-        {
+-            base.Include_collection_on_group_join_clause_with_filter(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_on_inner_group_join_clause_with_filter(bool useString)
+-        {
+-            base.Include_collection_on_inner_group_join_clause_with_filter(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_when_groupby(bool useString)
+-        {
+-            base.Include_collection_when_groupby(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_when_groupby_subquery(bool useString)
+-        {
+-            base.Include_collection_when_groupby_subquery(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_order_by_collection_column(bool useString)
+-        {
+-            base.Include_collection_order_by_collection_column(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_order_by_key(bool useString)
+-        {
+-            base.Include_collection_order_by_key(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_order_by_non_key(bool useString)
+-        {
+-            base.Include_collection_order_by_non_key(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_order_by_non_key_with_take(bool useString)
+-        {
+-            base.Include_collection_order_by_non_key_with_take(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_order_by_non_key_with_skip(bool useString)
+-        {
+-            base.Include_collection_order_by_non_key_with_skip(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_order_by_non_key_with_first_or_default(bool useString)
+-        {
+-            base.Include_collection_order_by_non_key_with_first_or_default(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_order_by_subquery(bool useString)
+-        {
+-            base.Include_collection_order_by_subquery(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_principal_already_tracked(bool useString)
+-        {
+-            base.Include_collection_principal_already_tracked(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_principal_already_tracked_as_no_tracking(bool useString)
+-        {
+-            base.Include_collection_principal_already_tracked_as_no_tracking(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_single_or_default_no_result(bool useString)
+-        {
+-            base.Include_collection_single_or_default_no_result(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_when_projection(bool useString)
+-        {
+-            base.Include_collection_when_projection(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_with_filter(bool useString)
+-        {
+-            base.Include_collection_with_filter(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_with_filter_reordered(bool useString)
+-        {
+-            base.Include_collection_with_filter_reordered(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_duplicate_collection(bool useString)
+-        {
+-            base.Include_duplicate_collection(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_duplicate_collection_result_operator(bool useString)
+-        {
+-            base.Include_duplicate_collection_result_operator(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_duplicate_collection_result_operator2(bool useString)
+-        {
+-            base.Include_duplicate_collection_result_operator2(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_with_client_filter(bool useString)
+-        {
+-            base.Include_collection_with_client_filter(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_multi_level_reference_and_collection_predicate(bool useString)
+-        {
+-            base.Include_multi_level_reference_and_collection_predicate(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_multi_level_collection_and_then_include_reference_predicate(bool useString)
+-        {
+-            base.Include_multi_level_collection_and_then_include_reference_predicate(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_multiple_references_and_collection_multi_level(bool useString)
+-        {
+-            base.Include_multiple_references_and_collection_multi_level(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_multiple_references_and_collection_multi_level_reverse(bool useString)
+-        {
+-            base.Include_multiple_references_and_collection_multi_level_reverse(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_reference_and_collection(bool useString)
+-        {
+-            base.Include_reference_and_collection(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_force_alias_uniquefication(bool useString)
+-        {
+-            base.Include_collection_force_alias_uniquefication(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_references_and_collection_multi_level(bool useString)
+-        {
+-            base.Include_references_and_collection_multi_level(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_then_include_collection(bool useString)
+-        {
+-            base.Include_collection_then_include_collection(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_then_include_collection_then_include_reference(bool useString)
+-        {
+-            base.Include_collection_then_include_collection_then_include_reference(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_then_include_collection_predicate(bool useString)
+-        {
+-            base.Include_collection_then_include_collection_predicate(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_references_and_collection_multi_level_predicate(bool useString)
+-        {
+-            base.Include_references_and_collection_multi_level_predicate(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_multi_level_reference_then_include_collection_predicate(bool useString)
+-        {
+-            base.Include_multi_level_reference_then_include_collection_predicate(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_multiple_references_then_include_collection_multi_level(bool useString)
+-        {
+-            base.Include_multiple_references_then_include_collection_multi_level(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_multiple_references_then_include_collection_multi_level_reverse(bool useString)
+-        {
+-            base.Include_multiple_references_then_include_collection_multi_level_reverse(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_references_then_include_collection_multi_level(bool useString)
+-        {
+-            base.Include_references_then_include_collection_multi_level(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_references_then_include_collection_multi_level_predicate(bool useString)
+-        {
+-            base.Include_references_then_include_collection_multi_level_predicate(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_with_conditional_order_by(bool useString)
+-        {
+-            base.Include_collection_with_conditional_order_by(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_GroupBy_Select(bool useString)
+-        {
+-            base.Include_collection_GroupBy_Select(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_Join_GroupBy_Select(bool useString)
+-        {
+-            base.Include_collection_Join_GroupBy_Select(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Join_Include_collection_GroupBy_Select(bool useString)
+-        {
+-            base.Join_Include_collection_GroupBy_Select(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_GroupJoin_GroupBy_Select(bool useString)
+-        {
+-            base.Include_collection_GroupJoin_GroupBy_Select(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void GroupJoin_Include_collection_GroupBy_Select(bool useString)
+-        {
+-            base.GroupJoin_Include_collection_GroupBy_Select(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_SelectMany_GroupBy_Select(bool useString)
+-        {
+-            base.Include_collection_SelectMany_GroupBy_Select(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void SelectMany_Include_collection_GroupBy_Select(bool useString)
+-        {
+-            base.SelectMany_Include_collection_GroupBy_Select(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_distinct_is_server_evaluated(bool useString)
+-        {
+-            base.Include_collection_distinct_is_server_evaluated(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_OrderBy_object(bool useString)
+-        {
+-            base.Include_collection_OrderBy_object(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_OrderBy_empty_list_contains(bool useString)
+-        {
+-            base.Include_collection_OrderBy_empty_list_contains(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_OrderBy_empty_list_does_not_contains(bool useString)
+-        {
+-            base.Include_collection_OrderBy_empty_list_does_not_contains(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_OrderBy_list_contains(bool useString)
+-        {
+-            base.Include_collection_OrderBy_list_contains(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_collection_OrderBy_list_does_not_contains(bool useString)
+-        {
+-            base.Include_collection_OrderBy_list_does_not_contains(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override Task Include_empty_collection_sets_IsLoaded(bool useString, bool async)
+-        {
+-            return base.Include_empty_collection_sets_IsLoaded(useString, async);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_closes_reader(bool useString)
+-        {
+-            base.Include_closes_reader(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_with_take(bool useString)
+-        {
+-            base.Include_with_take(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_with_skip(bool useString)
+-        {
+-            base.Include_with_skip(useString);
+-        }
+-
+-        [ConditionalTheory(Skip = "issue #16963")]
+-        public override void Include_list(bool useString)
+-        {
+-            base.Include_list(useString);
+-        }
+     }
+ }
+diff --git a/test/EFCore.InMemory.FunctionalTests/Query/SimpleQueryInMemoryTest.cs b/test/EFCore.InMemory.FunctionalTests/Query/SimpleQueryInMemoryTest.cs
+index 44efc864e45..b6ac70de0f9 100644
+--- a/test/EFCore.InMemory.FunctionalTests/Query/SimpleQueryInMemoryTest.cs
++++ b/test/EFCore.InMemory.FunctionalTests/Query/SimpleQueryInMemoryTest.cs
+@@ -265,18 +265,6 @@ public override Task Project_single_element_from_collection_with_OrderBy_Distinc
+             return base.Project_single_element_from_collection_with_OrderBy_Distinct_and_FirstOrDefault_followed_by_projecting_length(isAsync);
+         }
+ 
+-        [ConditionalTheory(Skip = "Issue#16963")]
+-        public override Task QueryType_with_included_nav(bool isAsync)
+-        {
+-            return base.QueryType_with_included_nav(isAsync);
+-        }
+-
+-        [ConditionalTheory(Skip = "Issue#16963")]
+-        public override Task QueryType_with_included_navs_multi_level(bool isAsync)
+-        {
+-            return base.QueryType_with_included_navs_multi_level(isAsync);
+-        }
+-
+         [ConditionalTheory(Skip = "Issue#17050")]
+         public override void Client_code_using_instance_in_static_method()
+         {
+diff --git a/test/EFCore.Specification.Tests/ConcurrencyDetectorTestBase.cs b/test/EFCore.Specification.Tests/ConcurrencyDetectorTestBase.cs
+index 0d6b5d1bd1f..8213cf49a55 100644
+--- a/test/EFCore.Specification.Tests/ConcurrencyDetectorTestBase.cs
++++ b/test/EFCore.Specification.Tests/ConcurrencyDetectorTestBase.cs
+@@ -3,6 +3,7 @@
+ 
+ using System;
+ using System.Linq;
++using System.Threading;
+ using System.Threading.Tasks;
+ using Microsoft.EntityFrameworkCore.Diagnostics;
+ using Microsoft.EntityFrameworkCore.Infrastructure;
+@@ -163,9 +164,18 @@ protected virtual async Task ConcurrencyDetectorTest(Func<NorthwindContext, Task
+         {
+             using (var context = CreateContext())
+             {
+-                context.Products.Add(new Product { ProductID = 10001 });
++                context.Products.Add(
++                    new Product
++                    {
++                        ProductID = 10001
++                    });
+ 
+-                using (context.GetService<IConcurrencyDetector>().EnterCriticalSection())
++                var concurrencyDetector = context.GetService<IConcurrencyDetector>();
++                IDisposable disposer = null;
++
++                Task.Run(() => disposer = concurrencyDetector.EnterCriticalSection()).Wait();
++
++                using (disposer)
+                 {
+                     Exception ex = await Assert.ThrowsAsync<InvalidOperationException>(() => test(context));
+ 
+diff --git a/test/EFCore.Tests/ChangeTracking/ChangeTrackerTest.cs b/test/EFCore.Tests/ChangeTracking/ChangeTrackerTest.cs
+index 28b7385fdc5..f552d6e58cd 100644
+--- a/test/EFCore.Tests/ChangeTracking/ChangeTrackerTest.cs
++++ b/test/EFCore.Tests/ChangeTracking/ChangeTrackerTest.cs
+@@ -81,7 +81,7 @@ public void Detect_property_change_is_logged(bool sensitive)
+             }
+         }
+ 
+-        [ConditionalTheory(Skip = "Issue #16963")]
++        [ConditionalTheory]
+         [InlineData(false)]
+         [InlineData(true)]
+         public void Detect_foreign_key_property_change_is_logged(bool sensitive)
+@@ -121,7 +121,7 @@ public void Detect_foreign_key_property_change_is_logged(bool sensitive)
+             }
+         }
+ 
+-        [ConditionalTheory(Skip = "Issue #16963")]
++        [ConditionalTheory]
+         [InlineData(false)]
+         [InlineData(true)]
+         public void Detect_collection_change_is_logged(bool sensitive)
+@@ -161,7 +161,7 @@ public void Detect_collection_change_is_logged(bool sensitive)
+             }
+         }
+ 
+-        [ConditionalTheory(Skip = "Issue #16963")]
++        [ConditionalTheory]
+         [InlineData(false)]
+         [InlineData(true)]
+         public void Detect_reference_change_is_logged(bool sensitive)
+@@ -352,7 +352,7 @@ public void Reset(bool generateTemporaryValues)
+             }
+         }
+ 
+-        [ConditionalTheory(Skip = "Issue #16963")]
++        [ConditionalTheory]
+         [InlineData(false, CascadeTiming.OnSaveChanges, CascadeTiming.OnSaveChanges)]
+         [InlineData(false, CascadeTiming.OnSaveChanges, CascadeTiming.Immediate)]
+         [InlineData(false, CascadeTiming.OnSaveChanges, CascadeTiming.Never)]
+@@ -471,7 +471,7 @@ void ClearMessages()
+             }
+         }
+ 
+-        [ConditionalTheory(Skip = "Issue #16963")]
++        [ConditionalTheory]
+         [InlineData(false, CascadeTiming.OnSaveChanges, CascadeTiming.OnSaveChanges)]
+         [InlineData(false, CascadeTiming.OnSaveChanges, CascadeTiming.Immediate)]
+         [InlineData(false, CascadeTiming.OnSaveChanges, CascadeTiming.Never)]
+diff --git a/test/EFCore.Tests/ChangeTracking/Internal/QueryFixupTest.cs b/test/EFCore.Tests/ChangeTracking/Internal/QueryFixupTest.cs
+index 2cd8b405f64..0e4940fc2df 100644
+--- a/test/EFCore.Tests/ChangeTracking/Internal/QueryFixupTest.cs
++++ b/test/EFCore.Tests/ChangeTracking/Internal/QueryFixupTest.cs
+@@ -33,7 +33,7 @@ public void Query_dependent_include_principal()
+             }
+         }
+ 
+-        [ConditionalFact(Skip = "Issue #16963")]
++        [ConditionalFact]
+         public void Query_principal_include_dependent()
+         {
+             Seed();
+@@ -74,7 +74,7 @@ public void Query_dependent_include_principal_unidirectional()
+             }
+         }
+ 
+-        [ConditionalFact(Skip = "Issue #16963")]
++        [ConditionalFact]
+         public void Query_principal_include_dependent_unidirectional()
+         {
+             Seed();
+@@ -220,7 +220,7 @@ public void Query_dependent_include_principal_self_ref()
+             }
+         }
+ 
+-        [ConditionalFact(Skip = "Issue #16963")]
++        [ConditionalFact]
+         public void Query_principal_include_dependent_self_ref()
+         {
+             Seed();
+@@ -305,7 +305,7 @@ public void Query_dependent_include_principal_self_ref_unidirectional()
+             }
+         }
+ 
+-        [ConditionalFact(Skip = "Issue #16963")]
++        [ConditionalFact]
+         public void Query_principal_include_dependent_self_ref_unidirectional()
+         {
+             Seed();
+@@ -500,7 +500,7 @@ public void Query_dependent_include_principal_multiple_relationships()
+             }
+         }
+ 
+-        [ConditionalFact(Skip = "Issue #16963")]
++        [ConditionalFact]
+         public void Query_principal_include_dependent_multiple_relationships()
+         {
+             Seed();
+@@ -558,7 +558,7 @@ public void Query_dependent_include_principal_with_existing(EntityState existing
+             }
+         }
+ 
+-        [ConditionalTheory(Skip = "Issue #16963")]
++        [ConditionalTheory]
+         [InlineData(EntityState.Added)]
+         [InlineData(EntityState.Modified)]
+         [InlineData(EntityState.Unchanged)]
+@@ -624,7 +624,7 @@ public void Query_dependent_include_principal_unidirectional_with_existing(Entit
+             }
+         }
+ 
+-        [ConditionalTheory(Skip = "Issue #16963")]
++        [ConditionalTheory]
+         [InlineData(EntityState.Added)]
+         [InlineData(EntityState.Modified)]
+         [InlineData(EntityState.Unchanged)]
+@@ -726,7 +726,7 @@ public void Query_dependent_include_principal_self_ref_with_existing(EntityState
+             }
+         }
+ 
+-        [ConditionalTheory(Skip = "Issue #16963")]
++        [ConditionalTheory]
+         [InlineData(EntityState.Added)]
+         [InlineData(EntityState.Modified)]
+         [InlineData(EntityState.Unchanged)]
+@@ -860,7 +860,7 @@ public void Query_dependent_include_principal_self_ref_unidirectional_with_exist
+             }
+         }
+ 
+-        [ConditionalTheory(Skip = "Issue #16963")]
++        [ConditionalTheory]
+         [InlineData(EntityState.Added)]
+         [InlineData(EntityState.Modified)]
+         [InlineData(EntityState.Unchanged)]

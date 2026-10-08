@@ -1,0 +1,307 @@
+diff --git a/e2e/docker-compose.yml b/e2e/docker-compose.yml
+index c925f6b3d07bd3..f98def2b2a1846 100644
+--- a/e2e/docker-compose.yml
++++ b/e2e/docker-compose.yml
+@@ -33,6 +33,28 @@ services:
+     ports:
+       - 2285:2285
+ 
++  immich-machine-learning:
++    container_name: immich-e2e-machine_learning
++    image: immich-machine-learning-dev:latest
++    # extends:
++    #   file: hwaccel.ml.yml
++    #   service: cpu # set to one of [armnn, cuda, openvino, openvino-wsl] for accelerated inference
++    build:
++      context: ../machine-learning
++      dockerfile: Dockerfile
++      args:
++        - DEVICE=cpu # set to one of [armnn, cuda, openvino, openvino-wsl] for accelerated inference
++    ports:
++      - 3003:3003
++    volumes:
++      - ../machine-learning:/usr/src/app
++      - model-cache:/cache
++    depends_on:
++      - database
++    restart: unless-stopped
++    healthcheck:
++      disable: false
++
+   redis:
+     image: redis:6.2-alpine@sha256:905c4ee67b8e0aa955331960d2aa745781e6bd89afc44a8584bfd13bc890f0ae
+ 
+@@ -45,3 +67,6 @@ services:
+       POSTGRES_DB: immich
+     ports:
+       - 5435:5432
++
++volumes:
++  model-cache:
+diff --git a/e2e/src/api/specs/asset.e2e-spec.ts b/e2e/src/api/specs/asset.e2e-spec.ts
+index 1b644454aab0b0..8700356256b326 100644
+--- a/e2e/src/api/specs/asset.e2e-spec.ts
++++ b/e2e/src/api/specs/asset.e2e-spec.ts
+@@ -4,7 +4,6 @@ import {
+   AssetResponseDto,
+   AssetTypeEnum,
+   getAssetInfo,
+-  getConfig,
+   getMyUser,
+   LoginResponseDto,
+   SharedLinkType,
+@@ -45,8 +44,6 @@ const locationAssetFilepath = `${testAssetDir}/metadata/gps-position/thompson-sp
+ const ratingAssetFilepath = `${testAssetDir}/metadata/rating/mongolels.jpg`;
+ const facesAssetFilepath = `${testAssetDir}/metadata/faces/portrait.jpg`;
+ 
+-const getSystemConfig = (accessToken: string) => getConfig({ headers: asBearerAuth(accessToken) });
+-
+ const readTags = async (bytes: Buffer, filename: string) => {
+   const filepath = join(tempDir, filename);
+   await writeFile(filepath, bytes);
+@@ -228,7 +225,7 @@ describe('/asset', () => {
+     });
+ 
+     it('should get the asset faces', async () => {
+-      const config = await getSystemConfig(admin.accessToken);
++      const config = await utils.getSystemConfig(admin.accessToken);
+       config.metadata.faces.import = true;
+       await updateConfig({ systemConfigDto: config }, { headers: asBearerAuth(admin.accessToken) });
+ 
+diff --git a/e2e/src/api/specs/jobs.e2e-spec.ts b/e2e/src/api/specs/jobs.e2e-spec.ts
+index 4b8126c9414048..94c6ab8dc5eb7c 100644
+--- a/e2e/src/api/specs/jobs.e2e-spec.ts
++++ b/e2e/src/api/specs/jobs.e2e-spec.ts
+@@ -1,8 +1,8 @@
+-import { JobCommand, JobName, LoginResponseDto } from '@immich/sdk';
++import { JobCommand, JobName, LoginResponseDto, updateConfig } from '@immich/sdk';
+ import { readFile } from 'node:fs/promises';
+ import { basename } from 'node:path';
+ import { errorDto } from 'src/responses';
+-import { app, testAssetDir, utils } from 'src/utils';
++import { app, asBearerAuth, testAssetDir, utils } from 'src/utils';
+ import request from 'supertest';
+ import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+ 
+@@ -20,6 +20,16 @@ describe('/jobs', () => {
+         command: JobCommand.Resume,
+         force: false,
+       });
++
++      await utils.jobCommand(admin.accessToken, JobName.ThumbnailGeneration, {
++        command: JobCommand.Resume,
++        force: false,
++      });
++
++      await utils.jobCommand(admin.accessToken, JobName.FaceDetection, {
++        command: JobCommand.Resume,
++        force: false,
++      });
+     });
+ 
+     it('should require authentication', async () => {
+@@ -82,5 +92,129 @@ describe('/jobs', () => {
+         expect(asset.exifInfo?.make).toBe('NIKON CORPORATION');
+       }
+     });
++
++    it('should queue thumbnail extraction for missing assets', async () => {
++      const path1 = `${testAssetDir}/formats/raw/Nikon/D700/philadelphia.nef`;
++      const path2 = `${testAssetDir}/formats/raw/Nikon/D80/glarus.nef`;
++
++      await utils.createAsset(admin.accessToken, {
++        assetData: { bytes: await readFile(path1), filename: basename(path1) },
++      });
++
++      await utils.waitForQueueFinish(admin.accessToken, JobName.MetadataExtraction);
++      await utils.waitForQueueFinish(admin.accessToken, JobName.ThumbnailGeneration);
++
++      await utils.jobCommand(admin.accessToken, JobName.ThumbnailGeneration, {
++        command: JobCommand.Pause,
++        force: false,
++      });
++
++      const { id } = await utils.createAsset(admin.accessToken, {
++        assetData: { bytes: await readFile(path2), filename: basename(path2) },
++      });
++
++      await utils.waitForQueueFinish(admin.accessToken, JobName.MetadataExtraction);
++      await utils.waitForQueueFinish(admin.accessToken, JobName.ThumbnailGeneration);
++
++      {
++        const asset = await utils.getAssetInfo(admin.accessToken, id);
++
++        expect(asset.thumbhash).toBeNull();
++      }
++
++      await utils.jobCommand(admin.accessToken, JobName.MetadataExtraction, {
++        command: JobCommand.Empty,
++        force: false,
++      });
++
++      await utils.waitForQueueFinish(admin.accessToken, JobName.MetadataExtraction);
++      await utils.waitForQueueFinish(admin.accessToken, JobName.ThumbnailGeneration);
++
++      await utils.jobCommand(admin.accessToken, JobName.ThumbnailGeneration, {
++        command: JobCommand.Resume,
++        force: false,
++      });
++
++      await utils.jobCommand(admin.accessToken, JobName.ThumbnailGeneration, {
++        command: JobCommand.Start,
++        force: false,
++      });
++
++      await utils.waitForQueueFinish(admin.accessToken, JobName.MetadataExtraction);
++      await utils.waitForQueueFinish(admin.accessToken, JobName.ThumbnailGeneration);
++
++      {
++        const asset = await utils.getAssetInfo(admin.accessToken, id);
++
++        expect(asset.thumbhash).not.toBeNull();
++      }
++    });
++
++    it('should queue face detection for missing faces', async () => {
++      const config = await utils.getSystemConfig(admin.accessToken);
++      config.metadata.faces.import = true;
++      config.machineLearning.enabled = true;
++      await updateConfig({ systemConfigDto: config }, { headers: asBearerAuth(admin.accessToken) });
++
++      const path = `${testAssetDir}/metadata/faces/solvay.jpg`;
++
++      await utils.jobCommand(admin.accessToken, JobName.FaceDetection, {
++        command: JobCommand.Pause,
++        force: false,
++      });
++
++      await utils.jobCommand(admin.accessToken, JobName.FacialRecognition, {
++        command: JobCommand.Pause,
++        force: false,
++      });
++
++      const { id } = await utils.createAsset(admin.accessToken, {
++        assetData: { bytes: await readFile(path), filename: basename(path) },
++      });
++
++      await utils.waitForQueueFinish(admin.accessToken, JobName.MetadataExtraction);
++      await utils.waitForQueueFinish(admin.accessToken, JobName.ThumbnailGeneration);
++      await utils.waitForQueueFinish(admin.accessToken, JobName.FaceDetection);
++
++      {
++        const asset = await utils.getAssetInfo(admin.accessToken, id);
++        expect(asset.people).toEqual([]);
++      }
++
++      await utils.jobCommand(admin.accessToken, JobName.FaceDetection, {
++        command: JobCommand.Empty,
++        force: false,
++      });
++
++      await utils.waitForQueueFinish(admin.accessToken, JobName.MetadataExtraction);
++      await utils.waitForQueueFinish(admin.accessToken, JobName.ThumbnailGeneration);
++      await utils.waitForQueueFinish(admin.accessToken, JobName.FaceDetection);
++
++      await utils.jobCommand(admin.accessToken, JobName.FaceDetection, {
++        command: JobCommand.Resume,
++        force: false,
++      });
++
++      await utils.jobCommand(admin.accessToken, JobName.FacialRecognition, {
++        command: JobCommand.Resume,
++        force: false,
++      });
++
++      await utils.jobCommand(admin.accessToken, JobName.FaceDetection, {
++        command: JobCommand.Start,
++        force: false,
++      });
++
++      await utils.waitForQueueFinish(admin.accessToken, JobName.MetadataExtraction);
++      await utils.waitForQueueFinish(admin.accessToken, JobName.ThumbnailGeneration);
++      await utils.waitForQueueFinish(admin.accessToken, JobName.FaceDetection, 60_000);
++      await utils.waitForQueueFinish(admin.accessToken, JobName.FacialRecognition);
++
++      {
++        const asset = await utils.getAssetInfo(admin.accessToken, id);
++
++        expect(asset.unassignedFaces?.length).toBeGreaterThan(10);
++      }
++    }, 120_000);
+   });
+ });
+diff --git a/e2e/src/utils.ts b/e2e/src/utils.ts
+index d303b71eaa9b9b..6089b7d4e72344 100644
+--- a/e2e/src/utils.ts
++++ b/e2e/src/utils.ts
+@@ -28,6 +28,7 @@ import {
+   deleteAssets,
+   getAllJobsStatus,
+   getAssetInfo,
++  getConfig,
+   getConfigDefaults,
+   login,
+   searchAssets,
+@@ -414,6 +415,8 @@ export const utils = {
+     rmSync(path, { recursive: true });
+   },
+ 
++  getSystemConfig: (accessToken: string) => getConfig({ headers: asBearerAuth(accessToken) }),
++
+   getAssetInfo: (accessToken: string, id: string) => getAssetInfo({ id }, { headers: asBearerAuth(accessToken) }),
+ 
+   checkExistingAssets: (accessToken: string, checkExistingAssetsDto: CheckExistingAssetsDto) =>
+diff --git a/e2e/test-assets b/e2e/test-assets
+index 9e3b964b080dca..f75059bb2b9538 160000
+--- a/e2e/test-assets
++++ b/e2e/test-assets
+@@ -1 +1 @@
+-Subproject commit 9e3b964b080dca6f035b29b86e66454ae8aeda78
++Subproject commit f75059bb2b953831babefe287518050b28fb2719
+diff --git a/server/src/repositories/asset.repository.ts b/server/src/repositories/asset.repository.ts
+index 201f295d4973a0..0672daab898960 100644
+--- a/server/src/repositories/asset.repository.ts
++++ b/server/src/repositories/asset.repository.ts
+@@ -473,9 +473,13 @@ export class AssetRepository implements IAssetRepository {
+       )
+       .$if(property === WithoutProperty.FACES, (qb) =>
+         qb
+-          .innerJoin('asset_job_status as job_status', 'assetId', 'assets.id')
+-          .where('job_status.previewAt', 'is not', null)
+-          .where('job_status.facesRecognizedAt', 'is', null)
++          .leftJoin('asset_job_status as job_status', 'assetId', 'assets.id')
++          .where((eb) =>
++            eb.or([
++              eb.and([eb('job_status.previewAt', 'is not', null), eb('job_status.facesRecognizedAt', 'is', null)]),
++              eb('assetId', 'is', null),
++            ]),
++          )
+           .where('assets.isVisible', '=', true),
+       )
+       .$if(property === WithoutProperty.SIDECAR, (qb) =>
+@@ -494,10 +498,11 @@ export class AssetRepository implements IAssetRepository {
+       )
+       .$if(property === WithoutProperty.THUMBNAIL, (qb) =>
+         qb
+-          .innerJoin('asset_job_status as job_status', 'assetId', 'assets.id')
++          .leftJoin('asset_job_status as job_status', 'assetId', 'assets.id')
+           .where('assets.isVisible', '=', true)
+           .where((eb) =>
+             eb.or([
++              eb('assetId', 'is', null),
+               eb('job_status.previewAt', 'is', null),
+               eb('job_status.thumbnailAt', 'is', null),
+               eb('assets.thumbhash', 'is', null),
+diff --git a/server/src/services/job.service.ts b/server/src/services/job.service.ts
+index c8ac8fc6bfb468..1366281f5f8ed8 100644
+--- a/server/src/services/job.service.ts
++++ b/server/src/services/job.service.ts
+@@ -61,7 +61,7 @@ export class JobService extends BaseService {
+   }
+ 
+   async handleCommand(queueName: QueueName, dto: JobCommandDto): Promise<JobStatusDto> {
+-    this.logger.debug(`Handling command: queue=${queueName},force=${dto.force}`);
++    this.logger.debug(`Handling command: queue=${queueName},command=${dto.command},force=${dto.force}`);
+ 
+     switch (dto.command) {
+       case JobCommand.START: {

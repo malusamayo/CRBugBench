@@ -1,0 +1,755 @@
+diff --git a/Common/DataMonitor.cs b/Common/DataMonitor.cs
+new file mode 100644
+index 000000000000..0fa95b3398a3
+--- /dev/null
++++ b/Common/DataMonitor.cs
+@@ -0,0 +1,265 @@
++/*
++ * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
++ * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++*/
++
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Threading;
++using Newtonsoft.Json;
++using QuantConnect.Configuration;
++using QuantConnect.Interfaces;
++using QuantConnect.Util;
++
++namespace QuantConnect
++{
++    /// <summary>
++    /// Monitors data requests and reports on missing data
++    /// </summary>
++    public class DataMonitor : IDataMonitor
++    {
++        private bool _exited;
++
++        private readonly TextWriter _succeededDataRequestsWriter;
++        private readonly TextWriter _failedDataRequestsWriter;
++
++        private long _succeededDataRequestsCount;
++        private long _failedDataRequestsCount;
++
++        private long _succeededUniverseDataRequestsCount;
++        private long _failedUniverseDataRequestsCount;
++
++        private readonly List<double> _requestRates = new();
++        private long _prevRequestsCount;
++        private DateTime _lastRequestRateCalculationTime;
++
++        private Thread _requestRateCalculationThread;
++        private CancellationTokenSource _cancellationTokenSource;
++
++        private string _succeededDataRequestsFileName;
++        private string _failedDataRequestsFileName;
++
++        /// <summary>
++        /// Directory location to store results
++        /// </summary>
++        public string ResultsDestinationFolder { get; }
++
++        /// <summary>
++        /// Initializes a new instance of the <see cref="DataMonitor"/> class
++        /// </summary>
++        public DataMonitor()
++        {
++            ResultsDestinationFolder = Config.Get("results-destination-folder", Directory.GetCurrentDirectory());
++            _succeededDataRequestsFileName = GetFilePath("succeeded-data-requests.txt");
++            _failedDataRequestsFileName = GetFilePath("failed-data-requests.txt");
++            _succeededDataRequestsWriter = OpenStream(_succeededDataRequestsFileName);
++            _failedDataRequestsWriter = OpenStream(_failedDataRequestsFileName);
++        }
++
++        /// <summary>
++        /// Event handler for the <see cref="IDataProvider.NewDataRequest"/> event
++        /// </summary>
++        public void OnNewDataRequest(object sender, DataProviderNewDataRequestEventArgs e)
++        {
++            if (_exited)
++            {
++                return;
++            }
++
++            Initialize();
++
++            if (e.Path.Contains("map_files", StringComparison.OrdinalIgnoreCase) || 
++                e.Path.Contains("factor_files", StringComparison.OrdinalIgnoreCase))
++            {
++                return;
++            }
++
++            var path = StripDataFolder(e.Path);
++            var isUniverseData = path.Contains("coarse", StringComparison.OrdinalIgnoreCase) || 
++                path.Contains("universe", StringComparison.OrdinalIgnoreCase);
++
++            if (e.Succeded)
++            {
++                WriteLineToFile(_succeededDataRequestsWriter, path, _succeededDataRequestsFileName);
++                Interlocked.Increment(ref _succeededDataRequestsCount);
++                if (isUniverseData)
++                {
++                    Interlocked.Increment(ref _succeededUniverseDataRequestsCount);
++                }
++            }
++            else
++            {
++                WriteLineToFile(_failedDataRequestsWriter, path, _failedDataRequestsFileName);
++                Interlocked.Increment(ref _failedDataRequestsCount);
++                if (isUniverseData)
++                {
++                    Interlocked.Increment(ref _failedUniverseDataRequestsCount);
++                }
++
++                if (Logging.Log.DebuggingEnabled)
++                {
++                    Logging.Log.Debug($"DataMonitor.OnNewDataRequest(): Data from {path} could not be fetched");
++                }
++            }
++        }
++
++        /// <summary>
++        /// Terminates the data monitor generating a final report
++        /// </summary>
++        public void Exit()
++        {
++            if (_exited)
++            {
++                return;
++            }
++
++            _requestRateCalculationThread.StopSafely(TimeSpan.FromSeconds(5), _cancellationTokenSource);
++            _succeededDataRequestsWriter.Close();
++            _failedDataRequestsWriter.Close();
++            _exited = true;
++
++            StoreDataMonitorReport(GenerateReport());
++            
++            _succeededDataRequestsCount = 0;
++            _failedDataRequestsCount = 0;
++            _requestRates.Clear();
++            _prevRequestsCount = 0;
++            _lastRequestRateCalculationTime = default;
++        }
++
++        public void Dispose()
++        {
++            _succeededDataRequestsWriter.Close();
++            _succeededDataRequestsWriter.DisposeSafely();
++            _failedDataRequestsWriter.Close();
++            _failedDataRequestsWriter.DisposeSafely();
++            _cancellationTokenSource?.DisposeSafely();
++        }
++
++        protected virtual string StripDataFolder(string path)
++        {
++            if (path.StartsWith(Globals.DataFolder, StringComparison.OrdinalIgnoreCase))
++            {
++                return path.Substring(Globals.DataFolder.Length);
++            }
++
++            return path;
++        }
++
++        /// <summary>
++        /// Initializes the <see cref="DataMonitor"/> instance
++        /// </summary>
++        private void Initialize()
++        {
++            if (_requestRateCalculationThread != null)
++            {
++                return;
++            }
++            
++            _cancellationTokenSource = new CancellationTokenSource();
++
++            _requestRateCalculationThread = new Thread(() =>
++            {
++                while (!_cancellationTokenSource.Token.WaitHandle.WaitOne(3000))
++                {
++                    ComputeFileRequestFrequency();
++                }
++            })
++            { IsBackground = true };
++            _requestRateCalculationThread.Start();
++        }
++        
++        private DataMonitorReport GenerateReport()
++        {
++            var report = new DataMonitorReport(_succeededDataRequestsCount, 
++                _failedDataRequestsCount, 
++                _succeededUniverseDataRequestsCount, 
++                _failedUniverseDataRequestsCount, 
++                _requestRates);
++
++            Logging.Log.Trace($"DataMonitor.GenerateReport():{Environment.NewLine}" +
++                $"DATA USAGE:: Total data requests {report.TotalRequestsCount}{Environment.NewLine}" +
++                $"DATA USAGE:: Succeeded data requests {report.SucceededDataRequestsCount}{Environment.NewLine}" +
++                $"DATA USAGE:: Failed data requests {report.FailedDataRequestsCount}{Environment.NewLine}" +
++                $"DATA USAGE:: Failed data requests percentage {report.FailedDataRequestsPercentage}%{Environment.NewLine}" +
++                $"DATA USAGE:: Total universe data requests {report.TotalUniverseDataRequestsCount}{Environment.NewLine}" +
++                $"DATA USAGE:: Succeeded universe data requests {report.SucceededUniverseDataRequestsCount}{Environment.NewLine}" +
++                $"DATA USAGE:: Failed universe data requests {report.FailedUniverseDataRequestsCount}{Environment.NewLine}" +
++                $"DATA USAGE:: Failed universe data requests percentage {report.FailedUniverseDataRequestsPercentage}%");
++
++            return report;
++        }
++
++        private void ComputeFileRequestFrequency()
++        {
++            var requestsCount = _succeededDataRequestsCount + _failedDataRequestsCount;
++
++            if (_lastRequestRateCalculationTime == default)
++            {
++                // First time we calculate the request rate.
++                // We don't have a previous value to compare to so we just store the current value.
++                _lastRequestRateCalculationTime = DateTime.UtcNow;
++                _prevRequestsCount = requestsCount;
++                return;
++            }
++
++            var requestsCountDelta = requestsCount - _prevRequestsCount;
++            var now = DateTime.UtcNow;
++            var timeDelta = now - _lastRequestRateCalculationTime;
++
++            _requestRates.Add(Math.Round(requestsCountDelta / timeDelta.TotalSeconds));
++            _prevRequestsCount = requestsCount;
++            _lastRequestRateCalculationTime = now;
++        }
++
++        /// <summary>
++        /// Stores the data monitor report
++        /// </summary>
++        /// <param name="report">The data monitor report to be stored<param>
++        private void StoreDataMonitorReport(DataMonitorReport report)
++        {
++            if (report == null)
++            {
++                return;
++            }
++
++            var path = GetFilePath("data-monitor-report.json");
++            var data = JsonConvert.SerializeObject(report, Formatting.None  );
++            File.WriteAllText(path, data);
++        }
++        
++        private string GetFilePath(string filename)
++        {
++            return Path.Combine(ResultsDestinationFolder, $"{filename}-{DateTime.Now.ToStringInvariant("yyyyMMddHHmmssfff")}");
++        }
++
++        private static TextWriter OpenStream(string filename)
++        {
++            var writer = new StreamWriter(filename);
++            return TextWriter.Synchronized(writer);
++        }
++
++        private static void WriteLineToFile(TextWriter writer, string line, string filename)
++        {
++            try
++            {
++                writer.WriteLine(line);
++            }
++            catch (IOException exception)
++            {
++                Logging.Log.Error($"DataMonitor.OnNewDataRequest(): Failed to write to file {filename}: {exception.Message}");
++            }
++        }
++    }
++}
+diff --git a/Common/DataMonitorReport.cs b/Common/DataMonitorReport.cs
+new file mode 100644
+index 000000000000..cadebc2945a1
+--- /dev/null
++++ b/Common/DataMonitorReport.cs
+@@ -0,0 +1,134 @@
++/*
++ * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
++ * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++*/
++
++using Newtonsoft.Json;
++using QuantConnect.Interfaces;
++using QuantConnect.Util;
++using System;
++using System.Collections.Generic;
++using System.Linq;
++
++namespace QuantConnect
++{
++    /// <summary>
++    /// Report generated by the <see cref="IDataMonitor"/> class that contains information about data requests
++    /// </summary>
++    public class DataMonitorReport
++    {
++        /// <summary>
++        /// Gets the number of data files that were requested and successfully fetched
++        /// </summary>
++        [JsonProperty(PropertyName = "succeeded-data-requests-count")]
++        public long SucceededDataRequestsCount { get; set; }
++
++        /// <summary>
++        /// Gets the number of data files that were requested but could not be fetched
++        /// </summary>
++        [JsonProperty(PropertyName = "failed-data-requests-count")]
++        public long FailedDataRequestsCount { get; set; }
++
++        /// <summary>
++        /// Gets the number of universe data files that were requested and successfully fetched
++        /// </summary>
++        [JsonProperty(PropertyName = "succeeded-universe-data-requests-count")]
++        public long SucceededUniverseDataRequestsCount { get; set; }
++
++        /// <summary>
++        /// Gets the number of universe data files that were requested but could not be fetched
++        /// </summary>
++        [JsonProperty(PropertyName = "failed-universe-data-requests-count")]
++        public long FailedUniverseDataRequestsCount { get; set; }
++
++        /// <summary>
++        /// Gets the number of data files that were requested
++        /// </summary>
++        [JsonProperty(PropertyName = "total-data-requests-count")]
++        public long TotalRequestsCount
++        {
++            get { return SucceededDataRequestsCount + FailedDataRequestsCount; }
++        }
++
++        /// <summary>
++        /// Fets the percentage of data requests that could not be satisfied
++        /// </summary>
++        [JsonProperty(PropertyName = "failed-data-requests-percentage")]
++        public double FailedDataRequestsPercentage
++        {
++            get { return GetPercentage(TotalRequestsCount, FailedDataRequestsCount); }
++        }
++
++        /// <summary>
++        /// Gets the number of universe data files that were requested
++        /// </summary>
++        [JsonProperty(PropertyName = "total-universe-data-requests-count")]
++        public long TotalUniverseDataRequestsCount
++        {
++            get { return SucceededUniverseDataRequestsCount + FailedUniverseDataRequestsCount; }
++        }
++
++        /// <summary>
++        /// Fets the percentage of universe data requests that could not be satisfied
++        /// </summary>
++        [JsonProperty(PropertyName = "failed-universe-data-requests-percentage")]
++        public double FailedUniverseDataRequestsPercentage
++        {
++            get { return GetPercentage(TotalUniverseDataRequestsCount, FailedUniverseDataRequestsCount); }
++        }
++
++        /// <summary>
++        /// Rates at which data requests were made per second
++        /// </summary>
++        [JsonProperty(PropertyName = "data-request-rates")]
++        public IReadOnlyList<double> DataRequestRates { get; set; }
++
++        /// <summary>
++        /// Initializes an empty instance of the <see cref="DataMonitorReport"/> class
++        /// </summary>
++        public DataMonitorReport()
++        {
++        }
++
++        /// <summary>
++        /// Initializes a new instance of the <see cref="DataMonitorReport"/> class
++        /// </summary>
++        /// <param name="succeededDataRequestsCount">Number of data paths that were requested and successfuly served</param>
++        /// <param name="failedDataRequestsCount">Number of data paths that were requested but could not be served</param>
++        /// <param name="succeededUniverseDataRequestsCount">Number of universe data paths that were requested and successfuly served</param>
++        /// <param name="failedUniverseDataRequestsCount">Number of universe data paths that were requested but could not be served</param>
++        /// <param name="dataRequestRates">Rates at which data requests were made per second</param>
++        public DataMonitorReport(long succeededDataRequestsCount, 
++            long failedDataRequestsCount, 
++            long succeededUniverseDataRequestsCount, 
++            long failedUniverseDataRequestsCount, 
++            IReadOnlyList<double> dataRequestRates)
++        {
++            SucceededDataRequestsCount = succeededDataRequestsCount;
++            FailedDataRequestsCount = failedDataRequestsCount;
++            SucceededUniverseDataRequestsCount = succeededUniverseDataRequestsCount;
++            FailedUniverseDataRequestsCount = failedUniverseDataRequestsCount;
++            DataRequestRates = dataRequestRates;
++        }
++        
++        private static double GetPercentage(long total, long value)
++        {
++            if (total == 0)
++            {
++                return 0;
++            }
++
++            return Math.Round(value / (double)total * 100);
++        }
++    }
++}
+diff --git a/Common/Interfaces/DataProviderDataFetchedEventArgs.cs b/Common/Interfaces/DataProviderDataFetchedEventArgs.cs
+new file mode 100644
+index 000000000000..8124eff54369
+--- /dev/null
++++ b/Common/Interfaces/DataProviderDataFetchedEventArgs.cs
+@@ -0,0 +1,46 @@
++/*
++ * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
++ * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++*/
++
++using System;
++
++namespace QuantConnect.Interfaces
++{
++    /// <summary>
++    /// Event arguments for the <see cref="IDataProvider.NewDataRequest"/> event
++    /// </summary>
++    public class DataProviderNewDataRequestEventArgs : EventArgs
++    {
++        /// <summary>
++        /// Path to the fetched data
++        /// </summary>
++        public string Path { get; }
++
++        /// <summary>
++        /// Whether the data was fetched successfully
++        /// </summary>
++        public bool Succeded { get; }
++
++        /// <summary>
++        /// Initializes a new instance of the <see cref="DataProviderNewDataRequestEventArgs"/> class
++        /// </summary>
++        /// <param name="path">The path to the fetched data</param>
++        /// <param name="succeded">Whether the data was fetched successfully</param>
++        public DataProviderNewDataRequestEventArgs(string path, bool succeded)
++        {
++            Path = path;
++            Succeded = succeded;
++        }
++    }
++}
+diff --git a/Common/Interfaces/IDataMonitor.cs b/Common/Interfaces/IDataMonitor.cs
+new file mode 100644
+index 000000000000..4d63756da9c8
+--- /dev/null
++++ b/Common/Interfaces/IDataMonitor.cs
+@@ -0,0 +1,40 @@
++/*
++ * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
++ * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
++ * 
++ * Licensed under the Apache License, Version 2.0 (the "License"); 
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
++ * 
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++*/
++
++using System.IO;
++using System.ComponentModel.Composition;
++using System;
++using System.Threading.Tasks;
++using System.Threading;
++
++namespace QuantConnect.Interfaces
++{
++    /// <summary>
++    /// Monitors data requests and reports on missing data
++    /// </summary>
++    [InheritedExport(typeof(IDataMonitor))]
++    public interface IDataMonitor : IDisposable
++    {
++        /// <summary>
++        /// Terminates the data monitor generating a final report
++        /// </summary>
++        void Exit();
++        
++        /// <summary>
++        /// Event handler for the <see cref="IDataProvider.NewDataRequest"/> event
++        /// </summary>
++        void OnNewDataRequest(object sender, DataProviderNewDataRequestEventArgs e);
++    }
++}
+diff --git a/Common/Interfaces/IDataProvider.cs b/Common/Interfaces/IDataProvider.cs
+index 74aa7054f0b4..210c08c3c99b 100644
+--- a/Common/Interfaces/IDataProvider.cs
++++ b/Common/Interfaces/IDataProvider.cs
+@@ -15,6 +15,7 @@
+ 
+ using System.IO;
+ using System.ComponentModel.Composition;
++using System;
+ 
+ namespace QuantConnect.Interfaces
+ {
+@@ -25,6 +26,11 @@ namespace QuantConnect.Interfaces
+     [InheritedExport(typeof(IDataProvider))]
+     public interface IDataProvider
+     {
++        /// <summary>
++        /// Event raised each time data fetch is finished (successfully or not)
++        /// </summary>
++        event EventHandler<DataProviderNewDataRequestEventArgs> NewDataRequest;
++
+         /// <summary>
+         /// Retrieves data to be used in an algorithm
+         /// </summary>
+diff --git a/Engine/DataFeeds/CompositeDataProvider.cs b/Engine/DataFeeds/CompositeDataProvider.cs
+index ce1e43ec9880..9b0a0514a09e 100644
+--- a/Engine/DataFeeds/CompositeDataProvider.cs
++++ b/Engine/DataFeeds/CompositeDataProvider.cs
+@@ -28,6 +28,11 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+     /// </summary>
+     public class CompositeDataProvider : IDataProvider
+     {
++        /// <summary>
++        /// Event raised each time data fetch is finished (successfully or not)
++        /// </summary>
++        public event EventHandler<DataProviderNewDataRequestEventArgs> NewDataRequest;
++
+         private readonly List<IDataProvider> _dataProviders;
+ 
+         /// <summary>
+@@ -55,6 +60,8 @@ public CompositeDataProvider()
+             {
+                 throw new ArgumentException("CompositeDataProvider(): requires 'composite-data-providers' to be set with a valid type name");
+             }
++
++            _dataProviders.ForEach(x => x.NewDataRequest += OnNewDataRequest);
+         }
+ 
+         /// <summary>
+@@ -76,5 +83,13 @@ public Stream Fetch(string key)
+ 
+             return null;
+         }
++
++        /// <summary>
++        /// Event invocator for the <see cref="NewDataRequest"/> event
++        /// </summary>
++        private void OnNewDataRequest(object sender, DataProviderNewDataRequestEventArgs e)
++        {
++            NewDataRequest?.Invoke(this, e);
++        }
+     }
+ }
+diff --git a/Engine/DataFeeds/DefaultDataProvider.cs b/Engine/DataFeeds/DefaultDataProvider.cs
+index 2f6bb7d752f5..6df6367277a9 100644
+--- a/Engine/DataFeeds/DefaultDataProvider.cs
++++ b/Engine/DataFeeds/DefaultDataProvider.cs
+@@ -24,6 +24,11 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+     /// </summary>
+     public class DefaultDataProvider : IDataProvider, IDisposable
+     {
++        /// <summary>
++        /// Event raised each time data fetch is finished (successfully or not)
++        /// </summary>
++        public event EventHandler<DataProviderNewDataRequestEventArgs> NewDataRequest;
++
+         /// <summary>
+         /// Retrieves data from disc to be used in an algorithm
+         /// </summary>
+@@ -31,12 +36,14 @@ public class DefaultDataProvider : IDataProvider, IDisposable
+         /// <returns>A <see cref="Stream"/> of the data requested</returns>
+         public virtual Stream Fetch(string key)
+         {
++            var success = true;
+             try
+             {
+                 return new FileStream(key, FileMode.Open, FileAccess.Read, FileShare.Read);
+             }
+             catch (Exception exception)
+             {
++                success = false;
+                 if (exception is DirectoryNotFoundException
+                     || exception is FileNotFoundException)
+                 {
+@@ -45,6 +52,10 @@ public virtual Stream Fetch(string key)
+ 
+                 throw;
+             }
++            finally
++            {
++                OnNewDataRequest(new DataProviderNewDataRequestEventArgs(key, success));
++            }
+         }
+ 
+         /// <summary>
+@@ -54,5 +65,13 @@ public void Dispose()
+         {
+             //
+         }
++
++        /// <summary>
++        /// Event invocator for the <see cref="NewDataRequest"/> event
++        /// </summary>
++        protected virtual void OnNewDataRequest(DataProviderNewDataRequestEventArgs e)
++        {
++            NewDataRequest?.Invoke(this, e);
++        }
+     }
+ }
+diff --git a/Engine/Engine.cs b/Engine/Engine.cs
+index 8efd61175f0c..a78912f2263f 100644
+--- a/Engine/Engine.cs
++++ b/Engine/Engine.cs
+@@ -448,6 +448,7 @@ public void Run(AlgorithmNodePacket job, AlgorithmManager manager, string assemb
+                 AlgorithmHandlers.DataFeed.Exit();
+                 AlgorithmHandlers.Transactions.Exit();
+                 AlgorithmHandlers.RealTime.Exit();
++                AlgorithmHandlers.DataMonitor.Exit();
+             }
+         }
+ 
+diff --git a/Engine/LeanEngineAlgorithmHandlers.cs b/Engine/LeanEngineAlgorithmHandlers.cs
+index 511c6524bee7..a6c38e32466b 100644
+--- a/Engine/LeanEngineAlgorithmHandlers.cs
++++ b/Engine/LeanEngineAlgorithmHandlers.cs
+@@ -95,6 +95,11 @@ public class LeanEngineAlgorithmHandlers : IDisposable
+         /// </summary>
+         public IDataPermissionManager DataPermissionsManager { get; }
+ 
++        /// <summary>
++        /// Monitors data requests and reports on missing data
++        /// </summary>
++        public IDataMonitor DataMonitor { get; }
++
+         /// <summary>
+         /// Initializes a new instance of the <see cref="LeanEngineAlgorithmHandlers"/> class from the specified handlers
+         /// </summary>
+@@ -181,6 +186,12 @@ bool liveMode
+             ObjectStore = objectStore;
+             DataPermissionsManager = dataPermissionsManager;
+             DataCacheProvider = new ZipDataCacheProvider(DataProvider, isDataEphemeral: liveMode);
++            DataMonitor = new DataMonitor();
++
++            if (!liveMode)
++            {
++                DataProvider.NewDataRequest += DataMonitor.OnNewDataRequest;
++            }
+         }
+ 
+         /// <summary>
+@@ -242,6 +253,7 @@ public void Dispose()
+             DataCacheProvider.DisposeSafely();
+             Setup.DisposeSafely();
+             ObjectStore.DisposeSafely();
++            DataMonitor.DisposeSafely();
+ 
+             Log.Trace("LeanEngineAlgorithmHandlers.Dispose(): Disposed of algorithm handlers.");
+         }
+diff --git a/Tests/Common/DataMonitorReportTests.cs b/Tests/Common/DataMonitorReportTests.cs
+new file mode 100644
+index 000000000000..a54661300ac5
+--- /dev/null
++++ b/Tests/Common/DataMonitorReportTests.cs
+@@ -0,0 +1,72 @@
++/*
++ * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
++ * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++*/
++
++using NUnit.Framework;
++using System.Collections.Generic;
++
++namespace QuantConnect.Tests.Common
++{
++    [TestFixture]
++    public class DataMonitorReportTests
++    {
++        [Test]
++        public void TotalRequestsCountIsTheSumOfSucceededAndFailedRequests()
++        {
++            var report = new DataMonitorReport
++            {
++                SucceededDataRequestsCount = 6,
++                FailedDataRequestsCount = 3
++            };
++
++            Assert.AreEqual(9, report.TotalRequestsCount);
++        }
++
++        [Test]
++        public void TotalUniverseRequestsCountIsTheSumOfSucceededAndFailedUniverseRequests()
++        {
++            var report = new DataMonitorReport
++            {
++                SucceededUniverseDataRequestsCount = 6,
++                FailedUniverseDataRequestsCount = 3
++            };
++
++            Assert.AreEqual(9, report.TotalUniverseDataRequestsCount);
++        }
++
++        [Test]
++        public void FailedRequestsPercentageIsProperlyCalculatedAndRounded()
++        {
++            var report = new DataMonitorReport
++            {
++                SucceededDataRequestsCount = 6,
++                FailedDataRequestsCount = 3
++            };
++
++            Assert.AreEqual(33d, report.FailedDataRequestsPercentage);
++        }
++
++        [Test]
++        public void FailedUniverseRequestsPercentageIsProperlyCalculatedAndRounded()
++        {
++            var report = new DataMonitorReport
++            {
++                SucceededUniverseDataRequestsCount = 6,
++                FailedUniverseDataRequestsCount = 3
++            };
++
++            Assert.AreEqual(33d, report.FailedUniverseDataRequestsPercentage);
++        }
++    }
++}

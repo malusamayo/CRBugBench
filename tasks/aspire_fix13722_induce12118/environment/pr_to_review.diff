@@ -1,0 +1,807 @@
+commit 6240bd598a916a886ebc241a1bb41a8154042a9f
+Author: Copilot <198982749+Copilot@users.noreply.github.com>
+Date:   Tue Oct 21 07:05:29 2025 +1100
+
+    Add `aspire update --self` command for CLI self-updates (#12118)
+    
+    * Initial plan
+    
+    * Add aspire self update command implementation
+    
+    Co-authored-by: mitchdenny <513398+mitchdenny@users.noreply.github.com>
+    
+    * Add documentation for aspire self update command
+    
+    Co-authored-by: mitchdenny <513398+mitchdenny@users.noreply.github.com>
+    
+    * Use File.GetUnixFileMode/SetUnixFileMode instead of chmod command
+    
+    Co-authored-by: davidfowl <95136+davidfowl@users.noreply.github.com>
+    
+    * Display version after update and hide self command for dotnet tool
+    
+    Co-authored-by: davidfowl <95136+davidfowl@users.noreply.github.com>
+    
+    * Update quality names to match existing channels and add interactive prompt
+    
+    Co-authored-by: davidfowl <95136+davidfowl@users.noreply.github.com>
+    
+    * Change command from 'aspire self update' to 'aspire update --self'
+    
+    Co-authored-by: davidfowl <95136+davidfowl@users.noreply.github.com>
+    
+    * Use ShowStatusAsync for CLI download operation
+    
+    Co-authored-by: davidfowl <95136+davidfowl@users.noreply.github.com>
+    
+    * Fix tests.
+    
+    * Update emojis.
+    
+    * Emoji fixes.
+    
+    * Move CLI download URLs from CliDownloader to PackagingService
+    
+    Co-authored-by: mitchdenny <513398+mitchdenny@users.noreply.github.com>
+    
+    * PR feedback.
+    
+    * Apply PR feedback: use Directory.CreateTempSubdirectory, singleton HttpClient, Path.PathSeparator, and log warnings
+    
+    Co-authored-by: davidfowl <95136+davidfowl@users.noreply.github.com>
+    
+    ---------
+    
+    Co-authored-by: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+    Co-authored-by: mitchdenny <513398+mitchdenny@users.noreply.github.com>
+    Co-authored-by: davidfowl <95136+davidfowl@users.noreply.github.com>
+    Co-authored-by: Mitch Denny <mitch@mitchdeny.com>
+    Co-authored-by: Mitch Denny <midenn@microsoft.com>
+
+diff --git a/src/Aspire.Cli/Commands/UpdateCommand.cs b/src/Aspire.Cli/Commands/UpdateCommand.cs
+index a79393d896..9ecaafab3f 100644
+--- a/src/Aspire.Cli/Commands/UpdateCommand.cs
++++ b/src/Aspire.Cli/Commands/UpdateCommand.cs
+@@ -2,12 +2,17 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System.CommandLine;
++using System.Diagnostics;
++using System.Formats.Tar;
++using System.IO.Compression;
++using System.Runtime.InteropServices;
+ using Aspire.Cli.Configuration;
+ using Aspire.Cli.Interaction;
+ using Aspire.Cli.Packaging;
+ using Aspire.Cli.Projects;
+ using Aspire.Cli.Resources;
+ using Aspire.Cli.Utils;
++using Microsoft.Extensions.Logging;
+ using Spectre.Console;
+ 
+ namespace Aspire.Cli.Commands;
+@@ -17,24 +22,82 @@ internal sealed class UpdateCommand : BaseCommand
+     private readonly IProjectLocator _projectLocator;
+     private readonly IPackagingService _packagingService;
+     private readonly IProjectUpdater _projectUpdater;
++    private readonly ILogger<UpdateCommand> _logger;
++    private readonly ICliDownloader? _cliDownloader;
+ 
+-    public UpdateCommand(IProjectLocator projectLocator, IPackagingService packagingService, IProjectUpdater projectUpdater, IInteractionService interactionService, IFeatures features, ICliUpdateNotifier updateNotifier, CliExecutionContext executionContext) : base("update", UpdateCommandStrings.Description, features, updateNotifier, executionContext, interactionService)
++    public UpdateCommand(
++        IProjectLocator projectLocator, 
++        IPackagingService packagingService, 
++        IProjectUpdater projectUpdater, 
++        ILogger<UpdateCommand> logger,
++        ICliDownloader? cliDownloader,
++        IInteractionService interactionService, 
++        IFeatures features, 
++        ICliUpdateNotifier updateNotifier, 
++        CliExecutionContext executionContext) 
++        : base("update", UpdateCommandStrings.Description, features, updateNotifier, executionContext, interactionService)
+     {
+         ArgumentNullException.ThrowIfNull(projectLocator);
+         ArgumentNullException.ThrowIfNull(packagingService);
+         ArgumentNullException.ThrowIfNull(projectUpdater);
++        ArgumentNullException.ThrowIfNull(logger);
+ 
+         _projectLocator = projectLocator;
+         _packagingService = packagingService;
+         _projectUpdater = projectUpdater;
++        _logger = logger;
++        _cliDownloader = cliDownloader;
+ 
+         var projectOption = new Option<FileInfo?>("--project");
+         projectOption.Description = UpdateCommandStrings.ProjectArgumentDescription;
+         Options.Add(projectOption);
++
++        // Only add --self option if not running as dotnet tool
++        if (!IsRunningAsDotNetTool())
++        {
++            var selfOption = new Option<bool>("--self");
++            selfOption.Description = "Update the Aspire CLI itself to the latest version";
++            Options.Add(selfOption);
++
++            var qualityOption = new Option<string?>("--quality");
++            qualityOption.Description = "Quality level to update to when using --self (stable, staging, daily)";
++            Options.Add(qualityOption);
++        }
++    }
++
++    protected override bool UpdateNotificationsEnabled => false;
++
++    private static bool IsRunningAsDotNetTool()
++    {
++        // When running as a dotnet tool, the process path points to "dotnet" or "dotnet.exe"
++        // When running as a native binary, it points to "aspire" or "aspire.exe"
++        var processPath = Environment.ProcessPath;
++        if (string.IsNullOrEmpty(processPath))
++        {
++            return false;
++        }
++
++        var fileName = Path.GetFileNameWithoutExtension(processPath);
++        return string.Equals(fileName, "dotnet", StringComparison.OrdinalIgnoreCase);
+     }
+ 
+     protected override async Task<int> ExecuteAsync(ParseResult parseResult, CancellationToken cancellationToken)
+     {
++        var isSelfUpdate = parseResult.GetValue<bool>("--self");
++
++        // If --self is specified, handle CLI self-update
++        if (isSelfUpdate)
++        {
++            if (_cliDownloader is null)
++            {
++                InteractionService.DisplayError("CLI self-update is not available in this environment.");
++                return ExitCodeConstants.InvalidCommand;
++            }
++
++            return await ExecuteSelfUpdateAsync(parseResult, cancellationToken);
++        }
++
++        // Otherwise, handle project update
+         try
+         {
+             var passedAppHostProjectFile = parseResult.GetValue<FileInfo?>("--project");
+@@ -67,4 +130,256 @@ internal sealed class UpdateCommand : BaseCommand
+ 
+         return 0;
+     }
++
++    private async Task<int> ExecuteSelfUpdateAsync(ParseResult parseResult, CancellationToken cancellationToken)
++    {
++        var quality = parseResult.GetValue<string?>("--quality");
++
++        // If quality is not specified, prompt the user
++        if (string.IsNullOrEmpty(quality))
++        {
++            var qualities = new[] { "stable", "staging", "daily" };
++            quality = await InteractionService.PromptForSelectionAsync(
++                "Select the quality level to update to:",
++                qualities,
++                q => q,
++                cancellationToken);
++        }
++
++        try
++        {
++            // Get current executable path for display purposes only
++            var currentExePath = Environment.ProcessPath;
++            if (string.IsNullOrEmpty(currentExePath))
++            {
++                InteractionService.DisplayError("Unable to determine the current executable path.");
++                return ExitCodeConstants.InvalidCommand;
++            }
++
++            InteractionService.DisplayMessage("package", $"Current CLI location: {currentExePath}");
++            InteractionService.DisplayMessage("up_arrow", $"Updating to quality level: {quality}");
++
++            // Download the latest CLI
++            var archivePath = await _cliDownloader!.DownloadLatestCliAsync(quality, cancellationToken);
++
++            // Extract and update to $HOME/.aspire/bin
++            await ExtractAndUpdateAsync(archivePath, cancellationToken);
++
++            return 0;
++        }
++        catch (Exception ex)
++        {
++            _logger.LogError(ex, "Failed to update CLI");
++            InteractionService.DisplayError($"Failed to update CLI: {ex.Message}");
++            return ExitCodeConstants.InvalidCommand;
++        }
++    }
++
++    private async Task ExtractAndUpdateAsync(string archivePath, CancellationToken cancellationToken)
++    {
++        // Always install to $HOME/.aspire/bin
++        var homeDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
++        if (string.IsNullOrEmpty(homeDir))
++        {
++            throw new InvalidOperationException("Unable to determine home directory.");
++        }
++
++        var installDir = Path.Combine(homeDir, ".aspire", "bin");
++        Directory.CreateDirectory(installDir);
++
++        var exeName = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "aspire.exe" : "aspire";
++        var targetExePath = Path.Combine(installDir, exeName);
++        var tempExtractDir = Directory.CreateTempSubdirectory("aspire-cli-extract").FullName;
++
++        try
++        {
++
++            // Extract archive
++            InteractionService.DisplayMessage("package", "Extracting new CLI...");
++            await ExtractArchiveAsync(archivePath, tempExtractDir, cancellationToken);
++
++            // Find the aspire executable in the extracted files
++            var newExePath = Path.Combine(tempExtractDir, exeName);
++            if (!File.Exists(newExePath))
++            {
++                throw new FileNotFoundException($"Extracted CLI executable not found: {newExePath}");
++            }
++
++            // Backup current executable if it exists
++            var backupPath = $"{targetExePath}.old";
++            if (File.Exists(targetExePath))
++            {
++                InteractionService.DisplayMessage("floppy_disk", "Backing up current CLI...");
++                _logger.LogDebug("Creating backup: {BackupPath}", backupPath);
++
++                // Remove old backup if it exists
++                if (File.Exists(backupPath))
++                {
++                    File.Delete(backupPath);
++                }
++
++                // Rename current executable to .old
++                File.Move(targetExePath, backupPath);
++            }
++
++            try
++            {
++                // Copy new executable to install location
++                InteractionService.DisplayMessage("wrench", $"Installing new CLI to {installDir}...");
++                File.Copy(newExePath, targetExePath, overwrite: true);
++
++                // On Unix systems, ensure the executable bit is set
++                if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
++                {
++                    SetExecutablePermission(targetExePath);
++                }
++
++                // Test the new executable and display its version
++                _logger.LogDebug("Testing new CLI executable and displaying version");
++                var newVersion = await GetNewVersionAsync(targetExePath, cancellationToken);
++                if (newVersion is null)
++                {
++                    throw new InvalidOperationException("New CLI executable failed verification test.");
++                }
++
++                // If we get here, the update was successful, remove the backup
++                if (File.Exists(backupPath))
++                {
++                    _logger.LogDebug("Update successful, removing backup");
++                    File.Delete(backupPath);
++                }
++
++                // Display helpful message about PATH
++                if (!IsInPath(installDir))
++                {
++                    InteractionService.DisplayMessage("information", $"Note: {installDir} is not in your PATH. Add it to use the updated CLI globally.");
++                }
++            }
++            catch
++            {
++                // If anything goes wrong, restore the backup
++                _logger.LogWarning("Update failed, restoring backup");
++                if (File.Exists(backupPath))
++                {
++                    if (File.Exists(targetExePath))
++                    {
++                        File.Delete(targetExePath);
++                    }
++                    File.Move(backupPath, targetExePath);
++                }
++                throw;
++            }
++        }
++        finally
++        {
++            // Clean up temp directories
++            CleanupDirectory(tempExtractDir);
++            CleanupDirectory(Path.GetDirectoryName(archivePath)!);
++        }
++    }
++
++    private static bool IsInPath(string directory)
++    {
++        var pathEnv = Environment.GetEnvironmentVariable("PATH");
++        if (string.IsNullOrEmpty(pathEnv))
++        {
++            return false;
++        }
++
++        var pathSeparator = Path.PathSeparator;
++        var paths = pathEnv.Split(pathSeparator, StringSplitOptions.RemoveEmptyEntries);
++        
++        return paths.Any(p => 
++            string.Equals(Path.GetFullPath(p.Trim()), Path.GetFullPath(directory), 
++                RuntimeInformation.IsOSPlatform(OSPlatform.Windows) 
++                    ? StringComparison.OrdinalIgnoreCase 
++                    : StringComparison.Ordinal));
++    }
++
++    private static async Task ExtractArchiveAsync(string archivePath, string destinationPath, CancellationToken cancellationToken)
++    {
++        if (archivePath.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
++        {
++            ZipFile.ExtractToDirectory(archivePath, destinationPath, overwriteFiles: true);
++        }
++        else if (archivePath.EndsWith(".tar.gz", StringComparison.OrdinalIgnoreCase))
++        {
++            await using var fileStream = new FileStream(archivePath, FileMode.Open, FileAccess.Read);
++            await using var gzipStream = new GZipStream(fileStream, CompressionMode.Decompress);
++            await TarFile.ExtractToDirectoryAsync(gzipStream, destinationPath, overwriteFiles: true, cancellationToken);
++        }
++        else
++        {
++            throw new NotSupportedException($"Unsupported archive format: {archivePath}");
++        }
++    }
++
++    private void SetExecutablePermission(string filePath)
++    {
++        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
++        {
++            try
++            {
++                var mode = File.GetUnixFileMode(filePath);
++                mode |= UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute;
++                File.SetUnixFileMode(filePath, mode);
++            }
++            catch (Exception ex)
++            {
++                _logger.LogWarning(ex, "Failed to set executable permission on {FilePath}", filePath);
++            }
++        }
++    }
++
++    private async Task<string?> GetNewVersionAsync(string exePath, CancellationToken cancellationToken)
++    {
++        try
++        {
++            var psi = new ProcessStartInfo
++            {
++                FileName = exePath,
++                Arguments = "--version",
++                RedirectStandardOutput = true,
++                RedirectStandardError = true,
++                UseShellExecute = false
++            };
++
++            using var process = Process.Start(psi);
++            if (process is null)
++            {
++                return null;
++            }
++
++            var output = await process.StandardOutput.ReadToEndAsync(cancellationToken);
++            await process.WaitForExitAsync(cancellationToken);
++            
++            if (process.ExitCode == 0)
++            {
++                var version = output.Trim();
++                InteractionService.DisplaySuccess($"Updated to version: {version}");
++                return version;
++            }
++            
++            return null;
++        }
++        catch
++        {
++            return null;
++        }
++    }
++
++    private void CleanupDirectory(string directory)
++    {
++        try
++        {
++            if (Directory.Exists(directory))
++            {
++                Directory.Delete(directory, recursive: true);
++            }
++        }
++        catch (Exception ex)
++        {
++            _logger.LogWarning(ex, "Failed to clean up directory {Directory}", directory);
++        }
++    }
+ }
+diff --git a/src/Aspire.Cli/Packaging/PackageChannel.cs b/src/Aspire.Cli/Packaging/PackageChannel.cs
+index aeb28ecc41..e9bc936d6e 100644
+--- a/src/Aspire.Cli/Packaging/PackageChannel.cs
++++ b/src/Aspire.Cli/Packaging/PackageChannel.cs
+@@ -8,13 +8,14 @@ using NuGetPackage = Aspire.Shared.NuGetPackageCli;
+ 
+ namespace Aspire.Cli.Packaging;
+ 
+-internal class PackageChannel(string name, PackageChannelQuality quality, PackageMapping[]? mappings, INuGetPackageCache nuGetPackageCache, bool configureGlobalPackagesFolder = false)
++internal class PackageChannel(string name, PackageChannelQuality quality, PackageMapping[]? mappings, INuGetPackageCache nuGetPackageCache, bool configureGlobalPackagesFolder = false, string? cliDownloadBaseUrl = null)
+ {
+     public string Name { get; } = name;
+     public PackageChannelQuality Quality { get; } = quality;
+     public PackageMapping[]? Mappings { get; } = mappings;
+     public PackageChannelType Type { get; } = mappings is null ? PackageChannelType.Implicit : PackageChannelType.Explicit;
+     public bool ConfigureGlobalPackagesFolder { get; } = configureGlobalPackagesFolder;
++    public string? CliDownloadBaseUrl { get; } = cliDownloadBaseUrl;
+     
+     public string SourceDetails { get; } = ComputeSourceDetails(mappings);
+     
+@@ -174,9 +175,9 @@ internal class PackageChannel(string name, PackageChannelQuality quality, Packag
+         return filteredPackages;
+     }
+ 
+-    public static PackageChannel CreateExplicitChannel(string name, PackageChannelQuality quality, PackageMapping[]? mappings, INuGetPackageCache nuGetPackageCache, bool configureGlobalPackagesFolder = false)
++    public static PackageChannel CreateExplicitChannel(string name, PackageChannelQuality quality, PackageMapping[]? mappings, INuGetPackageCache nuGetPackageCache, bool configureGlobalPackagesFolder = false, string? cliDownloadBaseUrl = null)
+     {
+-        return new PackageChannel(name, quality, mappings, nuGetPackageCache, configureGlobalPackagesFolder);
++        return new PackageChannel(name, quality, mappings, nuGetPackageCache, configureGlobalPackagesFolder, cliDownloadBaseUrl);
+     }
+ 
+     public static PackageChannel CreateImplicitChannel(INuGetPackageCache nuGetPackageCache)
+diff --git a/src/Aspire.Cli/Packaging/PackagingService.cs b/src/Aspire.Cli/Packaging/PackagingService.cs
+index fb027f5871..de2e91e98d 100644
+--- a/src/Aspire.Cli/Packaging/PackagingService.cs
++++ b/src/Aspire.Cli/Packaging/PackagingService.cs
+@@ -22,13 +22,13 @@ internal class PackagingService(CliExecutionContext executionContext, INuGetPack
+         var stableChannel = PackageChannel.CreateExplicitChannel("stable", PackageChannelQuality.Stable, new[]
+         {
+             new PackageMapping(PackageMapping.AllPackages, "https://api.nuget.org/v3/index.json")
+-        }, nuGetPackageCache);
++        }, nuGetPackageCache, cliDownloadBaseUrl: "https://aka.ms/dotnet/9/aspire/ga/daily");
+ 
+         var dailyChannel = PackageChannel.CreateExplicitChannel("daily", PackageChannelQuality.Prerelease, new[]
+         {
+             new PackageMapping("Aspire*", "https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet9/nuget/v3/index.json"),
+             new PackageMapping(PackageMapping.AllPackages, "https://api.nuget.org/v3/index.json")
+-        }, nuGetPackageCache);
++        }, nuGetPackageCache, cliDownloadBaseUrl: "https://aka.ms/dotnet/9/aspire/daily");
+ 
+         var prPackageChannels = new List<PackageChannel>();
+ 
+@@ -80,7 +80,7 @@ internal class PackagingService(CliExecutionContext executionContext, INuGetPack
+         {
+             new PackageMapping("Aspire*", stagingFeedUrl),
+             new PackageMapping(PackageMapping.AllPackages, "https://api.nuget.org/v3/index.json")
+-        }, nuGetPackageCache, configureGlobalPackagesFolder: true);
++        }, nuGetPackageCache, configureGlobalPackagesFolder: true, cliDownloadBaseUrl: "https://aka.ms/dotnet/9/aspire/rc/daily");
+ 
+         return stagingChannel;
+     }
+diff --git a/src/Aspire.Cli/Program.cs b/src/Aspire.Cli/Program.cs
+index 987f2d8e39..9dc8af31d4 100644
+--- a/src/Aspire.Cli/Program.cs
++++ b/src/Aspire.Cli/Program.cs
+@@ -138,6 +138,7 @@ public class Program
+         builder.Services.AddHostedService(sp => sp.GetRequiredService<NuGetPackagePrefetcher>());
+         builder.Services.AddSingleton<ICliUpdateNotifier, CliUpdateNotifier>();
+         builder.Services.AddSingleton<IPackagingService, PackagingService>();
++        builder.Services.AddSingleton<ICliDownloader, CliDownloader>();
+         builder.Services.AddMemoryCache();
+ 
+         // Template factories.
+diff --git a/src/Aspire.Cli/README.md b/src/Aspire.Cli/README.md
+index 6f550e51d0..2b6edc3574 100644
+--- a/src/Aspire.Cli/README.md
++++ b/src/Aspire.Cli/README.md
+@@ -134,9 +134,36 @@ Update integrations in the Aspire project. (Preview)
+ aspire update [options]
+ ```
+ 
++**Options:**
++- `--project` - The path to the project file
++- `--self` - Update the Aspire CLI itself to the latest version
++- `--quality <quality>` - Quality level to update to when using --self (stable, staging, daily)
++
+ **Description:**
+ Updates Aspire integration packages to their latest compatible versions. Supports both traditional package management (PackageReference with Version) and Central Package Management (CPM) using Directory.Packages.props. The command automatically detects the package management approach used in the project and updates packages accordingly.
+ 
++When using `--self`, the CLI will update itself to the latest available version for the current platform. The command automatically detects the operating system and architecture, downloads the appropriate CLI package, validates its checksum, and performs an in-place update with automatic backup and rollback on failure. If the quality level is not specified with `--self`, an interactive prompt will appear to select from the available options.
++
++**Quality Levels (for --self):**
++- `stable` - Latest stable release version
++- `staging` - Latest release candidate/staging version
++- `daily` - Latest development build from main branch
++
++**Example:**
++```cli
++# Update project integrations
++aspire update
++
++# Update CLI with interactive quality selection
++aspire update --self
++
++# Update CLI to latest stable release
++aspire update --self --quality stable
++
++# Update CLI to latest development build
++aspire update --self --quality daily
++```
++
+ ### config
+ 
+ Manage configuration settings.
+diff --git a/src/Aspire.Cli/Utils/CliDownloader.cs b/src/Aspire.Cli/Utils/CliDownloader.cs
+new file mode 100644
+index 0000000000..4d8b86d428
+--- /dev/null
++++ b/src/Aspire.Cli/Utils/CliDownloader.cs
+@@ -0,0 +1,198 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System.Diagnostics;
++using System.Runtime.InteropServices;
++using System.Security.Cryptography;
++using Aspire.Cli.Interaction;
++using Aspire.Cli.Packaging;
++using Microsoft.Extensions.Logging;
++
++namespace Aspire.Cli.Utils;
++
++/// <summary>
++/// Handles downloading the Aspire CLI.
++/// </summary>
++internal interface ICliDownloader
++{
++    Task<string> DownloadLatestCliAsync(string channelName, CancellationToken cancellationToken);
++}
++
++internal class CliDownloader(
++    ILogger<CliDownloader> logger,
++    IInteractionService interactionService,
++    IPackagingService packagingService) : ICliDownloader
++{
++    private const int ArchiveDownloadTimeoutSeconds = 600;
++    private const int ChecksumDownloadTimeoutSeconds = 120;
++    
++    private static readonly HttpClient s_httpClient = new();
++
++    public async Task<string> DownloadLatestCliAsync(string channelName, CancellationToken cancellationToken)
++    {
++        // Get the channel information from PackagingService
++        var channels = await packagingService.GetChannelsAsync(cancellationToken);
++        var channel = channels.FirstOrDefault(c => c.Name.Equals(channelName, StringComparison.OrdinalIgnoreCase));
++        
++        if (channel is null)
++        {
++            throw new ArgumentException($"Unsupported channel '{channelName}'. Available channels: {string.Join(", ", channels.Select(c => c.Name))}");
++        }
++
++        if (string.IsNullOrEmpty(channel.CliDownloadBaseUrl))
++        {
++            throw new InvalidOperationException($"Channel '{channelName}' does not support CLI downloads.");
++        }
++
++        var baseUrl = channel.CliDownloadBaseUrl;
++
++        var (os, arch) = DetectPlatform();
++        var runtimeIdentifier = $"{os}-{arch}";
++        var extension = os == "win" ? "zip" : "tar.gz";
++        var archiveFilename = $"aspire-cli-{runtimeIdentifier}.{extension}";
++        var checksumFilename = $"{archiveFilename}.sha512";
++        var archiveUrl = $"{baseUrl}/{archiveFilename}";
++        var checksumUrl = $"{baseUrl}/{checksumFilename}";
++
++        // Create temp directory for download
++        var tempDir = Directory.CreateTempSubdirectory("aspire-cli-download").FullName;
++
++        try
++        {
++            var archivePath = Path.Combine(tempDir, archiveFilename);
++            var checksumPath = Path.Combine(tempDir, checksumFilename);
++
++            // Download archive
++            _ = await interactionService.ShowStatusAsync($"Downloading Aspire CLI from: {archiveUrl}", async () =>
++            {
++                logger.LogDebug("Downloading archive from {Url} to {Path}", archiveUrl, archivePath);
++                await DownloadFileAsync(archiveUrl, archivePath, ArchiveDownloadTimeoutSeconds, cancellationToken);
++
++                // Download checksum
++                logger.LogDebug("Downloading checksum from {Url} to {Path}", checksumUrl, checksumPath);
++                await DownloadFileAsync(checksumUrl, checksumPath, ChecksumDownloadTimeoutSeconds, cancellationToken);
++                
++                return 0; // Return dummy value for ShowStatusAsync
++            });
++
++            // Validate checksum
++            interactionService.DisplayMessage("check_mark", "Validating downloaded file...");
++            await ValidateChecksumAsync(archivePath, checksumPath, cancellationToken);
++
++            interactionService.DisplaySuccess("Download completed successfully");
++            return archivePath;
++        }
++        catch
++        {
++            // Clean up temp directory on failure
++            try
++            {
++                if (Directory.Exists(tempDir))
++                {
++                    Directory.Delete(tempDir, recursive: true);
++                }
++            }
++            catch (Exception ex)
++            {
++                logger.LogWarning(ex, "Failed to clean up temporary directory {TempDir}", tempDir);
++            }
++            throw;
++        }
++    }
++
++    private static (string os, string arch) DetectPlatform()
++    {
++        var os = DetectOperatingSystem();
++        var arch = DetectArchitecture();
++        return (os, arch);
++    }
++
++    private static string DetectOperatingSystem()
++    {
++        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
++        {
++            return "win";
++        }
++        else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
++        {
++            // Check if it's musl-based (Alpine, etc.)
++            try
++            {
++                var lddPath = "/usr/bin/ldd";
++                if (File.Exists(lddPath))
++                {
++                    var psi = new ProcessStartInfo
++                    {
++                        FileName = lddPath,
++                        Arguments = "--version",
++                        RedirectStandardOutput = true,
++                        RedirectStandardError = true,
++                        UseShellExecute = false
++                    };
++                    using var process = Process.Start(psi);
++                    if (process is not null)
++                    {
++                        var output = process.StandardOutput.ReadToEnd() + process.StandardError.ReadToEnd();
++                        process.WaitForExit();
++                        if (output.Contains("musl", StringComparison.OrdinalIgnoreCase))
++                        {
++                            return "linux-musl";
++                        }
++                    }
++                }
++            }
++            catch
++            {
++                // Fall back to regular linux
++            }
++            return "linux";
++        }
++        else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
++        {
++            return "osx";
++        }
++        else
++        {
++            throw new PlatformNotSupportedException($"Unsupported operating system: {RuntimeInformation.OSDescription}");
++        }
++    }
++
++    private static string DetectArchitecture()
++    {
++        var arch = RuntimeInformation.ProcessArchitecture;
++        return arch switch
++        {
++            Architecture.X64 => "x64",
++            Architecture.X86 => "x86",
++            Architecture.Arm64 => "arm64",
++            _ => throw new PlatformNotSupportedException($"Unsupported architecture: {arch}")
++        };
++    }
++
++    private static async Task DownloadFileAsync(string url, string outputPath, int timeoutSeconds, CancellationToken cancellationToken)
++    {
++        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
++        cts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
++
++        using var response = await s_httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cts.Token);
++        response.EnsureSuccessStatusCode();
++
++        await using var fileStream = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None);
++        await response.Content.CopyToAsync(fileStream, cts.Token);
++    }
++
++    private static async Task ValidateChecksumAsync(string archivePath, string checksumPath, CancellationToken cancellationToken)
++    {
++        var expectedChecksum = (await File.ReadAllTextAsync(checksumPath, cancellationToken)).Trim().ToLowerInvariant();
++
++        using var sha512 = SHA512.Create();
++        await using var fileStream = new FileStream(archivePath, FileMode.Open, FileAccess.Read, FileShare.Read);
++        var hashBytes = await sha512.ComputeHashAsync(fileStream, cancellationToken);
++        var actualChecksum = Convert.ToHexString(hashBytes).ToLowerInvariant();
++
++        if (expectedChecksum != actualChecksum)
++        {
++            throw new InvalidOperationException($"Checksum validation failed. Expected: {expectedChecksum}, Actual: {actualChecksum}");
++        }
++    }
++}
+diff --git a/tests/Aspire.Cli.Tests/TestServices/TestCliDownloader.cs b/tests/Aspire.Cli.Tests/TestServices/TestCliDownloader.cs
+new file mode 100644
+index 0000000000..0d30214ab2
+--- /dev/null
++++ b/tests/Aspire.Cli.Tests/TestServices/TestCliDownloader.cs
+@@ -0,0 +1,34 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using Aspire.Cli.Utils;
++
++namespace Aspire.Cli.Tests.TestServices;
++
++/// <summary>
++/// Test implementation of ICliDownloader for unit tests.
++/// </summary>
++internal sealed class TestCliDownloader : ICliDownloader
++{
++    private readonly DirectoryInfo _tempDirectory;
++
++    public TestCliDownloader(DirectoryInfo tempDirectory)
++    {
++        _tempDirectory = tempDirectory;
++    }
++
++    public Task<string> DownloadLatestCliAsync(string quality, CancellationToken cancellationToken)
++    {
++        // Ensure the directory exists
++        if (!_tempDirectory.Exists)
++        {
++            _tempDirectory.Create();
++        }
++
++        // Generate a unique filename for the test download
++        var filename = $"test-cli-download-{Guid.NewGuid():N}";
++        var path = Path.Combine(_tempDirectory.FullName, filename);
++        
++        return Task.FromResult(path);
++    }
++}
+diff --git a/tests/Aspire.Cli.Tests/Utils/CliTestHelper.cs b/tests/Aspire.Cli.Tests/Utils/CliTestHelper.cs
+index 6de6c9df8c..c63c7b8dc5 100644
+--- a/tests/Aspire.Cli.Tests/Utils/CliTestHelper.cs
++++ b/tests/Aspire.Cli.Tests/Utils/CliTestHelper.cs
+@@ -91,6 +91,7 @@ internal static class CliTestHelper
+         services.AddSingleton(options.CliExecutionContextFactory);
+         services.AddSingleton(options.DiskCacheFactory);
+         services.AddSingleton(options.CliHostEnvironmentFactory);
++        services.AddSingleton(options.CliDownloaderFactory);
+         services.AddSingleton<FallbackProjectParser>();
+         services.AddSingleton(options.ProjectUpdaterFactory);
+         services.AddSingleton<NuGetPackagePrefetcher>();
+@@ -336,6 +337,13 @@ internal sealed class CliServiceCollectionTestOptions
+     };
+ 
+     public Func<IServiceProvider, IDiskCache> DiskCacheFactory { get; set; } = (IServiceProvider serviceProvider) => new NullDiskCache();
++
++    public Func<IServiceProvider, ICliDownloader> CliDownloaderFactory { get; set; } = (IServiceProvider serviceProvider) =>
++    {
++        var executionContext = serviceProvider.GetRequiredService<CliExecutionContext>();
++        var tmpDirectory = new DirectoryInfo(Path.Combine(executionContext.WorkingDirectory.FullName, "tmp"));
++        return new TestCliDownloader(tmpDirectory);
++    };
+ }
+ 
+ internal sealed class TestOutputTextWriter : TextWriter

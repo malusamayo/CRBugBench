@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "track": "fix",
+  "task": {
+    "pr_number": 13621,
+    "pr_url": "https://github.com/explosion/spaCy/pull/13621",
+    "commit": "1b8d560d0e665626f9cdcb89b9d2cb7b0c4ccfcb",
+    "detectability": 4,
+    "szz_confidence": "high",
+    "blamed_line_share": 1.0
+  },
+  "cases": [
+    {
+      "id": "issue:13924",
+      "provenance": "A user reported this defect after the reviewed pull request, and a later fix repaired it.",
+      "summary": "Exception in memory_zone does not clear vocab",
+      "description": "When using the `nlp.memory_zone()`, if an exception occurs inside the memory zone and you then try and use the `nlp` object to process another doc, it retains the vocab from the previous use.\n\n## How to reproduce the behaviour\n```python\nimport spacy\n\ndef spacy_proc(nlp, text, should_raise=False):\n    with nlp.memory_zone():\n        doc = nlp(text)\n        for token in doc:\n            print(token.text, token.pos_, token.dep_)\n\n        if should_raise:\n            raise Exception(\"This is a test exception to check memory zone handling.\")\n\n        return doc\n\ndef main():\n    nlp = spacy.load(\"en_core_web_md\")\n    try:\n        spacy_proc(nlp, \"This is a test sentence to check memory zones in spaCy.\", should_raise=True)\n    except Exception:\n        pass  # Handle the exception gracefully\n\n    spacy_proc(nlp, \"Some more text to process after the exception.\")\n    # raises AssertionError on \"spacy/vocab.pyx\", line 199, in spacy.vocab.Vocab.get\n```\nYou can work around this by using a try/except inside the memory zone, and raising the caught exception _outside_ of it, like this:\n```python\nimport spacy\n\ndef spacy_proc(nlp, text, should_raise=False):\n    err = None\n    with nlp.memory_zone():\n        try:\n          doc = nlp(text)\n          for token in doc:\n              print(token.text, token.pos_, token.dep_)\n\n          if should_raise: \n              raise Exception(\"This is a test exception to check memory zone handling.\")\n\n          return doc\n        except Exception as e:\n             err = e\n    raise err  # raise _after_ the memory zone closes\n\ndef main():\n    nlp = spacy.load(\"en_core_web_md\")\n    try:\n        spacy_proc(nlp, \"This is a test sentence to check memory zones in spaCy.\", should_raise=Tr  ue)\n    except Exception:\n        pass  # Handle the exception gracefully\n\n    spacy_proc(nlp, \"Some more text to process after the exception.\") # succeeds\n```\n\nI'm not sure if this is the intended implementation, but it feels like a sharp edge to me and should be documented. Or the memory zone should ensure it handles exceptions and closes down correctly before raising them.\n\n## Your Environment\n### Info about spaCy\n\n- **spaCy version:** 3.8.11\n- **Platform:** macOS-26.1-arm64-arm-64bit-Mach-O (also seeing this on AWS Graviton, ARM environment)\n- **Python version:** 3.13.3\n- **Pipelines:** en_core_web_md (3.8.0)",
+      "location": {
+        "files": [
+          "spacy/strings.pyx",
+          "spacy/vocab.pyx"
+        ]
+      },
+      "evidence": {
+        "eventual_fix_title": "Fix memory_zone cleanup on exception",
+        "eventual_fix_problem_statement": "Fix memory_zone cleanup on exception\n\n## Summary\n\nWhen an exception propagates out of `nlp.memory_zone()`, the cleanup code in `StringStore.memory_zone()` and `Vocab.memory_zone()` never runs. This leaves the vocab in a broken state (transient strings/lexemes not cleared, `self.mem` still pointing to a temporary pool), causing an `AssertionError` in `Vocab.get()` on the next call to `nlp()`.\n\nFixes #13924\n\n## Root cause\n\nBoth `StringStore.memory_zone()` and `Vocab.memory_zone()` use `@contextmanager` with cleanup code placed after `yield` but without a `try/finally` wrapper. In a `@contextmanager`, code after `yield` only runs on normal exit. If an exception is thrown at the `yield` point, it propagates without executing the cleanup.\n\n## Changes\n\n- **`spacy/strings.pyx`**: Wrap `yield` and cleanup (clearing transient keys, restoring `self.mem`) in `try/finally`\n- **`spacy/vocab.pyx`**: Same pattern for `_clear_transient_orths()` and `self.mem` restore\n- **`spacy/tests/vocab_vectors/test_memory_zone.py`**: Add regression test that raises inside a memory zone and verifies the vocab is usable afterward\n\n## Testing\n\n- All existing `test_memory_zone` tests pass (no change to happy-path behavior)\n- New `test_memory_zone_exception_cleanup` verifies:\n  - `vocab.in_memory_zone` is `False` after exception\n  - Pre-existing words still accessible\n  - Transient words from the failed zone are cleaned up\n  - Vocab accepts new words without errors",
+        "eventual_fix_diff": "commit cfa1d3a59abd8ebb859070f97d681120ac9d07a7\nAuthor: Kaushik Rajan <kaushi@alumni.ncsu.edu>\nDate:   Sun Mar 15 15:59:09 2026 +0530\n\n    fix: ensure memory_zone cleanup runs on exception (#13924) (#13932)\n    \n    Wrap yield in try/finally in StringStore.memory_zone and\n    Vocab.memory_zone so transient state is always cleaned up,\n    even when an exception propagates through the context manager.\n\ndiff --git a/spacy/strings.pyx b/spacy/strings.pyx\nindex 65e851cae..a65cdb6fc 100644\n--- a/spacy/strings.pyx\n+++ b/spacy/strings.pyx\n@@ -205,11 +205,13 @@ cdef class StringStore:\n         if mem is None:\n             mem = Pool()\n         self.mem = mem\n-        yield mem\n-        for key in self._transient_keys:\n-            map_clear(self._map.c_map, key)\n-        self._transient_keys.clear()\n-        self.mem = self._non_temp_mem\n+        try:\n+            yield mem\n+        finally:\n+            for key in self._transient_keys:\n+                map_clear(self._map.c_map, key)\n+            self._transient_keys.clear()\n+            self.mem = self._non_temp_mem\n \n     def add(self, string: str, allow_transient: Optional[bool] = None) -> int:\n         \"\"\"Add a string to the StringStore.\ndiff --git a/spacy/tests/vocab_vectors/test_memory_zone.py b/spacy/tests/vocab_vectors/test_memory_zone.py\nindex 910d2664e..f718afa2f 100644\n--- a/spacy/tests/vocab_vectors/test_memory_zone.py\n+++ b/spacy/tests/vocab_vectors/test_memory_zone.py\n@@ -34,3 +34,26 @@ def test_memory_zone_redundant_insertion():\n         _ = vocab[\"dog\"]\n     assert \"dog\" in vocab\n     assert \"horse\" not in vocab\n+\n+\n+def test_memory_zone_exception_cleanup():\n+    \"\"\"Test that if an exception occurs inside a memory zone, the vocab\n+    is properly cleaned up and remains usable afterward.\"\"\"\n+    vocab = Vocab()\n+    _ = vocab[\"dog\"]\n+    assert \"dog\" in vocab\n+    try:\n+        with vocab.memory_zone():\n+            _ = vocab[\"horse\"]\n+            raise ValueError(\"simulated error\")\n+    except ValueError:\n+        pass\n+    # Vocab should not be stuck in memory zone state\n+    assert not vocab.in_memory_zone\n+    # Pre-existing words should still work\n+    assert \"dog\" in vocab\n+    # Transient word from failed zone should be cleaned up\n+    assert \"horse\" not in vocab\n+    # Vocab should be fully usable for new operations\n+    lex = vocab[\"cat\"]\n+    assert lex.text == \"cat\"\ndiff --git a/spacy/vocab.pyx b/spacy/vocab.pyx\nindex 11043c17a..4bf80c85d 100644\n--- a/spacy/vocab.pyx\n+++ b/spacy/vocab.pyx\n@@ -150,9 +150,11 @@ cdef class Vocab:\n             if hasattr(self._vectors, \"memory_zone\"):\n                 contexts.append(stack.enter_context(self._vectors.memory_zone(mem)))\n             self.mem = mem\n-            yield mem\n-        self._clear_transient_orths()\n-        self.mem = self._non_temp_mem\n+            try:\n+                yield mem\n+            finally:\n+                self._clear_transient_orths()\n+                self.mem = self._non_temp_mem\n \n     def add_flag(self, flag_getter, int flag_id=-1):\n         \"\"\"Set a new boolean flag to words in the vocabulary.\n"
+      },
+      "metadata": {
+        "oracle_source": "issue",
+        "issue_number": 13924,
+        "issue_url": "https://github.com/explosion/spaCy/issues/13924",
+        "issue_type": "",
+        "issue_priority": null,
+        "issue_severity": null,
+        "issue_tags": [],
+        "issue_area_path": "",
+        "issue_resolved_reason": "",
+        "fix_pr": 13932,
+        "fix_pr_url": "https://github.com/explosion/spaCy/pull/13932",
+        "fix_commit": "cfa1d3a59abd8ebb859070f97d681120ac9d07a7",
+        "verification": {
+          "root_cause_confirmed": "yes",
+          "source": "published task list"
+        }
+      }
+    }
+  ]
+}

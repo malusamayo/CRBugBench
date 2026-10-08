@@ -1,0 +1,1030 @@
+diff --git a/packages/react-reconciler/src/ReactFiberAsyncAction.js b/packages/react-reconciler/src/ReactFiberAsyncAction.js
+new file mode 100644
+index 000000000000..4c1b67e11eed
+--- /dev/null
++++ b/packages/react-reconciler/src/ReactFiberAsyncAction.js
+@@ -0,0 +1,130 @@
++/**
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ *
++ * @flow
++ */
++
++import type {Wakeable} from 'shared/ReactTypes';
++import type {Lane} from './ReactFiberLane';
++import {requestTransitionLane} from './ReactFiberRootScheduler';
++
++interface AsyncActionImpl {
++  lane: Lane;
++  listeners: Array<(false) => mixed>;
++  count: number;
++  then(
++    onFulfill: (value: boolean) => mixed,
++    onReject: (error: mixed) => mixed,
++  ): void;
++}
++
++interface PendingAsyncAction extends AsyncActionImpl {
++  status: 'pending';
++}
++
++interface FulfilledAsyncAction extends AsyncActionImpl {
++  status: 'fulfilled';
++  value: boolean;
++}
++
++interface RejectedAsyncAction extends AsyncActionImpl {
++  status: 'rejected';
++  reason: mixed;
++}
++
++type AsyncAction =
++  | PendingAsyncAction
++  | FulfilledAsyncAction
++  | RejectedAsyncAction;
++
++let currentAsyncAction: AsyncAction | null = null;
++
++export function requestAsyncActionContext(
++  actionReturnValue: mixed,
++): AsyncAction | false {
++  if (
++    actionReturnValue !== null &&
++    typeof actionReturnValue === 'object' &&
++    typeof actionReturnValue.then === 'function'
++  ) {
++    // This is an async action.
++    //
++    // Return a thenable that resolves once the action scope (i.e. the async
++    // function passed to startTransition) has finished running. The fulfilled
++    // value is `false` to represent that the action is not pending.
++    const thenable: Wakeable = (actionReturnValue: any);
++    if (currentAsyncAction === null) {
++      // There's no outer async action scope. Create a new one.
++      const asyncAction: AsyncAction = {
++        lane: requestTransitionLane(),
++        listeners: [],
++        count: 0,
++        status: 'pending',
++        value: false,
++        reason: undefined,
++        then(resolve: boolean => mixed) {
++          asyncAction.listeners.push(resolve);
++        },
++      };
++      attachPingListeners(thenable, asyncAction);
++      currentAsyncAction = asyncAction;
++      return asyncAction;
++    } else {
++      // Inherit the outer scope.
++      const asyncAction: AsyncAction = (currentAsyncAction: any);
++      attachPingListeners(thenable, asyncAction);
++      return asyncAction;
++    }
++  } else {
++    // This is not an async action, but it may be part of an outer async action.
++    if (currentAsyncAction === null) {
++      // There's no outer async action scope.
++      return false;
++    } else {
++      // Inherit the outer scope.
++      return currentAsyncAction;
++    }
++  }
++}
++
++export function peekAsyncActionContext(): AsyncAction | null {
++  return currentAsyncAction;
++}
++
++function attachPingListeners(thenable: Wakeable, asyncAction: AsyncAction) {
++  asyncAction.count++;
++  thenable.then(
++    () => {
++      if (--asyncAction.count === 0) {
++        const fulfilledAsyncAction: FulfilledAsyncAction = (asyncAction: any);
++        fulfilledAsyncAction.status = 'fulfilled';
++        completeAsyncActionScope(asyncAction);
++      }
++    },
++    (error: mixed) => {
++      if (--asyncAction.count === 0) {
++        const rejectedAsyncAction: RejectedAsyncAction = (asyncAction: any);
++        rejectedAsyncAction.status = 'rejected';
++        rejectedAsyncAction.reason = error;
++        completeAsyncActionScope(asyncAction);
++      }
++    },
++  );
++  return asyncAction;
++}
++
++function completeAsyncActionScope(action: AsyncAction) {
++  if (currentAsyncAction === action) {
++    currentAsyncAction = null;
++  }
++
++  const listeners = action.listeners;
++  action.listeners = [];
++  for (let i = 0; i < listeners.length; i++) {
++    const listener = listeners[i];
++    listener(false);
++  }
++}
+diff --git a/packages/react-reconciler/src/ReactFiberHooks.js b/packages/react-reconciler/src/ReactFiberHooks.js
+index 4be1994114a3..67375ad82925 100644
+--- a/packages/react-reconciler/src/ReactFiberHooks.js
++++ b/packages/react-reconciler/src/ReactFiberHooks.js
+@@ -15,6 +15,7 @@ import type {
+   StartTransitionOptions,
+   Usable,
+   Thenable,
++  RejectedThenable,
+ } from 'shared/ReactTypes';
+ import type {
+   Fiber,
+@@ -41,6 +42,7 @@ import {
+   enableUseEffectEventHook,
+   enableLegacyCache,
+   debugRenderPhaseSideEffectsForStrictMode,
++  enableAsyncActions,
+ } from 'shared/ReactFeatureFlags';
+ import {
+   REACT_CONTEXT_TYPE,
+@@ -143,6 +145,7 @@ import {
+ } from './ReactFiberThenable';
+ import type {ThenableState} from './ReactFiberThenable';
+ import type {BatchConfigTransition} from './ReactFiberTracingMarkerComponent';
++import {requestAsyncActionContext} from './ReactFiberAsyncAction';
+ 
+ const {ReactCurrentDispatcher, ReactCurrentBatchConfig} = ReactSharedInternals;
+ 
+@@ -947,38 +950,40 @@ if (enableUseMemoCacheHook) {
+   };
+ }
+ 
++function useThenable<T>(thenable: Thenable<T>): T {
++  // Track the position of the thenable within this fiber.
++  const index = thenableIndexCounter;
++  thenableIndexCounter += 1;
++  if (thenableState === null) {
++    thenableState = createThenableState();
++  }
++  const result = trackUsedThenable(thenableState, thenable, index);
++  if (
++    currentlyRenderingFiber.alternate === null &&
++    (workInProgressHook === null
++      ? currentlyRenderingFiber.memoizedState === null
++      : workInProgressHook.next === null)
++  ) {
++    // Initial render, and either this is the first time the component is
++    // called, or there were no Hooks called after this use() the previous
++    // time (perhaps because it threw). Subsequent Hook calls should use the
++    // mount dispatcher.
++    if (__DEV__) {
++      ReactCurrentDispatcher.current = HooksDispatcherOnMountInDEV;
++    } else {
++      ReactCurrentDispatcher.current = HooksDispatcherOnMount;
++    }
++  }
++  return result;
++}
++
+ function use<T>(usable: Usable<T>): T {
+   if (usable !== null && typeof usable === 'object') {
+     // $FlowFixMe[method-unbinding]
+     if (typeof usable.then === 'function') {
+       // This is a thenable.
+       const thenable: Thenable<T> = (usable: any);
+-
+-      // Track the position of the thenable within this fiber.
+-      const index = thenableIndexCounter;
+-      thenableIndexCounter += 1;
+-
+-      if (thenableState === null) {
+-        thenableState = createThenableState();
+-      }
+-      const result = trackUsedThenable(thenableState, thenable, index);
+-      if (
+-        currentlyRenderingFiber.alternate === null &&
+-        (workInProgressHook === null
+-          ? currentlyRenderingFiber.memoizedState === null
+-          : workInProgressHook.next === null)
+-      ) {
+-        // Initial render, and either this is the first time the component is
+-        // called, or there were no Hooks called after this use() the previous
+-        // time (perhaps because it threw). Subsequent Hook calls should use the
+-        // mount dispatcher.
+-        if (__DEV__) {
+-          ReactCurrentDispatcher.current = HooksDispatcherOnMountInDEV;
+-        } else {
+-          ReactCurrentDispatcher.current = HooksDispatcherOnMount;
+-        }
+-      }
+-      return result;
++      return useThenable(thenable);
+     } else if (
+       usable.$$typeof === REACT_CONTEXT_TYPE ||
+       usable.$$typeof === REACT_SERVER_CONTEXT_TYPE
+@@ -2400,8 +2405,8 @@ function updateDeferredValueImpl<T>(hook: Hook, prevValue: T, value: T): T {
+ }
+ 
+ function startTransition(
+-  setPending: boolean => void,
+-  callback: () => void,
++  setPending: (Thenable<boolean> | boolean) => void,
++  callback: () => mixed,
+   options?: StartTransitionOptions,
+ ): void {
+   const previousPriority = getCurrentUpdatePriority();
+@@ -2427,8 +2432,36 @@ function startTransition(
+   }
+ 
+   try {
+-    setPending(false);
+-    callback();
++    if (enableAsyncActions) {
++      const returnValue = callback();
++
++      // `isPending` is either `false` or a thenable that resolves to `false`,
++      // depending on whether the action scope is an async function. In the
++      // async case, the resulting render will suspend until the async action
++      // scope has finished.
++      const isPending = requestAsyncActionContext(returnValue);
++      setPending(isPending);
++    } else {
++      // Async actions are not enabled.
++      callback();
++      setPending(false);
++    }
++  } catch (error) {
++    if (enableAsyncActions) {
++      // This is a trick to get the `useTransition` hook to rethrow the error.
++      // When it unwraps the thenable with the `use` algorithm, the error
++      // will be thrown.
++      const rejectedThenable: RejectedThenable<boolean> = {
++        then() {},
++        status: 'rejected',
++        reason: error,
++      };
++      setPending(rejectedThenable);
++    } else {
++      // The error rethrowing behavior is only enabled when the async actions
++      // feature is on, even for sync actions.
++      throw error;
++    }
+   } finally {
+     setCurrentUpdatePriority(previousPriority);
+ 
+@@ -2454,21 +2487,26 @@ function mountTransition(): [
+   boolean,
+   (callback: () => void, options?: StartTransitionOptions) => void,
+ ] {
+-  const [isPending, setPending] = mountState(false);
++  const [, setPending] = mountState((false: Thenable<boolean> | boolean));
+   // The `start` method never changes.
+   const start = startTransition.bind(null, setPending);
+   const hook = mountWorkInProgressHook();
+   hook.memoizedState = start;
+-  return [isPending, start];
++  return [false, start];
+ }
+ 
+ function updateTransition(): [
+   boolean,
+   (callback: () => void, options?: StartTransitionOptions) => void,
+ ] {
+-  const [isPending] = updateState(false);
++  const [booleanOrThenable] = updateState(false);
+   const hook = updateWorkInProgressHook();
+   const start = hook.memoizedState;
++  const isPending =
++    typeof booleanOrThenable === 'boolean'
++      ? booleanOrThenable
++      : // This will suspend until the async action scope has finished.
++        useThenable(booleanOrThenable);
+   return [isPending, start];
+ }
+ 
+@@ -2476,9 +2514,14 @@ function rerenderTransition(): [
+   boolean,
+   (callback: () => void, options?: StartTransitionOptions) => void,
+ ] {
+-  const [isPending] = rerenderState(false);
++  const [booleanOrThenable] = rerenderState(false);
+   const hook = updateWorkInProgressHook();
+   const start = hook.memoizedState;
++  const isPending =
++    typeof booleanOrThenable === 'boolean'
++      ? booleanOrThenable
++      : // This will suspend until the async action scope has finished.
++        useThenable(booleanOrThenable);
+   return [isPending, start];
+ }
+ 
+diff --git a/packages/react-reconciler/src/ReactFiberRootScheduler.js b/packages/react-reconciler/src/ReactFiberRootScheduler.js
+index 86f882a02572..8e0c65b8552d 100644
+--- a/packages/react-reconciler/src/ReactFiberRootScheduler.js
++++ b/packages/react-reconciler/src/ReactFiberRootScheduler.js
+@@ -22,6 +22,7 @@ import {
+   markStarvedLanesAsExpired,
+   markRootEntangled,
+   mergeLanes,
++  claimNextTransitionLane,
+ } from './ReactFiberLane';
+ import {
+   CommitContext,
+@@ -78,7 +79,7 @@ let mightHavePendingSyncWork: boolean = false;
+ 
+ let isFlushingWork: boolean = false;
+ 
+-let currentEventTransitionLane: Lane = NoLanes;
++let currentEventTransitionLane: Lane = NoLane;
+ 
+ export function ensureRootIsScheduled(root: FiberRoot): void {
+   // This function is called whenever a root receives an update. It does two
+@@ -491,10 +492,17 @@ function scheduleImmediateTask(cb: () => mixed) {
+   }
+ }
+ 
+-export function getCurrentEventTransitionLane(): Lane {
++export function requestTransitionLane(): Lane {
++  // The algorithm for assigning an update to a lane should be stable for all
++  // updates at the same priority within the same event. To do this, the
++  // inputs to the algorithm must be the same.
++  //
++  // The trick we use is to cache the first of each of these inputs within an
++  // event. Then reset the cached values once we can be sure the event is
++  // over. Our heuristic for that is whenever we enter a concurrent work loop.
++  if (currentEventTransitionLane === NoLane) {
++    // All transitions within the same event are assigned the same lane.
++    currentEventTransitionLane = claimNextTransitionLane();
++  }
+   return currentEventTransitionLane;
+ }
+-
+-export function setCurrentEventTransitionLane(lane: Lane): void {
+-  currentEventTransitionLane = lane;
+-}
+diff --git a/packages/react-reconciler/src/ReactFiberWorkLoop.js b/packages/react-reconciler/src/ReactFiberWorkLoop.js
+index 89781a4cfad2..96c4ea925511 100644
+--- a/packages/react-reconciler/src/ReactFiberWorkLoop.js
++++ b/packages/react-reconciler/src/ReactFiberWorkLoop.js
+@@ -129,7 +129,6 @@ import {
+   NoLanes,
+   NoLane,
+   SyncLane,
+-  claimNextTransitionLane,
+   claimNextRetryLane,
+   includesSyncLane,
+   isSubsetOfLanes,
+@@ -278,10 +277,10 @@ import {
+   flushSyncWorkOnAllRoots,
+   flushSyncWorkOnLegacyRootsOnly,
+   getContinuationForRoot,
+-  getCurrentEventTransitionLane,
+-  setCurrentEventTransitionLane,
++  requestTransitionLane,
+ } from './ReactFiberRootScheduler';
+ import {getMaskedContext, getUnmaskedContext} from './ReactFiberContext';
++import {peekAsyncActionContext} from './ReactFiberAsyncAction';
+ 
+ const PossiblyWeakMap = typeof WeakMap === 'function' ? WeakMap : Map;
+ 
+@@ -633,18 +632,15 @@ export function requestUpdateLane(fiber: Fiber): Lane {
+ 
+       transition._updatedFibers.add(fiber);
+     }
+-    // The algorithm for assigning an update to a lane should be stable for all
+-    // updates at the same priority within the same event. To do this, the
+-    // inputs to the algorithm must be the same.
+-    //
+-    // The trick we use is to cache the first of each of these inputs within an
+-    // event. Then reset the cached values once we can be sure the event is
+-    // over. Our heuristic for that is whenever we enter a concurrent work loop.
+-    if (getCurrentEventTransitionLane() === NoLane) {
+-      // All transitions within the same event are assigned the same lane.
+-      setCurrentEventTransitionLane(claimNextTransitionLane());
+-    }
+-    return getCurrentEventTransitionLane();
++
++    const asyncAction = peekAsyncActionContext();
++    return asyncAction !== null
++      ? // We're inside an async action scope. Reuse the same lane.
++        asyncAction.lane
++      : // We may or may not be inside an async action scope. If we are, this
++        // is the first update in that scope. Either way, we need to get a
++        // fresh transition lane.
++        requestTransitionLane();
+   }
+ 
+   // Updates originating inside certain React methods, like flushSync, have
+diff --git a/packages/react-reconciler/src/__tests__/ReactAsyncActions-test.js b/packages/react-reconciler/src/__tests__/ReactAsyncActions-test.js
+new file mode 100644
+index 000000000000..c9b6efcae833
+--- /dev/null
++++ b/packages/react-reconciler/src/__tests__/ReactAsyncActions-test.js
+@@ -0,0 +1,503 @@
++let React;
++let ReactNoop;
++let Scheduler;
++let act;
++let assertLog;
++let useTransition;
++let useState;
++let textCache;
++
++describe('ReactAsyncActions', () => {
++  beforeEach(() => {
++    jest.resetModules();
++
++    React = require('react');
++    ReactNoop = require('react-noop-renderer');
++    Scheduler = require('scheduler');
++    act = require('internal-test-utils').act;
++    assertLog = require('internal-test-utils').assertLog;
++    useTransition = React.useTransition;
++    useState = React.useState;
++
++    textCache = new Map();
++  });
++
++  function resolveText(text) {
++    const record = textCache.get(text);
++    if (record === undefined) {
++      const newRecord = {
++        status: 'resolved',
++        value: text,
++      };
++      textCache.set(text, newRecord);
++    } else if (record.status === 'pending') {
++      const thenable = record.value;
++      record.status = 'resolved';
++      record.value = text;
++      thenable.pings.forEach(t => t());
++    }
++  }
++
++  function readText(text) {
++    const record = textCache.get(text);
++    if (record !== undefined) {
++      switch (record.status) {
++        case 'pending':
++          Scheduler.log(`Suspend! [${text}]`);
++          throw record.value;
++        case 'rejected':
++          throw record.value;
++        case 'resolved':
++          return record.value;
++      }
++    } else {
++      Scheduler.log(`Suspend! [${text}]`);
++      const thenable = {
++        pings: [],
++        then(resolve) {
++          if (newRecord.status === 'pending') {
++            thenable.pings.push(resolve);
++          } else {
++            Promise.resolve().then(() => resolve(newRecord.value));
++          }
++        },
++      };
++
++      const newRecord = {
++        status: 'pending',
++        value: thenable,
++      };
++      textCache.set(text, newRecord);
++
++      throw thenable;
++    }
++  }
++
++  function getText(text) {
++    const record = textCache.get(text);
++    if (record === undefined) {
++      const thenable = {
++        pings: [],
++        then(resolve) {
++          if (newRecord.status === 'pending') {
++            thenable.pings.push(resolve);
++          } else {
++            Promise.resolve().then(() => resolve(newRecord.value));
++          }
++        },
++      };
++      const newRecord = {
++        status: 'pending',
++        value: thenable,
++      };
++      textCache.set(text, newRecord);
++      return thenable;
++    } else {
++      switch (record.status) {
++        case 'pending':
++          return record.value;
++        case 'rejected':
++          return Promise.reject(record.value);
++        case 'resolved':
++          return Promise.resolve(record.value);
++      }
++    }
++  }
++
++  function Text({text}) {
++    Scheduler.log(text);
++    return text;
++  }
++
++  function AsyncText({text}) {
++    readText(text);
++    Scheduler.log(text);
++    return text;
++  }
++
++  // @gate enableAsyncActions
++  test('isPending remains true until async action finishes', async () => {
++    let startTransition;
++    function App() {
++      const [isPending, _start] = useTransition();
++      startTransition = _start;
++      return <Text text={'Pending: ' + isPending} />;
++    }
++
++    const root = ReactNoop.createRoot();
++    await act(() => {
++      root.render(<App />);
++    });
++    assertLog(['Pending: false']);
++    expect(root).toMatchRenderedOutput('Pending: false');
++
++    // At the start of an async action, isPending is set to true.
++    await act(() => {
++      startTransition(async () => {
++        Scheduler.log('Async action started');
++        await getText('Wait');
++        Scheduler.log('Async action ended');
++      });
++    });
++    assertLog(['Async action started', 'Pending: true']);
++    expect(root).toMatchRenderedOutput('Pending: true');
++
++    // Once the action finishes, isPending is set back to false.
++    await act(() => resolveText('Wait'));
++    assertLog(['Async action ended', 'Pending: false']);
++    expect(root).toMatchRenderedOutput('Pending: false');
++  });
++
++  // @gate enableAsyncActions
++  test('multiple updates in an async action scope are entangled together', async () => {
++    let startTransition;
++    function App({text}) {
++      const [isPending, _start] = useTransition();
++      startTransition = _start;
++      return (
++        <>
++          <span>
++            <Text text={'Pending: ' + isPending} />
++          </span>
++          <span>
++            <Text text={text} />
++          </span>
++        </>
++      );
++    }
++
++    const root = ReactNoop.createRoot();
++    await act(() => {
++      root.render(<App text="A" />);
++    });
++    assertLog(['Pending: false', 'A']);
++    expect(root).toMatchRenderedOutput(
++      <>
++        <span>Pending: false</span>
++        <span>A</span>
++      </>,
++    );
++
++    await act(() => {
++      startTransition(async () => {
++        Scheduler.log('Async action started');
++        await getText('Yield before updating');
++        Scheduler.log('Async action ended');
++        startTransition(() => root.render(<App text="B" />));
++      });
++    });
++    assertLog(['Async action started', 'Pending: true', 'A']);
++    expect(root).toMatchRenderedOutput(
++      <>
++        <span>Pending: true</span>
++        <span>A</span>
++      </>,
++    );
++
++    await act(() => resolveText('Yield before updating'));
++    assertLog(['Async action ended', 'Pending: false', 'B']);
++    expect(root).toMatchRenderedOutput(
++      <>
++        <span>Pending: false</span>
++        <span>B</span>
++      </>,
++    );
++  });
++
++  // @gate enableAsyncActions
++  test('multiple async action updates in the same scope are entangled together', async () => {
++    let setStepA;
++    function A() {
++      const [step, setStep] = useState(0);
++      setStepA = setStep;
++      return <AsyncText text={'A' + step} />;
++    }
++
++    let setStepB;
++    function B() {
++      const [step, setStep] = useState(0);
++      setStepB = setStep;
++      return <AsyncText text={'B' + step} />;
++    }
++
++    let setStepC;
++    function C() {
++      const [step, setStep] = useState(0);
++      setStepC = setStep;
++      return <AsyncText text={'C' + step} />;
++    }
++
++    let startTransition;
++    function App() {
++      const [isPending, _start] = useTransition();
++      startTransition = _start;
++      return (
++        <>
++          <span>
++            <Text text={'Pending: ' + isPending} />
++          </span>
++          <span>
++            <A />, <B />, <C />
++          </span>
++        </>
++      );
++    }
++
++    const root = ReactNoop.createRoot();
++    resolveText('A0');
++    resolveText('B0');
++    resolveText('C0');
++    await act(() => {
++      root.render(<App text="A" />);
++    });
++    assertLog(['Pending: false', 'A0', 'B0', 'C0']);
++    expect(root).toMatchRenderedOutput(
++      <>
++        <span>Pending: false</span>
++        <span>A0, B0, C0</span>
++      </>,
++    );
++
++    await act(() => {
++      startTransition(async () => {
++        Scheduler.log('Async action started');
++        setStepA(1);
++        await getText('Wait before updating B');
++        startTransition(() => setStepB(1));
++        await getText('Wait before updating C');
++        startTransition(() => setStepC(1));
++        Scheduler.log('Async action ended');
++      });
++    });
++    assertLog(['Async action started', 'Pending: true', 'A0', 'B0', 'C0']);
++    expect(root).toMatchRenderedOutput(
++      <>
++        <span>Pending: true</span>
++        <span>A0, B0, C0</span>
++      </>,
++    );
++
++    // This will schedule an update on B, but nothing will render yet because
++    // the async action scope hasn't finished.
++    await act(() => resolveText('Wait before updating B'));
++    assertLog([]);
++    expect(root).toMatchRenderedOutput(
++      <>
++        <span>Pending: true</span>
++        <span>A0, B0, C0</span>
++      </>,
++    );
++
++    // This will schedule an update on C, and also the async action scope
++    // will end. This will allow React to attempt to render the updates.
++    await act(() => resolveText('Wait before updating C'));
++    assertLog(['Async action ended', 'Pending: false', 'Suspend! [A1]']);
++    expect(root).toMatchRenderedOutput(
++      <>
++        <span>Pending: true</span>
++        <span>A0, B0, C0</span>
++      </>,
++    );
++
++    // Progressively load the all the data. Because they are all entangled
++    // together, only when the all of A, B, and C updates are unblocked is the
++    // render allowed to proceed.
++    await act(() => resolveText('A1'));
++    assertLog(['Pending: false', 'A1', 'Suspend! [B1]']);
++    expect(root).toMatchRenderedOutput(
++      <>
++        <span>Pending: true</span>
++        <span>A0, B0, C0</span>
++      </>,
++    );
++    await act(() => resolveText('B1'));
++    assertLog(['Pending: false', 'A1', 'B1', 'Suspend! [C1]']);
++    expect(root).toMatchRenderedOutput(
++      <>
++        <span>Pending: true</span>
++        <span>A0, B0, C0</span>
++      </>,
++    );
++
++    // Finally, all the data has loaded and the transition is complete.
++    await act(() => resolveText('C1'));
++    assertLog(['Pending: false', 'A1', 'B1', 'C1']);
++    expect(root).toMatchRenderedOutput(
++      <>
++        <span>Pending: false</span>
++        <span>A1, B1, C1</span>
++      </>,
++    );
++  });
++
++  // @gate enableAsyncActions
++  test('urgent updates are not blocked during an async action', async () => {
++    let setStepA;
++    function A() {
++      const [step, setStep] = useState(0);
++      setStepA = setStep;
++      return <Text text={'A' + step} />;
++    }
++
++    let setStepB;
++    function B() {
++      const [step, setStep] = useState(0);
++      setStepB = setStep;
++      return <Text text={'B' + step} />;
++    }
++
++    let startTransition;
++    function App() {
++      const [isPending, _start] = useTransition();
++      startTransition = _start;
++      return (
++        <>
++          <span>
++            <Text text={'Pending: ' + isPending} />
++          </span>
++          <span>
++            <A />, <B />
++          </span>
++        </>
++      );
++    }
++
++    const root = ReactNoop.createRoot();
++    await act(() => {
++      root.render(<App text="A" />);
++    });
++    assertLog(['Pending: false', 'A0', 'B0']);
++    expect(root).toMatchRenderedOutput(
++      <>
++        <span>Pending: false</span>
++        <span>A0, B0</span>
++      </>,
++    );
++
++    await act(() => {
++      startTransition(async () => {
++        Scheduler.log('Async action started');
++        startTransition(() => setStepA(1));
++        await getText('Wait');
++        Scheduler.log('Async action ended');
++      });
++    });
++    assertLog(['Async action started', 'Pending: true', 'A0', 'B0']);
++    expect(root).toMatchRenderedOutput(
++      <>
++        <span>Pending: true</span>
++        <span>A0, B0</span>
++      </>,
++    );
++
++    // Update B at urgent priority. This should be allowed to finish.
++    await act(() => setStepB(1));
++    assertLog(['B1']);
++    expect(root).toMatchRenderedOutput(
++      <>
++        <span>Pending: true</span>
++        <span>A0, B1</span>
++      </>,
++    );
++
++    // Finish the async action.
++    await act(() => resolveText('Wait'));
++    assertLog(['Async action ended', 'Pending: false', 'A1', 'B1']);
++    expect(root).toMatchRenderedOutput(
++      <>
++        <span>Pending: false</span>
++        <span>A1, B1</span>
++      </>,
++    );
++  });
++
++  // @gate enableAsyncActions
++  test("if a sync action throws, it's rethrown from the `useTransition`", async () => {
++    class ErrorBoundary extends React.Component {
++      state = {error: null};
++      static getDerivedStateFromError(error) {
++        return {error};
++      }
++      render() {
++        if (this.state.error) {
++          return <Text text={this.state.error.message} />;
++        }
++        return this.props.children;
++      }
++    }
++
++    let startTransition;
++    function App() {
++      const [isPending, _start] = useTransition();
++      startTransition = _start;
++      return <Text text={'Pending: ' + isPending} />;
++    }
++
++    const root = ReactNoop.createRoot();
++    await act(() => {
++      root.render(
++        <ErrorBoundary>
++          <App />
++        </ErrorBoundary>,
++      );
++    });
++    assertLog(['Pending: false']);
++    expect(root).toMatchRenderedOutput('Pending: false');
++
++    await act(() => {
++      startTransition(() => {
++        throw new Error('Oops!');
++      });
++    });
++    assertLog(['Pending: true', 'Oops!', 'Oops!']);
++    expect(root).toMatchRenderedOutput('Oops!');
++  });
++
++  // @gate enableAsyncActions
++  test("if an async action throws, it's rethrown from the `useTransition`", async () => {
++    class ErrorBoundary extends React.Component {
++      state = {error: null};
++      static getDerivedStateFromError(error) {
++        return {error};
++      }
++      render() {
++        if (this.state.error) {
++          return <Text text={this.state.error.message} />;
++        }
++        return this.props.children;
++      }
++    }
++
++    let startTransition;
++    function App() {
++      const [isPending, _start] = useTransition();
++      startTransition = _start;
++      return <Text text={'Pending: ' + isPending} />;
++    }
++
++    const root = ReactNoop.createRoot();
++    await act(() => {
++      root.render(
++        <ErrorBoundary>
++          <App />
++        </ErrorBoundary>,
++      );
++    });
++    assertLog(['Pending: false']);
++    expect(root).toMatchRenderedOutput('Pending: false');
++
++    await act(() => {
++      startTransition(async () => {
++        Scheduler.log('Async action started');
++        await getText('Wait');
++        throw new Error('Oops!');
++      });
++    });
++    assertLog(['Async action started', 'Pending: true']);
++    expect(root).toMatchRenderedOutput('Pending: true');
++
++    await act(() => resolveText('Wait'));
++    assertLog(['Oops!', 'Oops!']);
++    expect(root).toMatchRenderedOutput('Oops!');
++  });
++});
+diff --git a/packages/shared/ReactFeatureFlags.js b/packages/shared/ReactFeatureFlags.js
+index 58500c823973..5bb3bd112888 100644
+--- a/packages/shared/ReactFeatureFlags.js
++++ b/packages/shared/ReactFeatureFlags.js
+@@ -120,6 +120,8 @@ export const enableFizzExternalRuntime = true;
+ // Performance related test
+ export const diffInCommitPhase = __EXPERIMENTAL__;
+ 
++export const enableAsyncActions = __EXPERIMENTAL__;
++
+ // -----------------------------------------------------------------------------
+ // Chopping Block
+ //
+diff --git a/packages/shared/forks/ReactFeatureFlags.native-fb.js b/packages/shared/forks/ReactFeatureFlags.native-fb.js
+index cc7dc4ef91d4..0e2c91573145 100644
+--- a/packages/shared/forks/ReactFeatureFlags.native-fb.js
++++ b/packages/shared/forks/ReactFeatureFlags.native-fb.js
+@@ -82,6 +82,7 @@ export const useModernStrictMode = false;
+ export const enableFizzExternalRuntime = false;
+ 
+ export const diffInCommitPhase = true;
++export const enableAsyncActions = false;
+ 
+ // Flow magic to verify the exports of this file match the original version.
+ ((((null: any): ExportsType): FeatureFlagsType): ExportsType);
+diff --git a/packages/shared/forks/ReactFeatureFlags.native-oss.js b/packages/shared/forks/ReactFeatureFlags.native-oss.js
+index ebb4f2b154db..ef559e28b59f 100644
+--- a/packages/shared/forks/ReactFeatureFlags.native-oss.js
++++ b/packages/shared/forks/ReactFeatureFlags.native-oss.js
+@@ -72,6 +72,7 @@ export const enableFizzExternalRuntime = false;
+ export const enableDeferRootSchedulingToMicrotask = true;
+ 
+ export const diffInCommitPhase = true;
++export const enableAsyncActions = false;
+ 
+ // Flow magic to verify the exports of this file match the original version.
+ ((((null: any): ExportsType): FeatureFlagsType): ExportsType);
+diff --git a/packages/shared/forks/ReactFeatureFlags.test-renderer.js b/packages/shared/forks/ReactFeatureFlags.test-renderer.js
+index b733725c9dc8..221663c3a8c8 100644
+--- a/packages/shared/forks/ReactFeatureFlags.test-renderer.js
++++ b/packages/shared/forks/ReactFeatureFlags.test-renderer.js
+@@ -72,6 +72,7 @@ export const enableFizzExternalRuntime = false;
+ export const enableDeferRootSchedulingToMicrotask = true;
+ 
+ export const diffInCommitPhase = true;
++export const enableAsyncActions = false;
+ 
+ // Flow magic to verify the exports of this file match the original version.
+ ((((null: any): ExportsType): FeatureFlagsType): ExportsType);
+diff --git a/packages/shared/forks/ReactFeatureFlags.test-renderer.native.js b/packages/shared/forks/ReactFeatureFlags.test-renderer.native.js
+index 2554dd117a29..d4a0e763f7bc 100644
+--- a/packages/shared/forks/ReactFeatureFlags.test-renderer.native.js
++++ b/packages/shared/forks/ReactFeatureFlags.test-renderer.native.js
+@@ -69,6 +69,7 @@ export const useModernStrictMode = false;
+ export const enableDeferRootSchedulingToMicrotask = true;
+ 
+ export const diffInCommitPhase = true;
++export const enableAsyncActions = false;
+ 
+ // Flow magic to verify the exports of this file match the original version.
+ ((((null: any): ExportsType): FeatureFlagsType): ExportsType);
+diff --git a/packages/shared/forks/ReactFeatureFlags.test-renderer.www.js b/packages/shared/forks/ReactFeatureFlags.test-renderer.www.js
+index 25a318e81cf2..bff726e27c01 100644
+--- a/packages/shared/forks/ReactFeatureFlags.test-renderer.www.js
++++ b/packages/shared/forks/ReactFeatureFlags.test-renderer.www.js
+@@ -74,6 +74,7 @@ export const enableFizzExternalRuntime = false;
+ export const enableDeferRootSchedulingToMicrotask = true;
+ 
+ export const diffInCommitPhase = true;
++export const enableAsyncActions = false;
+ 
+ // Flow magic to verify the exports of this file match the original version.
+ ((((null: any): ExportsType): FeatureFlagsType): ExportsType);
+diff --git a/packages/shared/forks/ReactFeatureFlags.www-dynamic.js b/packages/shared/forks/ReactFeatureFlags.www-dynamic.js
+index 2a45a1969cad..ad284d30c545 100644
+--- a/packages/shared/forks/ReactFeatureFlags.www-dynamic.js
++++ b/packages/shared/forks/ReactFeatureFlags.www-dynamic.js
+@@ -26,6 +26,7 @@ export const enableTransitionTracing = __VARIANT__;
+ export const enableCustomElementPropertySupport = __VARIANT__;
+ export const enableDeferRootSchedulingToMicrotask = __VARIANT__;
+ export const diffInCommitPhase = __VARIANT__;
++export const enableAsyncActions = __VARIANT__;
+ 
+ // Enable this flag to help with concurrent mode debugging.
+ // It logs information to the console about React scheduling, rendering, and commit phases.
+diff --git a/packages/shared/forks/ReactFeatureFlags.www.js b/packages/shared/forks/ReactFeatureFlags.www.js
+index d6143be018d9..25fb6d818c2c 100644
+--- a/packages/shared/forks/ReactFeatureFlags.www.js
++++ b/packages/shared/forks/ReactFeatureFlags.www.js
+@@ -29,6 +29,7 @@ export const {
+   enableCustomElementPropertySupport,
+   enableDeferRootSchedulingToMicrotask,
+   diffInCommitPhase,
++  enableAsyncActions,
+ } = dynamicFeatureFlags;
+ 
+ // On WWW, __EXPERIMENTAL__ is used for a new modern build.

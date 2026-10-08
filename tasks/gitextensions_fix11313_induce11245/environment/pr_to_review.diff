@@ -1,0 +1,1018 @@
+commit 6fd6c26d3558feecf9145395cb10f647301aa7e4
+Author: Gerhard Olsson <6248932+gerhardol@users.noreply.github.com>
+Date:   Sat Oct 7 02:40:05 2023 +0200
+
+    Use RevisionReader to read GitRevision with Notes (#11245)
+    
+    * Use RevisionReader to read GitRevision with Notes
+    
+    Do not allocate when replacing VerticalFeed.
+    Add vertical feed test.
+    
+    Optionally read Git Notes in RevisionReader
+    Tests were added.
+    
+    Use RevisionReader to parse revisions also in
+    CommitData and GitModule.
+    This require support of Notes.
+    
+    Add LogOutputEncoding to IGitModule so RevisionReader can use the
+    interface internally.
+    
+    If showing Git Notes, read them when loading the grid so they are handled
+    with the Body in the standard scenario.
+    
+    
+    ---------
+    
+    Co-authored-by: Gerhard Gerhard Olsson <gerhardol@users.noreply.github.com>
+
+diff --git a/GitCommands/CommitDataManager.cs b/GitCommands/CommitDataManager.cs
+index 30cf1818e..47c66930f 100644
+--- a/GitCommands/CommitDataManager.cs
++++ b/GitCommands/CommitDataManager.cs
+@@ -25,9 +25,8 @@ namespace GitCommands
+         /// Gets <see cref="CommitData"/> for the specified <paramref name="commitId"/>.
+         /// </summary>
+         /// <param name="commitId">The sha or Git reference.</param>
+-        /// <param name="error">error message for the Git command</param>
+         /// <param name="cache">Allow caching of the Git command, should only be used if commitId is a sha and Notes are not used.</param>
+-        CommitData? GetCommitData(string commitId, out string? error, bool cache = false);
++        CommitData? GetCommitData(string commitId, bool cache = false);
+ 
+         /// <summary>
+         /// Updates the <see cref="CommitData.Body"/> (commit message) property of <paramref name="commitData"/>.
+@@ -37,11 +36,6 @@ namespace GitCommands
+ 
+     public sealed class CommitDataManager : ICommitDataManager
+     {
+-        private const string CommitDataFormat = "%H%n%n%P%n%aN <%aE>%n%at%n%cN <%cE>%n%ct%n%e%n%B";
+-        private const string CommitDataWithNotesFormat = "%H%n%n%P%n%aN <%aE>%n%at%n%cN <%cE>%n%ct%n%e%n%B%nNotes:%n%-N";
+-        private const string BodyAndNotesFormat = "%B%nNotes:%n%-N";
+-        private const string NotesFormat = "%-N";
+-
+         private readonly Func<IGitModule> _getModule;
+ 
+         public CommitDataManager(Func<IGitModule> getModule)
+@@ -52,7 +46,10 @@ namespace GitCommands
+         /// <inheritdoc />
+         public void UpdateBody(CommitData commitData, bool appendNotesOnly, out string? error)
+         {
+-            if (!TryGetCommitLog(commitData.ObjectId.ToString(), appendNotesOnly ? NotesFormat : BodyAndNotesFormat, out error, out var data, cache: false))
++            const string BodyAndNotesFormat = "%B%nNotes:%n%-N";
++            const string NotesFormat = "%-N";
++
++            if (!TryGetCommitLog(commitData.ObjectId.ToString(), appendNotesOnly ? NotesFormat : BodyAndNotesFormat, out error, out string? data, cache: false))
+             {
+                 return;
+             }
+@@ -61,87 +58,27 @@ namespace GitCommands
+             {
+                 if (!string.IsNullOrWhiteSpace(data))
+                 {
+-                    commitData.Body += $"\nNotes:\n    {GetModule().ReEncodeCommitMessage(data)}";
++                    commitData.Body += $"\nNotes:\n    {GetModule().ReEncodeCommitMessage(data.Replace('\v', '\n'))}";
+                 }
+             }
+             else
+             {
+-                string[] lines = data.Split(Delimiters.LineFeed);
++                string[] lines = data.Split(Delimiters.LineAndVerticalFeed);
+ 
+                 // Commit message is not re-encoded by Git when format is given
+-                commitData.Body = GetModule().ReEncodeCommitMessage(ProcessDiffNotes(startIndex: 0, lines)).Replace('\v', '\n');
++                commitData.Body = GetModule().ReEncodeCommitMessage(ProcessDiffNotes(startIndex: 0, lines));
+             }
+         }
+ 
+         /// <inheritdoc />
+-        public CommitData? GetCommitData(string commitId, [NotNullWhen(true)] out string? error, bool cache = false)
++        public CommitData? GetCommitData(string commitId, bool includeNotes = false)
+         {
+-            return TryGetCommitLog(commitId, cache ? CommitDataFormat : CommitDataWithNotesFormat, out error, out var info, cache)
+-                ? CreateFromFormattedData(info)
++            GitRevision revision = new RevisionReader(GetModule(), allBodies: true).GetRevision(commitId, hasNotes: includeNotes, cancellationToken: default);
++            return revision is not null
++                ? CreateFromRevision(revision, null)
+                 : null;
+         }
+ 
+-        /// <summary>
+-        /// Parses <paramref name="data"/> into a <see cref="CommitData"/> object.
+-        /// </summary>
+-        /// <param name="data">Data produced by a <c>git log</c> or <c>git show</c> command where <c>--format</c>
+-        /// was provided the string <see cref="CommitDataFormat"/>.</param>
+-        /// <returns>CommitData object populated with parsed info from git string.</returns>
+-        internal CommitData CreateFromFormattedData(string data)
+-        {
+-            if (data is null)
+-            {
+-                throw new ArgumentNullException(nameof(data));
+-            }
+-
+-            var module = GetModule();
+-
+-            // $ git log --pretty="format:%H%n%n%P%n%aN <%aE>%n%at%n%cN <%cE>%n%ct%n%e%n%B%nNotes:%n%-N" -1
+-            // 4bc1049fc3b9191dbd390e1ae6885aedd1a4e34b
+-            // (comment: used to contain %T, kept newline)
+-            // 8e3873685d89f8cb543657d1b9e66e516cae7e1d dfd353d3b02d24a0d98855f6a1848c51d9ba4d6b
+-            // RussKie <RussKie@users.noreply.github.com>
+-            // 1521115435
+-            // GitHub <noreply@github.com>
+-            // 1521115435
+-            // Merge pull request #4615 from drewnoakes/modernise-3
+-            //
+-            // New language features
+-            // Notes:
+-
+-            // commit id
+-            // tree id
+-            // parent ids (separated by spaces)
+-            // author
+-            // authored date (unix time)
+-            // committer
+-            // committed date (unix time)
+-            // diff notes
+-            // ...
+-
+-            var lines = data.Split(Delimiters.LineFeed);
+-
+-            var guid = ObjectId.Parse(lines[0]);
+-
+-            // lines[1] is empty (contained the optional treeGuid)
+-
+-            // TODO: we can use this to add more relationship info like gitk does if wanted
+-            var parentIds = lines[2].LazySplit(' ').Where(id => !string.IsNullOrWhiteSpace(id)).Select(id => ObjectId.Parse(id)).ToList();
+-            var author = module.ReEncodeStringFromLossless(lines[3]);
+-            var authorDate = DateTimeUtils.ParseUnixTime(lines[4]);
+-            var committer = module.ReEncodeStringFromLossless(lines[5]);
+-            var commitDate = DateTimeUtils.ParseUnixTime(lines[6]);
+-            var message = ProcessDiffNotes(startIndex: 7, lines);
+-
+-            // commit message is not re-encoded by git when format is given
+-            var body = module.ReEncodeCommitMessage(message).Replace('\v', '\n');
+-
+-            Validates.NotNull(author);
+-            Validates.NotNull(committer);
+-
+-            return new CommitData(guid, parentIds, author, authorDate, committer, commitDate, body);
+-        }
+-
+         /// <inheritdoc />
+         public CommitData CreateFromRevision(GitRevision revision, IReadOnlyList<ObjectId>? children)
+         {
+diff --git a/GitCommands/Git/GitModule.cs b/GitCommands/Git/GitModule.cs
+index 610899092..e62816a39 100644
+--- a/GitCommands/Git/GitModule.cs
++++ b/GitCommands/Git/GitModule.cs
+@@ -956,66 +956,7 @@ namespace GitCommands
+ 
+         public GitRevision GetRevision(ObjectId? objectId = null, bool shortFormat = false, bool loadRefs = false)
+         {
+-            const string formatString =
+-                /* Hash           */ "%H%n" +
+-                /* Tree           */ "%T%n" +
+-                /* Parents        */ "%P%n" +
+-                /* Author Name    */ "%aN%n" +
+-                /* Author EMail   */ "%aE%n" +
+-                /* Author Date    */ "%at%n" +
+-                /* Committer Name */ "%cN%n" +
+-                /* Committer EMail*/ "%cE%n" +
+-                /* Committer Date */ "%ct%n";
+-
+-            string format = formatString + (shortFormat ? "%s" : "%B%nNotes:%n%-N");
+-
+-            GitArgumentBuilder args = new("log")
+-            {
+-                "-n1",
+-                $"--pretty=format:{format}",
+-                objectId
+-            };
+-
+-            // cache output only if revision is specified
+-            CommandCache? cache = objectId is null ? null : GitCommandCache;
+-
+-            string revInfo = _gitExecutable.GetOutput(args, cache: cache, outputEncoding: LosslessEncoding);
+-
+-            // TODO improve parsing to reduce temporary string (see similar code in RevisionReader)
+-            string[] lines = revInfo.Split(Delimiters.LineFeed);
+-
+-            GitRevision revision = new(ObjectId.Parse(lines[0]))
+-            {
+-                TreeGuid = ObjectId.Parse(lines[1]),
+-                ParentIds = lines[2].LazySplit(' ', StringSplitOptions.RemoveEmptyEntries).Select(line => ObjectId.Parse(line)).ToList(),
+-                Author = ReEncodeStringFromLossless(lines[3]),
+-                AuthorEmail = ReEncodeStringFromLossless(lines[4]),
+-                Committer = ReEncodeStringFromLossless(lines[6]),
+-                CommitterEmail = ReEncodeStringFromLossless(lines[7]),
+-                AuthorUnixTime = long.Parse(lines[5]),
+-                CommitUnixTime = long.Parse(lines[8]),
+-                HasNotes = !shortFormat
+-            };
+-            if (shortFormat)
+-            {
+-                revision.Subject = ReEncodeCommitMessage(lines[9]) ?? "";
+-            }
+-            else
+-            {
+-                string message = ProcessDiffNotes(startIndex: 9);
+-
+-                // commit message is not re-encoded by git when format is given
+-                // See also RevisionReader for parsing commit body
+-                string body = ReEncodeCommitMessage(message ?? "").Replace('\v', '\n');
+-                revision.Body = body;
+-
+-                ReadOnlySpan<char> span = body.AsSpan();
+-                int endSubjectIndex = span.IndexOf('\n');
+-                revision.HasMultiLineMessage = endSubjectIndex >= 0;
+-                revision.Subject = revision.HasMultiLineMessage
+-                    ? span[..endSubjectIndex].TrimEnd().ToString()
+-                    : body;
+-            }
++            GitRevision revision = new RevisionReader(this, allBodies: true).GetRevision(objectId?.ToString(), hasNotes: !shortFormat, cancellationToken: default);
+ 
+             if (loadRefs)
+             {
+@@ -1025,36 +966,6 @@ namespace GitCommands
+             }
+ 
+             return revision;
+-
+-            string ProcessDiffNotes(int startIndex)
+-            {
+-                var endIndex = lines.Length - 1;
+-
+-                if (lines[endIndex] == "Notes:")
+-                {
+-                    endIndex--;
+-                }
+-
+-                StringBuilder message = new();
+-                var inNoteSection = false;
+-
+-                for (var i = startIndex; i <= endIndex; i++)
+-                {
+-                    if (inNoteSection)
+-                    {
+-                        message.Append("    ");
+-                    }
+-
+-                    message.AppendLine(lines[i]);
+-
+-                    if (lines[i] == "Notes:")
+-                    {
+-                        inNoteSection = true;
+-                    }
+-                }
+-
+-                return message.ToString();
+-            }
+         }
+ 
+         public IReadOnlyList<ObjectId> GetParents(ObjectId objectId)
+@@ -2177,10 +2088,9 @@ namespace GitCommands
+             foreach (string[] parts in commitsInfos)
+             {
+                 string commitHash = parts[1];
+-                string? error = null;
+                 CommitData? data = rebasedCommitsRevisions.TryGetValue(commitHash, out GitRevision commitRevision)
+                     ? _commitDataManager.CreateFromRevision(commitRevision, null)
+-                    : _commitDataManager.GetCommitData(commitHash, out error);
++                    : _commitDataManager.GetCommitData(commitHash);
+ 
+                 bool isApplying = currentCommitShortHash is not null && commitHash.StartsWith(currentCommitShortHash);
+                 isCurrentFound |= isApplying;
+@@ -2203,8 +2113,8 @@ namespace GitCommands
+                     // During a rebase, "Patch" subject is filled with commit **body** to display it
+                     // packed in the grid and more readable in the cell tooltip
+                     Subject = data?.Body ?? string.Join(' ', parts.Skip(2)),
+-                    Author = error ?? data?.Author,
+-                    Date = error ?? data?.CommitDate.LocalDateTime.ToString(),
++                    Author = data?.Author,
++                    Date = data?.CommitDate.LocalDateTime.ToString(),
+                     IsNext = isApplying,
+                     IsApplied = !isCurrentFound,
+                 });
+@@ -3993,7 +3903,7 @@ namespace GitCommands
+ 
+             if (loadData)
+             {
+-                oldData = _commitDataManager.GetCommitData(oldCommit.ToString(), out _, cache: true);
++                oldData = _commitDataManager.GetCommitData(oldCommit.ToString(), cache: true);
+             }
+ 
+             if (oldData is null)
+@@ -4003,7 +3913,7 @@ namespace GitCommands
+ 
+             if (loadData)
+             {
+-                data = _commitDataManager.GetCommitData(commit.ToString(), out _, cache: true);
++                data = _commitDataManager.GetCommitData(commit.ToString(), cache: true);
+             }
+ 
+             if (data is null)
+diff --git a/GitCommands/RevisionReader.cs b/GitCommands/RevisionReader.cs
+index 2a897c9f2..fe913db2c 100644
+--- a/GitCommands/RevisionReader.cs
++++ b/GitCommands/RevisionReader.cs
+@@ -5,6 +5,7 @@ using System.Runtime.CompilerServices;
+ using System.Text;
+ using GitExtUtils;
+ using GitUIPluginInterfaces;
++using Microsoft.Toolkit.HighPerformance;
+ using Microsoft.Toolkit.HighPerformance.Buffers;
+ 
+ namespace GitCommands
+@@ -27,14 +28,18 @@ namespace GitCommands
+             /* Committer name  */ "%cN%n" +
+             /* Committer email */ "%cE%n" +
+             /* Reflog selector placeholder */ "{0}" +
+-            /* Commit raw body */ "%B";
++            /* Commit raw body */ "%B" +
++            /* Notes placeholder */ "{1}";
+ 
+         private const string _reflogSelectorFormat = "%gD%n";
++        private const string _notesPrefix = "Notes:";
++        private const string _notesMarker = $"\n{_notesPrefix}";
++        private const string _notesFormat = $"%n{_notesPrefix}%n%N";
+ 
+         // Trace info for parse errors
+         private int _noOfParseError = 0;
+ 
+-        private readonly GitModule _module;
++        private readonly IGitModule _module;
+         private readonly Encoding _logOutputEncoding;
+         private readonly long _oldestBody;
+         private const int _offsetDaysForOldestBody = 6 * 30; // about 6 months
+@@ -42,15 +47,18 @@ namespace GitCommands
+         // reflog selector to identify stashes
+         private bool _hasReflogSelector;
+ 
++        // Include Git Notes for the commit
++        private bool _hasNotes;
++
+         // Buffer to decode subject
+         private char[] _decodeBuffer = new char[4096];
+ 
+-        public RevisionReader(GitModule module, bool allBodies = false)
++        public RevisionReader(IGitModule module, bool allBodies = false)
+             : this(module, module.LogOutputEncoding, allBodies ? 0 : GetUnixTimeForOffset(_offsetDaysForOldestBody))
+         {
+         }
+ 
+-        private RevisionReader(GitModule module, Encoding logOutputEncoding, long oldestBody)
++        private RevisionReader(IGitModule module, Encoding logOutputEncoding, long oldestBody)
+         {
+             _module = module;
+             _logOutputEncoding = logOutputEncoding;
+@@ -61,10 +69,12 @@ namespace GitCommands
+         /// Return the git-log format and set the reflogSelector flag
+         /// (used when parsing the buffer).
+         /// </summary>
+-        private string GetLogFormat(bool hasReflogSelector = false)
++        private string GetLogFormat(bool hasReflogSelector = false, bool hasNotes = false)
+         {
+             _hasReflogSelector = hasReflogSelector;
+-            return string.Format(_fullFormat, hasReflogSelector ? _reflogSelectorFormat : "");
++            _hasNotes = hasNotes;
++
++            return string.Format(_fullFormat, hasReflogSelector ? _reflogSelectorFormat : "", hasNotes ? _notesFormat : "");
+         }
+ 
+         private static long GetUnixTimeForOffset(int days)
+@@ -127,15 +137,59 @@ namespace GitCommands
+             }
+ 
+             GitArgumentBuilder arguments = new("log")
+-                {
+-                    "-z",
+-                    $"--pretty=format:\"{GetLogFormat()}\"",
+-                    $"{olderCommitHash}~..{newerCommitHash}"
+-                };
++            {
++                "-z",
++                $"--pretty=format:\"{GetLogFormat()}\"",
++                $"{olderCommitHash}~..{newerCommitHash}"
++            };
+ 
+             return GetRevisionsFromArguments(arguments, cancellationToken);
+         }
+ 
++        /// <summary>
++        /// Retrieves the GitRevision.
++        /// </summary>
++        /// <param name="commitHash">The Git commit hash.</param>
++        /// <param name="hasNotes">A cancellation token.</param>
++        /// <param name="cancellationToken">A cancellation token.</param>
++        /// <returns>The retrieved git history.</returns>
++        public GitRevision GetRevision(string commitHash, bool hasNotes, CancellationToken cancellationToken)
++        {
++            GitArgumentBuilder arguments = new("log")
++            {
++                "-z",
++                "-1",
++                $"--pretty=format:\"{GetLogFormat(hasNotes: hasNotes)}\"",
++                commitHash
++            };
++
++            // output can be cached if Git Notes is not included
++            if (!hasNotes && GitModule.GitCommandCache.TryGet(arguments.ToString(), out byte[]? commandOutput, out _) is true)
++            {
++                // OK
++            }
++            else
++            {
++#if DEBUG
++                Debug.WriteLine($"git {arguments}");
++#endif
++                using IProcess process = _module.GitCommandRunner.RunDetached(cancellationToken, arguments, redirectOutput: true, outputEncoding: null);
++                commandOutput = process.StandardOutput.BaseStream.SplitLogOutput().SingleOrDefault().ToArray();
++            }
++
++            if (!TryParseRevision(commandOutput, out GitRevision? revision))
++            {
++                return null;
++            }
++
++            if (!hasNotes)
++            {
++                GitModule.GitCommandCache.Add(arguments.ToString(), commandOutput, commandOutput);
++            }
++
++            return revision;
++        }
++
+         /// <summary>
+         /// Get the GitRevisions for Git argument.
+         /// </summary>
+@@ -166,18 +220,20 @@ namespace GitCommands
+         /// <param name="subject">Observer to update the revision grid when the revisions are available.</param>
+         /// <param name="revisionFilter">Revision filter, including branch filter.</param>
+         /// <param name="pathFilter">Pathfilter.</param>
++        /// <param name="hasNotes">Include Git Notes.</param>
+         /// <param name="cancellationToken">Cancellation cancellationToken.</param>
+         public void GetLog(
+             IObserver<GitRevision> subject,
+             string revisionFilter,
+             string pathFilter,
++            bool hasNotes,
+             CancellationToken cancellationToken)
+         {
+ #if TRACE_REVISIONREADER
+             int revisionCount = 0;
+             Stopwatch sw = Stopwatch.StartNew();
+ #endif
+-            ArgumentBuilder arguments = BuildArguments(revisionFilter, pathFilter);
++            ArgumentBuilder arguments = BuildArguments(revisionFilter, pathFilter, hasNotes);
+ #if DEBUG
+             Debug.WriteLine($"git {arguments}");
+ #endif
+@@ -208,12 +264,12 @@ namespace GitCommands
+             }
+         }
+ 
+-        private ArgumentBuilder BuildArguments(string revisionFilter, string pathFilter)
++        private ArgumentBuilder BuildArguments(string revisionFilter, string pathFilter, bool hasNotes)
+         {
+             return new GitArgumentBuilder("log")
+             {
+                 "-z",
+-                $"--pretty=format:\"{GetLogFormat()}\"",
++                $"--pretty=format:\"{GetLogFormat(hasNotes: hasNotes)}\"",
+ 
+                 // sorting
+                 { AppSettings.RevisionSortOrder == RevisionSortOrder.AuthorDate, "--author-date-order" },
+@@ -347,8 +403,7 @@ namespace GitCommands
+                 AuthorUnixTime = authorUnixTime,
+                 Committer = GetNextLine(buffer),
+                 CommitterEmail = GetNextLine(buffer),
+-                CommitUnixTime = commitUnixTime,
+-                HasNotes = false
++                CommitUnixTime = commitUnixTime
+             };
+ 
+             // Body is occasionally big, like linux repo has 35K bytes, the buffer is over 100K
+@@ -368,7 +423,7 @@ namespace GitCommands
+             }
+ 
+             int decodedLength = _logOutputEncoding.GetChars(buffer.Slice(offset), _decodeBuffer);
+-            Span<char> decoded = _decodeBuffer.AsSpan(0, decodedLength);
++            Span<char> decoded = _decodeBuffer.AsSpan(0, decodedLength).TrimEnd();
+ 
+             // reflogSelector are only used when listing stashes
+             if (_hasReflogSelector)
+@@ -381,7 +436,6 @@ namespace GitCommands
+                     return false;
+                 }
+ 
+-                // No reflogselector for notes and such
+                 revision.ReflogSelector = lineLength > 0 ? decoded.Slice(0, lineLength).ToString() : null;
+                 decoded = decoded.Slice(lineLength + 1);
+             }
+@@ -389,27 +443,81 @@ namespace GitCommands
+             // Keep a full multi-line message body within the last six months (by default).
+             // Note also that if body and subject are identical (single line), the body never need to be stored
+             bool keepBody = authorUnixTime >= _oldestBody;
+-            decoded = decoded.TrimEnd();
+ 
+             // Subject can also be defined as the contents before empty line (%s for --pretty),
+             // this uses the alternative definition of first line in body.
+-            // Handle '\v' (Shift-Enter) as '\n' for users that by habit avoid Enter to 'send'
+-            int lengthSubject = decoded.IndexOfAny('\n', '\v');
+-            revision.HasMultiLineMessage = lengthSubject >= 0;
+-            revision.Subject = (revision.HasMultiLineMessage
++            int lengthSubject = decoded.IndexOfAny(Delimiters.LineAndVerticalFeed);
++            revision.HasMultiLineMessage = _hasNotes
++                ? decoded.Length != lengthSubject + _notesMarker.Length + 1 // Notes must always include the notes marker
++                : lengthSubject >= 0;
++
++            revision.Subject = (lengthSubject >= 0
+                 ? decoded.Slice(0, lengthSubject).TrimEnd()
+                 : decoded)
+                 .ToString();
+ 
+             if (keepBody && revision.HasMultiLineMessage)
+             {
+-                // Only allocate additional string if \v exists,
+-                // (If Span.Replace() is added, this can be improved).
+-                revision.Body = decoded.Contains('\v')
+-                    ? decoded.ToString().Replace('\v', '\n')
+-                    : decoded.ToString();
++                // Handle '\v' (Shift-Enter) as '\n' for users that by habit avoid Enter to 'send'
++                int currentOffset = lengthSubject - 1;
++                int verticalFeedIndex;
++                while ((verticalFeedIndex = decoded.Slice(currentOffset).IndexOf('\v')) >= 0)
++                {
++                    currentOffset += verticalFeedIndex;
++                    decoded[currentOffset] = '\n';
++                    currentOffset++;
++                }
++
++                // Removes empty Notes markers (this is the most common case)
++                bool hasNonEmptyNotes = _hasNotes;
++                if (hasNonEmptyNotes)
++                {
++                    if (decoded.EndsWith(_notesMarker))
++                    {
++                        // Remove the empty marker
++                        decoded = decoded[..^_notesMarker.Length].TrimEnd();
++                        hasNonEmptyNotes = false;
++                    }
++                }
++
++                if (hasNonEmptyNotes)
++                {
++                    // Format Notes, add indentation
++                    int notesStartIndex = ((ReadOnlySpan<char>)decoded).IndexOf(_notesMarker, StringComparison.Ordinal);
++
++                    StringBuilder message = new();
++                    currentOffset = notesStartIndex + _notesMarker.Length + 1;
++                    message.Append(decoded.Slice(0, currentOffset));
++                    while (currentOffset < decoded.Length)
++                    {
++                        message.Append("    ");
++                        int lineLength = decoded.Slice(currentOffset).IndexOf('\n');
++                        if (lineLength == -1)
++                        {
++                            message.Append(decoded.Slice(currentOffset));
++                            break;
++                        }
++                        else
++                        {
++                            message.Append(decoded.Slice(currentOffset, lineLength))
++                                .Append('\n');
++                        }
++
++                        currentOffset += lineLength + 1;
++                    }
++
++                    revision.Body = message.ToString();
++                }
++                else
++                {
++                    revision.Body = decoded.ToString();
++                }
+             }
+ 
++            if (_hasNotes)
++            {
++                revision.HasNotes = true;
++            }
+ #if DEBUG
+             if (revision.Author is null || revision.AuthorEmail is null || revision.Committer is null || revision.CommitterEmail is null || revision.Subject is null || (keepBody && revision.HasMultiLineMessage && revision.Body is null))
+             {
+@@ -464,17 +572,20 @@ namespace GitCommands
+                 _revisionReader = revisionReader;
+             }
+ 
+-            internal static RevisionReader RevisionReader(GitModule module, bool hasReflogSelector, Encoding logOutputEncoding, long sixMonths)
++            internal static RevisionReader RevisionReader(GitModule module, Encoding logOutputEncoding, long sixMonths)
+             {
+-                RevisionReader reader = new(module, logOutputEncoding, sixMonths)
+-                {
+-                    _hasReflogSelector = hasReflogSelector
+-                };
++                RevisionReader reader = new(module, logOutputEncoding, sixMonths);
+                 return reader;
+             }
+ 
++            internal void SetParserAttributes(bool hasReflogSelector, bool hasNotes)
++            {
++                _revisionReader._hasReflogSelector = hasReflogSelector;
++                _revisionReader._hasNotes = hasNotes;
++            }
++
+             internal ArgumentBuilder BuildArguments(string revisionFilter, string pathFilter) =>
+-                _revisionReader.BuildArguments(revisionFilter, pathFilter);
++                _revisionReader.BuildArguments(revisionFilter, pathFilter, hasNotes: false);
+ 
+             internal bool TryParseRevision(ReadOnlySpan<byte> chunk, [NotNullWhen(returnValue: true)] out GitRevision? revision) =>
+                 _revisionReader.TryParseRevision(chunk, out revision);
+diff --git a/GitExtUtils/Delimiters.cs b/GitExtUtils/Delimiters.cs
+index 287ea3f4b..d5e41af74 100644
+--- a/GitExtUtils/Delimiters.cs
++++ b/GitExtUtils/Delimiters.cs
+@@ -10,6 +10,7 @@ namespace System
+     internal static class Delimiters
+     {
+         public static readonly char[] LineFeed = { '\n' };
++        public static readonly char[] LineAndVerticalFeed = { '\n', '\v' };
+         public static readonly char[] Space = { ' ' };
+         public static readonly char[] Tab = { '\t' };
+         public static readonly char[] Null = { '\0' };
+diff --git a/GitUI/CommandsDialogs/FormBrowse.cs b/GitUI/CommandsDialogs/FormBrowse.cs
+index ab9474fb0..7e250bf92 100644
+--- a/GitUI/CommandsDialogs/FormBrowse.cs
++++ b/GitUI/CommandsDialogs/FormBrowse.cs
+@@ -2357,7 +2357,7 @@ namespace GitUI.CommandsDialogs
+                 case "gotobranch":
+                 case "gototag":
+                     Validates.NotNull(e.Data);
+-                    CommitData? commit = _commitDataManager.GetCommitData(e.Data, out _);
++                    CommitData? commit = _commitDataManager.GetCommitData(e.Data);
+                     if (commit is null)
+                     {
+                         break;
+@@ -2744,7 +2744,7 @@ namespace GitUI.CommandsDialogs
+                 Lazy<IReadOnlyCollection<GitRevision>> getStashRevs = new(() =>
+                     !AppSettings.ShowStashes
+                     ? Array.Empty<GitRevision>()
+-                    : new RevisionReader(new(UICommands.GitModule.WorkingDir)).GetStashes(CancellationToken.None));
++                    : new RevisionReader(new GitModule(UICommands.GitModule.WorkingDir)).GetStashes(CancellationToken.None));
+ 
+                 RefreshLeftPanel(new FilteredGitRefsProvider(UICommands.GitModule).GetRefs, getStashRevs, forceRefresh: true);
+                 repoObjectsTree.RefreshRevisionsLoaded();
+diff --git a/GitUI/CommandsDialogs/FormFileHistory.cs b/GitUI/CommandsDialogs/FormFileHistory.cs
+index f41d7594a..4a5e78543 100644
+--- a/GitUI/CommandsDialogs/FormFileHistory.cs
++++ b/GitUI/CommandsDialogs/FormFileHistory.cs
+@@ -557,7 +557,7 @@ namespace GitUI.CommandsDialogs
+             else if (e.Command == "gotobranch" || e.Command == "gototag")
+             {
+                 Validates.NotNull(e.Data);
+-                CommitData? commit = _commitDataManager.GetCommitData(e.Data, out _);
++                CommitData? commit = _commitDataManager.GetCommitData(e.Data);
+                 if (commit is not null)
+                 {
+                     if (!RevisionGrid.SetSelectedRevision(commit.ObjectId))
+diff --git a/GitUI/UserControls/RevisionGrid/Graph/RevisionGraph.cs b/GitUI/UserControls/RevisionGrid/Graph/RevisionGraph.cs
+index 21a4a5cde..297d63a81 100644
+--- a/GitUI/UserControls/RevisionGrid/Graph/RevisionGraph.cs
++++ b/GitUI/UserControls/RevisionGrid/Graph/RevisionGraph.cs
+@@ -194,18 +194,6 @@ namespace GitUI.UserControls.RevisionGrid.Graph
+             }
+         }
+ 
+-        /// <summary>
+-        /// Set HasNotes for all GitRevisions (marking Notes as fetched).
+-        /// This is used when no Git Notes at all exist and notes never need to be retrieved.
+-        /// </summary>
+-        public void SetHasNotesForRevisions()
+-        {
+-            foreach (RevisionGraphRevision revision in _nodes)
+-            {
+-                revision.GitRevision.HasNotes = true;
+-            }
+-        }
+-
+         /// <summary>
+         /// Add a single revision from the git log to the graph, including segments to parents.
+         /// </summary>
+diff --git a/GitUI/UserControls/RevisionGrid/RevisionGridControl.cs b/GitUI/UserControls/RevisionGrid/RevisionGridControl.cs
+index 6bb598439..58c865262 100644
+--- a/GitUI/UserControls/RevisionGrid/RevisionGridControl.cs
++++ b/GitUI/UserControls/RevisionGrid/RevisionGridControl.cs
+@@ -1070,6 +1070,7 @@ namespace GitUI
+                             observeRevisions,
+                             _filterInfo.GetRevisionFilter(currentCheckout),
+                             pathFilter,
++                            AppSettings.ShowGitNotes,
+                             cancellationToken);
+                     },
+                     ex => observeRevisions.OnError(ex));
+@@ -1425,15 +1426,6 @@ namespace GitUI
+ 
+                     await TaskScheduler.Default;
+ 
+-                    // optimize for no notes at all in repo
+-                    // Improvement: set .HasNotes for commits not included in git-notes
+-                    bool hasAnyNotes = AppSettings.ShowGitNotes && getUnfilteredRefs.Value.Any(i => i.CompleteName == GitRefName.RefsNotesPrefix);
+-                    if (!hasAnyNotes)
+-                    {
+-                        // No notes at all in this repo
+-                        _gridView._revisionGraph.SetHasNotesForRevisions();
+-                    }
+-
+                     if (ShowBuildServerInfo)
+                     {
+                         await _buildServerWatcher.LaunchBuildServerInfoFetchOperationAsync();
+diff --git a/Plugins/GitUIPluginInterfaces/IGitModule.cs b/Plugins/GitUIPluginInterfaces/IGitModule.cs
+index 1fcb7c07d..cb7ae78b5 100644
+--- a/Plugins/GitUIPluginInterfaces/IGitModule.cs
++++ b/Plugins/GitUIPluginInterfaces/IGitModule.cs
+@@ -1,4 +1,5 @@
+ ﻿using System.Diagnostics.CodeAnalysis;
++using System.Text;
+ 
+ namespace GitUIPluginInterfaces
+ {
+@@ -137,6 +138,11 @@ namespace GitUIPluginInterfaces
+ 
+         ISettingsSource GetEffectiveSettings();
+ 
++        /// <summary>
++        /// Encoding for commit header (message, notes, author, committer, emails).
++        /// </summary>
++        Encoding LogOutputEncoding { get; }
++
+         string? ReEncodeStringFromLossless(string? s);
+ 
+         string ReEncodeCommitMessage(string s);
+diff --git a/ResourceManager/LocalizationHelpers.cs b/ResourceManager/LocalizationHelpers.cs
+index bd5f179e8..4e7f5dde2 100644
+--- a/ResourceManager/LocalizationHelpers.cs
++++ b/ResourceManager/LocalizationHelpers.cs
+@@ -88,7 +88,7 @@ namespace ResourceManager
+                 // TEMP, will be moved in the follow up refactor
+                 ICommitDataManager commitDataManager = new CommitDataManager(() => module);
+ 
+-                CommitData? data = commitDataManager.GetCommitData(hash, out _, cache);
++                CommitData? data = commitDataManager.GetCommitData(hash, cache);
+                 if (data is null)
+                 {
+                     sb.AppendLine("Commit hash:\t" + hash);
+@@ -149,7 +149,7 @@ namespace ResourceManager
+                 {
+                     if (status.OldCommit is not null)
+                     {
+-                        oldCommitData = commitDataManager.GetCommitData(status.OldCommit.ToString(), out _, cache: true);
++                        oldCommitData = commitDataManager.GetCommitData(status.OldCommit.ToString(), cache: true);
+                     }
+ 
+                     if (oldCommitData is not null)
+@@ -181,7 +181,7 @@ namespace ResourceManager
+             {
+                 if (status.Commit is not null)
+                 {
+-                    commitData = commitDataManager.GetCommitData(status.Commit.ToString(), out _, cache: true);
++                    commitData = commitDataManager.GetCommitData(status.Commit.ToString(), cache: true);
+                 }
+ 
+                 if (commitData is not null)
+diff --git a/UnitTests/GitCommands.Tests/CommitDataManagerTest.cs b/UnitTests/GitCommands.Tests/CommitDataManagerTest.cs
+index 0cb1f7dc5..c50e01d27 100644
+--- a/UnitTests/GitCommands.Tests/CommitDataManagerTest.cs
++++ b/UnitTests/GitCommands.Tests/CommitDataManagerTest.cs
+@@ -23,41 +23,5 @@ namespace GitCommandsTests
+             _getModule = () => _module;
+             _commitDataManager = new CommitDataManager(_getModule);
+         }
+-
+-        [Test]
+-        public void CreateFromFormattedData()
+-        {
+-            var body = "\tI made a really neat change.\n\n" +
+-                       "Notes (p4notes):\n" +
+-                       "\tP4@547123";
+-
+-            var rawData = "37da2014bc5128ca084543423e410d81df838845\n" +
+-                          "optional treeGuid is not parsed: a13ae23be4d207c7af2818fd7cc2caa2d0a63e47\n" +
+-                          "ad1ccc2ecc00865d61e74b703a260d17b4db1216 a8d564d3bb8c65e88e40239937cb48dda57f01b8 1711f4a6522f86c3e4e404a66a78f4586d25d89d\n" +
+-                          "John Doe (Acme Inc) <John.Doe@test.com>\n" +
+-                          "1508676972\n" +
+-                          "John Doe <John.Doe@test.com>\n" +
+-                          "1508676972\n" +
+-                          body;
+-
+-            var data = _commitDataManager.CreateFromFormattedData(rawData);
+-
+-            data.Should().NotBeNull();
+-            data.Author.Should().Be("John Doe (Acme Inc) <John.Doe@test.com>");
+-            data.Committer.Should().Be("John Doe <John.Doe@test.com>");
+-            data.ObjectId.Should().Be(ObjectId.Parse("37da2014bc5128ca084543423e410d81df838845"));
+-            data.ParentIds.Should().BeEquivalentTo(ObjectId.Parse("ad1ccc2ecc00865d61e74b703a260d17b4db1216"), ObjectId.Parse("a8d564d3bb8c65e88e40239937cb48dda57f01b8"), ObjectId.Parse("1711f4a6522f86c3e4e404a66a78f4586d25d89d"));
+-
+-            data.AuthorDate.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture).Should().Be("2017-10-22T12:56:12");
+-            data.CommitDate.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture).Should().Be("2017-10-22T12:56:12");
+-
+-            // split the text into lines because of the different newline characters for Windows and Linux
+-            // TODO: it looks like a bug, data.Body has an extra trailing newline
+-            data.Body.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None).Should()
+-                .BeEquivalentTo((body + Environment.NewLine).Split(new[] { "\r\n", "\n" }, StringSplitOptions.None));
+-
+-            // TODO: this is a bad API design, a collection should not be null
+-            data.ChildIds.Should().BeNull();
+-        }
+     }
+ }
+diff --git a/UnitTests/GitCommands.Tests/RevisionReaderTests.TryParseRevision_test_testName=notes_data.verified.json b/UnitTests/GitCommands.Tests/RevisionReaderTests.TryParseRevision_test_testName=notes_data.verified.json
+new file mode 100644
+index 000000000..e170ec8c2
+--- /dev/null
++++ b/UnitTests/GitCommands.Tests/RevisionReaderTests.TryParseRevision_test_testName=notes_data.verified.json
+@@ -0,0 +1,40 @@
++﻿{
++  "ObjectId": {
++    "IsArtificial": false
++  },
++  "Guid": "0c350e248500e4e893e6d17dcc61591cc1cd64e7",
++  "ParentIds": [
++    {
++      "IsArtificial": false
++    },
++    {
++      "IsArtificial": false
++    },
++    {
++      "IsArtificial": false
++    }
++  ],
++  "TreeGuid": {
++    "IsArtificial": false
++  },
++  "Author": "Gerhard Olsson",
++  "AuthorEmail": "gerhardol@users.noreply.github.com",
++  "AuthorUnixTime": 1624479586,
++  "AuthorDate": "DateTimeOffset_1",
++  "Committer": "Gerhard Olsson",
++  "CommitterEmail": "gerhardol@users.noreply.github.com",
++  "CommitUnixTime": 1624479586,
++  "CommitDate": "DateTimeOffset_1",
++  "BuildStatus": null,
++  "Subject": "Notes subject1",
++  "Body": "Notes subject1\n\nline\nNotes:\n    line",
++  "HasMultiLineMessage": true,
++  "HasNotes": true,
++  "IsArtificial": false,
++  "IsStash": false,
++  "ReflogSelector": null,
++  "HasParent": true,
++  "FirstParentId": {
++    "IsArtificial": false
++  }
++}
+diff --git a/UnitTests/GitCommands.Tests/RevisionReaderTests.TryParseRevision_test_testName=notes_empty.verified.json b/UnitTests/GitCommands.Tests/RevisionReaderTests.TryParseRevision_test_testName=notes_empty.verified.json
+new file mode 100644
+index 000000000..4362d5c86
+--- /dev/null
++++ b/UnitTests/GitCommands.Tests/RevisionReaderTests.TryParseRevision_test_testName=notes_empty.verified.json
+@@ -0,0 +1,40 @@
++﻿{
++  "ObjectId": {
++    "IsArtificial": false
++  },
++  "Guid": "0c350e248500e4e893e6d17dcc61591cc1cd64e7",
++  "ParentIds": [
++    {
++      "IsArtificial": false
++    },
++    {
++      "IsArtificial": false
++    },
++    {
++      "IsArtificial": false
++    }
++  ],
++  "TreeGuid": {
++    "IsArtificial": false
++  },
++  "Author": "Gerhard Olsson",
++  "AuthorEmail": "gerhardol@users.noreply.github.com",
++  "AuthorUnixTime": 1624479586,
++  "AuthorDate": "DateTimeOffset_1",
++  "Committer": "Gerhard Olsson",
++  "CommitterEmail": "gerhardol@users.noreply.github.com",
++  "CommitUnixTime": 1624479586,
++  "CommitDate": "DateTimeOffset_1",
++  "BuildStatus": null,
++  "Subject": "Notes subject",
++  "Body": "Notes subject\n\nline",
++  "HasMultiLineMessage": true,
++  "HasNotes": true,
++  "IsArtificial": false,
++  "IsStash": false,
++  "ReflogSelector": null,
++  "HasParent": true,
++  "FirstParentId": {
++    "IsArtificial": false
++  }
++}
+diff --git a/UnitTests/GitCommands.Tests/RevisionReaderTests.TryParseRevision_test_testName=vertical_tab.verified.json b/UnitTests/GitCommands.Tests/RevisionReaderTests.TryParseRevision_test_testName=vertical_tab.verified.json
+new file mode 100644
+index 000000000..a31e568ea
+--- /dev/null
++++ b/UnitTests/GitCommands.Tests/RevisionReaderTests.TryParseRevision_test_testName=vertical_tab.verified.json
+@@ -0,0 +1,40 @@
++﻿{
++  "ObjectId": {
++    "IsArtificial": false
++  },
++  "Guid": "0c350e248500e4e893e6d17dcc61591cc1cd64e7",
++  "ParentIds": [
++    {
++      "IsArtificial": false
++    },
++    {
++      "IsArtificial": false
++    },
++    {
++      "IsArtificial": false
++    }
++  ],
++  "TreeGuid": {
++    "IsArtificial": false
++  },
++  "Author": "Gerhard Olsson",
++  "AuthorEmail": "gerhardol@users.noreply.github.com",
++  "AuthorUnixTime": 1624479586,
++  "AuthorDate": "DateTimeOffset_1",
++  "Committer": "Gerhard Olsson",
++  "CommitterEmail": "gerhardol@users.noreply.github.com",
++  "CommitUnixTime": 1624479586,
++  "CommitDate": "DateTimeOffset_1",
++  "BuildStatus": null,
++  "Subject": "wip tests",
++  "Body": "wip tests\n\nsecond line\nthird line before multiple whitespace",
++  "HasMultiLineMessage": true,
++  "HasNotes": false,
++  "IsArtificial": false,
++  "IsStash": false,
++  "ReflogSelector": null,
++  "HasParent": true,
++  "FirstParentId": {
++    "IsArtificial": false
++  }
++}
+diff --git a/UnitTests/GitCommands.Tests/RevisionReaderTests.cs b/UnitTests/GitCommands.Tests/RevisionReaderTests.cs
+index a75bd0910..3f90b0e5c 100644
+--- a/UnitTests/GitCommands.Tests/RevisionReaderTests.cs
++++ b/UnitTests/GitCommands.Tests/RevisionReaderTests.cs
+@@ -11,8 +11,8 @@ namespace GitCommandsTests
+     [TestFixture]
+     public sealed class RevisionReaderTests
+     {
+-        private Encoding _logOutputEncoding = Encoding.UTF8;
+-        private long _sixMonths = new DateTimeOffset(new DateTime(2021, 01, 01)).ToUnixTimeSeconds();
++        private readonly Encoding _logOutputEncoding = Encoding.UTF8;
++        private readonly long _sixMonths = new DateTimeOffset(new DateTime(2021, 01, 01)).ToUnixTimeSeconds();
+ 
+         [SetUp]
+         public void Setup()
+@@ -22,7 +22,7 @@ namespace GitCommandsTests
+         [Test]
+         public void BuildArguments_should_be_NUL_terminated()
+         {
+-            RevisionReader reader = RevisionReader.TestAccessor.RevisionReader(new GitModule(""), hasReflogSelector: false, _logOutputEncoding, _sixMonths);
++            RevisionReader reader = RevisionReader.TestAccessor.RevisionReader(new GitModule(""), _logOutputEncoding, _sixMonths);
+             ArgumentBuilder args = reader.GetTestAccessor().BuildArguments("", "");
+ 
+             args.ToString().Should().Contain(" log -z ");
+@@ -32,7 +32,7 @@ namespace GitCommandsTests
+         public void TryParseRevisionshould_return_false_if_argument_is_invalid()
+         {
+             ArraySegment<byte> chunk = null;
+-            RevisionReader reader = RevisionReader.TestAccessor.RevisionReader(new(""), hasReflogSelector: false, _logOutputEncoding, _sixMonths);
++            RevisionReader reader = RevisionReader.TestAccessor.RevisionReader(new(""), _logOutputEncoding, _sixMonths);
+ 
+             // Set to a high value so Debug.Assert do not raise exceptions
+             reader.GetTestAccessor().NoOfParseError = 100;
+@@ -58,13 +58,17 @@ namespace GitCommandsTests
+         [TestCase("simple_pathfilter", true)]
+         [TestCase("subject_no_body", true)]
+         [TestCase("empty_commit", true)]
++        [TestCase("vertical_tab", true)]
+         [TestCase("reflogselector", true, true, false)]
+         [TestCase("reflogselector_empty", true, true)]
+-        public async Task TryParseRevision_test(string testName, bool expectedReturn, bool hasReflogSelector = false, bool hasEmptyReflogSelector = true)
++        [TestCase("notes_data", true, false, true, true)]
++        [TestCase("notes_empty", true, false, true, true)]
++        public async Task TryParseRevision_test(string testName, bool expectedReturn, bool hasReflogSelector = false, bool hasEmptyReflogSelector = true, bool hasNotes = false)
+         {
+             string path = Path.Combine(TestContext.CurrentContext.TestDirectory, "TestData/RevisionReader", testName + ".bin");
+             ArraySegment<byte> chunk = File.ReadAllBytes(path);
+-            RevisionReader reader = RevisionReader.TestAccessor.RevisionReader(new GitModule(""), hasReflogSelector, _logOutputEncoding, _sixMonths);
++            RevisionReader reader = RevisionReader.TestAccessor.RevisionReader(new GitModule(""), _logOutputEncoding, _sixMonths);
++            reader.GetTestAccessor().SetParserAttributes(hasReflogSelector, hasNotes);
+ 
+             // Set to a high value so Debug.Assert do not raise exceptions
+             reader.GetTestAccessor().NoOfParseError = 100;

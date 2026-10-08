@@ -1,0 +1,190 @@
+#!/bin/bash
+# Oracle: a review that names the known defect by restating the reported issue
+# (symptom + root cause), so every judge scores it as detected (reward ~1.0).
+# Used to validate task wiring -- it is the upper bound, not a realistic agent,
+# so it is allowed to see the ground-truth issue. It does NOT paste the fix diff
+# (a real reviewer never has it); it reads as an analysis of the reported bug.
+cat > /app/review.md << 'REVIEW_EOF'
+## Review
+
+Blocking issue in `core/src/main/resources/hudson/model/Run/console-log.jelly`:
+
+This pull request introduces the defect later reported as "Console copy button on freestyle job does not copy to clipboard". The
+problem a user observed, and its root cause:
+
+### Jenkins and plugins versions report
+
+<details>
+  <summary>Environment</summary>
+
+  <!-- Paste your environment details below -->
+  ```text
+Jenkins: 2.542
+OS: Linux - 6.6.112.1-2.azl3
+Java: 21.0.9 - Eclipse Adoptium (OpenJDK 64-Bit Server VM)
+---
+analysis-model-api:13.18.0-933.v90e9a_fdff4e2
+ansicolor:1.0.6
+antisamy-markup-formatter:173.v680e3a_b_69ff3
+apache-httpcomponents-client-4-api:4.5.14-269.vfa_2321039a_83
+apache-httpcomponents-client-5-api:5.5-170.v023de017ccd7
+asm-api:9.9.1-189.vb_5ef2964da_91
+authentication-tokens:1.144.v5ff4a_5ec5c33
+basic-branch-build-strategies:275.vde2351b_4a_58b_
+bootstrap5-api:5.3.8-895.v4d0d8e47fea_d
+bouncycastle-api:2.30.1.82-277.v70ca_0b_877184
+branch-api:2.1268.v044a_87612da_8
+buildtriggerbadge:325.vdcd8a_826e87a_
+caffeine-api:3.2.3-194.v31a_b_f7a_b_5a_81
+catppuccin-theme:3.v903b_635ffa_b_4
+checks-api:373.vfe7645102093
+chocolate-theme:7.v6a_8b_000467c6
+cloud-stats:377.vd8a_6c953e98e
+cloudbees-bitbucket-branch-source:937.2.2
+cloudbees-folder:6.1073.va_7888eb_dd514
+cloudbees-jenkins-advisor:392.v6ca_b_ff4e12fa_
+command-launcher:123.v37cfdc92ef67
+commons-collections4-api:4.5.0-8.va_d5448ef9011
+commons-lang3-api:3.20.0-109.ve43756e2d2b_4
+commons-text-api:1.15.0-210.v7480a_da_70b_9e
+config-file-provider:1006.vc7366c201f57
+configuration-as-code:2006.v001a_2ca_6b_574
+copyartifact:770.va_6c69e063442
+coverage:2.3060.v035a_5557cdb_c
+credentials:1453.v9b_a_29777a_b_fd
+credentials-binding:702.vfe613e537e88
+customizable-header:257.v1c5c2d5c0594
+dark-theme:574.va_19f05d54df5
+data-tables-api:2.3.5-1482.vb_47a_3c19f78c
+design-library:403.v0787db_1c972b_
+display-url-api:2.217.va_6b_de84cc74b_
+docker-commons:457.v0f62a_94f11a_3
+durable-task:639.vefb_3d8372f6d
+echarts-api:6.0.0-1165.vd1283a_3e37d4
+eddsa-api:0.3.0.1-19.vc432d923e5ee
+extended-read-permission:68.vd270568a_7520
+favorite:2.253.v9b_413168133b_
+flatpickr-api:4.6.13-18.vcf5f6a_5b_8468
+font-awesome-api:7.1.0-882.v1dfb_771e3278
+forensics-api:3.1772.v99ca_3d83b_9fa_
+git:5.8.1
+git-client:6.4.2
+git-forensics:3.2138.vf25ea_d549e33
+github:1.45.0
+github-api:1.330-492.v3941a_032db_2a_
+github-branch-source:1925.v62fb_7ffb_08ce
+github-checks:634.v371dc6d978a_3
+github-label-filter:1.0.0
+groovy:497.v7b_061a_a_de65d
+gson-api:2.13.2-173.va_a_092315913c
+handy-uri-templates-2-api:2.1.8-38.vcea_5d521d5f3
+inline-pipeline:1.0.32.vf433f2d57630
+instance-identity:203.v15e81a_1b_7a_38
+ionicons-api:94.vcc3065403257
+jackson2-api:2.20.1-423.v13951f6b_6532
+jakarta-activation-api:2.1.4-1
+jakarta-mail-api:2.1.5-1
+jakarta-xml-bind-api:4.0.6-10.v9b_7e1d1fc40b_
+javax-activation-api:1.2.0-8
+javax-mail-api:1.6.2-11
+jaxb:2.3.9-133.vb_ec76a_73f706
+jdk-tool:83.v417146707a_3d
+jersey2-api:2.47-165.ve7809a_3e87e0
+jjwt-api:0.11.5-120.v0268cf544b_89
+jnr-posix-api:3.1.21-186.vb_7ec9b_23ce83
+job-dsl:1.93
+joda-time-api:2.14.0-149.v1c3ce991d1b_9
+jquery3-api:3.7.1-619.vdb_10e002501a_
+jsch:0.2.16-95.v3eecb_55fa_b_78
+json-api:20250517-173.v596efb_962a_31
+json-path-api:2.10.0-202.va_9cc16c1e476
+jsoup:1.21.2-66.v6ea_38164b_8a_2
+junit:1380.v491ff054cd35
+ldap:793.v754d6b_41b_ea_4
+mailer:525.v2458b_d8a_1a_71
+matrix-auth:3.2.9
+matrix-project:870.v9db_fcfc2f45b_
+metrics:4.2.37-489.vb_6db_69b_ce753
+mina-sshd-api-common:2.16.0-167.va_269f38cc024
+mina-sshd-api-core:2.16.0-167.va_269f38cc024
+node-iterator-api:72.vc90e81737df1
+nord-theme:1.1
+okhttp-api:4.12.0-195.vc02552c04ffd
+pipeline-build-step:571.v08a_fffd4b_0ce
+pipeline-github:2.8-162.382498405fdc
+pipeline-graph-analysis:245.v88f03631a_b_21
+pipeline-graph-view:730.v433816a_b_7a_73
+pipeline-groovy-lib:787.ve2fef0efdca_6
+pipeline-input-step:540.v14b_100d754dd
+pipeline-milestone-step:138.v78ca_76831a_43
+pipeline-model-api:2.2277.v00573e73ddf1
+pipeline-model-definition:2.2277.v00573e73ddf1
+pipeline-model-extensions:2.2277.v00573e73ddf1
+pipeline-rest-api:2.38
+pipeline-stage-step:322.vecffa_99f371c
+pipeline-stage-tags-metadata:2.2277.v00573e73ddf1
+plain-credentials:199.v9f8e1f741799
+plugin-util-api:6.1192.v30fe6e2837ff
+prism-api:1.30.0-630.va_e19d17f83b_0
+pubsub-light:1.19
+scm-api:724.v7d839074eb_5c
+scm-filter-branch-pr:222.v72301ecb_a_ee7
+script-security:1385.v7d2d9ec4d909
+snakeyaml-api:2.5-143.v93b_c004f89de
+solarized-theme:28.vfe25223f14fe
+sse-gateway:1.28
+ssh-agent:386.v36cc0c7582f0
+ssh-credentials:361.vb_f6760818e8c
+sshd:3.374.v19b_d59ce6610
+structs:362.va_b_695ef4fdf9
+support-core:1763.ve4ce0d10a_3f0
+theme-manager:327.v780d7096ec29
+timestamper:1.30
+token-macro:477.vd4f0dc3cb_cf1
+trilead-api:2.284.v1974ea_324382
+variant:70.va_d9f17f859e0
+warnings-ng:12.9923.v0a_d61546e93d
+workflow-aggregator:608.v67378e9d3db_1
+workflow-api:1398.v67030756d3fb_
+workflow-basic-steps:1098.v808b_fd7f8cf4
+workflow-cps:4238.va_6fb_65c1f699
+workflow-durable-task-step:1464.v2d3f5c68f84c
+workflow-job:1559.va_a_533730b_ea_d
+workflow-multibranch:821.vc3b_4ea_780798
+workflow-scm-step:466.va_d69e602552b_
+workflow-step-api:710.v3e456cc85233
+workflow-support:1010.vb_b_39488a_9841
+  ```
+
+</details>
+
+
+### What Operating System are you using (both controller, and any agents involved in the problem)?
+
+Linux for controller with no agents
+
+### Reproduction steps
+
+1. Open https://weekly.ci.jenkins.io/job/freestyle/1/console and press the "Copy" button
+2. Paste the contents of the clipboard into a text editor.  It will paste "null"
+
+### Expected Results
+
+Console output should be copied to the clipboard
+
+### Actual Results
+
+Console output is not copied to the clipboard
+
+### Anything else?
+
+Reported by @thcipriani in [Jenkins pull request #25953](https://github.com/jenkinsci/jenkins/pull/25953)
+
+### Are you interested in contributing a fix?
+
+Fixed by pull request:
+
+* https://github.com/jenkinsci/jenkins/pull/25953
+
+This same root cause must be fixed before merging.
+REVIEW_EOF

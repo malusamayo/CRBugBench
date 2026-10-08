@@ -1,0 +1,2444 @@
+commit 99f0e433d4c48eb4f6640c8cf2da102c14f8d9f6
+Author: Azim Afroozeh <afroozeh3@gmail.com>
+Date:   Tue Jan 20 19:53:02 2026 +0100
+
+    perf: Add dedicated kernel for group-by `arg_max/arg_min` (#26093)
+
+diff --git a/crates/polars-arrow/src/legacy/kernels/take_agg/mod.rs b/crates/polars-arrow/src/legacy/kernels/take_agg/mod.rs
+index c4ba81508c..96cfaf32d8 100644
+--- a/crates/polars-arrow/src/legacy/kernels/take_agg/mod.rs
++++ b/crates/polars-arrow/src/legacy/kernels/take_agg/mod.rs
+@@ -123,6 +123,34 @@ pub unsafe fn take_agg_bin_iter_unchecked<
+     }
+ }
+ 
++/// # Safety
++/// caller must ensure iterators indexes are in bounds
++#[inline]
++pub unsafe fn take_agg_bin_iter_unchecked_arg<
++    'a,
++    I: IntoIterator<Item = usize>,
++    F: Fn((IdxSize, &'a [u8]), (IdxSize, &'a [u8])) -> (IdxSize, &'a [u8]),
++>(
++    arr: &'a BinaryViewArray,
++    indices: I,
++    f: F,
++) -> Option<IdxSize> {
++    let validity = arr.validity().unwrap();
++
++    indices
++        .into_iter()
++        .enumerate()
++        .filter_map(|(pos, idx)| {
++            if validity.get_bit_unchecked(idx) {
++                Some((pos as IdxSize, arr.value_unchecked(idx)))
++            } else {
++                None
++            }
++        })
++        .reduce(f)
++        .map(|(pos, _)| pos)
++}
++
+ /// Take kernel for single chunk and an iterator as index.
+ /// # Safety
+ /// caller must ensure iterators indexes are in bounds
+@@ -141,3 +169,23 @@ pub unsafe fn take_agg_bin_iter_unchecked_no_null<
+         .map(|idx| arr.value_unchecked(idx))
+         .reduce(|acc, str_val| f(acc, str_val))
+ }
++
++/// # Safety
++/// caller must ensure iterators indexes are in bounds
++#[inline]
++pub unsafe fn take_agg_bin_iter_unchecked_no_null_arg<
++    'a,
++    I: IntoIterator<Item = usize>,
++    F: Fn((IdxSize, &'a [u8]), (IdxSize, &'a [u8])) -> (IdxSize, &'a [u8]),
++>(
++    arr: &'a BinaryViewArray,
++    indices: I,
++    f: F,
++) -> Option<IdxSize> {
++    indices
++        .into_iter()
++        .enumerate()
++        .map(|(pos, idx)| (pos as IdxSize, arr.value_unchecked(idx)))
++        .reduce(f)
++        .map(|(pos, _)| pos)
++}
+diff --git a/crates/polars-compute/src/rolling/arg_min_max.rs b/crates/polars-compute/src/rolling/arg_min_max.rs
+new file mode 100644
+index 0000000000..abe42de564
+--- /dev/null
++++ b/crates/polars-compute/src/rolling/arg_min_max.rs
+@@ -0,0 +1,172 @@
++use std::collections::VecDeque;
++use std::marker::PhantomData;
++
++use arrow::bitmap::Bitmap;
++use arrow::types::NativeType;
++use polars_utils::IdxSize;
++use polars_utils::min_max::{MaxPropagateNan, MinMaxPolicy, MinPropagateNan};
++
++use super::RollingFnParams;
++use super::no_nulls::RollingAggWindowNoNulls;
++use super::nulls::RollingAggWindowNulls;
++
++// Algorithm: https://cs.stackexchange.com/questions/120915/interview-question-with-arrays-and-consecutive-subintervals/120936#120936
++// Modified to return the argmin/argmax instead of the value:
++pub struct ArgMinMaxWindow<'a, T, P> {
++    pub(crate) values: &'a [T],
++    validity: Option<&'a Bitmap>,
++    // values[monotonic_idxs[i]] is better than values[monotonic_idxs[i+1]] for
++    // all i, as per the policy.
++    monotonic_idxs: VecDeque<usize>,
++    nonnulls_in_window: usize,
++    last_start: usize,
++    last_end: usize,
++    policy: PhantomData<P>,
++}
++
++impl<T: NativeType, P: MinMaxPolicy> ArgMinMaxWindow<'_, T, P> {
++    /// # Safety
++    /// The index must be in-bounds.
++    unsafe fn insert_nonnull_value(&mut self, idx: usize) {
++        unsafe {
++            let value = self.values.get_unchecked(idx);
++
++            // Remove values which are older and worse.
++            while let Some(&tail_idx) = self.monotonic_idxs.back() {
++                let tail_value = self.values.get_unchecked(tail_idx);
++                if !P::is_better(value, tail_value) {
++                    break;
++                }
++                self.monotonic_idxs.pop_back();
++            }
++
++            self.monotonic_idxs.push_back(idx);
++            self.nonnulls_in_window += 1;
++        }
++    }
++
++    fn remove_old_values(&mut self, window_start: usize) {
++        // Remove values which have fallen outside the window start.
++        while let Some(&head_idx) = self.monotonic_idxs.front() {
++            if head_idx >= window_start {
++                break;
++            }
++            self.monotonic_idxs.pop_front();
++        }
++    }
++}
++
++impl<T: NativeType, P: MinMaxPolicy> RollingAggWindowNulls<T, IdxSize>
++    for ArgMinMaxWindow<'_, T, P>
++{
++    type This<'a> = ArgMinMaxWindow<'a, T, P>;
++
++    fn new<'a>(
++        slice: &'a [T],
++        validity: &'a Bitmap,
++        start: usize,
++        end: usize,
++        params: Option<RollingFnParams>,
++        _window_size: Option<usize>,
++    ) -> Self::This<'a> {
++        assert!(params.is_none());
++        assert!(start <= slice.len() && end <= slice.len() && start <= end);
++
++        let mut this = ArgMinMaxWindow {
++            values: slice,
++            validity: Some(validity),
++            monotonic_idxs: VecDeque::new(),
++            nonnulls_in_window: 0,
++            last_start: 0,
++            last_end: 0,
++            policy: PhantomData,
++        };
++        // SAFETY: We bounds checked `start` and `end`.
++        unsafe { RollingAggWindowNulls::update(&mut this, start, end) };
++        this
++    }
++
++    unsafe fn update(&mut self, start: usize, end: usize) -> Option<IdxSize> {
++        unsafe {
++            let v = self.validity.unwrap_unchecked();
++            self.remove_old_values(start);
++            for i in self.last_start..start.min(self.last_end) {
++                self.nonnulls_in_window -= v.get_bit_unchecked(i) as usize;
++            }
++            for i in start.max(self.last_end)..end {
++                if v.get_bit_unchecked(i) {
++                    self.insert_nonnull_value(i);
++                }
++            }
++
++            self.last_start = start;
++            self.last_end = end;
++            self.monotonic_idxs
++                .front()
++                .map(|&best_abs| (best_abs - start) as IdxSize)
++        }
++    }
++
++    fn is_valid(&self, min_periods: usize) -> bool {
++        self.nonnulls_in_window >= min_periods
++    }
++
++    fn slice_len(&self) -> usize {
++        self.values.len()
++    }
++}
++
++impl<T: NativeType, P: MinMaxPolicy> RollingAggWindowNoNulls<T, IdxSize>
++    for ArgMinMaxWindow<'_, T, P>
++{
++    type This<'a> = ArgMinMaxWindow<'a, T, P>;
++
++    fn new<'a>(
++        slice: &'a [T],
++        start: usize,
++        end: usize,
++        params: Option<RollingFnParams>,
++        _window_size: Option<usize>,
++    ) -> Self::This<'a> {
++        assert!(params.is_none());
++        assert!(start <= slice.len() && end <= slice.len() && start <= end);
++
++        let mut this = ArgMinMaxWindow {
++            values: slice,
++            validity: None,
++            monotonic_idxs: VecDeque::new(),
++            nonnulls_in_window: 0,
++            last_start: 0,
++            last_end: 0,
++            policy: PhantomData,
++        };
++
++        // SAFETY: We bounds checked `start` and `end`.
++        unsafe { RollingAggWindowNoNulls::update(&mut this, start, end) };
++        this
++    }
++
++    unsafe fn update(&mut self, start: usize, end: usize) -> Option<IdxSize> {
++        unsafe {
++            self.remove_old_values(start);
++
++            for i in start.max(self.last_end)..end {
++                self.insert_nonnull_value(i);
++            }
++
++            self.last_start = start;
++            self.last_end = end;
++
++            self.monotonic_idxs
++                .front()
++                .map(|&best_abs| (best_abs - start) as IdxSize)
++        }
++    }
++
++    fn slice_len(&self) -> usize {
++        self.values.len()
++    }
++}
++
++pub type ArgMinWindow<'a, T> = ArgMinMaxWindow<'a, T, MinPropagateNan>;
++pub type ArgMaxWindow<'a, T> = ArgMinMaxWindow<'a, T, MaxPropagateNan>;
+diff --git a/crates/polars-compute/src/rolling/min_max.rs b/crates/polars-compute/src/rolling/min_max.rs
+index 61644de030..d7d1d690bc 100644
+--- a/crates/polars-compute/src/rolling/min_max.rs
++++ b/crates/polars-compute/src/rolling/min_max.rs
+@@ -1,161 +1,94 @@
+-use std::collections::VecDeque;
+-use std::marker::PhantomData;
+-
+ use arrow::bitmap::Bitmap;
+ use arrow::types::NativeType;
++use polars_utils::IdxSize;
+ use polars_utils::min_max::MinMaxPolicy;
+ 
+ use super::RollingFnParams;
++use super::arg_min_max::ArgMinMaxWindow;
+ use super::no_nulls::RollingAggWindowNoNulls;
+ use super::nulls::RollingAggWindowNulls;
+ 
+-// Algorithm: https://cs.stackexchange.com/questions/120915/interview-question-with-arrays-and-consecutive-subintervals/120936#120936
++/// Min/max window implemented on top of ArgMinMaxWindow (arg-based).
+ pub struct MinMaxWindow<'a, T, P> {
+-    values: &'a [T],
+-    validity: Option<&'a Bitmap>,
+-    // values[monotonic_idxs[i]] is better than values[monotonic_idxs[i+1]] for
+-    // all i, as per the policy.
+-    monotonic_idxs: VecDeque<usize>,
+-    nonnulls_in_window: usize,
+-    last_start: usize,
+-    last_end: usize,
+-    policy: PhantomData<P>,
+-}
+-
+-impl<T: NativeType, P: MinMaxPolicy> MinMaxWindow<'_, T, P> {
+-    /// # Safety
+-    /// The index must be in-bounds.
+-    unsafe fn insert_nonnull_value(&mut self, idx: usize) {
+-        unsafe {
+-            let value = self.values.get_unchecked(idx);
+-
+-            // Remove values which are older and worse.
+-            while let Some(tail_idx) = self.monotonic_idxs.back() {
+-                let tail_value = self.values.get_unchecked(*tail_idx);
+-                if !P::is_better(value, tail_value) {
+-                    break;
+-                }
+-                self.monotonic_idxs.pop_back();
+-            }
+-
+-            self.monotonic_idxs.push_back(idx);
+-            self.nonnulls_in_window += 1;
+-        }
+-    }
+-
+-    fn remove_old_values(&mut self, window_start: usize) {
+-        // Remove values which have fallen outside the window start.
+-        while let Some(head_idx) = self.monotonic_idxs.front() {
+-            if *head_idx >= window_start {
+-                break;
+-            }
+-            self.monotonic_idxs.pop_front();
+-        }
+-    }
++    inner: ArgMinMaxWindow<'a, T, P>,
+ }
+ 
+-impl<T: NativeType, P: MinMaxPolicy> RollingAggWindowNulls<T> for MinMaxWindow<'_, T, P> {
+-    type This<'a> = MinMaxWindow<'a, T, P>;
++impl<'a, T: NativeType, P: MinMaxPolicy> RollingAggWindowNulls<T> for MinMaxWindow<'a, T, P> {
++    type This<'b> = MinMaxWindow<'b, T, P>;
+ 
+-    fn new<'a>(
+-        slice: &'a [T],
+-        validity: &'a Bitmap,
++    fn new<'b>(
++        slice: &'b [T],
++        validity: &'b Bitmap,
+         start: usize,
+         end: usize,
+         params: Option<RollingFnParams>,
+-        _window_size: Option<usize>,
+-    ) -> Self::This<'a> {
++        window_size: Option<usize>,
++    ) -> Self::This<'b> {
+         assert!(params.is_none());
+         assert!(start <= slice.len() && end <= slice.len() && start <= end);
+ 
+-        let mut this = MinMaxWindow {
+-            values: slice,
+-            validity: Some(validity),
+-            monotonic_idxs: VecDeque::new(),
+-            nonnulls_in_window: 0,
+-            last_start: 0,
+-            last_end: 0,
+-            policy: PhantomData,
+-        };
+-        // SAFETY: We bounds checked `start` and `end`.
+-        unsafe {
+-            RollingAggWindowNulls::update(&mut this, start, end);
+-        }
+-        this
++        let inner = <ArgMinMaxWindow<'b, T, P> as RollingAggWindowNulls<T, IdxSize>>::new(
++            slice,
++            validity,
++            start,
++            end,
++            None,
++            window_size,
++        );
++
++        MinMaxWindow { inner }
+     }
+ 
+     unsafe fn update(&mut self, start: usize, end: usize) -> Option<T> {
+-        unsafe {
+-            let v = self.validity.unwrap_unchecked();
+-            self.remove_old_values(start);
+-            for i in self.last_start..start.min(self.last_end) {
+-                self.nonnulls_in_window -= v.get_bit_unchecked(i) as usize;
+-            }
+-            for i in start.max(self.last_end)..end {
+-                if v.get_bit_unchecked(i) {
+-                    self.insert_nonnull_value(i);
+-                }
+-            }
+-
+-            self.last_start = start;
+-            self.last_end = end;
+-            self.monotonic_idxs
+-                .front()
+-                .map(|idx| *self.values.get_unchecked(*idx))
+-        }
++        let rel: IdxSize =
++            unsafe { RollingAggWindowNulls::<T, IdxSize>::update(&mut self.inner, start, end)? };
++
++        let abs = start + rel as usize;
++        unsafe { Some(*self.inner.values.get_unchecked(abs)) }
+     }
+ 
+     fn is_valid(&self, min_periods: usize) -> bool {
+-        self.nonnulls_in_window >= min_periods
++        RollingAggWindowNulls::<T, IdxSize>::is_valid(&self.inner, min_periods)
+     }
+ 
+     fn slice_len(&self) -> usize {
+-        self.values.len()
++        RollingAggWindowNulls::<T, IdxSize>::slice_len(&self.inner)
+     }
+ }
+ 
+-impl<T: NativeType, P: MinMaxPolicy> RollingAggWindowNoNulls<T> for MinMaxWindow<'_, T, P> {
+-    type This<'a> = MinMaxWindow<'a, T, P>;
++impl<'a, T: NativeType, P: MinMaxPolicy> RollingAggWindowNoNulls<T> for MinMaxWindow<'a, T, P> {
++    type This<'b> = MinMaxWindow<'b, T, P>;
+ 
+-    fn new<'a>(
+-        slice: &'a [T],
++    fn new<'b>(
++        slice: &'b [T],
+         start: usize,
+         end: usize,
+         params: Option<RollingFnParams>,
+-        _window_size: Option<usize>,
+-    ) -> Self::This<'a> {
++        window_size: Option<usize>,
++    ) -> Self::This<'b> {
+         assert!(params.is_none());
+-        let mut this = MinMaxWindow {
+-            values: slice,
+-            validity: None,
+-            monotonic_idxs: VecDeque::new(),
+-            nonnulls_in_window: 0,
+-            last_start: 0,
+-            last_end: 0,
+-            policy: PhantomData,
+-        };
+-        unsafe {
+-            RollingAggWindowNoNulls::update(&mut this, start, end);
+-        }
+-        this
++        assert!(start <= slice.len() && end <= slice.len() && start <= end);
++
++        let inner = <ArgMinMaxWindow<'b, T, P> as RollingAggWindowNoNulls<T, IdxSize>>::new(
++            slice,
++            start,
++            end,
++            None,
++            window_size,
++        );
++
++        MinMaxWindow { inner }
+     }
+ 
+     unsafe fn update(&mut self, start: usize, end: usize) -> Option<T> {
+-        unsafe {
+-            self.remove_old_values(start);
+-            for i in start.max(self.last_end)..end {
+-                self.insert_nonnull_value(i);
+-            }
+-
+-            self.last_start = start;
+-            self.last_end = end;
+-            self.monotonic_idxs
+-                .front()
+-                .map(|idx| *self.values.get_unchecked(*idx))
+-        }
++        let rel: IdxSize =
++            unsafe { RollingAggWindowNoNulls::<T, IdxSize>::update(&mut self.inner, start, end)? };
++
++        let abs = start + rel as usize;
++        unsafe { Some(*self.inner.values.get_unchecked(abs)) }
+     }
+ 
+     fn slice_len(&self) -> usize {
+-        self.values.len()
++        RollingAggWindowNoNulls::<T, IdxSize>::slice_len(&self.inner)
+     }
+ }
+diff --git a/crates/polars-compute/src/rolling/mod.rs b/crates/polars-compute/src/rolling/mod.rs
+index 81487b4c30..a8d0f66c51 100644
+--- a/crates/polars-compute/src/rolling/mod.rs
++++ b/crates/polars-compute/src/rolling/mod.rs
+@@ -7,10 +7,12 @@ pub mod quantile_filter;
+ mod rank;
+ mod sum;
+ 
++mod arg_min_max;
+ pub(super) mod window;
+ use std::hash::Hash;
+ use std::ops::{Add, AddAssign, Div, Mul, Sub, SubAssign};
+ 
++pub use arg_min_max::{ArgMaxWindow, ArgMinMaxWindow, ArgMinWindow};
+ use arrow::array::{ArrayRef, PrimitiveArray};
+ use arrow::bitmap::{Bitmap, MutableBitmap};
+ use arrow::types::NativeType;
+diff --git a/crates/polars-core/src/chunked_array/arg_min_max.rs b/crates/polars-core/src/chunked_array/arg_min_max.rs
+new file mode 100644
+index 0000000000..87e239425e
+--- /dev/null
++++ b/crates/polars-core/src/chunked_array/arg_min_max.rs
+@@ -0,0 +1,278 @@
++use arrow::array::Array;
++use polars_utils::arg_min_max::ArgMinMax;
++use polars_utils::min_max::{MaxIgnoreNan, MinIgnoreNan, MinMaxPolicy};
++
++use crate::chunked_array::ChunkedArray;
++use crate::chunked_array::ops::float_sorted_arg_max::{
++    float_arg_max_sorted_ascending, float_arg_max_sorted_descending,
++};
++use crate::datatypes::{
++    BinaryChunked, BooleanChunked, PolarsDataType, PolarsNumericType, StringChunked,
++};
++#[cfg(feature = "dtype-categorical")]
++use crate::datatypes::{CategoricalChunked, PolarsCategoricalType};
++use crate::series::IsSorted;
++
++pub fn arg_min_opt_iter<T, I>(iter: I) -> Option<usize>
++where
++    I: IntoIterator<Item = Option<T>>,
++    T: Ord,
++{
++    iter.into_iter()
++        .enumerate()
++        .flat_map(|(idx, val)| Some((idx, val?)))
++        .min_by(|x, y| Ord::cmp(&x.1, &y.1))
++        .map(|x| x.0)
++}
++
++pub fn arg_max_opt_iter<T, I>(iter: I) -> Option<usize>
++where
++    I: IntoIterator<Item = Option<T>>,
++    T: Ord,
++{
++    iter.into_iter()
++        .enumerate()
++        .flat_map(|(idx, val)| Some((idx, val?)))
++        .max_by(|x, y| Ord::cmp(&x.1, &y.1))
++        .map(|x| x.0)
++}
++
++pub fn arg_min_numeric<T>(ca: &ChunkedArray<T>) -> Option<usize>
++where
++    T: PolarsNumericType,
++    for<'b> &'b [T::Native]: ArgMinMax,
++{
++    if ca.null_count() == ca.len() {
++        None
++    } else if let Ok(vals) = ca.cont_slice() {
++        arg_min_numeric_slice(vals, ca.is_sorted_flag())
++    } else {
++        arg_min_numeric_chunked(ca)
++    }
++}
++
++pub fn arg_max_numeric<T>(ca: &ChunkedArray<T>) -> Option<usize>
++where
++    T: PolarsNumericType,
++    for<'b> &'b [T::Native]: ArgMinMax,
++{
++    if ca.null_count() == ca.len() {
++        None
++    } else if T::get_static_dtype().is_float() && !matches!(ca.is_sorted_flag(), IsSorted::Not) {
++        arg_max_float_sorted(ca)
++    } else if let Ok(vals) = ca.cont_slice() {
++        arg_max_numeric_slice(vals, ca.is_sorted_flag())
++    } else {
++        arg_max_numeric_chunked(ca)
++    }
++}
++
++/// # Safety
++/// `ca` has a float dtype, has at least one non-null value and is sorted.
++fn arg_max_float_sorted<T>(ca: &ChunkedArray<T>) -> Option<usize>
++where
++    T: PolarsNumericType,
++{
++    let out = match ca.is_sorted_flag() {
++        IsSorted::Ascending => float_arg_max_sorted_ascending(ca),
++        IsSorted::Descending => float_arg_max_sorted_descending(ca),
++        _ => unreachable!(),
++    };
++    Some(out)
++}
++
++#[cfg(feature = "dtype-categorical")]
++pub fn arg_min_cat<T: PolarsCategoricalType>(ca: &CategoricalChunked<T>) -> Option<usize> {
++    if ca.null_count() == ca.len() {
++        return None;
++    }
++    arg_min_opt_iter(ca.iter_str())
++}
++
++#[cfg(feature = "dtype-categorical")]
++pub fn arg_max_cat<T: PolarsCategoricalType>(ca: &CategoricalChunked<T>) -> Option<usize> {
++    if ca.null_count() == ca.len() {
++        return None;
++    }
++    arg_max_opt_iter(ca.iter_str())
++}
++
++pub fn arg_min_bool(ca: &BooleanChunked) -> Option<usize> {
++    ca.first_false_idx().or_else(|| ca.first_true_idx())
++}
++
++pub fn arg_max_bool(ca: &BooleanChunked) -> Option<usize> {
++    ca.first_true_idx().or_else(|| ca.first_false_idx())
++}
++
++pub fn arg_min_str(ca: &StringChunked) -> Option<usize> {
++    arg_min_physical_generic(ca)
++}
++
++pub fn arg_max_str(ca: &StringChunked) -> Option<usize> {
++    arg_max_physical_generic(ca)
++}
++
++pub fn arg_min_binary(ca: &BinaryChunked) -> Option<usize> {
++    arg_min_physical_generic(ca)
++}
++
++pub fn arg_max_binary(ca: &BinaryChunked) -> Option<usize> {
++    arg_max_physical_generic(ca)
++}
++
++fn arg_min_physical_generic<T>(ca: &ChunkedArray<T>) -> Option<usize>
++where
++    T: PolarsDataType,
++    for<'a> T::Physical<'a>: Ord,
++{
++    if ca.null_count() == ca.len() {
++        return None;
++    }
++    match ca.is_sorted_flag() {
++        IsSorted::Ascending => ca.first_non_null(),
++        IsSorted::Descending => ca.last_non_null(),
++        IsSorted::Not => arg_min_opt_iter(ca.iter()),
++    }
++}
++
++fn arg_max_physical_generic<T>(ca: &ChunkedArray<T>) -> Option<usize>
++where
++    T: PolarsDataType,
++    for<'a> T::Physical<'a>: Ord,
++{
++    if ca.null_count() == ca.len() {
++        return None;
++    }
++    match ca.is_sorted_flag() {
++        IsSorted::Ascending => ca.last_non_null(),
++        IsSorted::Descending => ca.first_non_null(),
++        IsSorted::Not => arg_max_opt_iter(ca.iter()),
++    }
++}
++
++fn arg_min_numeric_chunked<'a, T>(ca: &'a ChunkedArray<T>) -> Option<usize>
++where
++    T: PolarsNumericType,
++    for<'b> &'b [T::Native]: ArgMinMax,
++{
++    match ca.is_sorted_flag() {
++        IsSorted::Ascending => ca.first_non_null(),
++        IsSorted::Descending => ca.last_non_null(),
++        IsSorted::Not => {
++            let mut chunk_start_offset = 0;
++            let mut min_idx: Option<usize> = None;
++            let mut min_val: Option<T::Native> = None;
++            for arr in ca.downcast_iter() {
++                if arr.len() == arr.null_count() {
++                    chunk_start_offset += arr.len();
++                    continue;
++                }
++
++                let chunk_min: Option<(usize, T::Native)> = if arr.null_count() > 0 {
++                    arr.into_iter()
++                        .enumerate()
++                        .flat_map(|(idx, val)| Some((idx, *(val?))))
++                        .reduce(|acc, (idx, val)| {
++                            if MinIgnoreNan::is_better(&val, &acc.1) {
++                                (idx, val)
++                            } else {
++                                acc
++                            }
++                        })
++                } else {
++                    // When no nulls & array not empty => we can use fast argmin.
++                    let min_idx: usize = arr.values().as_slice().argmin();
++                    Some((min_idx, arr.value(min_idx)))
++                };
++
++                if let Some((chunk_min_idx, chunk_min_val)) = chunk_min {
++                    if min_val.is_none()
++                        || MinIgnoreNan::is_better(&chunk_min_val, &min_val.unwrap())
++                    {
++                        min_val = Some(chunk_min_val);
++                        min_idx = Some(chunk_start_offset + chunk_min_idx);
++                    }
++                }
++                chunk_start_offset += arr.len();
++            }
++            min_idx
++        },
++    }
++}
++
++fn arg_max_numeric_chunked<'a, T>(ca: &'a ChunkedArray<T>) -> Option<usize>
++where
++    T: PolarsNumericType,
++    for<'b> &'b [T::Native]: ArgMinMax,
++{
++    match ca.is_sorted_flag() {
++        IsSorted::Ascending => ca.last_non_null(),
++        IsSorted::Descending => ca.first_non_null(),
++        IsSorted::Not => {
++            let mut chunk_start_offset = 0;
++            let mut max_idx: Option<usize> = None;
++            let mut max_val: Option<T::Native> = None;
++            for arr in ca.downcast_iter() {
++                if arr.len() == arr.null_count() {
++                    chunk_start_offset += arr.len();
++                    continue;
++                }
++
++                let chunk_max: Option<(usize, T::Native)> = if arr.null_count() > 0 {
++                    arr.into_iter()
++                        .enumerate()
++                        .flat_map(|(idx, val)| Some((idx, *(val?))))
++                        .reduce(|acc, (idx, val)| {
++                            if MaxIgnoreNan::is_better(&val, &acc.1) {
++                                (idx, val)
++                            } else {
++                                acc
++                            }
++                        })
++                } else {
++                    // When no nulls & array not empty => we can use fast argmax.
++                    let max_idx: usize = arr.values().as_slice().argmax();
++                    Some((max_idx, arr.value(max_idx)))
++                };
++
++                if let Some((chunk_max_idx, chunk_max_val)) = chunk_max {
++                    if max_val.is_none()
++                        || MaxIgnoreNan::is_better(&chunk_max_val, &max_val.unwrap())
++                    {
++                        max_val = Some(chunk_max_val);
++                        max_idx = Some(chunk_start_offset + chunk_max_idx);
++                    }
++                }
++                chunk_start_offset += arr.len();
++            }
++            max_idx
++        },
++    }
++}
++
++fn arg_min_numeric_slice<T>(vals: &[T], is_sorted: IsSorted) -> Option<usize>
++where
++    for<'a> &'a [T]: ArgMinMax,
++{
++    match is_sorted {
++        // all vals are not null guarded by cont_slice
++        IsSorted::Ascending => Some(0),
++        // all vals are not null guarded by cont_slice
++        IsSorted::Descending => Some(vals.len() - 1),
++        IsSorted::Not => Some(vals.argmin()), // assumes not empty
++    }
++}
++
++fn arg_max_numeric_slice<T>(vals: &[T], is_sorted: IsSorted) -> Option<usize>
++where
++    for<'a> &'a [T]: ArgMinMax,
++{
++    match is_sorted {
++        // all vals are not null guarded by cont_slice
++        IsSorted::Ascending => Some(vals.len() - 1),
++        // all vals are not null guarded by cont_slice
++        IsSorted::Descending => Some(0),
++        IsSorted::Not => Some(vals.argmax()), // assumes not empty
++    }
++}
+diff --git a/crates/polars-core/src/chunked_array/mod.rs b/crates/polars-core/src/chunked_array/mod.rs
+index 8a8a7784f1..59627ec006 100644
+--- a/crates/polars-core/src/chunked_array/mod.rs
++++ b/crates/polars-core/src/chunked_array/mod.rs
+@@ -22,6 +22,7 @@ pub mod iterator;
+ #[cfg(feature = "ndarray")]
+ pub(crate) mod ndarray;
+ 
++pub mod arg_min_max;
+ #[cfg(feature = "dtype-array")]
+ pub(crate) mod array;
+ mod binary;
+@@ -48,7 +49,7 @@ mod struct_;
+ pub mod temporal;
+ mod to_vec;
+ mod trusted_len;
+-
++pub(crate) use arg_min_max::*;
+ use arrow::legacy::prelude::*;
+ #[cfg(feature = "dtype-struct")]
+ pub use struct_::StructChunked;
+diff --git a/crates/polars-core/src/chunked_array/ops/aggregate/mod.rs b/crates/polars-core/src/chunked_array/ops/aggregate/mod.rs
+index 5e655ebeab..4ddcde2322 100644
+--- a/crates/polars-core/src/chunked_array/ops/aggregate/mod.rs
++++ b/crates/polars-core/src/chunked_array/ops/aggregate/mod.rs
+@@ -16,7 +16,7 @@ pub use var::*;
+ use super::float_sorted_arg_max::{
+     float_arg_max_sorted_ascending, float_arg_max_sorted_descending,
+ };
+-use crate::chunked_array::ChunkedArray;
++use crate::chunked_array::{ChunkedArray, arg_max_binary, arg_min_binary};
+ use crate::datatypes::{BooleanChunked, PolarsNumericType};
+ use crate::prelude::*;
+ use crate::series::IsSorted;
+@@ -591,6 +591,29 @@ impl BinaryChunked {
+                 .reduce(MinMax::min_ignore_nan),
+         }
+     }
++    pub fn arg_min_binary(&self) -> Option<usize> {
++        if self.is_empty() || self.null_count() == self.len() {
++            return None;
++        }
++
++        match self.is_sorted_flag() {
++            IsSorted::Ascending => self.first_non_null(),
++            IsSorted::Descending => self.last_non_null(),
++            IsSorted::Not => arg_min_binary(self),
++        }
++    }
++
++    pub fn arg_max_binary(&self) -> Option<usize> {
++        if self.is_empty() || self.null_count() == self.len() {
++            return None;
++        }
++
++        match self.is_sorted_flag() {
++            IsSorted::Ascending => self.last_non_null(),
++            IsSorted::Descending => self.first_non_null(),
++            IsSorted::Not => arg_max_binary(self),
++        }
++    }
+ }
+ 
+ impl ChunkAggSeries for BinaryChunked {
+diff --git a/crates/polars-core/src/frame/column/mod.rs b/crates/polars-core/src/frame/column/mod.rs
+index 6296eb911a..92c763022e 100644
+--- a/crates/polars-core/src/frame/column/mod.rs
++++ b/crates/polars-core/src/frame/column/mod.rs
+@@ -759,6 +759,22 @@ impl Column {
+         self.agg_with_unit_scalar(groups, |s, g| unsafe { s.agg_mean(g) })
+     }
+ 
++    /// # Safety
++    ///
++    /// Does no bounds checks, groups must be correct.
++    #[cfg(feature = "algorithm_group_by")]
++    pub unsafe fn agg_arg_min(&self, groups: &GroupsType) -> Self {
++        self.agg_with_unit_scalar(groups, |s, g| unsafe { s.agg_arg_min(g) })
++    }
++
++    /// # Safety
++    ///
++    /// Does no bounds checks, groups must be correct.
++    #[cfg(feature = "algorithm_group_by")]
++    pub unsafe fn agg_arg_max(&self, groups: &GroupsType) -> Self {
++        self.agg_with_unit_scalar(groups, |s, g| unsafe { s.agg_arg_max(g) })
++    }
++
+     /// # Safety
+     ///
+     /// Does no bounds checks, groups must be correct.
+diff --git a/crates/polars-core/src/frame/group_by/aggregations/dispatch.rs b/crates/polars-core/src/frame/group_by/aggregations/dispatch.rs
+index 54ad73fae8..541793af3f 100644
+--- a/crates/polars-core/src/frame/group_by/aggregations/dispatch.rs
++++ b/crates/polars-core/src/frame/group_by/aggregations/dispatch.rs
+@@ -149,6 +149,140 @@ impl Series {
+         s.restore_logical(out)
+     }
+ 
++    #[doc(hidden)]
++    pub unsafe fn agg_arg_first(&self, groups: &GroupsType) -> Series {
++        let out: IdxCa = match groups {
++            GroupsType::Idx(groups) => groups
++                .iter()
++                .map(|(_, idx)| {
++                    if idx.is_empty() {
++                        None
++                    } else {
++                        Some(0 as IdxSize)
++                    }
++                })
++                .collect_ca(PlSmallStr::EMPTY),
++
++            GroupsType::Slice { groups, .. } => groups
++                .iter()
++                .map(|&[_first, len]| if len == 0 { None } else { Some(0 as IdxSize) })
++                .collect_ca(PlSmallStr::EMPTY),
++        };
++        out.into_series()
++    }
++
++    #[doc(hidden)]
++    pub unsafe fn agg_arg_first_non_null(&self, groups: &GroupsType) -> Series {
++        if !self.has_nulls() {
++            return self.agg_arg_first(groups);
++        }
++
++        let validity = self.rechunk_validity().unwrap();
++
++        let out: IdxCa = match groups {
++            GroupsType::Idx(groups) => groups
++                .iter()
++                .map(|(_, idx)| {
++                    let mut pos: Option<IdxSize> = None;
++                    for (p, &ii) in idx.iter().enumerate() {
++                        if validity.get_bit_unchecked(ii as usize) {
++                            pos = Some(p as IdxSize);
++                            break;
++                        }
++                    }
++                    pos
++                })
++                .collect_ca(PlSmallStr::EMPTY),
++
++            GroupsType::Slice { groups, .. } => {
++                let mask = BitMask::from_bitmap(&validity);
++                groups
++                    .iter()
++                    .map(|&[first, len]| {
++                        if len == 0 {
++                            return None;
++                        }
++                        let v = mask.sliced_unchecked(first as usize, len as usize);
++                        let lz = v.leading_zeros() as IdxSize;
++                        if lz == len { None } else { Some(lz) }
++                    })
++                    .collect_ca(PlSmallStr::EMPTY)
++            },
++        };
++
++        out.into_series()
++    }
++
++    #[doc(hidden)]
++    pub unsafe fn agg_arg_last(&self, groups: &GroupsType) -> Series {
++        let out: IdxCa = match groups {
++            GroupsType::Idx(groups) => groups
++                .all()
++                .iter()
++                .map(|idx| {
++                    if idx.is_empty() {
++                        None
++                    } else {
++                        Some((idx.len() - 1) as IdxSize)
++                    }
++                })
++                .collect_ca(PlSmallStr::EMPTY),
++
++            GroupsType::Slice { groups, .. } => groups
++                .iter()
++                .map(|&[_first, len]| {
++                    if len == 0 {
++                        None
++                    } else {
++                        Some((len - 1) as IdxSize)
++                    }
++                })
++                .collect_ca(PlSmallStr::EMPTY),
++        };
++
++        out.into_series()
++    }
++
++    #[doc(hidden)]
++    pub unsafe fn agg_arg_last_non_null(&self, groups: &GroupsType) -> Series {
++        if !self.has_nulls() {
++            return self.agg_arg_last(groups);
++        }
++
++        let validity = self.rechunk_validity().unwrap();
++
++        let out: IdxCa = match groups {
++            GroupsType::Idx(groups) => groups
++                .iter()
++                .map(|(_, idx)| {
++                    for (p, &ii) in idx.iter().enumerate().rev() {
++                        if validity.get_bit_unchecked(ii as usize) {
++                            return Some(p as IdxSize);
++                        }
++                    }
++                    None
++                })
++                .collect_ca(PlSmallStr::EMPTY),
++
++            GroupsType::Slice { groups, .. } => {
++                let mask = BitMask::from_bitmap(&validity);
++                groups
++                    .iter()
++                    .map(|&[first, len]| {
++                        if len == 0 {
++                            return None;
++                        }
++                        let v = mask.sliced_unchecked(first as usize, len as usize);
++                        let tz = v.trailing_zeros() as IdxSize;
++                        if tz == len { None } else { Some(len - tz - 1) }
++                    })
++                    .collect_ca(PlSmallStr::EMPTY)
++            },
++        };
++
++        out.into_series()
++    }
++
+     #[doc(hidden)]
+     pub unsafe fn agg_n_unique(&self, groups: &GroupsType) -> Series {
+         let values = self.to_physical_repr();
+diff --git a/crates/polars-core/src/frame/group_by/aggregations/mod.rs b/crates/polars-core/src/frame/group_by/aggregations/mod.rs
+index 4cc9e16385..66de312f7c 100644
+--- a/crates/polars-core/src/frame/group_by/aggregations/mod.rs
++++ b/crates/polars-core/src/frame/group_by/aggregations/mod.rs
+@@ -18,9 +18,10 @@ use polars_compute::rolling::no_nulls::{
+ use polars_compute::rolling::nulls::{RollingAggWindowNulls, VarianceMoment};
+ use polars_compute::rolling::quantile_filter::SealedRolling;
+ use polars_compute::rolling::{
+-    self, MeanWindow, QuantileMethod, RollingFnParams, RollingQuantileParams, RollingVarParams,
+-    SumWindow, quantile_filter,
++    self, ArgMaxWindow, ArgMinWindow, MeanWindow, QuantileMethod, RollingFnParams,
++    RollingQuantileParams, RollingVarParams, SumWindow, quantile_filter,
+ };
++use polars_utils::arg_min_max::ArgMinMax;
+ use polars_utils::float::IsFloat;
+ #[cfg(feature = "dtype-f16")]
+ use polars_utils::float16::pf16;
+@@ -33,7 +34,7 @@ use crate::POOL;
+ use crate::chunked_array::cast::CastOptions;
+ #[cfg(feature = "object")]
+ use crate::chunked_array::object::extension::create_extension;
+-use crate::frame::group_by::GroupsIdx;
++use crate::chunked_array::{arg_max_numeric, arg_min_numeric};
+ #[cfg(feature = "object")]
+ use crate::frame::group_by::GroupsIndicator;
+ use crate::prelude::*;
+@@ -64,20 +65,21 @@ pub fn _use_rolling_kernels(
+ }
+ 
+ // Use an aggregation window that maintains the state
+-pub fn _rolling_apply_agg_window_nulls<Agg, T, O>(
++pub fn _rolling_apply_agg_window_nulls<Agg, T, O, Out>(
+     values: &[T],
+     validity: &Bitmap,
+     offsets: O,
+     params: Option<RollingFnParams>,
+-) -> PrimitiveArray<T>
++) -> PrimitiveArray<Out>
+ where
+     O: Iterator<Item = (IdxSize, IdxSize)> + TrustedLen,
+-    Agg: RollingAggWindowNulls<T>,
++    Agg: RollingAggWindowNulls<T, Out>,
+     T: IsFloat + NativeType,
++    Out: NativeType,
+ {
+     if values.is_empty() {
+-        let out: Vec<T> = vec![];
+-        return PrimitiveArray::new(T::PRIMITIVE.into(), out.into(), None);
++        let out: Vec<Out> = vec![];
++        return PrimitiveArray::new(Out::PRIMITIVE.into(), out.into(), None);
+     }
+ 
+     // This iterators length can be trusted
+@@ -103,30 +105,31 @@ where
+                 None => {
+                     // SAFETY: we are in bounds
+                     unsafe { validity.set_unchecked(idx, false) };
+-                    T::default()
++                    Out::default()
+                 },
+             }
+         })
+         .collect_trusted::<Vec<_>>();
+ 
+-    PrimitiveArray::new(T::PRIMITIVE.into(), out.into(), Some(validity.into()))
++    PrimitiveArray::new(Out::PRIMITIVE.into(), out.into(), Some(validity.into()))
+ }
+ 
+ // Use an aggregation window that maintains the state.
+-pub fn _rolling_apply_agg_window_no_nulls<Agg, T, O>(
++pub fn _rolling_apply_agg_window_no_nulls<Agg, T, O, Out>(
+     values: &[T],
+     offsets: O,
+     params: Option<RollingFnParams>,
+-) -> PrimitiveArray<T>
++) -> PrimitiveArray<Out>
+ where
+     // items (offset, len) -> so offsets are offset, offset + len
+-    Agg: RollingAggWindowNoNulls<T>,
++    Agg: RollingAggWindowNoNulls<T, Out>,
+     O: Iterator<Item = (IdxSize, IdxSize)> + TrustedLen,
+     T: IsFloat + NativeType,
++    Out: NativeType,
+ {
+     if values.is_empty() {
+-        let out: Vec<T> = vec![];
+-        return PrimitiveArray::new(T::PRIMITIVE.into(), out.into(), None);
++        let out: Vec<Out> = vec![];
++        return PrimitiveArray::new(Out::PRIMITIVE.into(), out.into(), None);
+     }
+     // start with a dummy index, will be overwritten on first iteration.
+     let mut agg_window = Agg::new(values, 0, 0, params, None);
+@@ -138,7 +141,7 @@ where
+             // SAFETY: we are in bounds.
+             unsafe { agg_window.update(start as usize, end as usize) }
+         })
+-        .collect::<PrimitiveArray<T>>()
++        .collect::<PrimitiveArray<Out>>()
+ }
+ 
+ pub fn _slice_from_offsets<T>(ca: &ChunkedArray<T>, first: IdxSize, len: IdxSize) -> ChunkedArray<T>
+@@ -290,7 +293,7 @@ where
+                 let values = arr.values().as_slice();
+                 let offset_iter = groups.iter().map(|[first, len]| (*first, *len));
+                 let arr = match arr.validity() {
+-                    None => _rolling_apply_agg_window_no_nulls::<QuantileWindow<_>, _, _>(
++                    None => _rolling_apply_agg_window_no_nulls::<QuantileWindow<_>, _, _, _>(
+                         values,
+                         offset_iter,
+                         Some(RollingFnParams::Quantile(RollingQuantileParams {
+@@ -299,7 +302,7 @@ where
+                         })),
+                     ),
+                     Some(validity) => {
+-                        _rolling_apply_agg_window_nulls::<rolling::nulls::QuantileWindow<_>, _, _>(
++                        _rolling_apply_agg_window_nulls::<rolling::nulls::QuantileWindow<_>, _, _, _>(
+                             values,
+                             validity,
+                             offset_iter,
+@@ -479,18 +482,19 @@ where
+                     let values = arr.values().as_slice();
+                     let offset_iter = groups_slice.iter().map(|[first, len]| (*first, *len));
+                     let arr = match arr.validity() {
+-                        None => _rolling_apply_agg_window_no_nulls::<MinWindow<_>, _, _>(
++                        None => _rolling_apply_agg_window_no_nulls::<MinWindow<_>, _, _, _>(
+                             values,
+                             offset_iter,
+                             None,
+                         ),
+-                        Some(validity) => _rolling_apply_agg_window_nulls::<
+-                            rolling::nulls::MinWindow<_>,
+-                            _,
+-                            _,
+-                        >(
+-                            values, validity, offset_iter, None
+-                        ),
++                        Some(validity) => {
++                            _rolling_apply_agg_window_nulls::<rolling::nulls::MinWindow<_>, _, _, _>(
++                                values,
++                                validity,
++                                offset_iter,
++                                None,
++                            )
++                        },
+                     };
+                     Self::from(arr).into_series()
+                 } else {
+@@ -510,6 +514,113 @@ where
+         }
+     }
+ 
++    pub(crate) unsafe fn agg_arg_min(&self, groups: &GroupsType) -> Series
++    where
++        for<'b> &'b [T::Native]: ArgMinMax,
++    {
++        if groups.is_sorted_flag() {
++            match self.is_sorted_flag() {
++                IsSorted::Ascending => {
++                    return self.clone().into_series().agg_arg_first_non_null(groups);
++                },
++                IsSorted::Descending => {
++                    return self.clone().into_series().agg_arg_last_non_null(groups);
++                },
++                _ => {},
++            }
++        }
++
++        match groups {
++            GroupsType::Idx(groups) => {
++                let ca = self.rechunk();
++                let arr = ca.downcast_iter().next().unwrap();
++                let no_nulls = !arr.has_nulls();
++
++                agg_helper_idx_on_all::<IdxType, _>(groups, |idx| {
++                    if idx.is_empty() {
++                        return None;
++                    }
++
++                    if no_nulls {
++                        let first_i = idx[0] as usize;
++                        let mut best_pos: IdxSize = 0;
++                        let mut best_val: T::Native = unsafe { arr.value_unchecked(first_i) };
++
++                        for (pos, &i) in idx.iter().enumerate().skip(1) {
++                            let v = unsafe { arr.value_unchecked(i as usize) };
++                            if v.nan_max_lt(&best_val) {
++                                best_val = v;
++                                best_pos = pos as IdxSize;
++                            }
++                        }
++                        Some(best_pos)
++                    } else {
++                        let (start_pos, mut best_val) = idx
++                            .iter()
++                            .enumerate()
++                            .find_map(|(pos, &i)| arr.get(i as usize).map(|v| (pos, v)))?;
++
++                        let mut best_pos: IdxSize = start_pos as IdxSize;
++
++                        for (pos, &i) in idx.iter().enumerate().skip(start_pos + 1) {
++                            if let Some(v) = arr.get(i as usize) {
++                                if v.nan_max_lt(&best_val) {
++                                    best_val = v;
++                                    best_pos = pos as IdxSize;
++                                }
++                            }
++                        }
++
++                        Some(best_pos)
++                    }
++                })
++            },
++            GroupsType::Slice {
++                groups: groups_slice,
++                overlapping,
++                monotonic,
++            } => {
++                if _use_rolling_kernels(groups_slice, *overlapping, *monotonic, self.chunks()) {
++                    let arr = self.downcast_as_array();
++                    let values = arr.values().as_slice();
++                    let offset_iter = groups_slice.iter().map(|[first, len]| (*first, *len));
++                    let idx_arr = match arr.validity() {
++                        None => {
++                            _rolling_apply_agg_window_no_nulls::<ArgMinWindow<_>, _, _, IdxSize>(
++                                values,
++                                offset_iter,
++                                None,
++                            )
++                        },
++                        Some(validity) => {
++                            _rolling_apply_agg_window_nulls::<ArgMinWindow<_>, _, _, IdxSize>(
++                                values,
++                                validity,
++                                offset_iter,
++                                None,
++                            )
++                        },
++                    };
++
++                    IdxCa::from(idx_arr).into_series()
++                } else {
++                    _agg_helper_slice::<IdxType, _>(groups_slice, |[first, len]| {
++                        debug_assert!(len <= self.len() as IdxSize);
++                        match len {
++                            0 => None,
++                            1 => Some(0 as IdxSize),
++                            _ => {
++                                let group_ca = _slice_from_offsets(self, first, len);
++                                let pos_in_group: Option<usize> = arg_min_numeric(&group_ca);
++                                pos_in_group.map(|p| p as IdxSize)
++                            },
++                        }
++                    })
++                }
++            },
++        }
++    }
++
+     pub(crate) unsafe fn agg_max(&self, groups: &GroupsType) -> Series {
+         // faster paths
+         if groups.is_sorted_flag() {
+@@ -552,18 +663,19 @@ where
+                     let values = arr.values().as_slice();
+                     let offset_iter = groups_slice.iter().map(|[first, len]| (*first, *len));
+                     let arr = match arr.validity() {
+-                        None => _rolling_apply_agg_window_no_nulls::<MaxWindow<_>, _, _>(
++                        None => _rolling_apply_agg_window_no_nulls::<MaxWindow<_>, _, _, _>(
+                             values,
+                             offset_iter,
+                             None,
+                         ),
+-                        Some(validity) => _rolling_apply_agg_window_nulls::<
+-                            rolling::nulls::MaxWindow<_>,
+-                            _,
+-                            _,
+-                        >(
+-                            values, validity, offset_iter, None
+-                        ),
++                        Some(validity) => {
++                            _rolling_apply_agg_window_nulls::<rolling::nulls::MaxWindow<_>, _, _, _>(
++                                values,
++                                validity,
++                                offset_iter,
++                                None,
++                            )
++                        },
+                     };
+                     Self::from(arr).into_series()
+                 } else {
+@@ -583,6 +695,113 @@ where
+         }
+     }
+ 
++    pub(crate) unsafe fn agg_arg_max(&self, groups: &GroupsType) -> Series
++    where
++        for<'b> &'b [T::Native]: ArgMinMax,
++    {
++        if groups.is_sorted_flag() {
++            match self.is_sorted_flag() {
++                IsSorted::Ascending => {
++                    return self.clone().into_series().agg_arg_last_non_null(groups);
++                },
++                IsSorted::Descending => {
++                    return self.clone().into_series().agg_arg_first_non_null(groups);
++                },
++                _ => {},
++            }
++        }
++        match groups {
++            GroupsType::Idx(groups) => {
++                let ca = self.rechunk();
++                let arr = ca.downcast_as_array();
++                let no_nulls = arr.null_count() == 0;
++
++                agg_helper_idx_on_all::<IdxType, _>(groups, |idx| {
++                    if idx.is_empty() {
++                        return None;
++                    }
++
++                    if no_nulls {
++                        let first_i = idx[0] as usize;
++                        let mut best_pos: IdxSize = 0;
++                        let mut best_val: T::Native = unsafe { arr.value_unchecked(first_i) };
++
++                        for (pos, &i) in idx.iter().enumerate().skip(1) {
++                            let v = unsafe { arr.value_unchecked(i as usize) };
++
++                            if v.nan_min_gt(&best_val) {
++                                best_val = v;
++                                best_pos = pos as IdxSize;
++                            }
++                        }
++
++                        Some(best_pos)
++                    } else {
++                        let (start_pos, mut best_val) = idx
++                            .iter()
++                            .enumerate()
++                            .find_map(|(pos, &i)| arr.get(i as usize).map(|v| (pos, v)))?;
++
++                        let mut best_pos: IdxSize = start_pos as IdxSize;
++
++                        for (pos, &i) in idx.iter().enumerate().skip(start_pos + 1) {
++                            if let Some(v) = arr.get(i as usize) {
++                                if v.nan_min_gt(&best_val) {
++                                    best_val = v;
++                                    best_pos = pos as IdxSize;
++                                }
++                            }
++                        }
++
++                        Some(best_pos)
++                    }
++                })
++            },
++
++            GroupsType::Slice {
++                groups: groups_slice,
++                overlapping,
++                monotonic,
++            } => {
++                if _use_rolling_kernels(groups_slice, *overlapping, *monotonic, self.chunks()) {
++                    let arr = self.downcast_iter().next().unwrap();
++                    let values = arr.values().as_slice();
++                    let offset_iter = groups_slice.iter().map(|[first, len]| (*first, *len));
++                    let idx_arr = match arr.validity() {
++                        None => {
++                            _rolling_apply_agg_window_no_nulls::<ArgMaxWindow<_>, _, _, IdxSize>(
++                                values,
++                                offset_iter,
++                                None,
++                            )
++                        },
++                        Some(validity) => {
++                            _rolling_apply_agg_window_nulls::<ArgMaxWindow<_>, _, _, IdxSize>(
++                                values,
++                                validity,
++                                offset_iter,
++                                None,
++                            )
++                        },
++                    };
++                    IdxCa::from(idx_arr).into_series()
++                } else {
++                    _agg_helper_slice::<IdxType, _>(groups_slice, |[first, len]| {
++                        debug_assert!(len <= self.len() as IdxSize);
++                        match len {
++                            0 => None,
++                            1 => Some(0 as IdxSize),
++                            _ => {
++                                let group_ca = _slice_from_offsets(self, first, len);
++                                let pos_in_group: Option<usize> = arg_max_numeric(&group_ca);
++                                pos_in_group.map(|p| p as IdxSize)
++                            },
++                        }
++                    })
++                }
++            },
++        }
++    }
+     pub(crate) unsafe fn agg_sum(&self, groups: &GroupsType) -> Series {
+         match groups {
+             GroupsType::Idx(groups) => {
+@@ -628,14 +847,16 @@ where
+                             SumWindow<T::Native, T::Native>,
+                             _,
+                             _,
+-                        >(values, offset_iter, None),
+-                        Some(validity) => _rolling_apply_agg_window_nulls::<
+-                            SumWindow<T::Native, T::Native>,
+                             _,
+-                            _,
+-                        >(
+-                            values, validity, offset_iter, None
+-                        ),
++                        >(values, offset_iter, None),
++                        Some(validity) => {
++                            _rolling_apply_agg_window_nulls::<
++                                SumWindow<T::Native, T::Native>,
++                                _,
++                                _,
++                                _,
++                            >(values, validity, offset_iter, None)
++                        },
+                     };
+                     Self::from(arr).into_series()
+                 } else {
+@@ -715,17 +936,19 @@ where
+                     let values = arr.values().as_slice();
+                     let offset_iter = groups.iter().map(|[first, len]| (*first, *len));
+                     let arr = match arr.validity() {
+-                        None => _rolling_apply_agg_window_no_nulls::<MeanWindow<_>, _, _>(
+-                            values,
+-                            offset_iter,
+-                            None,
+-                        ),
+-                        Some(validity) => _rolling_apply_agg_window_nulls::<MeanWindow<_>, _, _>(
++                        None => _rolling_apply_agg_window_no_nulls::<MeanWindow<_>, _, _, _>(
+                             values,
+-                            validity,
+                             offset_iter,
+                             None,
+                         ),
++                        Some(validity) => {
++                            _rolling_apply_agg_window_nulls::<MeanWindow<_>, _, _, _>(
++                                values,
++                                validity,
++                                offset_iter,
++                                None,
++                            )
++                        },
+                     };
+                     ChunkedArray::<T>::from(arr).into_series()
+                 } else {
+@@ -782,6 +1005,7 @@ where
+                             MomentWindow<_, VarianceMoment>,
+                             _,
+                             _,
++                            _,
+                         >(
+                             values,
+                             offset_iter,
+@@ -791,6 +1015,7 @@ where
+                             rolling::nulls::MomentWindow<_, VarianceMoment>,
+                             _,
+                             _,
++                            _,
+                         >(
+                             values,
+                             validity,
+@@ -857,6 +1082,7 @@ where
+                             MomentWindow<_, VarianceMoment>,
+                             _,
+                             _,
++                            _,
+                         >(
+                             values,
+                             offset_iter,
+@@ -866,6 +1092,7 @@ where
+                             rolling::nulls::MomentWindow<_, rolling::nulls::VarianceMoment>,
+                             _,
+                             _,
++                            _,
+                         >(
+                             values,
+                             validity,
+diff --git a/crates/polars-core/src/frame/group_by/aggregations/string.rs b/crates/polars-core/src/frame/group_by/aggregations/string.rs
+index b718a3672c..28f468eee6 100644
+--- a/crates/polars-core/src/frame/group_by/aggregations/string.rs
++++ b/crates/polars-core/src/frame/group_by/aggregations/string.rs
+@@ -16,6 +16,22 @@ where
+     ca.into_series()
+ }
+ 
++pub fn _agg_helper_idx_idx<'a, F>(groups: &'a GroupsIdx, f: F) -> Series
++where
++    F: Fn((IdxSize, &'a IdxVec)) -> Option<IdxSize> + Send + Sync,
++{
++    let ca: IdxCa = POOL.install(|| groups.into_par_iter().map(f).collect());
++    ca.into_series()
++}
++
++pub fn _agg_helper_slice_idx<F>(groups: &[[IdxSize; 2]], f: F) -> Series
++where
++    F: Fn([IdxSize; 2]) -> Option<IdxSize> + Send + Sync,
++{
++    let ca: IdxCa = POOL.install(|| groups.par_iter().copied().map(f).collect());
++    ca.into_series()
++}
++
+ impl BinaryChunked {
+     #[allow(clippy::needless_lifetimes)]
+     pub(crate) unsafe fn agg_min<'a>(&'a self, groups: &GroupsType) -> Series {
+@@ -142,6 +158,136 @@ impl BinaryChunked {
+             }),
+         }
+     }
++
++    pub(crate) unsafe fn agg_arg_min(&self, groups: &GroupsType) -> Series {
++        // fast paths, consistent with other impls
++        if groups.is_sorted_flag() {
++            match self.is_sorted_flag() {
++                IsSorted::Ascending => {
++                    return self.clone().into_series().agg_arg_first_non_null(groups);
++                },
++                IsSorted::Descending => {
++                    return self.clone().into_series().agg_arg_last_non_null(groups);
++                },
++                _ => {},
++            }
++        }
++
++        let ca_self = self.rechunk();
++        let arr = ca_self.downcast_as_array();
++        let no_nulls = arr.null_count() == 0;
++        match groups {
++            GroupsType::Idx(groups) => {
++                _agg_helper_idx_idx(groups, |(_, idx)| {
++                    debug_assert!(idx.len() <= ca_self.len());
++
++                    if idx.is_empty() {
++                        None
++                    } else if idx.len() == 1 {
++                        // arg within group
++                        if no_nulls { Some(0) } else { None }
++                    } else if no_nulls {
++                        take_agg_bin_iter_unchecked_no_null_arg(
++                            arr,
++                            indexes_to_usizes(idx),
++                            |acc, cur| if cur.1 < acc.1 { cur } else { acc },
++                        )
++                    } else {
++                        take_agg_bin_iter_unchecked_arg(arr, indexes_to_usizes(idx), |acc, cur| {
++                            if cur.1 < acc.1 { cur } else { acc }
++                        })
++                    }
++                })
++            },
++
++            GroupsType::Slice {
++                groups: groups_slice,
++                ..
++            } => _agg_helper_slice_idx(groups_slice, |[first, len]| {
++                debug_assert!(len <= self.len() as IdxSize);
++                match len {
++                    0 => None,
++                    1 => {
++                        if no_nulls {
++                            Some(0)
++                        } else {
++                            None
++                        }
++                    },
++                    _ => {
++                        let arr_group = _slice_from_offsets(&ca_self, first, len);
++                        arr_group.arg_min_binary().map(|i| i as IdxSize)
++                    },
++                }
++            }),
++        }
++    }
++
++    pub(crate) unsafe fn agg_arg_max(&self, groups: &GroupsType) -> Series {
++        // fast paths
++        if groups.is_sorted_flag() {
++            match self.is_sorted_flag() {
++                IsSorted::Ascending => {
++                    return self.clone().into_series().agg_arg_last_non_null(groups);
++                },
++                IsSorted::Descending => {
++                    return self.clone().into_series().agg_arg_first_non_null(groups);
++                },
++                _ => {},
++            }
++        }
++
++        let ca_self = self.rechunk();
++        let arr = ca_self.downcast_as_array();
++        let no_nulls = arr.null_count() == 0;
++
++        match groups {
++            GroupsType::Idx(groups) => _agg_helper_idx_idx(groups, |(first, idx)| {
++                debug_assert!(idx.len() <= ca_self.len());
++
++                if idx.is_empty() {
++                    None
++                } else if idx.len() == 1 {
++                    if no_nulls || arr.is_valid(first as usize) {
++                        Some(first)
++                    } else {
++                        None
++                    }
++                } else if no_nulls {
++                    take_agg_bin_iter_unchecked_no_null_arg(
++                        arr,
++                        indexes_to_usizes(idx),
++                        |acc, cur| if cur.1 > acc.1 { cur } else { acc },
++                    )
++                } else {
++                    take_agg_bin_iter_unchecked_arg(arr, indexes_to_usizes(idx), |acc, cur| {
++                        if cur.1 > acc.1 { cur } else { acc }
++                    })
++                }
++            }),
++
++            GroupsType::Slice {
++                groups: groups_slice,
++                ..
++            } => _agg_helper_slice_idx(groups_slice, |[first, len]| {
++                debug_assert!(len <= self.len() as IdxSize);
++                match len {
++                    0 => None,
++                    1 => {
++                        if no_nulls {
++                            Some(0)
++                        } else {
++                            None
++                        }
++                    },
++                    _ => {
++                        let arr_group = _slice_from_offsets(&ca_self, first, len);
++                        arr_group.arg_max_binary().map(|i| i as IdxSize)
++                    },
++                }
++            }),
++        }
++    }
+ }
+ 
+ impl StringChunked {
+@@ -156,4 +302,14 @@ impl StringChunked {
+         let out = self.as_binary().agg_max(groups);
+         out.binary().unwrap().to_string_unchecked().into_series()
+     }
++
++    #[cfg(feature = "algorithm_group_by")]
++    pub(crate) unsafe fn agg_arg_min(&self, groups: &GroupsType) -> Series {
++        self.as_binary().agg_arg_min(groups)
++    }
++
++    #[cfg(feature = "algorithm_group_by")]
++    pub(crate) unsafe fn agg_arg_max(&self, groups: &GroupsType) -> Series {
++        self.as_binary().agg_arg_max(groups)
++    }
+ }
+diff --git a/crates/polars-core/src/frame/group_by/mod.rs b/crates/polars-core/src/frame/group_by/mod.rs
+index 915ee6f97f..e254cf9c7d 100644
+--- a/crates/polars-core/src/frame/group_by/mod.rs
++++ b/crates/polars-core/src/frame/group_by/mod.rs
+@@ -902,6 +902,8 @@ pub enum GroupByMethod {
+     Implode,
+     Std(u8),
+     Var(u8),
++    ArgMin,
++    ArgMax,
+ }
+ 
+ impl Display for GroupByMethod {
+@@ -927,6 +929,8 @@ impl Display for GroupByMethod {
+             Implode => "list",
+             Std(_) => "std",
+             Var(_) => "var",
++            ArgMin => "arg_min",
++            ArgMax => "arg_max",
+         };
+         write!(f, "{s}")
+     }
+@@ -955,6 +959,8 @@ pub fn fmt_group_by_column(name: &str, method: GroupByMethod) -> PlSmallStr {
+         Quantile(quantile, _interpol) => format_pl_smallstr!("{name}_quantile_{quantile:.2}"),
+         Std(_) => format_pl_smallstr!("{name}_agg_std"),
+         Var(_) => format_pl_smallstr!("{name}_agg_var"),
++        ArgMin => format_pl_smallstr!("{name}_arg_min"),
++        ArgMax => format_pl_smallstr!("{name}_arg_max"),
+     }
+ }
+ 
+diff --git a/crates/polars-core/src/series/implementations/categorical.rs b/crates/polars-core/src/series/implementations/categorical.rs
+index 09ec629b77..434bffc64c 100644
+--- a/crates/polars-core/src/series/implementations/categorical.rs
++++ b/crates/polars-core/src/series/implementations/categorical.rs
+@@ -119,6 +119,25 @@ macro_rules! impl_cat_series {
+                 }
+             }
+ 
++            #[cfg(feature = "algorithm_group_by")]
++            unsafe fn agg_arg_min(&self, groups: &GroupsType) -> Series {
++                if self.0.uses_lexical_ordering() {
++                    unimplemented!()
++                } else {
++                    self.0.physical().agg_arg_min(groups)
++                }
++            }
++
++            #[cfg(feature = "algorithm_group_by")]
++            unsafe fn agg_arg_max(&self, groups: &GroupsType) -> Series {
++                if self.0.uses_lexical_ordering() {
++                    unimplemented!()
++                } else {
++                    self.0.physical().agg_arg_max(groups)
++                }
++            }
++
++
+             #[cfg(feature = "algorithm_group_by")]
+             unsafe fn agg_list(&self, groups: &GroupsType) -> Series {
+                 // we cannot cast and dispatch as the inner type of the list would be incorrect
+diff --git a/crates/polars-core/src/series/implementations/date.rs b/crates/polars-core/src/series/implementations/date.rs
+index 21c7555349..dfd62c3440 100644
+--- a/crates/polars-core/src/series/implementations/date.rs
++++ b/crates/polars-core/src/series/implementations/date.rs
+@@ -84,6 +84,16 @@ impl private::PrivateSeries for SeriesWrap<DateChunked> {
+         self.0.physical().agg_max(groups).into_date().into_series()
+     }
+ 
++    #[cfg(feature = "algorithm_group_by")]
++    unsafe fn agg_arg_min(&self, groups: &GroupsType) -> Series {
++        self.0.physical().agg_arg_min(groups)
++    }
++
++    #[cfg(feature = "algorithm_group_by")]
++    unsafe fn agg_arg_max(&self, groups: &GroupsType) -> Series {
++        self.0.physical().agg_arg_max(groups)
++    }
++
+     #[cfg(feature = "algorithm_group_by")]
+     unsafe fn agg_list(&self, groups: &GroupsType) -> Series {
+         // we cannot cast and dispatch as the inner type of the list would be incorrect
+diff --git a/crates/polars-core/src/series/implementations/datetime.rs b/crates/polars-core/src/series/implementations/datetime.rs
+index 132403982d..5390ac2bc9 100644
+--- a/crates/polars-core/src/series/implementations/datetime.rs
++++ b/crates/polars-core/src/series/implementations/datetime.rs
+@@ -88,6 +88,17 @@ impl private::PrivateSeries for SeriesWrap<DatetimeChunked> {
+             .into_datetime(self.0.time_unit(), self.0.time_zone().clone())
+             .into_series()
+     }
++
++    #[cfg(feature = "algorithm_group_by")]
++    unsafe fn agg_arg_min(&self, groups: &GroupsType) -> Series {
++        self.0.physical().agg_arg_min(groups)
++    }
++
++    #[cfg(feature = "algorithm_group_by")]
++    unsafe fn agg_arg_max(&self, groups: &GroupsType) -> Series {
++        self.0.physical().agg_arg_max(groups)
++    }
++
+     #[cfg(feature = "algorithm_group_by")]
+     unsafe fn agg_list(&self, groups: &GroupsType) -> Series {
+         // we cannot cast and dispatch as the inner type of the list would be incorrect
+diff --git a/crates/polars-core/src/series/implementations/decimal.rs b/crates/polars-core/src/series/implementations/decimal.rs
+index 44468b7bfc..7dea7ff9b9 100644
+--- a/crates/polars-core/src/series/implementations/decimal.rs
++++ b/crates/polars-core/src/series/implementations/decimal.rs
+@@ -164,6 +164,16 @@ impl private::PrivateSeries for SeriesWrap<DecimalChunked> {
+         self.agg_helper(|ca| ca.agg_max(groups))
+     }
+ 
++    #[cfg(feature = "algorithm_group_by")]
++    unsafe fn agg_arg_min(&self, groups: &GroupsType) -> Series {
++        self.0.physical().agg_arg_min(groups)
++    }
++
++    #[cfg(feature = "algorithm_group_by")]
++    unsafe fn agg_arg_max(&self, groups: &GroupsType) -> Series {
++        self.0.physical().agg_arg_max(groups)
++    }
++
+     #[cfg(feature = "algorithm_group_by")]
+     unsafe fn agg_list(&self, groups: &GroupsType) -> Series {
+         self.agg_helper(|ca| ca.agg_list(groups))
+diff --git a/crates/polars-core/src/series/implementations/duration.rs b/crates/polars-core/src/series/implementations/duration.rs
+index b123bfdf99..2896b0504b 100644
+--- a/crates/polars-core/src/series/implementations/duration.rs
++++ b/crates/polars-core/src/series/implementations/duration.rs
+@@ -93,6 +93,16 @@ impl private::PrivateSeries for SeriesWrap<DurationChunked> {
+             .into_series()
+     }
+ 
++    #[cfg(feature = "algorithm_group_by")]
++    unsafe fn agg_arg_min(&self, groups: &GroupsType) -> Series {
++        self.0.physical().agg_arg_min(groups)
++    }
++
++    #[cfg(feature = "algorithm_group_by")]
++    unsafe fn agg_arg_max(&self, groups: &GroupsType) -> Series {
++        self.0.physical().agg_arg_max(groups)
++    }
++
+     #[cfg(feature = "algorithm_group_by")]
+     unsafe fn agg_sum(&self, groups: &GroupsType) -> Series {
+         self.0
+diff --git a/crates/polars-core/src/series/implementations/floats.rs b/crates/polars-core/src/series/implementations/floats.rs
+index d37f7b4bd4..5539903f18 100644
+--- a/crates/polars-core/src/series/implementations/floats.rs
++++ b/crates/polars-core/src/series/implementations/floats.rs
+@@ -79,6 +79,16 @@ macro_rules! impl_dyn_series {
+                 self.0.agg_max(groups)
+             }
+ 
++            #[cfg(feature = "algorithm_group_by")]
++            unsafe fn agg_arg_min(&self, groups: &GroupsType) -> Series {
++                self.0.agg_arg_min(groups)
++            }
++
++            #[cfg(feature = "algorithm_group_by")]
++            unsafe fn agg_arg_max(&self, groups: &GroupsType) -> Series {
++                self.0.agg_arg_max(groups)
++            }
++
+             #[cfg(feature = "algorithm_group_by")]
+             unsafe fn agg_sum(&self, groups: &GroupsType) -> Series {
+                 self.0.agg_sum(groups)
+diff --git a/crates/polars-core/src/series/implementations/mod.rs b/crates/polars-core/src/series/implementations/mod.rs
+index 6cd7510ba6..8bfa674baa 100644
+--- a/crates/polars-core/src/series/implementations/mod.rs
++++ b/crates/polars-core/src/series/implementations/mod.rs
+@@ -141,6 +141,16 @@ macro_rules! impl_dyn_series {
+                 self.0.agg_max(groups)
+             }
+ 
++            #[cfg(feature = "algorithm_group_by")]
++            unsafe fn agg_arg_min(&self, groups: &GroupsType) -> Series {
++                self.0.agg_arg_min(groups)
++            }
++
++            #[cfg(feature = "algorithm_group_by")]
++            unsafe fn agg_arg_max(&self, groups: &GroupsType) -> Series {
++                self.0.agg_arg_max(groups)
++            }
++
+             #[cfg(feature = "algorithm_group_by")]
+             unsafe fn agg_sum(&self, groups: &GroupsType) -> Series {
+                 use DataType::*;
+diff --git a/crates/polars-core/src/series/implementations/string.rs b/crates/polars-core/src/series/implementations/string.rs
+index 9518b06ab6..bb9574cdb7 100644
+--- a/crates/polars-core/src/series/implementations/string.rs
++++ b/crates/polars-core/src/series/implementations/string.rs
+@@ -69,6 +69,16 @@ impl private::PrivateSeries for SeriesWrap<StringChunked> {
+         self.0.agg_max(groups)
+     }
+ 
++    #[cfg(feature = "algorithm_group_by")]
++    unsafe fn agg_arg_min(&self, groups: &GroupsType) -> Series {
++        self.0.agg_arg_min(groups)
++    }
++
++    #[cfg(feature = "algorithm_group_by")]
++    unsafe fn agg_arg_max(&self, groups: &GroupsType) -> Series {
++        self.0.agg_arg_max(groups)
++    }
++
+     fn subtract(&self, rhs: &Series) -> PolarsResult<Series> {
+         NumOpsDispatch::subtract(&self.0, rhs)
+     }
+diff --git a/crates/polars-core/src/series/implementations/time.rs b/crates/polars-core/src/series/implementations/time.rs
+index 4e10095c11..1ef3b40474 100644
+--- a/crates/polars-core/src/series/implementations/time.rs
++++ b/crates/polars-core/src/series/implementations/time.rs
+@@ -83,6 +83,15 @@ impl private::PrivateSeries for SeriesWrap<TimeChunked> {
+     unsafe fn agg_max(&self, groups: &GroupsType) -> Series {
+         self.0.physical().agg_max(groups).into_time().into_series()
+     }
++    #[cfg(feature = "algorithm_group_by")]
++    unsafe fn agg_arg_min(&self, groups: &GroupsType) -> Series {
++        self.0.physical().agg_arg_min(groups)
++    }
++
++    #[cfg(feature = "algorithm_group_by")]
++    unsafe fn agg_arg_max(&self, groups: &GroupsType) -> Series {
++        self.0.physical().agg_arg_max(groups)
++    }
+ 
+     #[cfg(feature = "algorithm_group_by")]
+     unsafe fn agg_list(&self, groups: &GroupsType) -> Series {
+diff --git a/crates/polars-core/src/series/series_trait.rs b/crates/polars-core/src/series/series_trait.rs
+index b89bddeef5..4b9f0ccc03 100644
+--- a/crates/polars-core/src/series/series_trait.rs
++++ b/crates/polars-core/src/series/series_trait.rs
+@@ -115,6 +115,22 @@ pub(crate) mod private {
+         unsafe fn agg_max(&self, groups: &GroupsType) -> Series {
+             Series::full_null(self._field().name().clone(), groups.len(), self._dtype())
+         }
++        /// # Safety
++        ///
++        /// Does no bounds checks, groups must be correct.
++        #[cfg(feature = "algorithm_group_by")]
++        unsafe fn agg_arg_min(&self, groups: &GroupsType) -> Series {
++            Series::full_null(self._field().name().clone(), groups.len(), &IDX_DTYPE)
++        }
++
++        /// # Safety
++        ///
++        /// Does no bounds checks, groups must be correct.
++        #[cfg(feature = "algorithm_group_by")]
++        unsafe fn agg_arg_max(&self, groups: &GroupsType) -> Series {
++            Series::full_null(self._field().name().clone(), groups.len(), &IDX_DTYPE)
++        }
++
+         /// If the [`DataType`] is one of `{Int8, UInt8, Int16, UInt16}` the `Series` is
+         /// first cast to `Int64` to prevent overflow issues.
+         #[cfg(feature = "algorithm_group_by")]
+diff --git a/crates/polars-expr/src/expressions/aggregation.rs b/crates/polars-expr/src/expressions/aggregation.rs
+index 65df500f7c..11494ebaf1 100644
+--- a/crates/polars-expr/src/expressions/aggregation.rs
++++ b/crates/polars-expr/src/expressions/aggregation.rs
+@@ -6,6 +6,7 @@ use polars_core::POOL;
+ use polars_core::prelude::*;
+ use polars_core::series::IsSorted;
+ use polars_core::utils::{_split_offsets, NoNull};
++use polars_ops::prelude::ArgAgg;
+ #[cfg(feature = "propagate_nans")]
+ use polars_ops::prelude::nan_propagating_aggregate;
+ use rayon::prelude::*;
+@@ -160,6 +161,32 @@ impl PhysicalExpr for AggregationExpr {
+                 .var_reduce(ddof)
+                 .map(|sc| sc.into_column(s.name().clone())),
+             GroupByMethod::Quantile(_, _) => unimplemented!(),
++            GroupByMethod::ArgMin => {
++                let opt = s.as_materialized_series().arg_min();
++                Ok(opt.map_or_else(
++                    || Column::full_null(s.name().clone(), 1, &IDX_DTYPE),
++                    |idx| {
++                        Column::new_scalar(
++                            s.name().clone(),
++                            Scalar::new_idxsize(idx.try_into().unwrap()),
++                            1,
++                        )
++                    },
++                ))
++            },
++            GroupByMethod::ArgMax => {
++                let opt = s.as_materialized_series().arg_max();
++                Ok(opt.map_or_else(
++                    || Column::full_null(s.name().clone(), 1, &IDX_DTYPE),
++                    |idx| {
++                        Column::new_scalar(
++                            s.name().clone(),
++                            Scalar::new_idxsize(idx.try_into().unwrap()),
++                            1,
++                        )
++                    },
++                ))
++            },
+         }
+     }
+     #[allow(clippy::ptr_arg)]
+@@ -197,6 +224,16 @@ impl PhysicalExpr for AggregationExpr {
+                     let agg_c = c.agg_max(&groups);
+                     AggregatedScalar(agg_c.with_name(keep_name))
+                 },
++                GroupByMethod::ArgMin => {
++                    let (c, groups) = ac.get_final_aggregation();
++                    let agg_c = c.agg_arg_min(&groups);
++                    AggregatedScalar(agg_c.with_name(keep_name))
++                },
++                GroupByMethod::ArgMax => {
++                    let (c, groups) = ac.get_final_aggregation();
++                    let agg_c = c.agg_arg_max(&groups);
++                    AggregatedScalar(agg_c.with_name(keep_name))
++                },
+                 GroupByMethod::Median => {
+                     let (c, groups) = ac.get_final_aggregation();
+                     let agg_c = c.agg_median(&groups);
+diff --git a/crates/polars-expr/src/planner.rs b/crates/polars-expr/src/planner.rs
+index ee1cd803ab..87e8be4d24 100644
+--- a/crates/polars-expr/src/planner.rs
++++ b/crates/polars-expr/src/planner.rs
+@@ -440,6 +440,36 @@ fn create_physical_expr_inner(
+                 output_field,
+             )))
+         },
++        Function {
++            input,
++            function: function @ (IRFunctionExpr::ArgMin | IRFunctionExpr::ArgMax),
++            options: _,
++        } => {
++            let phys_input =
++                create_physical_expr_inner(input[0].node(), expr_arena, schema, state)?;
++
++            let mut output_field = expr_arena
++                .get(expression)
++                .to_field(&ToFieldContext::new(expr_arena, schema))?;
++            output_field = Field::new(output_field.name().clone(), IDX_DTYPE.clone());
++
++            let groupby = match function {
++                IRFunctionExpr::ArgMin => GroupByMethod::ArgMin,
++                IRFunctionExpr::ArgMax => GroupByMethod::ArgMax,
++                _ => unreachable!(), // guaranteed by pattern
++            };
++
++            let agg_type = AggregationType {
++                groupby,
++                allow_threading: state.allow_threading,
++            };
++
++            Ok(Arc::new(AggregationExpr::new(
++                phys_input,
++                agg_type,
++                output_field,
++            )))
++        },
+         Cast {
+             expr,
+             dtype,
+@@ -582,9 +612,11 @@ fn create_physical_expr_inner(
+             options,
+         } => {
+             let is_scalar = is_scalar_ae(expression, expr_arena);
++
+             let output_field = expr_arena
+                 .get(expression)
+                 .to_field(&ToFieldContext::new(expr_arena, schema))?;
++
+             let input = create_physical_expressions_from_irs(&input, expr_arena, schema, state)?;
+             let is_fallible = expr_arena.get(expression).is_fallible_top_level(expr_arena);
+ 
+@@ -601,6 +633,7 @@ fn create_physical_expr_inner(
+                 is_fallible,
+             )))
+         },
++
+         Slice {
+             input,
+             offset,
+diff --git a/crates/polars-expr/src/reduce/min_max_by.rs b/crates/polars-expr/src/reduce/min_max_by.rs
+index fe25eed2b2..eca5924ea0 100644
+--- a/crates/polars-expr/src/reduce/min_max_by.rs
++++ b/crates/polars-expr/src/reduce/min_max_by.rs
+@@ -3,10 +3,10 @@ use std::borrow::Cow;
+ use std::marker::PhantomData;
+ 
+ use num_traits::Bounded;
+-use polars_core::with_match_physical_integer_polars_type;
+-use polars_ops::series::arg_min_max::{
++use polars_core::chunked_array::arg_min_max::{
+     arg_max_binary, arg_max_bool, arg_max_numeric, arg_min_binary, arg_min_bool, arg_min_numeric,
+ };
++use polars_core::with_match_physical_integer_polars_type;
+ use polars_utils::arg_min_max::ArgMinMax;
+ use polars_utils::float::IsFloat;
+ use polars_utils::min_max::MinMax;
+@@ -431,7 +431,7 @@ impl<T: PolarsCategoricalType> SelectReducer for CatMinSelector<T> {
+     }
+ 
+     fn select_ca(&self, v: &mut Self::Value, ca: &ChunkedArray<Self::Dtype>) -> Option<usize> {
+-        use polars_ops::series::arg_min_max::arg_min_opt_iter;
++        use polars_core::chunked_array::arg_min_max::arg_min_opt_iter;
+         let arg_min = arg_min_opt_iter(ca.iter().map(|cat| self.0.cat_to_str(cat?.as_cat())));
+         arg_min.filter(|idx| {
+             let val = unsafe { ca.value_unchecked(*idx) };
+@@ -489,7 +489,7 @@ impl<T: PolarsCategoricalType> SelectReducer for CatMaxSelector<T> {
+     }
+ 
+     fn select_ca(&self, v: &mut Self::Value, ca: &ChunkedArray<Self::Dtype>) -> Option<usize> {
+-        use polars_ops::series::arg_min_max::arg_max_opt_iter;
++        use polars_core::chunked_array::arg_min_max::arg_max_opt_iter;
+         let arg_max = arg_max_opt_iter(ca.iter().map(|cat| self.0.cat_to_str(cat?.as_cat())));
+         arg_max.filter(|idx| {
+             let val = unsafe { ca.value_unchecked(*idx) };
+diff --git a/crates/polars-ops/src/chunked_array/nan_propagating_aggregate.rs b/crates/polars-ops/src/chunked_array/nan_propagating_aggregate.rs
+index 7cf0c8d7f9..5bce2c6b11 100644
+--- a/crates/polars-ops/src/chunked_array/nan_propagating_aggregate.rs
++++ b/crates/polars-ops/src/chunked_array/nan_propagating_aggregate.rs
+@@ -106,7 +106,7 @@ unsafe fn group_nan_max<T: PolarsFloatType>(ca: &ChunkedArray<T>, groups: &Group
+                 let values = arr.values().as_slice();
+                 let offset_iter = groups_slice.iter().map(|[first, len]| (*first, *len));
+                 let arr = match arr.validity() {
+-                    None => _rolling_apply_agg_window_no_nulls::<MaxWindow<_>, _, _>(
++                    None => _rolling_apply_agg_window_no_nulls::<MaxWindow<_>, _, _, _>(
+                         values,
+                         offset_iter,
+                         None,
+@@ -115,6 +115,7 @@ unsafe fn group_nan_max<T: PolarsFloatType>(ca: &ChunkedArray<T>, groups: &Group
+                         rolling::nulls::MaxWindow<_>,
+                         _,
+                         _,
++                        _,
+                     >(values, validity, offset_iter, None),
+                 };
+                 ChunkedArray::<T>::from(arr).into_series()
+@@ -172,7 +173,7 @@ unsafe fn group_nan_min<T: PolarsFloatType>(ca: &ChunkedArray<T>, groups: &Group
+                 let values = arr.values().as_slice();
+                 let offset_iter = groups_slice.iter().map(|[first, len]| (*first, *len));
+                 let arr = match arr.validity() {
+-                    None => _rolling_apply_agg_window_no_nulls::<MinWindow<_>, _, _>(
++                    None => _rolling_apply_agg_window_no_nulls::<MinWindow<_>, _, _, _>(
+                         values,
+                         offset_iter,
+                         None,
+@@ -181,6 +182,7 @@ unsafe fn group_nan_min<T: PolarsFloatType>(ca: &ChunkedArray<T>, groups: &Group
+                         rolling::nulls::MinWindow<_>,
+                         _,
+                         _,
++                        _,
+                     >(values, validity, offset_iter, None),
+                 };
+                 ChunkedArray::<T>::from(arr).into_series()
+diff --git a/crates/polars-ops/src/series/ops/arg_min_max.rs b/crates/polars-ops/src/series/ops/arg_min_max.rs
+index 4ef763c7c0..783ee42b19 100644
+--- a/crates/polars-ops/src/series/ops/arg_min_max.rs
++++ b/crates/polars-ops/src/series/ops/arg_min_max.rs
+@@ -1,35 +1,11 @@
+-use arrow::array::Array;
+-use polars_core::chunked_array::ops::float_sorted_arg_max::{
+-    float_arg_max_sorted_ascending, float_arg_max_sorted_descending,
++use polars_core::chunked_array::arg_min_max::{
++    arg_max_binary, arg_max_bool, arg_max_numeric, arg_max_str, arg_min_binary, arg_min_bool,
++    arg_min_numeric, arg_min_str,
+ };
+-use polars_core::series::IsSorted;
++#[cfg(feature = "dtype-categorical")]
++use polars_core::chunked_array::arg_min_max::{arg_max_cat, arg_min_cat};
++#[cfg(feature = "dtype-categorical")]
+ use polars_core::with_match_categorical_physical_type;
+-use polars_utils::arg_min_max::ArgMinMax;
+-use polars_utils::min_max::{MaxIgnoreNan, MinIgnoreNan, MinMaxPolicy};
+-
+-pub fn arg_min_opt_iter<T, I>(iter: I) -> Option<usize>
+-where
+-    I: IntoIterator<Item = Option<T>>,
+-    T: Ord,
+-{
+-    iter.into_iter()
+-        .enumerate()
+-        .flat_map(|(idx, val)| Some((idx, val?)))
+-        .min_by(|x, y| Ord::cmp(&x.1, &y.1))
+-        .map(|x| x.0)
+-}
+-
+-pub fn arg_max_opt_iter<T, I>(iter: I) -> Option<usize>
+-where
+-    I: IntoIterator<Item = Option<T>>,
+-    T: Ord,
+-{
+-    iter.into_iter()
+-        .enumerate()
+-        .flat_map(|(idx, val)| Some((idx, val?)))
+-        .max_by(|x, y| Ord::cmp(&x.1, &y.1))
+-        .map(|x| x.0)
+-}
+ 
+ use super::*;
+ 
+@@ -128,243 +104,3 @@ impl ArgAgg for Series {
+         }
+     }
+ }
+-
+-pub fn arg_min_numeric<T>(ca: &ChunkedArray<T>) -> Option<usize>
+-where
+-    T: PolarsNumericType,
+-    for<'b> &'b [T::Native]: ArgMinMax,
+-{
+-    if ca.null_count() == ca.len() {
+-        None
+-    } else if let Ok(vals) = ca.cont_slice() {
+-        arg_min_numeric_slice(vals, ca.is_sorted_flag())
+-    } else {
+-        arg_min_numeric_chunked(ca)
+-    }
+-}
+-
+-pub fn arg_max_numeric<T>(ca: &ChunkedArray<T>) -> Option<usize>
+-where
+-    T: PolarsNumericType,
+-    for<'b> &'b [T::Native]: ArgMinMax,
+-{
+-    if ca.null_count() == ca.len() {
+-        None
+-    } else if T::get_static_dtype().is_float() && !matches!(ca.is_sorted_flag(), IsSorted::Not) {
+-        arg_max_float_sorted(ca)
+-    } else if let Ok(vals) = ca.cont_slice() {
+-        arg_max_numeric_slice(vals, ca.is_sorted_flag())
+-    } else {
+-        arg_max_numeric_chunked(ca)
+-    }
+-}
+-
+-/// # Safety
+-/// `ca` has a float dtype, has at least one non-null value and is sorted.
+-fn arg_max_float_sorted<T>(ca: &ChunkedArray<T>) -> Option<usize>
+-where
+-    T: PolarsNumericType,
+-{
+-    let out = match ca.is_sorted_flag() {
+-        IsSorted::Ascending => float_arg_max_sorted_ascending(ca),
+-        IsSorted::Descending => float_arg_max_sorted_descending(ca),
+-        _ => unreachable!(),
+-    };
+-    Some(out)
+-}
+-
+-#[cfg(feature = "dtype-categorical")]
+-pub fn arg_min_cat<T: PolarsCategoricalType>(ca: &CategoricalChunked<T>) -> Option<usize> {
+-    if ca.null_count() == ca.len() {
+-        return None;
+-    }
+-    arg_min_opt_iter(ca.iter_str())
+-}
+-
+-#[cfg(feature = "dtype-categorical")]
+-pub fn arg_max_cat<T: PolarsCategoricalType>(ca: &CategoricalChunked<T>) -> Option<usize> {
+-    if ca.null_count() == ca.len() {
+-        return None;
+-    }
+-    arg_max_opt_iter(ca.iter_str())
+-}
+-
+-pub fn arg_min_bool(ca: &BooleanChunked) -> Option<usize> {
+-    ca.first_false_idx().or_else(|| ca.first_true_idx())
+-}
+-
+-pub fn arg_max_bool(ca: &BooleanChunked) -> Option<usize> {
+-    ca.first_true_idx().or_else(|| ca.first_false_idx())
+-}
+-
+-pub fn arg_min_str(ca: &StringChunked) -> Option<usize> {
+-    arg_min_physical_generic(ca)
+-}
+-
+-pub fn arg_max_str(ca: &StringChunked) -> Option<usize> {
+-    arg_max_physical_generic(ca)
+-}
+-
+-pub fn arg_min_binary(ca: &BinaryChunked) -> Option<usize> {
+-    arg_min_physical_generic(ca)
+-}
+-
+-pub fn arg_max_binary(ca: &BinaryChunked) -> Option<usize> {
+-    arg_max_physical_generic(ca)
+-}
+-
+-fn arg_min_physical_generic<T>(ca: &ChunkedArray<T>) -> Option<usize>
+-where
+-    T: PolarsDataType,
+-    for<'a> T::Physical<'a>: Ord,
+-{
+-    if ca.null_count() == ca.len() {
+-        return None;
+-    }
+-    match ca.is_sorted_flag() {
+-        IsSorted::Ascending => ca.first_non_null(),
+-        IsSorted::Descending => ca.last_non_null(),
+-        IsSorted::Not => arg_min_opt_iter(ca.iter()),
+-    }
+-}
+-
+-fn arg_max_physical_generic<T>(ca: &ChunkedArray<T>) -> Option<usize>
+-where
+-    T: PolarsDataType,
+-    for<'a> T::Physical<'a>: Ord,
+-{
+-    if ca.null_count() == ca.len() {
+-        return None;
+-    }
+-    match ca.is_sorted_flag() {
+-        IsSorted::Ascending => ca.last_non_null(),
+-        IsSorted::Descending => ca.first_non_null(),
+-        IsSorted::Not => arg_max_opt_iter(ca.iter()),
+-    }
+-}
+-
+-fn arg_min_numeric_chunked<'a, T>(ca: &'a ChunkedArray<T>) -> Option<usize>
+-where
+-    T: PolarsNumericType,
+-    for<'b> &'b [T::Native]: ArgMinMax,
+-{
+-    match ca.is_sorted_flag() {
+-        IsSorted::Ascending => ca.first_non_null(),
+-        IsSorted::Descending => ca.last_non_null(),
+-        IsSorted::Not => {
+-            let mut chunk_start_offset = 0;
+-            let mut min_idx: Option<usize> = None;
+-            let mut min_val: Option<T::Native> = None;
+-            for arr in ca.downcast_iter() {
+-                if arr.len() == arr.null_count() {
+-                    chunk_start_offset += arr.len();
+-                    continue;
+-                }
+-
+-                let chunk_min: Option<(usize, T::Native)> = if arr.null_count() > 0 {
+-                    arr.into_iter()
+-                        .enumerate()
+-                        .flat_map(|(idx, val)| Some((idx, *(val?))))
+-                        .reduce(|acc, (idx, val)| {
+-                            if MinIgnoreNan::is_better(&val, &acc.1) {
+-                                (idx, val)
+-                            } else {
+-                                acc
+-                            }
+-                        })
+-                } else {
+-                    // When no nulls & array not empty => we can use fast argmin.
+-                    let min_idx: usize = arr.values().as_slice().argmin();
+-                    Some((min_idx, arr.value(min_idx)))
+-                };
+-
+-                if let Some((chunk_min_idx, chunk_min_val)) = chunk_min {
+-                    if min_val.is_none()
+-                        || MinIgnoreNan::is_better(&chunk_min_val, &min_val.unwrap())
+-                    {
+-                        min_val = Some(chunk_min_val);
+-                        min_idx = Some(chunk_start_offset + chunk_min_idx);
+-                    }
+-                }
+-                chunk_start_offset += arr.len();
+-            }
+-            min_idx
+-        },
+-    }
+-}
+-
+-fn arg_max_numeric_chunked<'a, T>(ca: &'a ChunkedArray<T>) -> Option<usize>
+-where
+-    T: PolarsNumericType,
+-    for<'b> &'b [T::Native]: ArgMinMax,
+-{
+-    match ca.is_sorted_flag() {
+-        IsSorted::Ascending => ca.last_non_null(),
+-        IsSorted::Descending => ca.first_non_null(),
+-        IsSorted::Not => {
+-            let mut chunk_start_offset = 0;
+-            let mut max_idx: Option<usize> = None;
+-            let mut max_val: Option<T::Native> = None;
+-            for arr in ca.downcast_iter() {
+-                if arr.len() == arr.null_count() {
+-                    chunk_start_offset += arr.len();
+-                    continue;
+-                }
+-
+-                let chunk_max: Option<(usize, T::Native)> = if arr.null_count() > 0 {
+-                    arr.into_iter()
+-                        .enumerate()
+-                        .flat_map(|(idx, val)| Some((idx, *(val?))))
+-                        .reduce(|acc, (idx, val)| {
+-                            if MaxIgnoreNan::is_better(&val, &acc.1) {
+-                                (idx, val)
+-                            } else {
+-                                acc
+-                            }
+-                        })
+-                } else {
+-                    // When no nulls & array not empty => we can use fast argmax.
+-                    let max_idx: usize = arr.values().as_slice().argmax();
+-                    Some((max_idx, arr.value(max_idx)))
+-                };
+-
+-                if let Some((chunk_max_idx, chunk_max_val)) = chunk_max {
+-                    if max_val.is_none()
+-                        || MaxIgnoreNan::is_better(&chunk_max_val, &max_val.unwrap())
+-                    {
+-                        max_val = Some(chunk_max_val);
+-                        max_idx = Some(chunk_start_offset + chunk_max_idx);
+-                    }
+-                }
+-                chunk_start_offset += arr.len();
+-            }
+-            max_idx
+-        },
+-    }
+-}
+-
+-fn arg_min_numeric_slice<T>(vals: &[T], is_sorted: IsSorted) -> Option<usize>
+-where
+-    for<'a> &'a [T]: ArgMinMax,
+-{
+-    match is_sorted {
+-        // all vals are not null guarded by cont_slice
+-        IsSorted::Ascending => Some(0),
+-        // all vals are not null guarded by cont_slice
+-        IsSorted::Descending => Some(vals.len() - 1),
+-        IsSorted::Not => Some(vals.argmin()), // assumes not empty
+-    }
+-}
+-
+-fn arg_max_numeric_slice<T>(vals: &[T], is_sorted: IsSorted) -> Option<usize>
+-where
+-    for<'a> &'a [T]: ArgMinMax,
+-{
+-    match is_sorted {
+-        // all vals are not null guarded by cont_slice
+-        IsSorted::Ascending => Some(vals.len() - 1),
+-        // all vals are not null guarded by cont_slice
+-        IsSorted::Descending => Some(0),
+-        IsSorted::Not => Some(vals.argmax()), // assumes not empty
+-    }
+-}
+diff --git a/crates/polars-plan/src/dsl/mod.rs b/crates/polars-plan/src/dsl/mod.rs
+index fafda906d5..36156ad467 100644
+--- a/crates/polars-plan/src/dsl/mod.rs
++++ b/crates/polars-plan/src/dsl/mod.rs
+@@ -289,7 +289,6 @@ impl Expr {
+     pub fn arg_max(self) -> Self {
+         self.map_unary(FunctionExpr::ArgMax)
+     }
+-
+     /// Get the index values that would sort this expression.
+     pub fn arg_sort(self, descending: bool, nulls_last: bool) -> Self {
+         self.map_unary(FunctionExpr::ArgSort {
+diff --git a/crates/polars-plan/src/plans/aexpr/mod.rs b/crates/polars-plan/src/plans/aexpr/mod.rs
+index a806ef84b8..4392d58766 100644
+--- a/crates/polars-plan/src/plans/aexpr/mod.rs
++++ b/crates/polars-plan/src/plans/aexpr/mod.rs
+@@ -175,7 +175,6 @@ impl From<IRAggExpr> for GroupByMethod {
+             Std(_, ddof) => GroupByMethod::Std(ddof),
+             Var(_, ddof) => GroupByMethod::Var(ddof),
+             AggGroups(_) => GroupByMethod::Groups,
+-
+             // Multi-input aggregations.
+             Quantile { .. } | MinBy { .. } | MaxBy { .. } => unreachable!(),
+         }
+diff --git a/crates/polars-plan/src/plans/visitor/expr.rs b/crates/polars-plan/src/plans/visitor/expr.rs
+index 5dd39fb9ef..4b2525c2d2 100644
+--- a/crates/polars-plan/src/plans/visitor/expr.rs
++++ b/crates/polars-plan/src/plans/visitor/expr.rs
+@@ -78,6 +78,7 @@ impl TreeWalker for Expr {
+                 AggGroups(x) => AggGroups(am(x, f)?),
+                 Std(x, ddf) => Std(am(x, f)?, ddf),
+                 Var(x, ddf) => Var(am(x, f)?, ddf),
++
+             }),
+             Ternary { predicate, truthy, falsy } => Ternary { predicate: am(predicate, &mut f)?, truthy: am(truthy, &mut f)?, falsy: am(falsy, f)? },
+             Function { input, function } => Function { input: input.into_iter().map(f).collect::<Result<_, _>>()?, function },

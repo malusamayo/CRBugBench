@@ -1,0 +1,556 @@
+commit 1f8189fe91f649835026d37f1395dc8bb75cb836
+Author: RumovZ <gp5glkw78@relay.firefox.com>
+Date:   Sat Sep 3 03:29:06 2022 +0200
+
+    Some import/export features and fixes (#2038)
+    
+    * Keep filtered decks when importing apkg
+    
+    If all original decks exist and scheduling is included.
+    
+    * Create missing decks from csv
+    
+    * Export original decks if with_scheduling
+    
+    * Also remap original deck ids on import
+    
+    * Update imported filtered decks
+    
+    * Fix meta column being mapped to tags
+    
+    * Fix ids in csv deck and notetype columns
+    
+    Note: This implies names which parse to an i64 will be seen as ids,
+    likely resulting in the intended deck/notetype not being found.
+    
+    * Check for scheduling with revlog and deck configs
+    
+    Might help with cases in which scheduling was included, but all cards
+    are new. In such a case, filtered deck should not be converted.
+    
+    * Fix duplicate with same GUID being created
+    
+    * Remove redundant `distinct`s from sql query
+    
+    * Match notes by _either_ guid _or_ first field
+    
+    * Refactor to emphasise GUID/first field distinction
+    
+    * Export default deck and config if with scheduling
+    
+    * Fix default deck being exported if it's a parent
+
+diff --git a/rslib/src/import_export/gather.rs b/rslib/src/import_export/gather.rs
+index 7b7cb76e1..15025440f 100644
+--- a/rslib/src/import_export/gather.rs
++++ b/rslib/src/import_export/gather.rs
+@@ -42,7 +42,7 @@ impl ExchangeData {
+         self.notes = notes;
+         let (cards, guard) = guard.col.gather_cards()?;
+         self.cards = cards;
+-        self.decks = guard.col.gather_decks()?;
++        self.decks = guard.col.gather_decks(with_scheduling)?;
+         self.notetypes = guard.col.gather_notetypes()?;
+         self.check_ids()?;
+ 
+@@ -191,13 +191,21 @@ impl Collection {
+             .map(|cards| (cards, guard))
+     }
+ 
+-    fn gather_decks(&mut self) -> Result<Vec<Deck>> {
+-        let decks = self.storage.get_decks_for_search_cards()?;
++    /// If with_scheduling, also gather all original decks of cards in filtered
++    /// decks, so they don't have to be converted to regular decks on import.
++    /// If not with_scheduling, skip exporting the default deck to avoid changing
++    /// the importing client's defaults.
++    fn gather_decks(&mut self, with_scheduling: bool) -> Result<Vec<Deck>> {
++        let decks = if with_scheduling {
++            self.storage.get_decks_and_original_for_search_cards()
++        } else {
++            self.storage.get_decks_for_search_cards()
++        }?;
+         let parents = self.get_parent_decks(&decks)?;
+         Ok(decks
+             .into_iter()
+-            .filter(|deck| deck.id != DeckId(1))
+             .chain(parents)
++            .filter(|deck| with_scheduling || deck.id != DeckId(1))
+             .collect())
+     }
+ 
+@@ -243,7 +251,6 @@ impl Collection {
+             .iter()
+             .filter_map(|deck| deck.config_id())
+             .unique()
+-            .filter(|config_id| *config_id != DeckConfigId(1))
+             .map(|config_id| {
+                 self.storage
+                     .get_deck_config(config_id)?
+diff --git a/rslib/src/import_export/package/apkg/import/cards.rs b/rslib/src/import_export/package/apkg/import/cards.rs
+index 6a87510c1..563037ce1 100644
+--- a/rslib/src/import_export/package/apkg/import/cards.rs
++++ b/rslib/src/import_export/package/apkg/import/cards.rs
+@@ -70,6 +70,7 @@ impl Context<'_> {
+         &mut self,
+         imported_notes: &HashMap<NoteId, NoteId>,
+         imported_decks: &HashMap<DeckId, DeckId>,
++        keep_filtered: bool,
+     ) -> Result<()> {
+         let mut ctx = CardContext::new(
+             self.usn,
+@@ -78,16 +79,16 @@ impl Context<'_> {
+             imported_notes,
+             imported_decks,
+         )?;
+-        ctx.import_cards(mem::take(&mut self.data.cards))?;
++        ctx.import_cards(mem::take(&mut self.data.cards), keep_filtered)?;
+         ctx.import_revlog(mem::take(&mut self.data.revlog))
+     }
+ }
+ 
+ impl CardContext<'_> {
+-    fn import_cards(&mut self, mut cards: Vec<Card>) -> Result<()> {
++    fn import_cards(&mut self, mut cards: Vec<Card>, keep_filtered: bool) -> Result<()> {
+         for card in &mut cards {
+             if self.map_to_imported_note(card) && !self.card_ordinal_already_exists(card) {
+-                self.add_card(card)?;
++                self.add_card(card, keep_filtered)?;
+             }
+             // TODO: could update existing card
+         }
+@@ -119,11 +120,13 @@ impl CardContext<'_> {
+             .contains(&(card.note_id, card.template_idx))
+     }
+ 
+-    fn add_card(&mut self, card: &mut Card) -> Result<()> {
++    fn add_card(&mut self, card: &mut Card, keep_filtered: bool) -> Result<()> {
+         card.usn = self.usn;
+-        self.remap_deck_id(card);
++        self.remap_deck_ids(card);
+         card.shift_collection_relative_dates(self.collection_delta);
+-        card.maybe_remove_from_filtered_deck(self.scheduler_version);
++        if !keep_filtered {
++            card.maybe_remove_from_filtered_deck(self.scheduler_version);
++        }
+         let old_id = self.uniquify_card_id(card);
+ 
+         self.target_col.add_card_if_unique_undoable(card)?;
+@@ -141,10 +144,13 @@ impl CardContext<'_> {
+         original
+     }
+ 
+-    fn remap_deck_id(&self, card: &mut Card) {
++    fn remap_deck_ids(&self, card: &mut Card) {
+         if let Some(did) = self.remapped_decks.get(&card.deck_id) {
+             card.deck_id = *did;
+         }
++        if let Some(did) = self.remapped_decks.get(&card.original_deck_id) {
++            card.original_deck_id = *did;
++        }
+     }
+ }
+ 
+diff --git a/rslib/src/import_export/package/apkg/import/decks.rs b/rslib/src/import_export/package/apkg/import/decks.rs
+index 49c81a304..0b2aa2811 100644
+--- a/rslib/src/import_export/package/apkg/import/decks.rs
++++ b/rslib/src/import_export/package/apkg/import/decks.rs
+@@ -27,10 +27,13 @@ impl<'d> DeckContext<'d> {
+ }
+ 
+ impl Context<'_> {
+-    pub(super) fn import_decks_and_configs(&mut self) -> Result<HashMap<DeckId, DeckId>> {
++    pub(super) fn import_decks_and_configs(
++        &mut self,
++        keep_filtered: bool,
++    ) -> Result<HashMap<DeckId, DeckId>> {
+         let mut ctx = DeckContext::new(self.target_col, self.usn);
+         ctx.import_deck_configs(mem::take(&mut self.data.deck_configs))?;
+-        ctx.import_decks(mem::take(&mut self.data.decks))?;
++        ctx.import_decks(mem::take(&mut self.data.decks), keep_filtered)?;
+         Ok(ctx.imported_decks)
+     }
+ }
+@@ -44,19 +47,19 @@ impl DeckContext<'_> {
+         Ok(())
+     }
+ 
+-    fn import_decks(&mut self, mut decks: Vec<Deck>) -> Result<()> {
++    fn import_decks(&mut self, mut decks: Vec<Deck>, keep_filtered: bool) -> Result<()> {
+         // ensure parents are seen before children
+         decks.sort_unstable_by_key(|deck| deck.level());
+         for deck in &mut decks {
+-            self.prepare_deck(deck);
++            self.prepare_deck(deck, keep_filtered);
+             self.import_deck(deck)?;
+         }
+         Ok(())
+     }
+ 
+-    fn prepare_deck(&mut self, deck: &mut Deck) {
++    fn prepare_deck(&self, deck: &mut Deck, keep_filtered: bool) {
+         self.maybe_reparent(deck);
+-        if deck.is_filtered() {
++        if !keep_filtered && deck.is_filtered() {
+             deck.kind = DeckKind::Normal(NormalDeck {
+                 config_id: 1,
+                 ..Default::default()
+@@ -66,16 +69,14 @@ impl DeckContext<'_> {
+ 
+     fn import_deck(&mut self, deck: &mut Deck) -> Result<()> {
+         if let Some(original) = self.get_deck_by_name(deck)? {
+-            if original.is_filtered() {
+-                self.uniquify_name(deck);
+-                self.add_deck(deck)
++            if original.is_same_kind(deck) {
++                return self.update_deck(deck, original);
+             } else {
+-                self.update_deck(deck, original)
++                self.uniquify_name(deck);
+             }
+-        } else {
+-            self.ensure_valid_first_existing_parent(deck)?;
+-            self.add_deck(deck)
+         }
++        self.ensure_valid_first_existing_parent(deck)?;
++        self.add_deck(deck)
+     }
+ 
+     fn maybe_reparent(&self, deck: &mut Deck) {
+@@ -113,10 +114,16 @@ impl DeckContext<'_> {
+         Ok(())
+     }
+ 
+-    /// Caller must ensure decks are normal.
++    /// Caller must ensure decks are of the same kind.
+     fn update_deck(&mut self, deck: &Deck, original: Deck) -> Result<()> {
+         let mut new_deck = original.clone();
+-        new_deck.normal_mut()?.update_with_other(deck.normal()?);
++        if let (Ok(new), Ok(old)) = (new_deck.normal_mut(), deck.normal()) {
++            new.update_with_other(old);
++        } else if let (Ok(new), Ok(old)) = (new_deck.filtered_mut(), deck.filtered()) {
++            *new = old.clone();
++        } else {
++            return Err(AnkiError::invalid_input("decks have different kinds"));
++        }
+         self.imported_decks.insert(deck.id, new_deck.id);
+         self.target_col
+             .update_deck_inner(&mut new_deck, original, self.usn)
+@@ -152,6 +159,10 @@ impl Deck {
+     fn level(&self) -> usize {
+         self.name.components().count()
+     }
++
++    fn is_same_kind(&self, other: &Self) -> bool {
++        self.is_filtered() == other.is_filtered()
++    }
+ }
+ 
+ impl NormalDeck {
+@@ -194,7 +205,7 @@ mod test {
+             new_deck_with_machine_name("NEW PARENT\x1fchild", false),
+             new_deck_with_machine_name("new parent", false),
+         ];
+-        ctx.import_decks(imports).unwrap();
++        ctx.import_decks(imports, false).unwrap();
+         let existing_decks: HashSet<_> = ctx
+             .target_col
+             .get_all_deck_names(true)
+diff --git a/rslib/src/import_export/package/apkg/import/mod.rs b/rslib/src/import_export/package/apkg/import/mod.rs
+index e0cc2b2d8..7355acf88 100644
+--- a/rslib/src/import_export/package/apkg/import/mod.rs
++++ b/rslib/src/import_export/package/apkg/import/mod.rs
+@@ -6,7 +6,7 @@ mod decks;
+ mod media;
+ mod notes;
+ 
+-use std::{fs::File, io, path::Path};
++use std::{collections::HashSet, fs::File, io, path::Path};
+ 
+ pub(crate) use notes::NoteMeta;
+ use rusqlite::OptionalExtension;
+@@ -82,8 +82,9 @@ impl<'a> Context<'a> {
+     fn import(&mut self) -> Result<NoteLog> {
+         let mut media_map = self.prepare_media()?;
+         let note_imports = self.import_notes_and_notetypes(&mut media_map)?;
+-        let imported_decks = self.import_decks_and_configs()?;
+-        self.import_cards_and_revlog(&note_imports.id_map, &imported_decks)?;
++        let keep_filtered = self.data.enables_filtered_decks();
++        let imported_decks = self.import_decks_and_configs(keep_filtered)?;
++        self.import_cards_and_revlog(&note_imports.id_map, &imported_decks, keep_filtered)?;
+         self.copy_media(&mut media_map)?;
+         Ok(note_imports.log)
+     }
+@@ -107,6 +108,24 @@ impl ExchangeData {
+ 
+         Ok(data)
+     }
++
++    fn enables_filtered_decks(&self) -> bool {
++        // Earlier versions relied on the importer handling filtered decks by converting
++        // them into regular ones, so there is no guarantee that all original decks
++        // are included.
++        self.contains_scheduling() && self.contains_all_original_decks()
++    }
++
++    fn contains_scheduling(&self) -> bool {
++        !(self.revlog.is_empty() && self.deck_configs.is_empty())
++    }
++
++    fn contains_all_original_decks(&self) -> bool {
++        let deck_ids: HashSet<_> = self.decks.iter().map(|d| d.id).collect();
++        self.cards
++            .iter()
++            .all(|c| c.original_deck_id.0 == 0 || deck_ids.contains(&c.original_deck_id))
++    }
+ }
+ 
+ fn collection_to_tempfile(meta: &Meta, archive: &mut ZipArchive<File>) -> Result<NamedTempFile> {
+diff --git a/rslib/src/import_export/text/csv/import.rs b/rslib/src/import_export/text/csv/import.rs
+index a38d6166e..d6385e706 100644
+--- a/rslib/src/import_export/text/csv/import.rs
++++ b/rslib/src/import_export/text/csv/import.rs
+@@ -158,10 +158,10 @@ impl ColumnContext {
+ 
+     fn foreign_note_from_record(&self, record: &csv::StringRecord) -> ForeignNote {
+         ForeignNote {
+-            notetype: str_from_record_column(self.notetype_column, record).into(),
++            notetype: name_or_id_from_record_column(self.notetype_column, record),
+             fields: self.gather_note_fields(record),
+             tags: self.gather_tags(record),
+-            deck: str_from_record_column(self.deck_column, record).into(),
++            deck: name_or_id_from_record_column(self.deck_column, record),
+             guid: str_from_record_column(self.guid_column, record),
+             ..Default::default()
+         }
+@@ -192,6 +192,10 @@ fn str_from_record_column(column: Option<usize>, record: &csv::StringRecord) ->
+         .to_string()
+ }
+ 
++fn name_or_id_from_record_column(column: Option<usize>, record: &csv::StringRecord) -> NameOrId {
++    NameOrId::parse(column.and_then(|i| record.get(i - 1)).unwrap_or_default())
++}
++
+ pub(super) fn build_csv_reader(
+     mut reader: impl Read + Seek,
+     delimiter: Delimiter,
+diff --git a/rslib/src/import_export/text/csv/metadata.rs b/rslib/src/import_export/text/csv/metadata.rs
+index 10d8985d9..44eaacc72 100644
+--- a/rslib/src/import_export/text/csv/metadata.rs
++++ b/rslib/src/import_export/text/csv/metadata.rs
+@@ -67,7 +67,6 @@ impl Collection {
+         maybe_set_fallback_columns(&mut metadata)?;
+         self.maybe_set_fallback_notetype(&mut metadata, notetype_id)?;
+         self.maybe_init_notetype_map(&mut metadata)?;
+-        maybe_set_tags_column(&mut metadata);
+         self.maybe_set_fallback_deck(&mut metadata)?;
+ 
+         Ok(metadata)
+@@ -222,6 +221,7 @@ impl Collection {
+                 );
+             }
+             ensure_first_field_is_mapped(&mut global.field_columns, column_len, &meta_columns)?;
++            maybe_set_tags_column(metadata, &meta_columns);
+         }
+         Ok(())
+     }
+@@ -388,12 +388,15 @@ fn maybe_set_fallback_delimiter(
+     Ok(())
+ }
+ 
+-fn maybe_set_tags_column(metadata: &mut CsvMetadata) {
++fn maybe_set_tags_column(metadata: &mut CsvMetadata, meta_columns: &HashSet<usize>) {
+     if metadata.tags_column == 0 {
+         if let Some(CsvNotetype::GlobalNotetype(ref global)) = metadata.notetype {
+             let max_field = global.field_columns.iter().max().copied().unwrap_or(0);
+-            if max_field < metadata.column_labels.len() as u32 {
+-                metadata.tags_column = max_field + 1;
++            for idx in (max_field + 1) as usize..metadata.column_labels.len() {
++                if !meta_columns.contains(&idx) {
++                    metadata.tags_column = max_field + 1;
++                    break;
++                }
+             }
+         }
+     }
+diff --git a/rslib/src/import_export/text/import.rs b/rslib/src/import_export/text/import.rs
+index f51770a29..c29e76231 100644
+--- a/rslib/src/import_export/text/import.rs
++++ b/rslib/src/import_export/text/import.rs
+@@ -129,6 +129,11 @@ impl DeckIdsByNameOrId {
+             NameOrId::Name(name) => self.names.get(name).copied(),
+         }
+     }
++
++    fn insert(&mut self, deck_id: DeckId, name: String) {
++        self.ids.insert(deck_id);
++        self.names.insert(name, deck_id);
++    }
+ }
+ 
+ impl<'a> Context<'a> {
+@@ -195,7 +200,7 @@ impl<'a> Context<'a> {
+                 continue;
+             }
+             if let Some(notetype) = self.notetype_for_note(&foreign)? {
+-                if let Some(deck_id) = self.deck_ids.get(&foreign.deck) {
++                if let Some(deck_id) = self.get_or_create_deck_id(&foreign.deck)? {
+                     let ctx = self.build_note_context(
+                         foreign,
+                         notetype,
+@@ -214,6 +219,20 @@ impl<'a> Context<'a> {
+         Ok(log)
+     }
+ 
++    fn get_or_create_deck_id(&mut self, deck: &NameOrId) -> Result<Option<DeckId>> {
++        Ok(if let Some(did) = self.deck_ids.get(deck) {
++            Some(did)
++        } else if let NameOrId::Name(name) = deck {
++            let mut deck = Deck::new_normal();
++            deck.name = NativeDeckName::from_human_name(name);
++            self.col.add_deck_inner(&mut deck, self.usn)?;
++            self.deck_ids.insert(deck.id, deck.human_name());
++            Some(deck.id)
++        } else {
++            None
++        })
++    }
++
+     fn build_note_context<'tags>(
+         &mut self,
+         mut note: ForeignNote,
+@@ -240,16 +259,17 @@ impl<'a> Context<'a> {
+     }
+ 
+     fn find_duplicates(&self, notetype: &Notetype, note: &ForeignNote) -> Result<Vec<Duplicate>> {
+-        if let Some(nid) = self.existing_guids.get(&note.guid) {
+-            self.get_guid_dupe(*nid, note).map(|dupe| vec![dupe])
+-        } else if let Some(nids) = note
+-            .checksum()
+-            .and_then(|csum| self.existing_checksums.get(&(notetype.id, csum)))
+-        {
+-            self.get_first_field_dupes(note, nids)
+-        } else {
+-            Ok(Vec::new())
++        if note.guid.is_empty() {
++            if let Some(nids) = note
++                .checksum()
++                .and_then(|csum| self.existing_checksums.get(&(notetype.id, csum)))
++            {
++                return self.get_first_field_dupes(note, nids);
++            }
++        } else if let Some(nid) = self.existing_guids.get(&note.guid) {
++            return self.get_guid_dupe(*nid, note).map(|dupe| vec![dupe]);
+         }
++        Ok(Vec::new())
+     }
+ 
+     fn get_guid_dupe(&self, nid: NoteId, original: &ForeignNote) -> Result<Duplicate> {
+@@ -271,20 +291,21 @@ impl<'a> Context<'a> {
+ 
+     fn import_note(&mut self, ctx: NoteContext, log: &mut NoteLog) -> Result<()> {
+         match self.dupe_resolution {
+-            _ if ctx.dupes.is_empty() => self.add_note(ctx, log, false)?,
+-            DupeResolution::Add => self.add_note(ctx, log, true)?,
++            _ if !ctx.is_dupe() => self.add_note(ctx, log)?,
++            DupeResolution::Add if ctx.is_guid_dupe() => {
++                log.duplicate.push(ctx.note.into_log_note())
++            }
++            DupeResolution::Add if !ctx.has_first_field() => {
++                log.empty_first_field.push(ctx.note.into_log_note())
++            }
++            DupeResolution::Add => self.add_note(ctx, log)?,
+             DupeResolution::Update => self.update_with_note(ctx, log)?,
+             DupeResolution::Ignore => log.first_field_match.push(ctx.note.into_log_note()),
+         }
+         Ok(())
+     }
+ 
+-    fn add_note(&mut self, ctx: NoteContext, log: &mut NoteLog, dupe: bool) -> Result<()> {
+-        if !ctx.note.first_field_is_unempty() {
+-            log.empty_first_field.push(ctx.note.into_log_note());
+-            return Ok(());
+-        }
+-
++    fn add_note(&mut self, ctx: NoteContext, log: &mut NoteLog) -> Result<()> {
+         let mut note = Note::new(&ctx.notetype);
+         let mut cards = ctx
+             .note
+@@ -293,10 +314,10 @@ impl<'a> Context<'a> {
+         self.col.add_note_only_undoable(&mut note)?;
+         self.add_cards(&mut cards, &note, ctx.deck_id, ctx.notetype)?;
+ 
+-        if dupe {
+-            log.first_field_match.push(note.into_log_note());
+-        } else {
++        if ctx.dupes.is_empty() {
+             log.new.push(note.into_log_note());
++        } else {
++            log.first_field_match.push(note.into_log_note());
+         }
+ 
+         Ok(())
+@@ -376,6 +397,22 @@ impl<'a> Context<'a> {
+     }
+ }
+ 
++impl NoteContext<'_> {
++    fn is_dupe(&self) -> bool {
++        !self.dupes.is_empty()
++    }
++
++    fn is_guid_dupe(&self) -> bool {
++        self.dupes
++            .get(0)
++            .map_or(false, |d| d.note.guid == self.note.guid)
++    }
++
++    fn has_first_field(&self) -> bool {
++        self.note.first_field_is_unempty()
++    }
++}
++
+ impl Note {
+     fn first_field_stripped(&self) -> Cow<str> {
+         strip_html_preserving_media_filenames(&self.fields()[0])
+diff --git a/rslib/src/storage/deck/all_decks_and_original_of_search_cards.sql b/rslib/src/storage/deck/all_decks_and_original_of_search_cards.sql
+new file mode 100644
+index 000000000..fb5716327
+--- /dev/null
++++ b/rslib/src/storage/deck/all_decks_and_original_of_search_cards.sql
+@@ -0,0 +1,12 @@
++WITH cids AS (
++  SELECT cid
++  FROM search_cids
++)
++SELECT did
++FROM cards
++WHERE id IN cids
++UNION
++SELECT odid
++FROM cards
++WHERE odid != 0
++  AND id IN cids
+\ No newline at end of file
+diff --git a/rslib/src/storage/deck/mod.rs b/rslib/src/storage/deck/mod.rs
+index cf408a42d..8b8976aa8 100644
+--- a/rslib/src/storage/deck/mod.rs
++++ b/rslib/src/storage/deck/mod.rs
+@@ -131,6 +131,18 @@ impl SqliteStorage {
+             .collect()
+     }
+ 
++    pub(crate) fn get_decks_and_original_for_search_cards(&self) -> Result<Vec<Deck>> {
++        self.db
++            .prepare_cached(concat!(
++                include_str!("get_deck.sql"),
++                " WHERE id IN (",
++                include_str!("all_decks_and_original_of_search_cards.sql"),
++                ")",
++            ))?
++            .query_and_then([], row_to_deck)?
++            .collect()
++    }
++
+     /// Returns the deck id of the first existing card of every searched note.
+     pub(crate) fn all_decks_of_search_notes(&self) -> Result<HashMap<NoteId, DeckId>> {
+         self.db

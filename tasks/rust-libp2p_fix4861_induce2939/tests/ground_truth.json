@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "track": "fix",
+  "task": {
+    "pr_number": 2939,
+    "pr_url": "https://github.com/libp2p/rust-libp2p/pull/2939",
+    "commit": "a905a36cbcb97d5afde9b488c57ec6b3bf157416",
+    "detectability": 4,
+    "szz_confidence": "high",
+    "blamed_line_share": 1.0
+  },
+  "cases": [
+    {
+      "id": "issue:4860",
+      "provenance": "A user reported this defect after the reviewed pull request, and a later fix repaired it.",
+      "summary": "Mdns `InterfaceState` never being called again after returning `Poll::Pending`",
+      "description": "### Summary\n\nWhen updating to `0.53.0`, we encountered a curious bug with Mdns.\r\n\r\nAfter sending an incorrect Mdns packet, which is dropped (as expected), no packet is ever received by the peer after that, even if it is correct.\n\n### Expected behavior\n\nAn incorrect Mdns packet should not stop the polling of an `InterfaceState`.\n\n### Actual behavior\n\nThe polling of an `InterfaceState` is stopped after receiving an incorrect Mdns packet.\n\n### Relevant log output\n\n_No response_\n\n### Possible Solution\n\nMembers of our team diagnosed the problem and managed to find the solution. It seems a dormant bug was present for a long time in the `poll` implementation of `InterfaceState` but it was only awakened with the merge of #4623. \r\n\r\nhttps://github.com/libp2p/rust-libp2p/blob/cddc306978a7cca705de5ce10ec5e16e8b732084/protocols/mdns/src/behaviour/iface.rs#L313-L325\r\n\r\nAs we can see in the above code sample, many `Poll::Ready` are handled and returned as `Poll::Pending`. However, in the [rust documentation,](https://doc.rust-lang.org/stable/std/task/enum.Poll.html#variant.Pending) we can read that \"When a function returns Pending, the function *must* also ensure that the current task is scheduled to be awoken when progress can be made\". When looking at the current implementation, we can safely say that, when a `Poll::Ready` is caught and converted into a `Poll::Pending`, no scheduling is done to ensure the task will be woken up.\r\n\r\nEven if this bug has been present for a long time, it has not caused any problems up until now. Indeed, before the previously mentioned PR, all `InterfaceState` were stored in the `iface_states` `HashMap` and [were polled no matter what their previous returned value was](https://github.com/libp2p/rust-libp2p/pull/4623/files?diff=split&w=0#diff-9ec8c5fcec2242a830ffe46e2c0d7e32186d28ec335f0452af531a9025803b9fL292) (since `poll` was called in a `loop` over each `InterfaceState`). So, even if the `poll` method of `InterfaceState` had not scheduled its own awakening, it would still be called at the next iteration of the `poll` method of the mdns `Behaviour`.\r\n\r\nHowever, now that each `InterfaceState` is `spawned` in its own task, nobody is calling `poll` when it returns `Poll::Pending`. That is why returning a `Poll::Pending` when internally getting a `Poll::Ready` result in the `poll` method of `InterfaceState` never being called again, causing packets to never be handled.\n\n### Version\n\nv0.53.0 (master)\n\n### Would you like to work on fixing this bug ?\n\nYes",
+      "location": {
+        "files": [
+          "protocols/mdns/src/behaviour/iface.rs"
+        ]
+      },
+      "evidence": {
+        "eventual_fix_title": "fix(mdns): don't suspend task forever upon reading non-mDNS packet",
+        "eventual_fix_problem_statement": "fix(mdns): don't suspend task forever upon reading non-mDNS packet\n\n## Description\r\n\r\nFixes: #4860.\r\n\r\n## Notes & open questions\r\n\r\nWe are not completely sure if we should loop back again (ie. going through priorities `1`, `2` and `3` all over again) or if we should add another loop around priority `4`. From our understanding of the `poll` implementation, we should loop back at the top but we might be incorrect.\r\n\r\n## Change checklist\r\n\r\n<!-- Please add a Changelog entry in the appropriate crates and bump the crate versions if needed. See <https://github.com/libp2p/rust-libp2p/blob/master/docs/release.md#development-between-releases>-->\r\n\r\n- [x] I have performed a self-review of my own code\r\n- [ ] I have made corresponding changes to the documentation\r\n- [ ] I have added tests that prove my fix is effective or that my feature works\r\n- [x] A changelog entry has been made in the appropriate crates",
+        "eventual_fix_diff": "commit c718835585379dfd0e72e4359695450ce5100ae9\nAuthor: stormshield-frb <144998884+stormshield-frb@users.noreply.github.com>\nDate:   Wed Nov 22 21:40:26 2023 +0100\n\n    fix(mdns): don't suspend task forever upon reading non-mDNS packet\n    \n    Fixes: #4860.\n    \n    Pull-Request: #4861.\n\ndiff --git a/protocols/mdns/CHANGELOG.md b/protocols/mdns/CHANGELOG.md\nindex 6f5aa6945..cfd02232b 100644\n--- a/protocols/mdns/CHANGELOG.md\n+++ b/protocols/mdns/CHANGELOG.md\n@@ -2,6 +2,8 @@\n \n - Ensure `Multiaddr` handled and returned by `Behaviour` are `/p2p` terminated.\n   See [PR 4596](https://github.com/libp2p/rust-libp2p/pull/4596).\n+- Fix a bug in the `Behaviour::poll` method causing missed mdns packets.\n+  See [PR 4861](https://github.com/libp2p/rust-libp2p/pull/4861).\n \n ## 0.45.0\n \ndiff --git a/protocols/mdns/src/behaviour/iface.rs b/protocols/mdns/src/behaviour/iface.rs\nindex 7fe97c383..9302065cd 100644\n--- a/protocols/mdns/src/behaviour/iface.rs\n+++ b/protocols/mdns/src/behaviour/iface.rs\n@@ -312,14 +312,18 @@ where\n                 }\n                 Poll::Ready(Err(err)) if err.kind() == std::io::ErrorKind::WouldBlock => {\n                     // No more bytes available on the socket to read\n+                    continue;\n                 }\n                 Poll::Ready(Err(err)) => {\n                     tracing::error!(\"failed reading datagram: {}\", err);\n+                    return Poll::Ready(());\n                 }\n                 Poll::Ready(Ok(Err(err))) => {\n                     tracing::debug!(\"Parsing mdns packet failed: {:?}\", err);\n+                    continue;\n                 }\n-                Poll::Ready(Ok(Ok(None))) | Poll::Pending => {}\n+                Poll::Ready(Ok(Ok(None))) => continue,\n+                Poll::Pending => {}\n             }\n \n             return Poll::Pending;\n"
+      },
+      "metadata": {
+        "oracle_source": "issue",
+        "issue_number": 4860,
+        "issue_url": "https://github.com/libp2p/rust-libp2p/issues/4860",
+        "issue_type": "",
+        "issue_priority": null,
+        "issue_severity": null,
+        "issue_tags": [],
+        "issue_area_path": "",
+        "issue_resolved_reason": "",
+        "fix_pr": 4861,
+        "fix_pr_url": "https://github.com/libp2p/rust-libp2p/pull/4861",
+        "fix_commit": "c718835585379dfd0e72e4359695450ce5100ae9",
+        "verification": {
+          "root_cause_confirmed": "yes",
+          "source": "published task list"
+        }
+      }
+    }
+  ]
+}

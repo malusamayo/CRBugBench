@@ -1,0 +1,344 @@
+diff --git a/src/Controls/src/Core/Handlers/Items/ItemsViewHandler.iOS.cs b/src/Controls/src/Core/Handlers/Items/ItemsViewHandler.iOS.cs
+index f4024283c3f5..756aa3f6bfb0 100644
+--- a/src/Controls/src/Core/Handlers/Items/ItemsViewHandler.iOS.cs
++++ b/src/Controls/src/Core/Handlers/Items/ItemsViewHandler.iOS.cs
+@@ -3,6 +3,7 @@
+ using System.Collections.Generic;
+ using System.Text;
+ using Foundation;
++using Microsoft.Maui.Graphics;
+ using Microsoft.Maui.Handlers;
+ using ObjCRuntime;
+ using UIKit;
+@@ -145,5 +146,34 @@ protected bool IsIndexPathValid(NSIndexPath indexPath)
+ 
+ 			return true;
+ 		}
++
++		public override Size GetDesiredSize(double widthConstraint, double heightConstraint)
++		{
++			var size = base.GetDesiredSize(widthConstraint, heightConstraint);
++
++			var potentialContentSize = Controller.GetSize();
++
++			// If contentSize comes back null, it means none of the content has been realized yet;
++			// we need to return the expansive size the collection view wants by default to get
++			// it to start measuring its content
++			if (potentialContentSize == null)
++			{
++				return size;
++			}
++
++			var contentSize = potentialContentSize.Value;
++
++			// If contentSize does have a value, our target size is the smaller of it and the constraints
++
++			size.Width = contentSize.Width <= widthConstraint ? contentSize.Width : widthConstraint;
++			size.Height = contentSize.Height <= heightConstraint ? contentSize.Height : heightConstraint;
++
++			var virtualView = this.VirtualView as IView;
++
++			size.Width = ViewHandlerExtensions.ResolveConstraints(size.Width, virtualView.Width, virtualView.MinimumWidth, virtualView.MaximumWidth);
++			size.Height = ViewHandlerExtensions.ResolveConstraints(size.Height, virtualView.Height, virtualView.MinimumHeight, virtualView.MaximumHeight);
++
++			return size;
++		}
+ 	}
+ }
+diff --git a/src/Controls/src/Core/Handlers/Items/iOS/ItemsViewController.cs b/src/Controls/src/Core/Handlers/Items/iOS/ItemsViewController.cs
+index 73d34a37c26d..b0874a6b8903 100644
+--- a/src/Controls/src/Core/Handlers/Items/iOS/ItemsViewController.cs
++++ b/src/Controls/src/Core/Handlers/Items/iOS/ItemsViewController.cs
+@@ -31,6 +31,8 @@ public abstract class ItemsViewController<TItemsView> : UICollectionViewControll
+ 		bool _disposed;
+ 
+ 		Func<UICollectionViewCell> _getPrototype;
++		CGSize _previousContentSize = CGSize.Empty;
++
+ 		UIView _emptyUIView;
+ 		VisualElement _emptyViewFormsElement;
+ 		Dictionary<object, TemplatedCell> _measurementCells = new Dictionary<object, TemplatedCell>();
+@@ -175,9 +177,59 @@ public override void ViewWillLayoutSubviews()
+ 		{
+ 			ConstrainToItemsView();
+ 			base.ViewWillLayoutSubviews();
++			InvalidateMeasureIfContentSizeChanged();
+ 			LayoutEmptyView();
+ 		}
+ 
++		void InvalidateMeasureIfContentSizeChanged()
++		{
++			var contentSize = CollectionView.CollectionViewLayout.CollectionViewContentSize;
++
++			if (_initialized && (_previousContentSize.Width != contentSize.Width
++				|| _previousContentSize.Height != contentSize.Height))
++			{
++				var screenFrame = CollectionView.Window.Frame;
++				var screenWidth = screenFrame.Width;
++				var screenHeight = screenFrame.Height;
++				bool invalidate = false;
++
++				// If both the previous content size and the current content size are larger
++				// than the screen size, then we know that we're already maxed out and the 
++				// CollectionView items are scrollable. There's no reason to force an invalidation
++				// of the CollectionView to expand/contract it.
++
++				// If either size is smaller than that, we need to invalidate to ensure that the 
++				// CollectionView is re-measured and set to the correct size.
++
++				if (contentSize.Width < screenWidth || contentSize.Width < screenWidth)
++				{
++					invalidate = true;
++				}
++
++				if (contentSize.Height < screenHeight || contentSize.Height < screenHeight)
++				{
++					invalidate = true;
++				}
++
++				if (invalidate)
++				{
++					(ItemsView as IView).InvalidateMeasure();
++				}
++			}
++
++			_previousContentSize = contentSize;
++		}
++
++		internal Size? GetSize()
++		{
++			if (_emptyViewDisplayed)
++			{
++				return _emptyUIView.Frame.Size.ToSize();
++			}
++
++			return CollectionView.CollectionViewLayout.CollectionViewContentSize.ToSize();
++		}
++
+ 		void ConstrainToItemsView()
+ 		{
+ 			var itemsViewWidth = ItemsView.Width;
+@@ -229,8 +281,11 @@ public virtual void UpdateItemsSource()
+ 			ItemsViewLayout?.ClearCellSizeCache();
+ 			ItemsSource?.Dispose();
+ 			ItemsSource = CreateItemsViewSource();
++
+ 			CollectionView.ReloadData();
+ 			CollectionView.CollectionViewLayout.InvalidateLayout();
++
++			(ItemsView as IView)?.InvalidateMeasure();
+ 		}
+ 
+ 		public virtual void UpdateFlowDirection()
+@@ -245,6 +300,7 @@ public virtual void UpdateFlowDirection()
+ 			Layout.InvalidateLayout();
+ 		}
+ 
++
+ 		public override nint NumberOfSections(UICollectionView collectionView)
+ 		{
+ 			CheckForEmptySource();
+diff --git a/src/Controls/tests/DeviceTests/Elements/CollectionView/CollectionViewSizingTestCase.cs b/src/Controls/tests/DeviceTests/Elements/CollectionView/CollectionViewSizingTestCase.cs
+new file mode 100644
+index 000000000000..d85c02d4028a
+--- /dev/null
++++ b/src/Controls/tests/DeviceTests/Elements/CollectionView/CollectionViewSizingTestCase.cs
+@@ -0,0 +1,44 @@
++﻿using System;
++using System.Collections.Generic;
++using Microsoft.Maui.Controls;
++using Xunit.Abstractions;
++
++namespace Microsoft.Maui.DeviceTests
++{
++	public class CollectionViewSizingTestCase : IXunitSerializable
++	{
++		public LayoutOptions LayoutOptions { get; private set; }
++		public LinearItemsLayout ItemsLayout { get; private set; }
++
++		public CollectionViewSizingTestCase() { }
++
++		public CollectionViewSizingTestCase(LayoutOptions layoutOptions, LinearItemsLayout linearItemsLayout)
++		{
++			LayoutOptions = layoutOptions;
++			ItemsLayout = linearItemsLayout;
++		}
++
++		public void Deserialize(IXunitSerializationInfo info)
++		{
++			var orientationString = info.GetValue<string>(nameof(ItemsLayout));
++			var orientation = (ItemsLayoutOrientation)Enum.Parse(typeof(ItemsLayoutOrientation), orientationString);
++			ItemsLayout = new LinearItemsLayout(orientation);
++
++			var alignmentString = info.GetValue<string>(nameof(LayoutOptions));
++			var alignment = (LayoutAlignment)Enum.Parse(typeof(LayoutAlignment), alignmentString);
++			LayoutOptions = new LayoutOptions(alignment, false);
++		}
++
++		public void Serialize(IXunitSerializationInfo info)
++		{
++			info.AddValue(nameof(LayoutOptions), LayoutOptions.Alignment.ToString(), typeof(string));
++			info.AddValue(nameof(ItemsLayout), ItemsLayout.Orientation.ToString(), typeof(string));
++		}
++
++		public override string ToString()
++		{
++			var optionsString = LayoutOptions.Alignment.ToString();
++			return $"{ItemsLayout.Orientation}, {optionsString}";
++		}
++	}
++}
+\ No newline at end of file
+diff --git a/src/Controls/tests/DeviceTests/Elements/CollectionView/CollectionViewTests.cs b/src/Controls/tests/DeviceTests/Elements/CollectionView/CollectionViewTests.cs
+index fa5875331c32..e0f5e210f129 100644
+--- a/src/Controls/tests/DeviceTests/Elements/CollectionView/CollectionViewTests.cs
++++ b/src/Controls/tests/DeviceTests/Elements/CollectionView/CollectionViewTests.cs
+@@ -1,14 +1,17 @@
+ ﻿using System;
+ using System.Collections;
++using System.Collections.Generic;
+ using System.Collections.ObjectModel;
+ using System.Reflection;
+ using System.Threading.Tasks;
+ using Microsoft.Maui.Controls;
+ using Microsoft.Maui.Controls.Handlers.Items;
+ using Microsoft.Maui.DeviceTests.Stubs;
++using Microsoft.Maui.Graphics;
+ using Microsoft.Maui.Handlers;
+ using Microsoft.Maui.Hosting;
+ using Xunit;
++using Xunit.Abstractions;
+ 
+ namespace Microsoft.Maui.DeviceTests
+ {
+@@ -29,6 +32,7 @@ void SetupBuilder()
+ 
+ 					handlers.AddHandler<CollectionView, CollectionViewHandler>();
+ 					handlers.AddHandler<VerticalStackLayout, LayoutHandler>();
++					handlers.AddHandler<Grid, LayoutHandler>();
+ 					handlers.AddHandler<Label, LabelHandler>();
+ 				});
+ 			});
+@@ -77,5 +81,121 @@ await CreateHandlerAndAddToWindow<CollectionViewHandler>(collectionView, async h
+ 			Assert.NotNull(logicalChildren);
+ 			Assert.True(logicalChildren.Count <= 3, "_logicalChildren should not grow in size!");
+ 		}
++
++		[Theory]
++		[MemberData(nameof(GenerateLayoutOptionsCombos))]
++		public async Task CollectionViewCanSizeToContent(CollectionViewSizingTestCase testCase)
++		{
++			// The goal of this test is to create a CollectionView inside a container with each combination of
++			// ItemsLayout (vertical or horizontal collection) and LayoutAlignment (Fill, Center, etc).
++			// And then layout that CollectionView using a fixed-size template and different sizes of collection
++
++			// At each collection size, we check the size of the CollectionView to verify that it's laying out
++			// at its content size, or at the size of the container (if the number of items is sufficiently large)
++
++			var itemsLayout = testCase.ItemsLayout;
++			var layoutOptions = testCase.LayoutOptions;
++
++			double templateHeight = 50;
++			double templateWidth = 50;
++
++			double containerHeight = 500;
++			double containerWidth = 500;
++
++			int[] itemCounts = new int[] { 1, 2, 12, 0 };
++
++			double tolerance = 1;
++
++			SetupBuilder();
++
++			var collectionView = new CollectionView
++			{
++				ItemsLayout = itemsLayout,
++				ItemTemplate = new DataTemplate(() => new Label() { HeightRequest = templateHeight, WidthRequest = templateWidth }),
++			};
++
++			if (itemsLayout.Orientation == ItemsLayoutOrientation.Horizontal)
++			{
++				collectionView.HorizontalOptions = layoutOptions;
++			}
++			else
++			{
++				collectionView.VerticalOptions = layoutOptions;
++			}
++
++			var layout = new Grid() { IgnoreSafeArea = true, HeightRequest = containerHeight, WidthRequest = containerWidth };
++			layout.Add(collectionView);
++
++			ObservableCollection<string> data = new();
++
++			var frame = collectionView.Frame;
++
++			await CreateHandlerAndAddToWindow<LayoutHandler>(layout, async handler =>
++			{
++				for (int n = 0; n < itemCounts.Length; n++)
++				{
++					int itemsCount = itemCounts[n];
++
++					GenerateItems(itemsCount, data);
++					collectionView.ItemsSource = data;
++
++					await WaitForUIUpdate(frame, collectionView);
++					frame = collectionView.Frame;
++
++					double expectedWidth = layoutOptions == LayoutOptions.Fill
++						? containerWidth
++						: Math.Min(itemsCount * templateWidth, containerWidth);
++
++					double expectedHeight = layoutOptions == LayoutOptions.Fill
++						? containerHeight
++						: Math.Min(itemsCount * templateHeight, containerHeight);
++
++					if (itemsLayout.Orientation == ItemsLayoutOrientation.Horizontal)
++					{
++						Assert.Equal(expectedWidth, collectionView.Width, tolerance);
++					}
++					else
++					{
++						Assert.Equal(expectedHeight, collectionView.Height, tolerance);
++					}
++				}
++			});
++		}
++
++		public static IEnumerable<object[]> GenerateLayoutOptionsCombos()
++		{
++			var layoutOptions = new LayoutOptions[] { LayoutOptions.Center, LayoutOptions.Start, LayoutOptions.End, LayoutOptions.Fill };
++
++			foreach (var option in layoutOptions)
++			{
++				yield return new object[] { new CollectionViewSizingTestCase(option, new LinearItemsLayout(ItemsLayoutOrientation.Horizontal)) };
++				yield return new object[] { new CollectionViewSizingTestCase(option, new LinearItemsLayout(ItemsLayoutOrientation.Vertical)) };
++				yield return new object[] { new CollectionViewSizingTestCase(option, new LinearItemsLayout(ItemsLayoutOrientation.Horizontal)) };
++				yield return new object[] { new CollectionViewSizingTestCase(option, new LinearItemsLayout(ItemsLayoutOrientation.Vertical)) };
++			}
++		}
++
++		static void GenerateItems(int count, ObservableCollection<string> data)
++		{
++			if (data.Count > count)
++			{
++				data.Clear();
++			}
++
++			for (int n = data.Count; n < count; n++)
++			{
++				data.Add($"Item {n}");
++			}
++		}
++
++		static async Task WaitForUIUpdate(Rect frame, CollectionView collectionView, int timeout = 1000, int interval = 100)
++		{
++			// Wait for layout to happen
++			while (collectionView.Frame == frame && timeout >= 0)
++			{
++				await Task.Delay(interval);
++				timeout -= interval;
++			}
++		}
+ 	}
+ }
+\ No newline at end of file

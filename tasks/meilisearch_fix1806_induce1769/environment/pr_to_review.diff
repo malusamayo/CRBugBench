@@ -1,0 +1,153 @@
+commit c6d107a05fa0c45cd4ff7fb4f01f3492a2d65a4f
+Author: Tamo <tamo@meilisearch.com>
+Date:   Tue Oct 5 13:30:53 2021 +0200
+
+    makes the content-type mandatory for every routes
+
+diff --git a/meilisearch-http/src/error.rs b/meilisearch-http/src/error.rs
+index cbe963615..5a1c2064c 100644
+--- a/meilisearch-http/src/error.rs
++++ b/meilisearch-http/src/error.rs
+@@ -11,17 +11,21 @@ use serde::{Deserialize, Serialize};
+ 
+ #[derive(Debug, thiserror::Error)]
+ pub enum MeilisearchHttpError {
+-    #[error("A Content-Type header is missing. Accepted values for the Content-Type header are: \"application/json\", \"application/x-ndjson\", \"text/csv\"")]
+-    MissingContentType,
+-    #[error("The Content-Type \"{0}\" is invalid. Accepted values for the Content-Type header are: \"application/json\", \"application/x-ndjson\", \"text/csv\"")]
+-    InvalidContentType(String),
++    #[error("A Content-Type header is missing. Accepted values for the Content-Type header are: {}",
++            .0.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(", "))]
++    MissingContentType(Vec<String>),
++    #[error(
++        "The Content-Type \"{0}\" is invalid. Accepted values for the Content-Type header are: {}",
++        .1.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(", ")
++    )]
++    InvalidContentType(String, Vec<String>),
+ }
+ 
+ impl ErrorCode for MeilisearchHttpError {
+     fn error_code(&self) -> Code {
+         match self {
+-            MeilisearchHttpError::MissingContentType => Code::MissingContentType,
+-            MeilisearchHttpError::InvalidContentType(_) => Code::InvalidContentType,
++            MeilisearchHttpError::MissingContentType(_) => Code::MissingContentType,
++            MeilisearchHttpError::InvalidContentType(_, _) => Code::InvalidContentType,
+         }
+     }
+ }
+diff --git a/meilisearch-http/src/lib.rs b/meilisearch-http/src/lib.rs
+index 0b9dacbe0..870162516 100644
+--- a/meilisearch-http/src/lib.rs
++++ b/meilisearch-http/src/lib.rs
+@@ -11,7 +11,10 @@ pub mod routes;
+ use std::path::Path;
+ use std::time::Duration;
+ 
++use crate::error::{MeilisearchHttpError, ResponseError};
+ use crate::extractors::authentication::AuthConfig;
++use actix_web::error::JsonPayloadError;
++use http::header::CONTENT_TYPE;
+ pub use option::Opt;
+ 
+ use actix_web::web;
+@@ -98,9 +101,28 @@ pub fn configure_data(config: &mut web::ServiceConfig, data: MeiliSearch, opt: &
+         .app_data(data)
+         .app_data(
+             web::JsonConfig::default()
+-                .limit(http_payload_size_limit)
+-                .content_type(|_mime| true) // Accept all mime types
+-                .error_handler(|err, _req| error::payload_error_handler(err).into()),
++                .content_type(|mime| mime == mime::APPLICATION_JSON)
++                .error_handler(|err, req| match err {
++                    JsonPayloadError::ContentType if req.headers().get(CONTENT_TYPE).is_none() => {
++                        ResponseError::from(MeilisearchHttpError::MissingContentType(vec![
++                            mime::APPLICATION_JSON.to_string(),
++                        ]))
++                        .into()
++                    }
++                    JsonPayloadError::ContentType => {
++                        ResponseError::from(MeilisearchHttpError::InvalidContentType(
++                            req.headers()
++                                .get(CONTENT_TYPE)
++                                .unwrap()
++                                .to_str()
++                                .unwrap_or("unknown")
++                                .to_string(),
++                            vec![mime::APPLICATION_JSON.to_string()],
++                        ))
++                        .into()
++                    }
++                    err => error::payload_error_handler(err).into(),
++                }),
+         )
+         .app_data(PayloadConfig::new(http_payload_size_limit))
+         .app_data(
+@@ -180,6 +202,7 @@ macro_rules! create_app {
+         use actix_web::middleware::TrailingSlash;
+         use actix_web::App;
+         use actix_web::{middleware, web};
++        use meilisearch_http::error::{MeilisearchHttpError, ResponseError};
+         use meilisearch_http::routes;
+         use meilisearch_http::{configure_auth, configure_data, dashboard};
+ 
+diff --git a/meilisearch-http/src/routes/indexes/documents.rs b/meilisearch-http/src/routes/indexes/documents.rs
+index 50ba31c97..de53c3b3f 100644
+--- a/meilisearch-http/src/routes/indexes/documents.rs
++++ b/meilisearch-http/src/routes/indexes/documents.rs
+@@ -181,9 +181,24 @@ async fn document_addition(
+         Some("application/x-ndjson") => DocumentAdditionFormat::Ndjson,
+         Some("text/csv") => DocumentAdditionFormat::Csv,
+         Some(other) => {
+-            return Err(MeilisearchHttpError::InvalidContentType(other.to_string()).into())
++            return Err(MeilisearchHttpError::InvalidContentType(
++                other.to_string(),
++                vec![
++                    "application/json".to_string(),
++                    "application/x-ndjson".to_string(),
++                    "application/csv".to_string(),
++                ],
++            )
++            .into())
++        }
++        None => {
++            return Err(MeilisearchHttpError::MissingContentType(vec![
++                "application/json".to_string(),
++                "application/x-ndjson".to_string(),
++                "application/csv".to_string(),
++            ])
++            .into())
+         }
+-        None => return Err(MeilisearchHttpError::MissingContentType.into()),
+     };
+ 
+     let update = Update::DocumentAddition {
+diff --git a/meilisearch-http/tests/documents/add_documents.rs b/meilisearch-http/tests/documents/add_documents.rs
+index 13265dcfd..f0b01c4bd 100644
+--- a/meilisearch-http/tests/documents/add_documents.rs
++++ b/meilisearch-http/tests/documents/add_documents.rs
+@@ -67,7 +67,6 @@ async fn add_documents_test_no_content_types() {
+ 
+ /// any other content-type is must be refused
+ #[actix_rt::test]
+-#[ignore]
+ async fn add_documents_test_bad_content_types() {
+     let document = json!([
+         {
+@@ -91,8 +90,14 @@ async fn add_documents_test_bad_content_types() {
+     let res = test::call_service(&app, req).await;
+     let status_code = res.status();
+     let body = test::read_body(res).await;
+-    assert_eq!(status_code, 405);
+-    assert!(body.is_empty());
++    let response: Value = serde_json::from_slice(&body).unwrap_or_default();
++    assert_eq!(status_code, 415);
++    assert_eq!(
++        response["message"],
++        json!(
++            r#"The Content-Type "text/plain" is invalid. Accepted values for the Content-Type header are: "application/json", "application/x-ndjson", "application/csv""#
++        )
++    );
+ }
+ 
+ #[actix_rt::test]

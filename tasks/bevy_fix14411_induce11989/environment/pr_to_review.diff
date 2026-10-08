@@ -1,0 +1,3063 @@
+commit dfdf2b9ea4d26daff697b6851806cf342fadd8e3
+Author: Patrick Walton <pcwalton@mimiga.net>
+Date:   Thu Mar 7 12:22:42 2024 -0800
+
+    Implement the `AnimationGraph`, allowing for multiple animations to be blended together. (#11989)
+    
+    This is an implementation of RFC #51:
+    https://github.com/bevyengine/rfcs/blob/main/rfcs/51-animation-composition.md
+    
+    Note that the implementation strategy is different from the one outlined
+    in that RFC, because two-phase animation has now landed.
+    
+    # Objective
+    
+    Bevy needs animation blending. The RFC for this is [RFC 51].
+    
+    ## Solution
+    
+    This is an implementation of the RFC. Note that the implementation
+    strategy is different from the one outlined there, because two-phase
+    animation has now landed.
+    
+    This is just a draft to get the conversation started. Currently we're
+    missing a few things:
+    
+    - [x] A fully-fleshed-out mechanism for transitions
+    - [x] A serialization format for `AnimationGraph`s
+    - [x] Examples are broken, other than `animated_fox`
+    - [x] Documentation
+    
+    ---
+    
+    ## Changelog
+    
+    ### Added
+    
+    * The `AnimationPlayer` has been reworked to support blending multiple
+    animations together through an `AnimationGraph`, and as such will no
+    longer function unless a `Handle<AnimationGraph>` has been added to the
+    entity containing the player. See [RFC 51] for more details.
+    
+    * Transition functionality has moved from the `AnimationPlayer` to a new
+    component, `AnimationTransitions`, which works in tandem with the
+    `AnimationGraph`.
+    
+    ## Migration Guide
+    
+    * `AnimationPlayer`s can no longer play animations by themselves and
+    need to be paired with a `Handle<AnimationGraph>`. Code that was using
+    `AnimationPlayer` to play animations will need to create an
+    `AnimationGraph` asset first, add a node for the clip (or clips) you
+    want to play, and then supply the index of that node to the
+    `AnimationPlayer`'s `play` method.
+    
+    * The `AnimationPlayer::play_with_transition()` method has been removed
+    and replaced with the `AnimationTransitions` component. If you were
+    previously using `AnimationPlayer::play_with_transition()`, add all
+    animations that you were playing to the `AnimationGraph`, and create an
+    `AnimationTransitions` component to manage the blending between them.
+    
+    [RFC 51]:
+    https://github.com/bevyengine/rfcs/blob/main/rfcs/51-animation-composition.md
+    
+    ---------
+    
+    Co-authored-by: Rob Parrett <robparrett@gmail.com>
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 6de2dccef..4f365f59f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -980,6 +980,17 @@ description = "Plays an animation from a skinned glTF"
+ category = "Animation"
+ wasm = true
+ 
++[[example]]
++name = "animation_graph"
++path = "examples/animation/animation_graph.rs"
++doc-scrape-examples = true
++
++[package.metadata.example.animation_graph]
++name = "Animation Graph"
++description = "Blends multiple animations together with a graph"
++category = "Animation"
++wasm = true
++
+ [[example]]
+ name = "morph_targets"
+ path = "examples/animation/morph_targets.rs"
+diff --git a/assets/animation_graphs/Fox.animgraph.ron b/assets/animation_graphs/Fox.animgraph.ron
+new file mode 100644
+index 000000000..a1b21f125
+--- /dev/null
++++ b/assets/animation_graphs/Fox.animgraph.ron
+@@ -0,0 +1,35 @@
++(
++    graph: (
++        nodes: [
++            (
++                clip: None,
++                weight: 1.0,
++            ),
++            (
++                clip: None,
++                weight: 0.5,
++            ),
++            (
++                clip: Some(AssetPath("models/animated/Fox.glb#Animation0")),
++                weight: 1.0,
++            ),
++            (
++                clip: Some(AssetPath("models/animated/Fox.glb#Animation1")),
++                weight: 1.0,
++            ),
++            (
++                clip: Some(AssetPath("models/animated/Fox.glb#Animation2")),
++                weight: 1.0,
++            ),
++        ],
++        node_holes: [],
++        edge_property: directed,
++        edges: [
++            Some((0, 1, ())),
++            Some((0, 2, ())),
++            Some((1, 3, ())),
++            Some((1, 4, ())),
++        ],
++    ),
++    root: 0,
++)
+\ No newline at end of file
+diff --git a/crates/bevy_animation/Cargo.toml b/crates/bevy_animation/Cargo.toml
+index e47fefb98..c6cc5275f 100644
+--- a/crates/bevy_animation/Cargo.toml
++++ b/crates/bevy_animation/Cargo.toml
+@@ -13,9 +13,12 @@ keywords = ["bevy"]
+ bevy_app = { path = "../bevy_app", version = "0.14.0-dev" }
+ bevy_asset = { path = "../bevy_asset", version = "0.14.0-dev" }
+ bevy_core = { path = "../bevy_core", version = "0.14.0-dev" }
++bevy_derive = { path = "../bevy_derive", version = "0.14.0-dev" }
++bevy_log = { path = "../bevy_log", version = "0.14.0-dev" }
+ bevy_math = { path = "../bevy_math", version = "0.14.0-dev" }
+ bevy_reflect = { path = "../bevy_reflect", version = "0.14.0-dev", features = [
+   "bevy",
++  "petgraph",
+ ] }
+ bevy_render = { path = "../bevy_render", version = "0.14.0-dev" }
+ bevy_time = { path = "../bevy_time", version = "0.14.0-dev" }
+@@ -25,7 +28,13 @@ bevy_transform = { path = "../bevy_transform", version = "0.14.0-dev" }
+ bevy_hierarchy = { path = "../bevy_hierarchy", version = "0.14.0-dev" }
+ 
+ # other
++fixedbitset = "0.4"
++petgraph = { version = "0.6", features = ["serde-1"] }
++ron = "0.8"
++serde = "1"
+ sha1_smol = { version = "1.0" }
++thiserror = "1"
++thread_local = "1"
+ uuid = { version = "1.7", features = ["v4"] }
+ 
+ [lints]
+diff --git a/crates/bevy_animation/src/graph.rs b/crates/bevy_animation/src/graph.rs
+new file mode 100644
+index 000000000..aba53f1d7
+--- /dev/null
++++ b/crates/bevy_animation/src/graph.rs
+@@ -0,0 +1,400 @@
++//! The animation graph, which allows animations to be blended together.
++
++use std::io::{self, Write};
++use std::ops::{Index, IndexMut};
++
++use bevy_asset::io::Reader;
++use bevy_asset::{Asset, AssetId, AssetLoader, AssetPath, AsyncReadExt as _, Handle, LoadContext};
++use bevy_reflect::{Reflect, ReflectSerialize};
++use bevy_utils::BoxedFuture;
++use petgraph::graph::{DiGraph, NodeIndex};
++use ron::de::SpannedError;
++use serde::{Deserialize, Serialize};
++use thiserror::Error;
++
++use crate::AnimationClip;
++
++/// A graph structure that describes how animation clips are to be blended
++/// together.
++///
++/// Applications frequently want to be able to play multiple animations at once
++/// and to fine-tune the influence that animations have on a skinned mesh. Bevy
++/// uses an *animation graph* to store this information. Animation graphs are a
++/// directed acyclic graph (DAG) that describes how animations are to be
++/// weighted and combined together. Every frame, Bevy evaluates the graph from
++/// the root and blends the animations together in a bottom-up fashion to
++/// produce the final pose.
++///
++/// There are two types of nodes: *blend nodes* and *clip nodes*, both of which
++/// can have an associated weight. Blend nodes have no associated animation clip
++/// and simply affect the weights of all their descendant nodes. Clip nodes
++/// specify an animation clip to play. When a graph is created, it starts with
++/// only a single blend node, the root node.
++///
++/// For example, consider the following graph:
++///
++/// ```text
++/// ┌────────────┐                                      
++/// │            │                                      
++/// │    Idle    ├─────────────────────┐                
++/// │            │                     │                
++/// └────────────┘                     │                
++///                                    │                
++/// ┌────────────┐                     │  ┌────────────┐
++/// │            │                     │  │            │
++/// │    Run     ├──┐                  ├──┤    Root    │
++/// │            │  │  ┌────────────┐  │  │            │
++/// └────────────┘  │  │   Blend    │  │  └────────────┘
++///                 ├──┤            ├──┘                
++/// ┌────────────┐  │  │    0.5     │                   
++/// │            │  │  └────────────┘                   
++/// │    Walk    ├──┘                                   
++/// │            │                                      
++/// └────────────┘                                      
++/// ```
++///
++/// In this case, assuming that Idle, Run, and Walk are all playing with weight
++/// 1.0, the Run and Walk animations will be equally blended together, then
++/// their weights will be halved and finally blended with the Idle animation.
++/// Thus the weight of Run and Walk are effectively half of the weight of Idle.
++///
++/// Animation graphs are assets and can be serialized to and loaded from [RON]
++/// files. Canonically, such files have an `.animgraph.ron` extension.
++///
++/// The animation graph implements [RFC 51]. See that document for more
++/// information.
++///
++/// [RON]: https://github.com/ron-rs/ron
++///
++/// [RFC 51]: https://github.com/bevyengine/rfcs/blob/main/rfcs/51-animation-composition.md
++#[derive(Asset, Reflect, Clone, Debug, Serialize)]
++#[reflect(Serialize, Debug)]
++#[serde(into = "SerializedAnimationGraph")]
++pub struct AnimationGraph {
++    /// The `petgraph` data structure that defines the animation graph.
++    pub graph: AnimationDiGraph,
++    /// The index of the root node in the animation graph.
++    pub root: NodeIndex,
++}
++
++/// A type alias for the `petgraph` data structure that defines the animation
++/// graph.
++pub type AnimationDiGraph = DiGraph<AnimationGraphNode, (), u32>;
++
++/// The index of either an animation or blend node in the animation graph.
++///
++/// These indices are the way that [`crate::AnimationPlayer`]s identify
++/// particular animations.
++pub type AnimationNodeIndex = NodeIndex<u32>;
++
++/// An individual node within an animation graph.
++///
++/// If `clip` is present, this is a *clip node*. Otherwise, it's a *blend node*.
++/// Both clip and blend nodes can have weights, and those weights are propagated
++/// down to descendants.
++#[derive(Clone, Reflect, Debug)]
++pub struct AnimationGraphNode {
++    /// The animation clip associated with this node, if any.
++    ///
++    /// If the clip is present, this node is an *animation clip node*.
++    /// Otherwise, this node is a *blend node*.
++    pub clip: Option<Handle<AnimationClip>>,
++
++    /// The weight of this node.
++    ///
++    /// Weights are propagated down to descendants. Thus if an animation clip
++    /// has weight 0.3 and its parent blend node has weight 0.6, the computed
++    /// weight of the animation clip is 0.18.
++    pub weight: f32,
++}
++
++/// An [`AssetLoader`] that can load [`AnimationGraph`]s as assets.
++///
++/// The canonical extension for [`AnimationGraph`]s is `.animgraph.ron`. Plain
++/// `.animgraph` is supported as well.
++#[derive(Default)]
++pub struct AnimationGraphAssetLoader;
++
++/// Various errors that can occur when serializing or deserializing animation
++/// graphs to and from RON, respectively.
++#[derive(Error, Debug)]
++pub enum AnimationGraphLoadError {
++    /// An I/O error occurred.
++    #[error("I/O")]
++    Io(#[from] io::Error),
++    /// An error occurred in RON serialization or deserialization.
++    #[error("RON serialization")]
++    Ron(#[from] ron::Error),
++    /// An error occurred in RON deserialization, and the location of the error
++    /// is supplied.
++    #[error("RON serialization")]
++    SpannedRon(#[from] SpannedError),
++}
++
++/// A version of [`AnimationGraph`] suitable for serializing as an asset.
++///
++/// Animation nodes can refer to external animation clips, and the [`AssetId`]
++/// is typically not sufficient to identify the clips, since the
++/// [`bevy_asset::AssetServer`] assigns IDs in unpredictable ways. That fact
++/// motivates this type, which replaces the `Handle<AnimationClip>` with an
++/// asset path.  Loading an animation graph via the [`bevy_asset::AssetServer`]
++/// actually loads a serialized instance of this type, as does serializing an
++/// [`AnimationGraph`] through `serde`.
++#[derive(Serialize, Deserialize)]
++pub struct SerializedAnimationGraph {
++    /// Corresponds to the `graph` field on [`AnimationGraph`].
++    pub graph: DiGraph<SerializedAnimationGraphNode, (), u32>,
++    /// Corresponds to the `root` field on [`AnimationGraph`].
++    pub root: NodeIndex,
++}
++
++/// A version of [`AnimationGraphNode`] suitable for serializing as an asset.
++///
++/// See the comments in [`SerializedAnimationGraph`] for more information.
++#[derive(Serialize, Deserialize)]
++pub struct SerializedAnimationGraphNode {
++    /// Corresponds to the `clip` field on [`AnimationGraphNode`].
++    pub clip: Option<SerializedAnimationClip>,
++    /// Corresponds to the `weight` field on [`AnimationGraphNode`].
++    pub weight: f32,
++}
++
++/// A version of `Handle<AnimationClip>` suitable for serializing as an asset.
++///
++/// This replaces any handle that has a path with an [`AssetPath`]. Failing
++/// that, the asset ID is serialized directly.
++#[derive(Serialize, Deserialize)]
++pub enum SerializedAnimationClip {
++    /// Records an asset path.
++    AssetPath(AssetPath<'static>),
++    /// The fallback that records an asset ID.
++    ///
++    /// Because asset IDs can change, this should not be relied upon. Prefer to
++    /// use asset paths where possible.
++    AssetId(AssetId<AnimationClip>),
++}
++
++impl AnimationGraph {
++    /// Creates a new animation graph with a root node and no other nodes.
++    pub fn new() -> Self {
++        let mut graph = DiGraph::default();
++        let root = graph.add_node(AnimationGraphNode::default());
++        Self { graph, root }
++    }
++
++    /// A convenience function for creating an [`AnimationGraph`] from a single
++    /// [`AnimationClip`].
++    ///
++    /// The clip will be a direct child of the root with weight 1.0. Both the
++    /// graph and the index of the added node are returned as a tuple.
++    pub fn from_clip(clip: Handle<AnimationClip>) -> (Self, AnimationNodeIndex) {
++        let mut graph = Self::new();
++        let node_index = graph.add_clip(clip, 1.0, graph.root);
++        (graph, node_index)
++    }
++
++    /// Adds an [`AnimationClip`] to the animation graph with the given weight
++    /// and returns its index.
++    ///
++    /// The animation clip will be the child of the given parent.
++    pub fn add_clip(
++        &mut self,
++        clip: Handle<AnimationClip>,
++        weight: f32,
++        parent: AnimationNodeIndex,
++    ) -> AnimationNodeIndex {
++        let node_index = self.graph.add_node(AnimationGraphNode {
++            clip: Some(clip),
++            weight,
++        });
++        self.graph.add_edge(parent, node_index, ());
++        node_index
++    }
++
++    /// A convenience method to add multiple [`AnimationClip`]s to the animation
++    /// graph.
++    ///
++    /// All of the animation clips will have the same weight and will be
++    /// parented to the same node.
++    ///
++    /// Returns the indices of the new nodes.
++    pub fn add_clips<'a, I>(
++        &'a mut self,
++        clips: I,
++        weight: f32,
++        parent: AnimationNodeIndex,
++    ) -> impl Iterator<Item = AnimationNodeIndex> + 'a
++    where
++        I: IntoIterator<Item = Handle<AnimationClip>>,
++        <I as std::iter::IntoIterator>::IntoIter: 'a,
++    {
++        clips
++            .into_iter()
++            .map(move |clip| self.add_clip(clip, weight, parent))
++    }
++
++    /// Adds a blend node to the animation graph with the given weight and
++    /// returns its index.
++    ///
++    /// The blend node will be placed under the supplied `parent` node. During
++    /// animation evaluation, the descendants of this blend node will have their
++    /// weights multiplied by the weight of the blend.
++    pub fn add_blend(&mut self, weight: f32, parent: AnimationNodeIndex) -> AnimationNodeIndex {
++        let node_index = self
++            .graph
++            .add_node(AnimationGraphNode { clip: None, weight });
++        self.graph.add_edge(parent, node_index, ());
++        node_index
++    }
++
++    /// Adds an edge from the edge `from` to `to`, making `to` a child of
++    /// `from`.
++    ///
++    /// The behavior is unspecified if adding this produces a cycle in the
++    /// graph.
++    pub fn add_edge(&mut self, from: NodeIndex, to: NodeIndex) {
++        self.graph.add_edge(from, to, ());
++    }
++
++    /// Removes an edge between `from` and `to` if it exists.
++    ///
++    /// Returns true if the edge was successfully removed or false if no such
++    /// edge existed.
++    pub fn remove_edge(&mut self, from: NodeIndex, to: NodeIndex) -> bool {
++        self.graph
++            .find_edge(from, to)
++            .map(|edge| self.graph.remove_edge(edge))
++            .is_some()
++    }
++
++    /// Returns the [`AnimationGraphNode`] associated with the given index.
++    ///
++    /// If no node with the given index exists, returns `None`.
++    pub fn get(&self, animation: AnimationNodeIndex) -> Option<&AnimationGraphNode> {
++        self.graph.node_weight(animation)
++    }
++
++    /// Returns a mutable reference to the [`AnimationGraphNode`] associated
++    /// with the given index.
++    ///
++    /// If no node with the given index exists, returns `None`.
++    pub fn get_mut(&mut self, animation: AnimationNodeIndex) -> Option<&mut AnimationGraphNode> {
++        self.graph.node_weight_mut(animation)
++    }
++
++    /// Returns an iterator over the [`AnimationGraphNode`]s in this graph.
++    pub fn nodes(&self) -> impl Iterator<Item = AnimationNodeIndex> {
++        self.graph.node_indices()
++    }
++
++    /// Serializes the animation graph to the given [`Write`]r in RON format.
++    ///
++    /// If writing to a file, it can later be loaded with the
++    /// [`AnimationGraphAssetLoader`] to reconstruct the graph.
++    pub fn save<W>(&self, writer: &mut W) -> Result<(), AnimationGraphLoadError>
++    where
++        W: Write,
++    {
++        let mut ron_serializer = ron::ser::Serializer::new(writer, None)?;
++        Ok(self.serialize(&mut ron_serializer)?)
++    }
++}
++
++impl Index<AnimationNodeIndex> for AnimationGraph {
++    type Output = AnimationGraphNode;
++
++    fn index(&self, index: AnimationNodeIndex) -> &Self::Output {
++        &self.graph[index]
++    }
++}
++
++impl IndexMut<AnimationNodeIndex> for AnimationGraph {
++    fn index_mut(&mut self, index: AnimationNodeIndex) -> &mut Self::Output {
++        &mut self.graph[index]
++    }
++}
++
++impl Default for AnimationGraphNode {
++    fn default() -> Self {
++        Self {
++            clip: None,
++            weight: 1.0,
++        }
++    }
++}
++
++impl Default for AnimationGraph {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl AssetLoader for AnimationGraphAssetLoader {
++    type Asset = AnimationGraph;
++
++    type Settings = ();
++
++    type Error = AnimationGraphLoadError;
++
++    fn load<'a>(
++        &'a self,
++        reader: &'a mut Reader,
++        _: &'a Self::Settings,
++        load_context: &'a mut LoadContext,
++    ) -> BoxedFuture<'a, Result<Self::Asset, Self::Error>> {
++        Box::pin(async move {
++            let mut bytes = Vec::new();
++            reader.read_to_end(&mut bytes).await?;
++
++            // Deserialize a `SerializedAnimationGraph` directly, so that we can
++            // get the list of the animation clips it refers to and load them.
++            let mut deserializer = ron::de::Deserializer::from_bytes(&bytes)?;
++            let serialized_animation_graph =
++                SerializedAnimationGraph::deserialize(&mut deserializer)
++                    .map_err(|err| deserializer.span_error(err))?;
++
++            // Load all `AssetPath`s to convert from a
++            // `SerializedAnimationGraph` to a real `AnimationGraph`.
++            Ok(AnimationGraph {
++                graph: serialized_animation_graph.graph.map(
++                    |_, serialized_node| AnimationGraphNode {
++                        clip: serialized_node.clip.as_ref().map(|clip| match clip {
++                            SerializedAnimationClip::AssetId(asset_id) => Handle::Weak(*asset_id),
++                            SerializedAnimationClip::AssetPath(asset_path) => {
++                                load_context.load(asset_path)
++                            }
++                        }),
++                        weight: serialized_node.weight,
++                    },
++                    |_, _| (),
++                ),
++                root: serialized_animation_graph.root,
++            })
++        })
++    }
++
++    fn extensions(&self) -> &[&str] {
++        &["animgraph", "animgraph.ron"]
++    }
++}
++
++impl From<AnimationGraph> for SerializedAnimationGraph {
++    fn from(animation_graph: AnimationGraph) -> Self {
++        // If any of the animation clips have paths, then serialize them as
++        // `SerializedAnimationClip::AssetPath` so that the
++        // `AnimationGraphAssetLoader` can load them.
++        Self {
++            graph: animation_graph.graph.map(
++                |_, node| SerializedAnimationGraphNode {
++                    weight: node.weight,
++                    clip: node.clip.as_ref().map(|clip| match clip.path() {
++                        Some(path) => SerializedAnimationClip::AssetPath(path.clone()),
++                        None => SerializedAnimationClip::AssetId(clip.id()),
++                    }),
++                },
++                |_, _| (),
++            ),
++            root: animation_graph.root,
++        }
++    }
++}
+diff --git a/crates/bevy_animation/src/lib.rs b/crates/bevy_animation/src/lib.rs
+index 08f10a167..d3dbed840 100644
+--- a/crates/bevy_animation/src/lib.rs
++++ b/crates/bevy_animation/src/lib.rs
+@@ -1,12 +1,15 @@
+ //! Animation for the game engine Bevy
+ 
+ mod animatable;
++mod graph;
++mod transition;
+ mod util;
+ 
++use std::cell::RefCell;
++use std::collections::BTreeMap;
+ use std::hash::{Hash, Hasher};
+ use std::iter;
+ use std::ops::{Add, Mul};
+-use std::time::Duration;
+ 
+ use bevy_app::{App, Plugin, PostUpdate};
+ use bevy_asset::{Asset, AssetApp, Assets, Handle};
+@@ -20,19 +23,30 @@ use bevy_render::mesh::morph::MorphWeights;
+ use bevy_time::Time;
+ use bevy_transform::{prelude::Transform, TransformSystem};
+ use bevy_utils::hashbrown::HashMap;
+-use bevy_utils::{tracing::error, NoOpHash};
++use bevy_utils::{
++    tracing::{error, trace},
++    NoOpHash,
++};
++use fixedbitset::FixedBitSet;
++use graph::{AnimationGraph, AnimationNodeIndex};
++use petgraph::graph::NodeIndex;
++use petgraph::Direction;
++use prelude::{AnimationGraphAssetLoader, AnimationTransitions};
+ use sha1_smol::Sha1;
++use thread_local::ThreadLocal;
+ use uuid::Uuid;
+ 
+ #[allow(missing_docs)]
+ pub mod prelude {
+     #[doc(hidden)]
+     pub use crate::{
+-        animatable::*, AnimationClip, AnimationPlayer, AnimationPlugin, Interpolation, Keyframes,
+-        VariableCurve,
++        animatable::*, graph::*, transition::*, AnimationClip, AnimationPlayer, AnimationPlugin,
++        Interpolation, Keyframes, VariableCurve,
+     };
+ }
+ 
++use crate::transition::{advance_transitions, expire_completed_transitions};
++
+ /// The [UUID namespace] of animation targets (e.g. bones).
+ ///
+ /// [UUID namespace]: https://en.wikipedia.org/wiki/Universally_unique_identifier#Versions_3_and_5_(namespace_name-based)
+@@ -279,8 +293,17 @@ pub enum RepeatAnimation {
+     Forever,
+ }
+ 
++/// An animation that an [`AnimationPlayer`] is currently either playing or was
++/// playing, but is presently paused.
++///
++/// An stopped animation is considered no longer active.
+ #[derive(Debug, Reflect)]
+-struct PlayingAnimation {
++pub struct ActiveAnimation {
++    /// The factor by which the weight from the [`AnimationGraph`] is multiplied.
++    weight: f32,
++    /// The actual weight of this animation this frame, taking the
++    /// [`AnimationGraph`] into account.
++    computed_weight: f32,
+     repeat: RepeatAnimation,
+     speed: f32,
+     /// Total time the animation has been played.
+@@ -291,26 +314,28 @@ struct PlayingAnimation {
+     ///
+     /// Note: This will always be in the range [0.0, animation clip duration]
+     seek_time: f32,
+-    animation_clip: Handle<AnimationClip>,
+     /// Number of times the animation has completed.
+     /// If the animation is playing in reverse, this increments when the animation passes the start.
+     completions: u32,
++    paused: bool,
+ }
+ 
+-impl Default for PlayingAnimation {
++impl Default for ActiveAnimation {
+     fn default() -> Self {
+         Self {
++            weight: 1.0,
++            computed_weight: 1.0,
+             repeat: RepeatAnimation::default(),
+             speed: 1.0,
+             elapsed: 0.0,
+             seek_time: 0.0,
+-            animation_clip: Default::default(),
+             completions: 0,
++            paused: false,
+         }
+     }
+ }
+ 
+-impl PlayingAnimation {
++impl ActiveAnimation {
+     /// Check if the animation has finished, based on its repetition behavior and the number of times it has repeated.
+     ///
+     /// Note: An animation with `RepeatAnimation::Forever` will never finish.
+@@ -353,38 +378,112 @@ impl PlayingAnimation {
+     }
+ 
+     /// Reset back to the initial state as if no time has elapsed.
+-    fn replay(&mut self) {
++    pub fn replay(&mut self) {
+         self.completions = 0;
+         self.elapsed = 0.0;
+         self.seek_time = 0.0;
+     }
+-}
+ 
+-/// An animation that is being faded out as part of a transition
+-struct AnimationTransition {
+-    /// The current weight. Starts at 1.0 and goes to 0.0 during the fade-out.
+-    current_weight: f32,
+-    /// How much to decrease `current_weight` per second
+-    weight_decline_per_sec: f32,
+-    /// The animation that is being faded out
+-    animation: PlayingAnimation,
++    /// Returns the current weight of this animation.
++    pub fn weight(&self) -> f32 {
++        self.weight
++    }
++
++    /// Sets the weight of this animation.
++    pub fn set_weight(&mut self, weight: f32) {
++        self.weight = weight;
++    }
++
++    /// Pause the animation.
++    pub fn pause(&mut self) -> &mut Self {
++        self.paused = true;
++        self
++    }
++
++    /// Unpause the animation.
++    pub fn resume(&mut self) -> &mut Self {
++        self.paused = false;
++        self
++    }
++
++    /// Returns true if this animation is currently paused.
++    ///
++    /// Note that paused animations are still [`ActiveAnimation`]s.
++    #[inline]
++    pub fn is_paused(&self) -> bool {
++        self.paused
++    }
++
++    /// Sets the repeat mode for this playing animation.
++    pub fn set_repeat(&mut self, repeat: RepeatAnimation) -> &mut Self {
++        self.repeat = repeat;
++        self
++    }
++
++    /// Marks this animation as repeating forever.
++    pub fn repeat(&mut self) -> &mut Self {
++        self.set_repeat(RepeatAnimation::Forever)
++    }
++
++    /// Returns the repeat mode assigned to this active animation.
++    pub fn repeat_mode(&self) -> RepeatAnimation {
++        self.repeat
++    }
++
++    /// Returns the number of times this animation has completed.
++    pub fn completions(&self) -> u32 {
++        self.completions
++    }
++
++    /// Returns true if the animation is playing in reverse.
++    pub fn is_playback_reversed(&self) -> bool {
++        self.speed < 0.0
++    }
++
++    /// Returns the speed of the animation playback.
++    pub fn speed(&self) -> f32 {
++        self.speed
++    }
++
++    /// Sets the speed of the animation playback.
++    pub fn set_speed(&mut self, speed: f32) -> &mut Self {
++        self.speed = speed;
++        self
++    }
++
++    /// Returns the amount of time the animation has been playing.
++    pub fn elapsed(&self) -> f32 {
++        self.elapsed
++    }
++
++    /// Returns the seek time of the animation.
++    ///
++    /// This is nonnegative and no more than the clip duration.
++    pub fn seek_time(&self) -> f32 {
++        self.seek_time
++    }
++
++    /// Seeks to a specific time in the animation.
++    pub fn seek_to(&mut self, seek_time: f32) -> &mut Self {
++        self.seek_time = seek_time;
++        self
++    }
++
++    /// Seeks to the beginning of the animation.
++    pub fn rewind(&mut self) -> &mut Self {
++        self.seek_time = 0.0;
++        self
++    }
+ }
+ 
+ /// Animation controls
+ #[derive(Component, Default, Reflect)]
+ #[reflect(Component)]
+ pub struct AnimationPlayer {
+-    paused: bool,
+-
+-    animation: PlayingAnimation,
+-
+-    // List of previous animations we're currently transitioning away from.
+-    // Usually this is empty, when transitioning between animations, there is
+-    // one entry. When another animation transition happens while a transition
+-    // is still ongoing, then there can be more than one entry.
+-    // Once a transition is finished, it will be automatically removed from the list
+-    #[reflect(ignore)]
+-    transitions: Vec<AnimationTransition>,
++    /// We use a `BTreeMap` instead of a `HashMap` here to ensure a consistent
++    /// ordering when applying the animations.
++    active_animations: BTreeMap<AnimationNodeIndex, ActiveAnimation>,
++    blend_weights: HashMap<AnimationNodeIndex, f32>,
+ }
+ 
+ /// The components that we might need to read or write during animation of each
+@@ -397,157 +496,160 @@ struct AnimationTargetContext<'a> {
+     morph_weights: Option<Mut<'a, MorphWeights>>,
+ }
+ 
+-impl AnimationPlayer {
+-    /// Start playing an animation, resetting state of the player.
+-    /// This will use a linear blending between the previous and the new animation to make a smooth transition.
+-    pub fn start(&mut self, handle: Handle<AnimationClip>) -> &mut Self {
+-        self.animation = PlayingAnimation {
+-            animation_clip: handle,
+-            ..Default::default()
+-        };
+-
+-        // We want a hard transition.
+-        // In case any previous transitions are still playing, stop them
+-        self.transitions.clear();
+-
+-        self
+-    }
++/// Information needed during the traversal of the animation graph in
++/// [`advance_animations`].
++#[derive(Default)]
++pub struct AnimationGraphEvaluator {
++    /// The stack used for the depth-first search of the graph.
++    dfs_stack: Vec<NodeIndex>,
++    /// The list of visited nodes during the depth-first traversal.
++    dfs_visited: FixedBitSet,
++    /// Accumulated weights for each node.
++    weights: Vec<f32>,
++}
+ 
+-    /// Start playing an animation, resetting state of the player.
+-    /// This will use a linear blending between the previous and the new animation to make a smooth transition.
+-    pub fn start_with_transition(
+-        &mut self,
+-        handle: Handle<AnimationClip>,
+-        transition_duration: Duration,
+-    ) -> &mut Self {
+-        let mut animation = PlayingAnimation {
+-            animation_clip: handle,
+-            ..Default::default()
+-        };
+-        std::mem::swap(&mut animation, &mut self.animation);
+-
+-        // Add the current transition. If other transitions are still ongoing,
+-        // this will keep those transitions running and cause a transition between
+-        // the output of that previous transition to the new animation.
+-        self.transitions.push(AnimationTransition {
+-            current_weight: 1.0,
+-            weight_decline_per_sec: 1.0 / transition_duration.as_secs_f32(),
+-            animation,
+-        });
++thread_local! {
++    /// A cached per-thread copy of the graph evaluator.
++    ///
++    /// Caching the evaluator lets us save allocation traffic from frame to
++    /// frame.
++    static ANIMATION_GRAPH_EVALUATOR: RefCell<AnimationGraphEvaluator> =
++        RefCell::new(AnimationGraphEvaluator::default());
++}
+ 
+-        self
++impl AnimationPlayer {
++    /// Start playing an animation, restarting it if necessary.
++    pub fn start(&mut self, animation: AnimationNodeIndex) -> &mut ActiveAnimation {
++        self.active_animations.entry(animation).or_default()
+     }
+ 
+-    /// Start playing an animation, resetting state of the player, unless the requested animation is already playing.
+-    pub fn play(&mut self, handle: Handle<AnimationClip>) -> &mut Self {
+-        if !self.is_playing_clip(&handle) || self.is_paused() {
+-            self.start(handle);
+-        }
+-        self
++    /// Start playing an animation, unless the requested animation is already playing.
++    pub fn play(&mut self, animation: AnimationNodeIndex) -> &mut ActiveAnimation {
++        let playing_animation = self.active_animations.entry(animation).or_default();
++        playing_animation.weight = 1.0;
++        playing_animation
+     }
+ 
+-    /// Start playing an animation, resetting state of the player, unless the requested animation is already playing.
+-    /// This will use a linear blending between the previous and the new animation to make a smooth transition
+-    pub fn play_with_transition(
+-        &mut self,
+-        handle: Handle<AnimationClip>,
+-        transition_duration: Duration,
+-    ) -> &mut Self {
+-        if !self.is_playing_clip(&handle) || self.is_paused() {
+-            self.start_with_transition(handle, transition_duration);
+-        }
++    /// Stops playing the given animation, removing it from the list of playing
++    /// animations.
++    pub fn stop(&mut self, animation: AnimationNodeIndex) -> &mut Self {
++        self.active_animations.remove(&animation);
+         self
+     }
+ 
+-    /// Handle to the animation clip being played.
+-    pub fn animation_clip(&self) -> &Handle<AnimationClip> {
+-        &self.animation.animation_clip
+-    }
+-
+-    /// Check if the given animation clip is being played.
+-    pub fn is_playing_clip(&self, handle: &Handle<AnimationClip>) -> bool {
+-        self.animation_clip() == handle
+-    }
+-
+-    /// Check if the playing animation has finished, according to the repetition behavior.
+-    pub fn is_finished(&self) -> bool {
+-        self.animation.is_finished()
+-    }
+-
+-    /// Sets repeat to [`RepeatAnimation::Forever`].
+-    ///
+-    /// See also [`Self::set_repeat`].
+-    pub fn repeat(&mut self) -> &mut Self {
+-        self.animation.repeat = RepeatAnimation::Forever;
++    /// Stops all currently-playing animations.
++    pub fn stop_all(&mut self) -> &mut Self {
++        self.active_animations.clear();
+         self
+     }
+ 
+-    /// Set the repetition behaviour of the animation.
+-    pub fn set_repeat(&mut self, repeat: RepeatAnimation) -> &mut Self {
+-        self.animation.repeat = repeat;
+-        self
++    /// Iterates through all animations that this [`AnimationPlayer`] is
++    /// currently playing.
++    pub fn playing_animations(
++        &self,
++    ) -> impl Iterator<Item = (&AnimationNodeIndex, &ActiveAnimation)> {
++        self.active_animations.iter()
+     }
+ 
+-    /// Repetition behavior of the animation.
+-    pub fn repeat_mode(&self) -> RepeatAnimation {
+-        self.animation.repeat
++    /// Iterates through all animations that this [`AnimationPlayer`] is
++    /// currently playing, mutably.
++    pub fn playing_animations_mut(
++        &mut self,
++    ) -> impl Iterator<Item = (&AnimationNodeIndex, &mut ActiveAnimation)> {
++        self.active_animations.iter_mut()
+     }
+ 
+-    /// Number of times the animation has completed.
+-    pub fn completions(&self) -> u32 {
+-        self.animation.completions
++    /// Check if the given animation node is being played.
++    pub fn is_playing_animation(&self, animation: AnimationNodeIndex) -> bool {
++        self.active_animations.contains_key(&animation)
+     }
+ 
+-    /// Check if the animation is playing in reverse.
+-    pub fn is_playback_reversed(&self) -> bool {
+-        self.animation.speed < 0.0
++    /// Check if all playing animations have finished, according to the repetition behavior.
++    pub fn all_finished(&self) -> bool {
++        self.active_animations
++            .values()
++            .all(|playing_animation| playing_animation.is_finished())
+     }
+ 
+-    /// Pause the animation
+-    pub fn pause(&mut self) {
+-        self.paused = true;
++    /// Check if all playing animations are paused.
++    #[doc(alias = "is_paused")]
++    pub fn all_paused(&self) -> bool {
++        self.active_animations
++            .values()
++            .all(|playing_animation| playing_animation.is_paused())
+     }
+ 
+-    /// Unpause the animation
+-    pub fn resume(&mut self) {
+-        self.paused = false;
++    /// Resume all playing animations.
++    #[doc(alias = "pause")]
++    pub fn pause_all(&mut self) -> &mut Self {
++        for (_, playing_animation) in self.playing_animations_mut() {
++            playing_animation.pause();
++        }
++        self
+     }
+ 
+-    /// Is the animation paused
+-    pub fn is_paused(&self) -> bool {
+-        self.paused
++    /// Resume all active animations.
++    #[doc(alias = "resume")]
++    pub fn resume_all(&mut self) -> &mut Self {
++        for (_, playing_animation) in self.playing_animations_mut() {
++            playing_animation.resume();
++        }
++        self
+     }
+ 
+-    /// Speed of the animation playback
+-    pub fn speed(&self) -> f32 {
+-        self.animation.speed
++    /// Rewinds all active animations.
++    #[doc(alias = "rewind")]
++    pub fn rewind_all(&mut self) -> &mut Self {
++        for (_, playing_animation) in self.playing_animations_mut() {
++            playing_animation.rewind();
++        }
++        self
+     }
+ 
+-    /// Set the speed of the animation playback
+-    pub fn set_speed(&mut self, speed: f32) -> &mut Self {
+-        self.animation.speed = speed;
++    /// Multiplies the speed of all active animations by the given factor.
++    #[doc(alias = "set_speed")]
++    pub fn adjust_speeds(&mut self, factor: f32) -> &mut Self {
++        for (_, playing_animation) in self.playing_animations_mut() {
++            let new_speed = playing_animation.speed() * factor;
++            playing_animation.set_speed(new_speed);
++        }
+         self
+     }
+ 
+-    /// Time elapsed playing the animation
+-    pub fn elapsed(&self) -> f32 {
+-        self.animation.elapsed
++    /// Seeks all active animations forward or backward by the same amount.
++    ///
++    /// To seek forward, pass a positive value; to seek negative, pass a
++    /// negative value. Values below 0.0 or beyond the end of the animation clip
++    /// are clamped appropriately.
++    #[doc(alias = "seek_to")]
++    pub fn seek_all_by(&mut self, amount: f32) -> &mut Self {
++        for (_, playing_animation) in self.playing_animations_mut() {
++            let new_time = playing_animation.seek_time();
++            playing_animation.seek_to(new_time + amount);
++        }
++        self
+     }
+ 
+-    /// Seek time inside of the animation. Always within the range [0.0, clip duration].
+-    pub fn seek_time(&self) -> f32 {
+-        self.animation.seek_time
++    /// Returns the [`ActiveAnimation`] associated with the given animation
++    /// node if it's currently playing.
++    ///
++    /// If the animation isn't currently active, returns `None`.
++    pub fn animation(&self, animation: AnimationNodeIndex) -> Option<&ActiveAnimation> {
++        self.active_animations.get(&animation)
+     }
+ 
+-    /// Seek to a specific time in the animation.
+-    pub fn seek_to(&mut self, seek_time: f32) -> &mut Self {
+-        self.animation.seek_time = seek_time;
+-        self
++    /// Returns a mutable reference to the [`ActiveAnimation`] associated with
++    /// the given animation node if it's currently active.
++    ///
++    /// If the animation isn't currently active, returns `None`.
++    pub fn animation_mut(&mut self, animation: AnimationNodeIndex) -> Option<&mut ActiveAnimation> {
++        self.active_animations.get_mut(&animation)
+     }
+ 
+-    /// Reset the animation to its initial state, as if no time has elapsed.
+-    pub fn replay(&mut self) {
+-        self.animation.replay();
++    /// Returns true if the animation is currently playing or paused, or false
++    /// if the animation is stopped.
++    pub fn animation_is_playing(&self, animation: AnimationNodeIndex) -> bool {
++        self.active_animations.contains_key(&animation)
+     }
+ }
+ 
+@@ -555,46 +657,87 @@ impl AnimationPlayer {
+ pub fn advance_animations(
+     time: Res<Time>,
+     animation_clips: Res<Assets<AnimationClip>>,
+-    mut players: Query<&mut AnimationPlayer>,
++    animation_graphs: Res<Assets<AnimationGraph>>,
++    mut players: Query<(&mut AnimationPlayer, &Handle<AnimationGraph>)>,
++    animation_graph_evaluator: Local<ThreadLocal<RefCell<AnimationGraphEvaluator>>>,
+ ) {
+-    for mut player in players.iter_mut() {
+-        let paused = player.paused;
+-        if paused {
+-            continue;
+-        }
++    let delta_seconds = time.delta_seconds();
++    players
++        .par_iter_mut()
++        .for_each(|(mut player, graph_handle)| {
++            let Some(animation_graph) = animation_graphs.get(graph_handle) else {
++                return;
++            };
+ 
+-        // Advance the main animation.
+-        if let Some(animation_clip) = animation_clips.get(&player.animation.animation_clip) {
+-            player
+-                .animation
+-                .update(time.delta_seconds(), animation_clip.duration);
+-        };
++            // Tick animations, and schedule them.
++            //
++            // We use a thread-local here so we can reuse allocations across
++            // frames.
++            let mut evaluator = animation_graph_evaluator.get_or_default().borrow_mut();
++
++            let AnimationPlayer {
++                ref mut active_animations,
++                ref blend_weights,
++                ..
++            } = *player;
++
++            // Reset our state.
++            evaluator.reset(animation_graph.root, animation_graph.graph.node_count());
++
++            while let Some(node_index) = evaluator.dfs_stack.pop() {
++                // Skip if we've already visited this node.
++                if evaluator.dfs_visited.put(node_index.index()) {
++                    continue;
++                }
+ 
+-        // Advance transition animations.
+-        player.transitions.retain_mut(|transition| {
+-            // Decrease weight. Expire the transition if necessary.
+-            transition.current_weight -= transition.weight_decline_per_sec * time.delta_seconds();
+-            if transition.current_weight <= 0.0 {
+-                return false;
+-            }
++                let node = &animation_graph[node_index];
+ 
+-            if let Some(animation_clip) = animation_clips.get(&transition.animation.animation_clip)
+-            {
+-                transition
+-                    .animation
+-                    .update(time.delta_seconds(), animation_clip.duration);
+-            };
++                // Calculate weight from the graph.
++                let mut weight = node.weight;
++                for parent_index in animation_graph
++                    .graph
++                    .neighbors_directed(node_index, Direction::Incoming)
++                {
++                    weight *= animation_graph[parent_index].weight;
++                }
++                evaluator.weights[node_index.index()] = weight;
++
++                if let Some(active_animation) = active_animations.get_mut(&node_index) {
++                    // Tick the animation if necessary.
++                    if !active_animation.paused {
++                        if let Some(ref clip_handle) = node.clip {
++                            if let Some(clip) = animation_clips.get(clip_handle) {
++                                active_animation.update(delta_seconds, clip.duration);
++                            }
++                        }
++                    }
++
++                    weight *= active_animation.weight;
++                } else if let Some(&blend_weight) = blend_weights.get(&node_index) {
++                    weight *= blend_weight;
++                }
+ 
+-            true
++                // Write in the computed weight.
++                if let Some(active_animation) = active_animations.get_mut(&node_index) {
++                    active_animation.computed_weight = weight;
++                }
++
++                // Push children.
++                evaluator.dfs_stack.extend(
++                    animation_graph
++                        .graph
++                        .neighbors_directed(node_index, Direction::Outgoing),
++                );
++            }
+         });
+-    }
+ }
+ 
+ /// A system that modifies animation targets (e.g. bones in a skinned mesh)
+ /// according to the currently-playing animation.
+ pub fn animate_targets(
+     clips: Res<Assets<AnimationClip>>,
+-    players: Query<&AnimationPlayer>,
++    graphs: Res<Assets<AnimationGraph>>,
++    players: Query<(&AnimationPlayer, &Handle<AnimationGraph>)>,
+     mut targets: Query<(
+         Entity,
+         &AnimationTarget,
+@@ -611,6 +754,22 @@ pub fn animate_targets(
+     targets
+         .par_iter_mut()
+         .for_each(|(id, target, name, (transform, morph_weights))| {
++            let Ok((animation_player, animation_graph_handle)) = players.get(target.player) else {
++                trace!(
++                    "Either an animation player {:?} or a graph was missing for the target \
++                     entity {:?} ({:?}); no animations will play this frame",
++                    target.player,
++                    id,
++                    name,
++                );
++                return;
++            };
++
++            // The graph might not have loaded yet. Safely bail.
++            let Some(animation_graph) = graphs.get(animation_graph_handle) else {
++                return;
++            };
++
+             let mut target_context = AnimationTargetContext {
+                 entity: id,
+                 target,
+@@ -619,159 +778,106 @@ pub fn animate_targets(
+                 morph_weights,
+             };
+ 
+-            let Ok(player) = players.get(target.player) else {
+-                error!(
+-                    "Couldn't find the animation player {:?} for the target entity {:?} ({:?})",
+-                    target.player, target_context.entity, target_context.name,
+-                );
+-                return;
+-            };
+-
+-            player.animation.apply(&clips, 1.0, &mut target_context);
+-
+-            for transition in &player.transitions {
+-                transition
+-                    .animation
+-                    .apply(&clips, transition.current_weight, &mut target_context);
+-            }
+-        });
+-}
+-
+-/// Update `weights` based on weights in `keyframe` with a linear interpolation
+-/// on `key_lerp`.
+-fn lerp_morph_weights(weights: &mut [f32], keyframe: impl Iterator<Item = f32>, key_lerp: f32) {
+-    let zipped = weights.iter_mut().zip(keyframe);
+-    for (morph_weight, keyframe) in zipped {
+-        *morph_weight = morph_weight.lerp(keyframe, key_lerp);
+-    }
+-}
++            // Apply the animations one after another. The way we accumulate
++            // weights ensures that the order we apply them in doesn't matter.
++            //
++            // Proof: Consider three animations A₀, A₁, A₂, … with weights w₀,
++            // w₁, w₂, … respectively. We seek the value:
++            //
++            //     A₀w₀ + A₁w₁ + A₂w₂ + ⋯
++            //
++            // Defining lerp(a, b, t) = a + t(b - a), we have:
++            //
++            //                                    ⎛    ⎛          w₁   ⎞           w₂     ⎞
++            //     A₀w₀ + A₁w₁ + A₂w₂ + ⋯ = ⋯ lerp⎜lerp⎜A₀, A₁, ⎯⎯⎯⎯⎯⎯⎯⎯⎟, A₂, ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎟ ⋯
++            //                                    ⎝    ⎝        w₀ + w₁⎠      w₀ + w₁ + w₂⎠
++            //
++            // Each step of the following loop corresponds to one of the lerp
++            // operations above.
++            let mut total_weight = 0.0;
++            for (&animation_graph_node_index, active_animation) in
++                animation_player.active_animations.iter()
++            {
++                if active_animation.weight == 0.0 {
++                    continue;
++                }
+ 
+-/// Extract a keyframe from a list of keyframes by index.
+-///
+-/// # Panics
+-///
+-/// When `key_index * target_count` is larger than `keyframes`
+-///
+-/// This happens when `keyframes` is not formatted as described in
+-/// [`Keyframes::Weights`]. A possible cause is [`AnimationClip`] not being
+-/// meant to be used for the [`MorphWeights`] of the entity it's being applied to.
+-fn get_keyframe(target_count: usize, keyframes: &[f32], key_index: usize) -> &[f32] {
+-    let start = target_count * key_index;
+-    let end = target_count * (key_index + 1);
+-    &keyframes[start..end]
+-}
++                let Some(clip) = animation_graph
++                    .get(animation_graph_node_index)
++                    .and_then(|animation_graph_node| animation_graph_node.clip.as_ref())
++                    .and_then(|animation_clip_handle| clips.get(animation_clip_handle))
++                else {
++                    continue;
++                };
+ 
+-/// Helper function for cubic spline interpolation.
+-fn cubic_spline_interpolation<T>(
+-    value_start: T,
+-    tangent_out_start: T,
+-    tangent_in_end: T,
+-    value_end: T,
+-    lerp: f32,
+-    step_duration: f32,
+-) -> T
+-where
+-    T: Mul<f32, Output = T> + Add<Output = T>,
+-{
+-    value_start * (2.0 * lerp.powi(3) - 3.0 * lerp.powi(2) + 1.0)
+-        + tangent_out_start * (step_duration) * (lerp.powi(3) - 2.0 * lerp.powi(2) + lerp)
+-        + value_end * (-2.0 * lerp.powi(3) + 3.0 * lerp.powi(2))
+-        + tangent_in_end * step_duration * (lerp.powi(3) - lerp.powi(2))
+-}
++                let Some(curves) = clip.curves_for_target(target_context.target.id) else {
++                    continue;
++                };
+ 
+-/// Adds animation support to an app
+-#[derive(Default)]
+-pub struct AnimationPlugin;
++                let weight = active_animation.computed_weight;
++                total_weight += weight;
+ 
+-impl Plugin for AnimationPlugin {
+-    fn build(&self, app: &mut App) {
+-        app.init_asset::<AnimationClip>()
+-            .register_asset_reflect::<AnimationClip>()
+-            .register_type::<AnimationPlayer>()
+-            .register_type::<AnimationTarget>()
+-            .add_systems(
+-                PostUpdate,
+-                (advance_animations, animate_targets)
+-                    .chain()
+-                    .before(TransformSystem::TransformPropagate),
+-            );
+-    }
++                target_context.apply(curves, weight / total_weight, active_animation.seek_time);
++            }
++        });
+ }
+ 
+-impl PlayingAnimation {
+-    fn apply(
+-        &self,
+-        clips: &Assets<AnimationClip>,
+-        weight: f32,
+-        target_context: &mut AnimationTargetContext,
+-    ) {
+-        let Some(clip) = clips.get(&self.animation_clip) else {
+-            // The clip probably hasn't loaded yet. Bail.
+-            return;
+-        };
+-
+-        let Some(curves) = clip.curves_for_target(target_context.target.id) else {
+-            return;
+-        };
+-
++impl AnimationTargetContext<'_> {
++    /// Applies a clip to a single animation target according to the
++    /// [`AnimationTargetContext`].
++    fn apply(&mut self, curves: &[VariableCurve], weight: f32, seek_time: f32) {
+         for curve in curves {
+             // Some curves have only one keyframe used to set a transform
+             if curve.keyframe_timestamps.len() == 1 {
+-                self.apply_single_keyframe(curve, weight, target_context);
++                self.apply_single_keyframe(curve, weight);
+                 return;
+             }
+ 
+             // Find the current keyframe
+-            let Some(step_start) = curve.find_current_keyframe(self.seek_time) else {
++            let Some(step_start) = curve.find_current_keyframe(seek_time) else {
+                 return;
+             };
+ 
+             let timestamp_start = curve.keyframe_timestamps[step_start];
+             let timestamp_end = curve.keyframe_timestamps[step_start + 1];
+             // Compute how far we are through the keyframe, normalized to [0, 1]
+-            let lerp = f32::inverse_lerp(timestamp_start, timestamp_end, self.seek_time);
++            let lerp = f32::inverse_lerp(timestamp_start, timestamp_end, seek_time);
+ 
+             self.apply_tweened_keyframe(
+                 curve,
+                 step_start,
+-                weight,
+                 lerp,
++                weight,
+                 timestamp_end - timestamp_start,
+-                target_context,
+             );
+         }
+     }
+ 
+-    fn apply_single_keyframe(
+-        &self,
+-        curve: &VariableCurve,
+-        weight: f32,
+-        target_context: &mut AnimationTargetContext,
+-    ) {
++    fn apply_single_keyframe(&mut self, curve: &VariableCurve, weight: f32) {
+         match &curve.keyframes {
+             Keyframes::Rotation(keyframes) => {
+-                if let Some(ref mut transform) = target_context.transform {
++                if let Some(ref mut transform) = self.transform {
+                     transform.rotation = transform.rotation.slerp(keyframes[0], weight);
+                 }
+             }
+ 
+             Keyframes::Translation(keyframes) => {
+-                if let Some(ref mut transform) = target_context.transform {
++                if let Some(ref mut transform) = self.transform {
+                     transform.translation = transform.translation.lerp(keyframes[0], weight);
+                 }
+             }
+ 
+             Keyframes::Scale(keyframes) => {
+-                if let Some(ref mut transform) = target_context.transform {
++                if let Some(ref mut transform) = self.transform {
+                     transform.scale = transform.scale.lerp(keyframes[0], weight);
+                 }
+             }
+ 
+             Keyframes::Weights(keyframes) => {
+-                let Some(ref mut morphs) = target_context.morph_weights else {
++                let Some(ref mut morphs) = self.morph_weights else {
+                     error!(
+                         "Tried to animate morphs on {:?} ({:?}), but no `MorphWeights` was found",
+-                        target_context.entity, target_context.name,
++                        self.entity, self.name,
+                     );
+                     return;
+                 };
+@@ -787,23 +893,22 @@ impl PlayingAnimation {
+     }
+ 
+     fn apply_tweened_keyframe(
+-        &self,
++        &mut self,
+         curve: &VariableCurve,
+         step_start: usize,
+-        weight: f32,
+         lerp: f32,
++        weight: f32,
+         duration: f32,
+-        target_context: &mut AnimationTargetContext,
+     ) {
+         match (&curve.interpolation, &curve.keyframes) {
+             (Interpolation::Step, Keyframes::Rotation(keyframes)) => {
+-                if let Some(ref mut transform) = target_context.transform {
++                if let Some(ref mut transform) = self.transform {
+                     transform.rotation = transform.rotation.slerp(keyframes[step_start], weight);
+                 }
+             }
+ 
+             (Interpolation::Linear, Keyframes::Rotation(keyframes)) => {
+-                let Some(ref mut transform) = target_context.transform else {
++                let Some(ref mut transform) = self.transform else {
+                     return;
+                 };
+ 
+@@ -819,7 +924,7 @@ impl PlayingAnimation {
+             }
+ 
+             (Interpolation::CubicSpline, Keyframes::Rotation(keyframes)) => {
+-                let Some(ref mut transform) = target_context.transform else {
++                let Some(ref mut transform) = self.transform else {
+                     return;
+                 };
+ 
+@@ -839,14 +944,14 @@ impl PlayingAnimation {
+             }
+ 
+             (Interpolation::Step, Keyframes::Translation(keyframes)) => {
+-                if let Some(ref mut transform) = target_context.transform {
++                if let Some(ref mut transform) = self.transform {
+                     transform.translation =
+                         transform.translation.lerp(keyframes[step_start], weight);
+                 }
+             }
+ 
+             (Interpolation::Linear, Keyframes::Translation(keyframes)) => {
+-                let Some(ref mut transform) = target_context.transform else {
++                let Some(ref mut transform) = self.transform else {
+                     return;
+                 };
+ 
+@@ -857,7 +962,7 @@ impl PlayingAnimation {
+             }
+ 
+             (Interpolation::CubicSpline, Keyframes::Translation(keyframes)) => {
+-                let Some(ref mut transform) = target_context.transform else {
++                let Some(ref mut transform) = self.transform else {
+                     return;
+                 };
+ 
+@@ -877,13 +982,13 @@ impl PlayingAnimation {
+             }
+ 
+             (Interpolation::Step, Keyframes::Scale(keyframes)) => {
+-                if let Some(ref mut transform) = target_context.transform {
++                if let Some(ref mut transform) = self.transform {
+                     transform.scale = transform.scale.lerp(keyframes[step_start], weight);
+                 }
+             }
+ 
+             (Interpolation::Linear, Keyframes::Scale(keyframes)) => {
+-                let Some(ref mut transform) = target_context.transform else {
++                let Some(ref mut transform) = self.transform else {
+                     return;
+                 };
+ 
+@@ -894,7 +999,7 @@ impl PlayingAnimation {
+             }
+ 
+             (Interpolation::CubicSpline, Keyframes::Scale(keyframes)) => {
+-                let Some(ref mut transform) = target_context.transform else {
++                let Some(ref mut transform) = self.transform else {
+                     return;
+                 };
+ 
+@@ -914,7 +1019,7 @@ impl PlayingAnimation {
+             }
+ 
+             (Interpolation::Step, Keyframes::Weights(keyframes)) => {
+-                let Some(ref mut morphs) = target_context.morph_weights else {
++                let Some(ref mut morphs) = self.morph_weights else {
+                     return;
+                 };
+ 
+@@ -924,7 +1029,7 @@ impl PlayingAnimation {
+             }
+ 
+             (Interpolation::Linear, Keyframes::Weights(keyframes)) => {
+-                let Some(ref mut morphs) = target_context.morph_weights else {
++                let Some(ref mut morphs) = self.morph_weights else {
+                     return;
+                 };
+ 
+@@ -939,7 +1044,7 @@ impl PlayingAnimation {
+             }
+ 
+             (Interpolation::CubicSpline, Keyframes::Weights(keyframes)) => {
+-                let Some(ref mut morphs) = target_context.morph_weights else {
++                let Some(ref mut morphs) = self.morph_weights else {
+                     return;
+                 };
+ 
+@@ -971,6 +1076,77 @@ impl PlayingAnimation {
+     }
+ }
+ 
++/// Update `weights` based on weights in `keyframe` with a linear interpolation
++/// on `key_lerp`.
++fn lerp_morph_weights(weights: &mut [f32], keyframe: impl Iterator<Item = f32>, key_lerp: f32) {
++    let zipped = weights.iter_mut().zip(keyframe);
++    for (morph_weight, keyframe) in zipped {
++        *morph_weight = morph_weight.lerp(keyframe, key_lerp);
++    }
++}
++
++/// Extract a keyframe from a list of keyframes by index.
++///
++/// # Panics
++///
++/// When `key_index * target_count` is larger than `keyframes`
++///
++/// This happens when `keyframes` is not formatted as described in
++/// [`Keyframes::Weights`]. A possible cause is [`AnimationClip`] not being
++/// meant to be used for the [`MorphWeights`] of the entity it's being applied to.
++fn get_keyframe(target_count: usize, keyframes: &[f32], key_index: usize) -> &[f32] {
++    let start = target_count * key_index;
++    let end = target_count * (key_index + 1);
++    &keyframes[start..end]
++}
++
++/// Helper function for cubic spline interpolation.
++fn cubic_spline_interpolation<T>(
++    value_start: T,
++    tangent_out_start: T,
++    tangent_in_end: T,
++    value_end: T,
++    lerp: f32,
++    step_duration: f32,
++) -> T
++where
++    T: Mul<f32, Output = T> + Add<Output = T>,
++{
++    value_start * (2.0 * lerp.powi(3) - 3.0 * lerp.powi(2) + 1.0)
++        + tangent_out_start * (step_duration) * (lerp.powi(3) - 2.0 * lerp.powi(2) + lerp)
++        + value_end * (-2.0 * lerp.powi(3) + 3.0 * lerp.powi(2))
++        + tangent_in_end * step_duration * (lerp.powi(3) - lerp.powi(2))
++}
++
++/// Adds animation support to an app
++#[derive(Default)]
++pub struct AnimationPlugin;
++
++impl Plugin for AnimationPlugin {
++    fn build(&self, app: &mut App) {
++        app.init_asset::<AnimationClip>()
++            .init_asset::<AnimationGraph>()
++            .init_asset_loader::<AnimationGraphAssetLoader>()
++            .register_asset_reflect::<AnimationClip>()
++            .register_asset_reflect::<AnimationGraph>()
++            .register_type::<AnimationPlayer>()
++            .register_type::<AnimationTarget>()
++            .register_type::<AnimationTransitions>()
++            .register_type::<NodeIndex>()
++            .add_systems(
++                PostUpdate,
++                (
++                    advance_transitions,
++                    advance_animations,
++                    animate_targets,
++                    expire_completed_transitions,
++                )
++                    .chain()
++                    .before(TransformSystem::TransformPropagate),
++            );
++    }
++}
++
+ impl AnimationTargetId {
+     /// Creates a new [`AnimationTargetId`] by hashing a list of names.
+     ///
+@@ -1002,6 +1178,20 @@ impl MapEntities for AnimationTarget {
+     }
+ }
+ 
++impl AnimationGraphEvaluator {
++    // Starts a new depth-first search.
++    fn reset(&mut self, root: AnimationNodeIndex, node_count: usize) {
++        self.dfs_stack.clear();
++        self.dfs_stack.push(root);
++
++        self.dfs_visited.grow(node_count);
++        self.dfs_visited.clear();
++
++        self.weights.clear();
++        self.weights.extend(iter::repeat(0.0).take(node_count));
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use crate::VariableCurve;
+diff --git a/crates/bevy_animation/src/transition.rs b/crates/bevy_animation/src/transition.rs
+new file mode 100644
+index 000000000..e78339862
+--- /dev/null
++++ b/crates/bevy_animation/src/transition.rs
+@@ -0,0 +1,132 @@
++//! Animation transitions.
++//!
++//! Please note that this is an unstable temporary API. It may be replaced by a
++//! state machine in the future.
++
++use bevy_ecs::{
++    component::Component,
++    system::{Query, Res},
++};
++use bevy_reflect::Reflect;
++use bevy_time::Time;
++use bevy_utils::Duration;
++
++use crate::{graph::AnimationNodeIndex, ActiveAnimation, AnimationPlayer};
++
++/// Manages fade-out of animation blend factors, allowing for smooth transitions
++/// between animations.
++///
++/// To use this component, place it on the same entity as the
++/// [`AnimationPlayer`] and [`bevy_asset::Handle<AnimationGraph>`]. It'll take
++/// responsibility for adjusting the weight on the [`ActiveAnimation`] in order
++/// to fade out animations smoothly.
++///
++/// When using an [`AnimationTransitions`] component, you should play all
++/// animations through the [`AnimationTransitions::play`] method, rather than by
++/// directly manipulating the [`AnimationPlayer`]. Playing animations through
++/// the [`AnimationPlayer`] directly will cause the [`AnimationTransitions`]
++/// component to get confused about which animation is the "main" animation, and
++/// transitions will usually be incorrect as a result.
++#[derive(Component, Default, Reflect)]
++pub struct AnimationTransitions {
++    main_animation: Option<AnimationNodeIndex>,
++    transitions: Vec<AnimationTransition>,
++}
++
++/// An animation that is being faded out as part of a transition
++#[derive(Debug, Reflect)]
++pub struct AnimationTransition {
++    /// The current weight. Starts at 1.0 and goes to 0.0 during the fade-out.
++    current_weight: f32,
++    /// How much to decrease `current_weight` per second
++    weight_decline_per_sec: f32,
++    /// The animation that is being faded out
++    animation: AnimationNodeIndex,
++}
++
++impl AnimationTransitions {
++    /// Creates a new [`AnimationTransitions`] component, ready to be added to
++    /// an entity with an [`AnimationPlayer`].
++    pub fn new() -> AnimationTransitions {
++        AnimationTransitions::default()
++    }
++
++    /// Plays a new animation on the given [`AnimationPlayer`], fading out any
++    /// existing animations that were already playing over the
++    /// `transition_duration`.
++    ///
++    /// Pass [`Duration::ZERO`] to instantly switch to a new animation, avoiding
++    /// any transition.
++    pub fn play<'p>(
++        &mut self,
++        player: &'p mut AnimationPlayer,
++        new_animation: AnimationNodeIndex,
++        transition_duration: Duration,
++    ) -> &'p mut ActiveAnimation {
++        if let Some(old_animation_index) = self.main_animation.replace(new_animation) {
++            if let Some(old_animation) = player.animation_mut(old_animation_index) {
++                if !old_animation.is_paused() {
++                    self.transitions.push(AnimationTransition {
++                        current_weight: old_animation.weight,
++                        weight_decline_per_sec: 1.0 / transition_duration.as_secs_f32(),
++                        animation: old_animation_index,
++                    });
++                }
++            }
++        }
++
++        self.main_animation = Some(new_animation);
++        player.start(new_animation)
++    }
++}
++
++/// A system that alters the weight of currently-playing transitions based on
++/// the current time and decline amount.
++pub fn advance_transitions(
++    mut query: Query<(&mut AnimationTransitions, &mut AnimationPlayer)>,
++    time: Res<Time>,
++) {
++    // We use a "greedy layer" system here. The top layer (most recent
++    // transition) gets as much as weight as it wants, and the remaining amount
++    // is divided between all the other layers, eventually culminating in the
++    // currently-playing animation receiving whatever's left. This results in a
++    // nicely normalized weight.
++    let mut remaining_weight = 1.0;
++    for (mut animation_transitions, mut player) in query.iter_mut() {
++        for transition in &mut animation_transitions.transitions.iter_mut().rev() {
++            // Decrease weight.
++            transition.current_weight = (transition.current_weight
++                - transition.weight_decline_per_sec * time.delta_seconds())
++            .max(0.0);
++
++            // Update weight.
++            let Some(ref mut animation) = player.animation_mut(transition.animation) else {
++                continue;
++            };
++            animation.weight = transition.current_weight * remaining_weight;
++            remaining_weight -= animation.weight;
++        }
++
++        if let Some(main_animation_index) = animation_transitions.main_animation {
++            if let Some(ref mut animation) = player.animation_mut(main_animation_index) {
++                animation.weight = remaining_weight;
++            }
++        }
++    }
++}
++
++/// A system that removed transitions that have completed from the
++/// [`AnimationTransitions`] object.
++pub fn expire_completed_transitions(
++    mut query: Query<(&mut AnimationTransitions, &mut AnimationPlayer)>,
++) {
++    for (mut animation_transitions, mut player) in query.iter_mut() {
++        animation_transitions.transitions.retain(|transition| {
++            let expire = transition.current_weight <= 0.0;
++            if expire {
++                player.stop(transition.animation);
++            }
++            !expire
++        });
++    }
++}
+diff --git a/crates/bevy_asset/src/id.rs b/crates/bevy_asset/src/id.rs
+index fc9890278..f4c784d95 100644
+--- a/crates/bevy_asset/src/id.rs
++++ b/crates/bevy_asset/src/id.rs
+@@ -1,5 +1,6 @@
+ use crate::{Asset, AssetIndex};
+ use bevy_reflect::Reflect;
++use serde::{Deserialize, Serialize};
+ use uuid::Uuid;
+ 
+ use std::{
+@@ -16,7 +17,7 @@ use thiserror::Error;
+ /// For an identifier tied to the lifetime of an asset, see [`Handle`](`crate::Handle`).
+ ///
+ /// For an "untyped" / "generic-less" id, see [`UntypedAssetId`].
+-#[derive(Reflect)]
++#[derive(Reflect, Serialize, Deserialize)]
+ pub enum AssetId<A: Asset> {
+     /// A small / efficient runtime identifier that can be used to efficiently look up an asset stored in [`Assets`]. This is
+     /// the "default" identifier used for assets. The alternative(s) (ex: [`AssetId::Uuid`]) will only be used if assets are
+diff --git a/crates/bevy_reflect/Cargo.toml b/crates/bevy_reflect/Cargo.toml
+index 3a197c692..e1a2902cc 100644
+--- a/crates/bevy_reflect/Cargo.toml
++++ b/crates/bevy_reflect/Cargo.toml
+@@ -15,6 +15,7 @@ default = ["smallvec"]
+ bevy = ["smallvec", "bevy_math", "smol_str"]
+ glam = ["dep:glam"]
+ bevy_math = ["glam", "dep:bevy_math"]
++petgraph = ["dep:petgraph"]
+ smallvec = ["dep:smallvec"]
+ uuid = ["dep:uuid"]
+ # When enabled, allows documentation comments to be accessed via reflection
+@@ -37,6 +38,7 @@ serde = "1"
+ smallvec = { version = "1.11", optional = true }
+ 
+ glam = { version = "0.25", features = ["serde"], optional = true }
++petgraph = { version = "0.6", features = ["serde-1"], optional = true }
+ smol_str = { version = "0.2.0", optional = true }
+ uuid = { version = "1.0", optional = true, features = ["v4", "serde"] }
+ 
+diff --git a/crates/bevy_reflect/src/impls/petgraph.rs b/crates/bevy_reflect/src/impls/petgraph.rs
+new file mode 100644
+index 000000000..a4d02b4c8
+--- /dev/null
++++ b/crates/bevy_reflect/src/impls/petgraph.rs
+@@ -0,0 +1,15 @@
++use crate::{
++    self as bevy_reflect, impl_reflect_value, prelude::ReflectDefault, ReflectDeserialize,
++    ReflectSerialize,
++};
++
++impl_reflect_value!(::petgraph::graph::NodeIndex(
++    Default,
++    Serialize,
++    Deserialize
++));
++impl_reflect_value!(::petgraph::graph::DiGraph<
++    N: ::std::clone::Clone,
++    E: ::std::clone::Clone,
++    Ix: ::petgraph::graph::IndexType
++>());
+diff --git a/crates/bevy_reflect/src/lib.rs b/crates/bevy_reflect/src/lib.rs
+index 2add0144f..1d8303248 100644
+--- a/crates/bevy_reflect/src/lib.rs
++++ b/crates/bevy_reflect/src/lib.rs
+@@ -493,7 +493,8 @@ mod impls {
+         mod primitives3d;
+         mod rect;
+     }
+-
++    #[cfg(feature = "petgraph")]
++    mod petgraph;
+     #[cfg(feature = "smallvec")]
+     mod smallvec;
+     #[cfg(feature = "smol_str")]
+diff --git a/examples/3d/irradiance_volumes.rs b/examples/3d/irradiance_volumes.rs
+index b3d193658..24addb02a 100644
+--- a/examples/3d/irradiance_volumes.rs
++++ b/examples/3d/irradiance_volumes.rs
+@@ -97,8 +97,11 @@ struct ExampleAssets {
+     // The glTF scene containing the animated fox.
+     fox: Handle<Scene>,
+ 
+-    // The animation that the fox will play.
+-    fox_animation: Handle<AnimationClip>,
++    // The graph containing the animation that the fox will play.
++    fox_animation_graph: Handle<AnimationGraph>,
++
++    // The node within the animation graph containing the animation.
++    fox_animation_node: AnimationNodeIndex,
+ 
+     // The voxel cube mesh.
+     voxel_cube: Handle<Mesh>,
+@@ -513,6 +516,10 @@ fn handle_mouse_clicks(
+ 
+ impl FromWorld for ExampleAssets {
+     fn from_world(world: &mut World) -> Self {
++        let fox_animation = world.load_asset("models/animated/Fox.glb#Animation1");
++        let (fox_animation_graph, fox_animation_node) =
++            AnimationGraph::from_clip(fox_animation.clone());
++
+         ExampleAssets {
+             main_sphere: world.add_asset(Sphere::default().mesh().uv(32, 18)),
+             fox: world.load_asset("models/animated/Fox.glb#Scene0"),
+@@ -520,7 +527,8 @@ impl FromWorld for ExampleAssets {
+             main_scene: world
+                 .load_asset("models/IrradianceVolumeExample/IrradianceVolumeExample.glb#Scene0"),
+             irradiance_volume: world.load_asset("irradiance_volumes/Example.vxgi.ktx2"),
+-            fox_animation: world.load_asset("models/animated/Fox.glb#Animation1"),
++            fox_animation_graph: world.add_asset(fox_animation_graph),
++            fox_animation_node,
+             voxel_cube: world.add_asset(Cuboid::default()),
+             // Just use a specular map for the skybox since it's not too blurry.
+             // In reality you wouldn't do this--you'd use a real skybox texture--but
+@@ -531,10 +539,16 @@ impl FromWorld for ExampleAssets {
+ }
+ 
+ // Plays the animation on the fox.
+-fn play_animations(assets: Res<ExampleAssets>, mut players: Query<&mut AnimationPlayer>) {
+-    for mut player in players.iter_mut() {
+-        // This will safely do nothing if the animation is already playing.
+-        player.play(assets.fox_animation.clone()).repeat();
++fn play_animations(
++    mut commands: Commands,
++    assets: Res<ExampleAssets>,
++    mut players: Query<(Entity, &mut AnimationPlayer), Without<Handle<AnimationGraph>>>,
++) {
++    for (entity, mut player) in players.iter_mut() {
++        commands
++            .entity(entity)
++            .insert(assets.fox_animation_graph.clone());
++        player.play(assets.fox_animation_node).repeat();
+     }
+ }
+ 
+diff --git a/examples/README.md b/examples/README.md
+index fcad85d7c..c7e19f1e0 100644
+--- a/examples/README.md
++++ b/examples/README.md
+@@ -163,6 +163,7 @@ Example | Description
+ --- | ---
+ [Animated Fox](../examples/animation/animated_fox.rs) | Plays an animation from a skinned glTF
+ [Animated Transform](../examples/animation/animated_transform.rs) | Create and play an animation defined by code that operates on the `Transform` component
++[Animation Graph](../examples/animation/animation_graph.rs) | Blends multiple animations together with a graph
+ [Cubic Curve](../examples/animation/cubic_curve.rs) | Bezier curve example showing a cube following a cubic curve
+ [Custom Skinned Mesh](../examples/animation/custom_skinned_mesh.rs) | Skinned mesh example with mesh and joints data defined in code
+ [Morph Targets](../examples/animation/morph_targets.rs) | Plays an animation from a glTF file with meshes with morph targets
+diff --git a/examples/animation/animated_fox.rs b/examples/animation/animated_fox.rs
+index d188b3a1b..5483df3d5 100644
+--- a/examples/animation/animated_fox.rs
++++ b/examples/animation/animated_fox.rs
+@@ -3,7 +3,11 @@
+ use std::f32::consts::PI;
+ use std::time::Duration;
+ 
+-use bevy::{animation::RepeatAnimation, pbr::CascadeShadowConfigBuilder, prelude::*};
++use bevy::{
++    animation::{animate_targets, RepeatAnimation},
++    pbr::CascadeShadowConfigBuilder,
++    prelude::*,
++};
+ 
+ fn main() {
+     App::new()
+@@ -13,28 +17,47 @@ fn main() {
+         })
+         .add_plugins(DefaultPlugins)
+         .add_systems(Startup, setup)
+-        .add_systems(
+-            Update,
+-            (setup_scene_once_loaded, keyboard_animation_control),
+-        )
++        .add_systems(Update, setup_scene_once_loaded.before(animate_targets))
++        .add_systems(Update, keyboard_animation_control)
+         .run();
+ }
+ 
+ #[derive(Resource)]
+-struct Animations(Vec<Handle<AnimationClip>>);
++struct Animations {
++    animations: Vec<AnimationNodeIndex>,
++    #[allow(dead_code)]
++    graph: Handle<AnimationGraph>,
++}
+ 
+ fn setup(
+     mut commands: Commands,
+     asset_server: Res<AssetServer>,
+     mut meshes: ResMut<Assets<Mesh>>,
+     mut materials: ResMut<Assets<StandardMaterial>>,
++    mut graphs: ResMut<Assets<AnimationGraph>>,
+ ) {
++    // Build the animation graph
++    let mut graph = AnimationGraph::new();
++    let animations = graph
++        .add_clips(
++            [
++                "models/animated/Fox.glb#Animation2",
++                "models/animated/Fox.glb#Animation1",
++                "models/animated/Fox.glb#Animation0",
++            ]
++            .into_iter()
++            .map(|path| asset_server.load(path)),
++            1.0,
++            graph.root,
++        )
++        .collect();
++
+     // Insert a resource with the current scene information
+-    commands.insert_resource(Animations(vec![
+-        asset_server.load("models/animated/Fox.glb#Animation2"),
+-        asset_server.load("models/animated/Fox.glb#Animation1"),
+-        asset_server.load("models/animated/Fox.glb#Animation0"),
+-    ]));
++    let graph = graphs.add(graph);
++    commands.insert_resource(Animations {
++        animations,
++        graph: graph.clone(),
++    });
+ 
+     // Camera
+     commands.spawn(Camera3dBundle {
+@@ -83,76 +106,108 @@ fn setup(
+ 
+ // Once the scene is loaded, start the animation
+ fn setup_scene_once_loaded(
++    mut commands: Commands,
+     animations: Res<Animations>,
+-    mut players: Query<&mut AnimationPlayer, Added<AnimationPlayer>>,
++    mut players: Query<(Entity, &mut AnimationPlayer), Added<AnimationPlayer>>,
+ ) {
+-    for mut player in &mut players {
+-        player.play(animations.0[0].clone_weak()).repeat();
++    for (entity, mut player) in &mut players {
++        let mut transitions = AnimationTransitions::new();
++
++        // Make sure to start the animation via the `AnimationTransitions`
++        // component. The `AnimationTransitions` component wants to manage all
++        // the animations and will get confused if the animations are started
++        // directly via the `AnimationPlayer`.
++        transitions
++            .play(&mut player, animations.animations[0], Duration::ZERO)
++            .repeat();
++
++        commands
++            .entity(entity)
++            .insert(animations.graph.clone())
++            .insert(transitions);
+     }
+ }
+ 
+ fn keyboard_animation_control(
+     keyboard_input: Res<ButtonInput<KeyCode>>,
+-    mut animation_players: Query<&mut AnimationPlayer>,
++    mut animation_players: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
+     animations: Res<Animations>,
+     mut current_animation: Local<usize>,
+ ) {
+-    for mut player in &mut animation_players {
++    for (mut player, mut transitions) in &mut animation_players {
++        let Some((&playing_animation_index, _)) = player.playing_animations().next() else {
++            continue;
++        };
++
+         if keyboard_input.just_pressed(KeyCode::Space) {
+-            if player.is_paused() {
+-                player.resume();
++            let playing_animation = player.animation_mut(playing_animation_index).unwrap();
++            if playing_animation.is_paused() {
++                playing_animation.resume();
+             } else {
+-                player.pause();
++                playing_animation.pause();
+             }
+         }
+ 
+         if keyboard_input.just_pressed(KeyCode::ArrowUp) {
+-            let speed = player.speed();
+-            player.set_speed(speed * 1.2);
++            let playing_animation = player.animation_mut(playing_animation_index).unwrap();
++            let speed = playing_animation.speed();
++            playing_animation.set_speed(speed * 1.2);
+         }
+ 
+         if keyboard_input.just_pressed(KeyCode::ArrowDown) {
+-            let speed = player.speed();
+-            player.set_speed(speed * 0.8);
++            let playing_animation = player.animation_mut(playing_animation_index).unwrap();
++            let speed = playing_animation.speed();
++            playing_animation.set_speed(speed * 0.8);
+         }
+ 
+         if keyboard_input.just_pressed(KeyCode::ArrowLeft) {
+-            let elapsed = player.seek_time();
+-            player.seek_to(elapsed - 0.1);
++            let playing_animation = player.animation_mut(playing_animation_index).unwrap();
++            let elapsed = playing_animation.seek_time();
++            playing_animation.seek_to(elapsed - 0.1);
+         }
+ 
+         if keyboard_input.just_pressed(KeyCode::ArrowRight) {
+-            let elapsed = player.seek_time();
+-            player.seek_to(elapsed + 0.1);
++            let playing_animation = player.animation_mut(playing_animation_index).unwrap();
++            let elapsed = playing_animation.seek_time();
++            playing_animation.seek_to(elapsed + 0.1);
+         }
+ 
+         if keyboard_input.just_pressed(KeyCode::Enter) {
+-            *current_animation = (*current_animation + 1) % animations.0.len();
+-            player
+-                .play_with_transition(
+-                    animations.0[*current_animation].clone_weak(),
++            *current_animation = (*current_animation + 1) % animations.animations.len();
++
++            transitions
++                .play(
++                    &mut player,
++                    animations.animations[*current_animation],
+                     Duration::from_millis(250),
+                 )
+                 .repeat();
+         }
+ 
+         if keyboard_input.just_pressed(KeyCode::Digit1) {
+-            player.set_repeat(RepeatAnimation::Count(1));
+-            player.replay();
++            let playing_animation = player.animation_mut(playing_animation_index).unwrap();
++            playing_animation
++                .set_repeat(RepeatAnimation::Count(1))
++                .replay();
+         }
+ 
+         if keyboard_input.just_pressed(KeyCode::Digit3) {
+-            player.set_repeat(RepeatAnimation::Count(3));
+-            player.replay();
++            let playing_animation = player.animation_mut(playing_animation_index).unwrap();
++            playing_animation
++                .set_repeat(RepeatAnimation::Count(3))
++                .replay();
+         }
+ 
+         if keyboard_input.just_pressed(KeyCode::Digit5) {
+-            player.set_repeat(RepeatAnimation::Count(5));
+-            player.replay();
++            let playing_animation = player.animation_mut(playing_animation_index).unwrap();
++            playing_animation
++                .set_repeat(RepeatAnimation::Count(5))
++                .replay();
+         }
+ 
+         if keyboard_input.just_pressed(KeyCode::KeyL) {
+-            player.set_repeat(RepeatAnimation::Forever);
++            let playing_animation = player.animation_mut(playing_animation_index).unwrap();
++            playing_animation.set_repeat(RepeatAnimation::Forever);
+         }
+     }
+ }
+diff --git a/examples/animation/animated_transform.rs b/examples/animation/animated_transform.rs
+index 4c0e8b424..d85adf102 100644
+--- a/examples/animation/animated_transform.rs
++++ b/examples/animation/animated_transform.rs
+@@ -21,6 +21,7 @@ fn setup(
+     mut meshes: ResMut<Assets<Mesh>>,
+     mut materials: ResMut<Assets<StandardMaterial>>,
+     mut animations: ResMut<Assets<AnimationClip>>,
++    mut graphs: ResMut<Assets<AnimationGraph>>,
+ ) {
+     // Camera
+     commands.spawn(Camera3dBundle {
+@@ -125,9 +126,12 @@ fn setup(
+         },
+     );
+ 
++    // Create the animation graph
++    let (graph, animation_index) = AnimationGraph::from_clip(animations.add(animation));
++
+     // Create the animation player, and set it to repeat
+     let mut player = AnimationPlayer::default();
+-    player.play(animations.add(animation)).repeat();
++    player.play(animation_index).repeat();
+ 
+     // Create the scene that will be animated
+     // First entity is the planet
+@@ -138,8 +142,9 @@ fn setup(
+                 material: materials.add(Color::srgb(0.8, 0.7, 0.6)),
+                 ..default()
+             },
+-            // Add the animation player
++            // Add the animation graph and player
+             planet,
++            graphs.add(graph),
+             player,
+         ))
+         .id();
+diff --git a/examples/animation/animation_graph.rs b/examples/animation/animation_graph.rs
+new file mode 100644
+index 000000000..c81a7911e
+--- /dev/null
++++ b/examples/animation/animation_graph.rs
+@@ -0,0 +1,576 @@
++//! Demonstrates animation blending with animation graphs.
++//!
++//! The animation graph is shown on screen. You can change the weights of the
++//! playing animations by clicking and dragging left or right within the nodes.
++
++#[cfg(not(target_arch = "wasm32"))]
++use std::{fs::File, path::Path};
++
++use bevy::{
++    animation::animate_targets,
++    color::palettes::{
++        basic::WHITE,
++        css::{ANTIQUE_WHITE, DARK_GREEN},
++    },
++    prelude::*,
++    ui::RelativeCursorPosition,
++};
++
++use argh::FromArgs;
++#[cfg(not(target_arch = "wasm32"))]
++use bevy::asset::io::file::FileAssetReader;
++#[cfg(not(target_arch = "wasm32"))]
++use bevy::tasks::IoTaskPool;
++#[cfg(not(target_arch = "wasm32"))]
++use ron::ser::PrettyConfig;
++
++/// Where to find the serialized animation graph.
++static ANIMATION_GRAPH_PATH: &str = "animation_graphs/Fox.animgraph.ron";
++
++/// The indices of the nodes containing animation clips in the graph.
++static CLIP_NODE_INDICES: [u32; 3] = [2, 3, 4];
++
++/// The help text in the upper left corner.
++static HELP_TEXT: &str = "Click and drag an animation clip node to change its weight";
++
++/// The node widgets in the UI.
++static NODE_TYPES: [NodeType; 5] = [
++    NodeType::Clip(ClipNode::new("Idle", 0)),
++    NodeType::Clip(ClipNode::new("Walk", 1)),
++    NodeType::Blend("Root"),
++    NodeType::Blend("Blend\n0.5"),
++    NodeType::Clip(ClipNode::new("Run", 2)),
++];
++
++/// The positions of the node widgets in the UI.
++///
++/// These are in the same order as [`NODE_TYPES`] above.
++static NODE_RECTS: [NodeRect; 5] = [
++    NodeRect::new(10.00, 10.00, 97.64, 48.41),
++    NodeRect::new(10.00, 78.41, 97.64, 48.41),
++    NodeRect::new(286.08, 78.41, 97.64, 48.41),
++    NodeRect::new(148.04, 44.20, 97.64, 48.41),
++    NodeRect::new(10.00, 146.82, 97.64, 48.41),
++];
++
++/// The positions of the horizontal lines in the UI.
++static HORIZONTAL_LINES: [Line; 6] = [
++    Line::new(107.64, 34.21, 20.20),
++    Line::new(107.64, 102.61, 20.20),
++    Line::new(107.64, 171.02, 158.24),
++    Line::new(127.84, 68.41, 20.20),
++    Line::new(245.68, 68.41, 20.20),
++    Line::new(265.88, 102.61, 20.20),
++];
++
++/// The positions of the vertical lines in the UI.
++static VERTICAL_LINES: [Line; 2] = [
++    Line::new(127.83, 34.21, 68.40),
++    Line::new(265.88, 68.41, 102.61),
++];
++
++/// Initializes the app.
++fn main() {
++    #[cfg(not(target_arch = "wasm32"))]
++    let args: Args = argh::from_env();
++    #[cfg(target_arch = "wasm32")]
++    let args = Args::from_args(&[], &[]).unwrap();
++
++    App::new()
++        .add_plugins(DefaultPlugins.set(WindowPlugin {
++            primary_window: Some(Window {
++                title: "Bevy Animation Graph Example".into(),
++                ..default()
++            }),
++            ..default()
++        }))
++        .add_systems(Startup, (setup_assets, setup_scene, setup_ui))
++        .add_systems(Update, init_animations.before(animate_targets))
++        .add_systems(
++            Update,
++            (handle_weight_drag, update_ui, sync_weights).chain(),
++        )
++        .insert_resource(args)
++        .insert_resource(AmbientLight {
++            color: WHITE.into(),
++            brightness: 100.0,
++        })
++        .run();
++}
++
++/// Demonstrates animation blending with animation graphs
++#[derive(FromArgs, Resource)]
++struct Args {
++    /// disables loading of the animation graph asset from disk
++    #[argh(switch)]
++    no_load: bool,
++    /// regenerates the asset file; implies `--no-load`
++    #[argh(switch)]
++    save: bool,
++}
++
++/// The [`AnimationGraph`] asset, which specifies how the animations are to
++/// be blended together.
++#[derive(Clone, Resource)]
++struct ExampleAnimationGraph(Handle<AnimationGraph>);
++
++/// The current weights of the three playing animations.
++#[derive(Component)]
++struct ExampleAnimationWeights {
++    /// The weights of the three playing animations.
++    weights: [f32; 3],
++}
++
++/// Initializes the scene.
++fn setup_assets(
++    mut commands: Commands,
++    mut asset_server: ResMut<AssetServer>,
++    mut animation_graphs: ResMut<Assets<AnimationGraph>>,
++    args: Res<Args>,
++) {
++    // Create or load the assets.
++    if args.no_load || args.save {
++        setup_assets_programmatically(
++            &mut commands,
++            &mut asset_server,
++            &mut animation_graphs,
++            args.save,
++        );
++    } else {
++        setup_assets_via_serialized_animation_graph(&mut commands, &mut asset_server);
++    }
++}
++
++fn setup_ui(mut commands: Commands) {
++    setup_help_text(&mut commands);
++    setup_node_rects(&mut commands);
++    setup_node_lines(&mut commands);
++}
++
++/// Creates the assets programmatically, including the animation graph.
++/// Optionally saves them to disk if `save` is present (corresponding to the
++/// `--save` option).
++fn setup_assets_programmatically(
++    commands: &mut Commands,
++    asset_server: &mut AssetServer,
++    animation_graphs: &mut Assets<AnimationGraph>,
++    _save: bool,
++) {
++    // Create the nodes.
++    let mut animation_graph = AnimationGraph::new();
++    let blend_node = animation_graph.add_blend(0.5, animation_graph.root);
++    animation_graph.add_clip(
++        asset_server.load("models/animated/Fox.glb#Animation0"),
++        1.0,
++        animation_graph.root,
++    );
++    animation_graph.add_clip(
++        asset_server.load("models/animated/Fox.glb#Animation1"),
++        1.0,
++        blend_node,
++    );
++    animation_graph.add_clip(
++        asset_server.load("models/animated/Fox.glb#Animation2"),
++        1.0,
++        blend_node,
++    );
++
++    // If asked to save, do so.
++    #[cfg(not(target_arch = "wasm32"))]
++    if _save {
++        let animation_graph = animation_graph.clone();
++
++        IoTaskPool::get()
++            .spawn(async move {
++                let mut animation_graph_writer = File::create(Path::join(
++                    &FileAssetReader::get_base_path(),
++                    Path::join(Path::new("assets"), Path::new(ANIMATION_GRAPH_PATH)),
++                ))
++                .expect("Failed to open the animation graph asset");
++                ron::ser::to_writer_pretty(
++                    &mut animation_graph_writer,
++                    &animation_graph,
++                    PrettyConfig::default(),
++                )
++                .expect("Failed to serialize the animation graph");
++            })
++            .detach();
++    }
++
++    // Add the graph.
++    let handle = animation_graphs.add(animation_graph);
++
++    // Save the assets in a resource.
++    commands.insert_resource(ExampleAnimationGraph(handle));
++}
++
++fn setup_assets_via_serialized_animation_graph(
++    commands: &mut Commands,
++    asset_server: &mut AssetServer,
++) {
++    commands.insert_resource(ExampleAnimationGraph(
++        asset_server.load(ANIMATION_GRAPH_PATH),
++    ));
++}
++
++/// Spawns the animated fox.
++fn setup_scene(
++    mut commands: Commands,
++    asset_server: Res<AssetServer>,
++    mut meshes: ResMut<Assets<Mesh>>,
++    mut materials: ResMut<Assets<StandardMaterial>>,
++) {
++    commands.spawn(Camera3dBundle {
++        transform: Transform::from_xyz(-10.0, 5.0, 13.0).looking_at(Vec3::new(0., 1., 0.), Vec3::Y),
++        ..default()
++    });
++
++    commands.spawn(PointLightBundle {
++        point_light: PointLight {
++            intensity: 10_000_000.0,
++            shadows_enabled: true,
++            ..default()
++        },
++        transform: Transform::from_xyz(-4.0, 8.0, 13.0),
++        ..default()
++    });
++
++    commands.spawn(SceneBundle {
++        scene: asset_server.load("models/animated/Fox.glb#Scene0"),
++        transform: Transform::from_scale(Vec3::splat(0.07)),
++        ..default()
++    });
++
++    // Ground
++
++    commands.spawn(PbrBundle {
++        mesh: meshes.add(Circle::new(7.0)),
++        material: materials.add(Color::srgb(0.3, 0.5, 0.3)),
++        transform: Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
++        ..default()
++    });
++}
++
++/// Places the help text at the top left of the window.
++fn setup_help_text(commands: &mut Commands) {
++    commands.spawn(TextBundle {
++        text: Text::from_section(
++            HELP_TEXT,
++            TextStyle {
++                font_size: 20.0,
++                ..default()
++            },
++        ),
++        style: Style {
++            position_type: PositionType::Absolute,
++            top: Val::Px(12.0),
++            left: Val::Px(12.0),
++            ..default()
++        },
++        ..default()
++    });
++}
++
++/// Initializes the node UI widgets.
++fn setup_node_rects(commands: &mut Commands) {
++    for (node_rect, node_type) in NODE_RECTS.iter().zip(NODE_TYPES.iter()) {
++        let node_string = match *node_type {
++            NodeType::Clip(ref clip) => clip.text,
++            NodeType::Blend(text) => text,
++        };
++
++        let text = commands
++            .spawn(TextBundle {
++                text: Text::from_section(
++                    node_string,
++                    TextStyle {
++                        font_size: 16.0,
++                        color: ANTIQUE_WHITE.into(),
++                        ..default()
++                    },
++                )
++                .with_justify(JustifyText::Center),
++                ..default()
++            })
++            .id();
++
++        let container = {
++            let mut container = commands.spawn((
++                NodeBundle {
++                    style: Style {
++                        position_type: PositionType::Absolute,
++                        bottom: Val::Px(node_rect.bottom),
++                        left: Val::Px(node_rect.left),
++                        height: Val::Px(node_rect.height),
++                        width: Val::Px(node_rect.width),
++                        align_items: AlignItems::Center,
++                        justify_items: JustifyItems::Center,
++                        align_content: AlignContent::Center,
++                        justify_content: JustifyContent::Center,
++                        ..default()
++                    },
++                    border_color: WHITE.into(),
++                    ..default()
++                },
++                Outline::new(Val::Px(1.), Val::ZERO, Color::WHITE),
++            ));
++
++            if let NodeType::Clip(ref clip) = node_type {
++                container.insert((
++                    Interaction::None,
++                    RelativeCursorPosition::default(),
++                    (*clip).clone(),
++                ));
++            }
++
++            container.id()
++        };
++
++        // Create the background color.
++        if let NodeType::Clip(_) = node_type {
++            let background = commands
++                .spawn(NodeBundle {
++                    style: Style {
++                        position_type: PositionType::Absolute,
++                        top: Val::Px(0.),
++                        left: Val::Px(0.),
++                        height: Val::Px(node_rect.height),
++                        width: Val::Px(node_rect.width),
++                        ..default()
++                    },
++                    background_color: DARK_GREEN.into(),
++                    ..default()
++                })
++                .id();
++
++            commands.entity(container).add_child(background);
++        }
++
++        commands.entity(container).add_child(text);
++    }
++}
++
++/// Creates boxes for the horizontal and vertical lines.
++///
++/// This is a bit hacky: it uses 1-pixel-wide and 1-pixel-high boxes to draw
++/// vertical and horizontal lines, respectively.
++fn setup_node_lines(commands: &mut Commands) {
++    for line in &HORIZONTAL_LINES {
++        commands.spawn(NodeBundle {
++            style: Style {
++                position_type: PositionType::Absolute,
++                bottom: Val::Px(line.bottom),
++                left: Val::Px(line.left),
++                height: Val::Px(0.0),
++                width: Val::Px(line.length),
++                border: UiRect::bottom(Val::Px(1.0)),
++                ..default()
++            },
++            border_color: WHITE.into(),
++            ..default()
++        });
++    }
++
++    for line in &VERTICAL_LINES {
++        commands.spawn(NodeBundle {
++            style: Style {
++                position_type: PositionType::Absolute,
++                bottom: Val::Px(line.bottom),
++                left: Val::Px(line.left),
++                height: Val::Px(line.length),
++                width: Val::Px(0.0),
++                border: UiRect::left(Val::Px(1.0)),
++                ..default()
++            },
++            border_color: WHITE.into(),
++            ..default()
++        });
++    }
++}
++
++/// Attaches the animation graph to the scene, and plays all three animations.
++fn init_animations(
++    mut commands: Commands,
++    mut query: Query<(Entity, &mut AnimationPlayer)>,
++    animation_graph: Res<ExampleAnimationGraph>,
++    mut done: Local<bool>,
++) {
++    if *done {
++        return;
++    }
++
++    for (entity, mut player) in query.iter_mut() {
++        commands.entity(entity).insert((
++            animation_graph.0.clone(),
++            ExampleAnimationWeights::default(),
++        ));
++        for &node_index in &CLIP_NODE_INDICES {
++            player.play(node_index.into()).repeat();
++        }
++
++        *done = true;
++    }
++}
++
++/// Read cursor position relative to clip nodes, allowing the user to change weights
++/// when dragging the node UI widgets.
++fn handle_weight_drag(
++    mut interaction_query: Query<(&Interaction, &RelativeCursorPosition, &ClipNode)>,
++    mut animation_weights_query: Query<&mut ExampleAnimationWeights>,
++) {
++    for (interaction, relative_cursor, clip_node) in &mut interaction_query {
++        if !matches!(*interaction, Interaction::Pressed) {
++            continue;
++        }
++
++        let Some(pos) = relative_cursor.normalized else {
++            continue;
++        };
++
++        for mut animation_weights in animation_weights_query.iter_mut() {
++            animation_weights.weights[clip_node.index] = pos.x.clamp(0., 1.);
++        }
++    }
++}
++
++// Updates the UI based on the weights that the user has chosen.
++fn update_ui(
++    mut text_query: Query<&mut Text>,
++    mut background_query: Query<&mut Style, Without<Text>>,
++    container_query: Query<(&Children, &ClipNode)>,
++    animation_weights_query: Query<&ExampleAnimationWeights, Changed<ExampleAnimationWeights>>,
++) {
++    for animation_weights in animation_weights_query.iter() {
++        for (children, clip_node) in &container_query {
++            // Draw the green background color to visually indicate the weight.
++            let mut bg_iter = background_query.iter_many_mut(children);
++            if let Some(mut style) = bg_iter.fetch_next() {
++                // All nodes are the same width, so `NODE_RECTS[0]` is as good as any other.
++                style.width =
++                    Val::Px(NODE_RECTS[0].width * animation_weights.weights[clip_node.index]);
++            }
++
++            // Update the node labels with the current weights.
++            let mut text_iter = text_query.iter_many_mut(children);
++            if let Some(mut text) = text_iter.fetch_next() {
++                text.sections[0].value = format!(
++                    "{}\n{:.2}",
++                    clip_node.text, animation_weights.weights[clip_node.index]
++                );
++            }
++        }
++    }
++}
++
++/// Takes the weights that were set in the UI and assigns them to the actual
++/// playing animation.
++fn sync_weights(mut query: Query<(&mut AnimationPlayer, &ExampleAnimationWeights)>) {
++    for (mut animation_player, animation_weights) in query.iter_mut() {
++        for (&animation_node_index, &animation_weight) in CLIP_NODE_INDICES
++            .iter()
++            .zip(animation_weights.weights.iter())
++        {
++            // If the animation happens to be no longer active, restart it.
++            if !animation_player.animation_is_playing(animation_node_index.into()) {
++                animation_player.play(animation_node_index.into());
++            }
++
++            // Set the weight.
++            if let Some(active_animation) =
++                animation_player.animation_mut(animation_node_index.into())
++            {
++                active_animation.set_weight(animation_weight);
++            }
++        }
++    }
++}
++
++/// An on-screen representation of a node.
++#[derive(Debug)]
++struct NodeRect {
++    /// The number of pixels that this rectangle is from the left edge of the
++    /// window.
++    left: f32,
++    /// The number of pixels that this rectangle is from the bottom edge of the
++    /// window.
++    bottom: f32,
++    /// The width of this rectangle in pixels.
++    width: f32,
++    /// The height of this rectangle in pixels.
++    height: f32,
++}
++
++/// Either a straight horizontal or a straight vertical line on screen.
++///
++/// The line starts at (`left`, `bottom`) and goes either right (if the line is
++/// horizontal) or down (if the line is vertical).
++struct Line {
++    /// The number of pixels that the start of this line is from the left edge
++    /// of the screen.
++    left: f32,
++    /// The number of pixels that the start of this line is from the bottom edge
++    /// of the screen.
++    bottom: f32,
++    /// The length of the line.
++    length: f32,
++}
++
++/// The type of each node in the UI: either a clip node or a blend node.
++enum NodeType {
++    /// A clip node, which specifies an animation.
++    Clip(ClipNode),
++    /// A blend node with no animation and a string label.
++    Blend(&'static str),
++}
++
++/// The label for the UI representation of a clip node.
++#[derive(Clone, Component)]
++struct ClipNode {
++    /// The string label of the node.
++    text: &'static str,
++    /// Which of the three animations this UI widget represents.
++    index: usize,
++}
++
++impl Default for ExampleAnimationWeights {
++    fn default() -> Self {
++        Self { weights: [1.0; 3] }
++    }
++}
++
++impl ClipNode {
++    /// Creates a new [`ClipNodeText`] from a label and the animation index.
++    const fn new(text: &'static str, index: usize) -> Self {
++        Self { text, index }
++    }
++}
++
++impl NodeRect {
++    /// Creates a new [`NodeRect`] from the lower-left corner and size.
++    ///
++    /// Note that node rectangles are anchored in the *lower*-left corner. The
++    /// `bottom` parameter specifies vertical distance from the *bottom* of the
++    /// window.
++    const fn new(left: f32, bottom: f32, width: f32, height: f32) -> NodeRect {
++        NodeRect {
++            left,
++            bottom,
++            width,
++            height,
++        }
++    }
++}
++
++impl Line {
++    /// Creates a new [`Line`], either horizontal or vertical.
++    ///
++    /// Note that the line's start point is anchored in the lower-*left* corner,
++    /// and that the `length` extends either to the right or downward.
++    const fn new(left: f32, bottom: f32, length: f32) -> Self {
++        Self {
++            left,
++            bottom,
++            length,
++        }
++    }
++}
+diff --git a/examples/animation/morph_targets.rs b/examples/animation/morph_targets.rs
+index a2bb67726..3a0d51075 100644
+--- a/examples/animation/morph_targets.rs
++++ b/examples/animation/morph_targets.rs
+@@ -56,18 +56,24 @@ fn setup(asset_server: Res<AssetServer>, mut commands: Commands) {
+ /// Plays an [`AnimationClip`] from the loaded [`Gltf`] on the [`AnimationPlayer`] created by the spawned scene.
+ fn setup_animations(
+     mut has_setup: Local<bool>,
+-    mut players: Query<(&Name, &mut AnimationPlayer)>,
++    mut commands: Commands,
++    mut players: Query<(Entity, &Name, &mut AnimationPlayer)>,
+     morph_data: Res<MorphData>,
++    mut graphs: ResMut<Assets<AnimationGraph>>,
+ ) {
+     if *has_setup {
+         return;
+     }
+-    for (name, mut player) in &mut players {
++    for (entity, name, mut player) in &mut players {
+         // The name of the entity in the GLTF scene containing the AnimationPlayer for our morph targets is "Main"
+         if name.as_str() != "Main" {
+             continue;
+         }
+-        player.play(morph_data.the_wave.clone()).repeat();
++
++        let (graph, animation) = AnimationGraph::from_clip(morph_data.the_wave.clone());
++        commands.entity(entity).insert(graphs.add(graph));
++
++        player.play(animation).repeat();
+         *has_setup = true;
+     }
+ }
+diff --git a/examples/stress_tests/many_foxes.rs b/examples/stress_tests/many_foxes.rs
+index 7c0c5a768..45f3cf202 100644
+--- a/examples/stress_tests/many_foxes.rs
++++ b/examples/stress_tests/many_foxes.rs
+@@ -9,7 +9,7 @@ use bevy::{
+     diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
+     pbr::CascadeShadowConfigBuilder,
+     prelude::*,
+-    window::{PresentMode, WindowPlugin, WindowResolution},
++    window::{PresentMode, WindowResolution},
+     winit::{UpdateMode, WinitSettings},
+ };
+ 
+@@ -78,7 +78,10 @@ fn main() {
+ }
+ 
+ #[derive(Resource)]
+-struct Animations(Vec<Handle<AnimationClip>>);
++struct Animations {
++    node_indices: Vec<AnimationNodeIndex>,
++    graph: Handle<AnimationGraph>,
++}
+ 
+ const RING_SPACING: f32 = 2.0;
+ const FOX_SPACING: f32 = 2.0;
+@@ -108,16 +111,25 @@ fn setup(
+     asset_server: Res<AssetServer>,
+     mut meshes: ResMut<Assets<Mesh>>,
+     mut materials: ResMut<Assets<StandardMaterial>>,
++    mut animation_graphs: ResMut<Assets<AnimationGraph>>,
+     foxes: Res<Foxes>,
+ ) {
+     warn!(include_str!("warning_string.txt"));
+ 
+     // Insert a resource with the current scene information
+-    commands.insert_resource(Animations(vec![
++    let animation_clips = [
+         asset_server.load("models/animated/Fox.glb#Animation2"),
+         asset_server.load("models/animated/Fox.glb#Animation1"),
+         asset_server.load("models/animated/Fox.glb#Animation0"),
+-    ]));
++    ];
++    let mut animation_graph = AnimationGraph::new();
++    let node_indices = animation_graph
++        .add_clips(animation_clips.iter().cloned(), 1.0, animation_graph.root)
++        .collect();
++    commands.insert_resource(Animations {
++        node_indices,
++        graph: animation_graphs.add(animation_graph),
++    });
+ 
+     // Foxes
+     // Concentric rings of foxes, running in opposite directions. The rings are spaced at 2m radius intervals.
+@@ -222,14 +234,20 @@ fn setup(
+ fn setup_scene_once_loaded(
+     animations: Res<Animations>,
+     foxes: Res<Foxes>,
++    mut commands: Commands,
+     mut player: Query<(Entity, &mut AnimationPlayer)>,
+     mut done: Local<bool>,
+ ) {
+     if !*done && player.iter().len() == foxes.count {
+         for (entity, mut player) in &mut player {
+-            player.play(animations.0[0].clone_weak()).repeat();
++            commands
++                .entity(entity)
++                .insert(animations.graph.clone())
++                .insert(AnimationTransitions::new());
++
++            let playing_animation = player.play(animations.node_indices[0]).repeat();
+             if !foxes.sync {
+-                player.seek_to(entity.index() as f32 / 10.0);
++                playing_animation.seek_to(entity.index() as f32 / 10.0);
+             }
+         }
+         *done = true;
+@@ -254,7 +272,7 @@ fn update_fox_rings(
+ 
+ fn keyboard_animation_control(
+     keyboard_input: Res<ButtonInput<KeyCode>>,
+-    mut animation_player: Query<&mut AnimationPlayer>,
++    mut animation_player: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
+     animations: Res<Animations>,
+     mut current_animation: Local<usize>,
+     mut foxes: ResMut<Foxes>,
+@@ -272,42 +290,39 @@ fn keyboard_animation_control(
+     }
+ 
+     if keyboard_input.just_pressed(KeyCode::Enter) {
+-        *current_animation = (*current_animation + 1) % animations.0.len();
++        *current_animation = (*current_animation + 1) % animations.node_indices.len();
+     }
+ 
+-    for mut player in &mut animation_player {
++    for (mut player, mut transitions) in &mut animation_player {
+         if keyboard_input.just_pressed(KeyCode::Space) {
+-            if player.is_paused() {
+-                player.resume();
++            if player.all_paused() {
++                player.resume_all();
+             } else {
+-                player.pause();
++                player.pause_all();
+             }
+         }
+ 
+         if keyboard_input.just_pressed(KeyCode::ArrowUp) {
+-            let speed = player.speed();
+-            player.set_speed(speed * 1.25);
++            player.adjust_speeds(1.25);
+         }
+ 
+         if keyboard_input.just_pressed(KeyCode::ArrowDown) {
+-            let speed = player.speed();
+-            player.set_speed(speed * 0.8);
++            player.adjust_speeds(0.8);
+         }
+ 
+         if keyboard_input.just_pressed(KeyCode::ArrowLeft) {
+-            let elapsed = player.seek_time();
+-            player.seek_to(elapsed - 0.1);
++            player.seek_all_by(-0.1);
+         }
+ 
+         if keyboard_input.just_pressed(KeyCode::ArrowRight) {
+-            let elapsed = player.seek_time();
+-            player.seek_to(elapsed + 0.1);
++            player.seek_all_by(0.1);
+         }
+ 
+         if keyboard_input.just_pressed(KeyCode::Enter) {
+-            player
+-                .play_with_transition(
+-                    animations.0[*current_animation].clone_weak(),
++            transitions
++                .play(
++                    &mut player,
++                    animations.node_indices[*current_animation],
+                     Duration::from_millis(250),
+                 )
+                 .repeat();
+diff --git a/examples/tools/scene_viewer/animation_plugin.rs b/examples/tools/scene_viewer/animation_plugin.rs
+index 43f85b023..368df7c60 100644
+--- a/examples/tools/scene_viewer/animation_plugin.rs
++++ b/examples/tools/scene_viewer/animation_plugin.rs
+@@ -8,21 +8,24 @@ use crate::scene_viewer_plugin::SceneHandle;
+ /// Controls animation clips for a unique entity.
+ #[derive(Component)]
+ struct Clips {
+-    clips: Vec<Handle<AnimationClip>>,
++    nodes: Vec<AnimationNodeIndex>,
+     current: usize,
+ }
+ impl Clips {
+-    fn new(clips: Vec<Handle<AnimationClip>>) -> Self {
+-        Clips { clips, current: 0 }
++    fn new(clips: Vec<AnimationNodeIndex>) -> Self {
++        Clips {
++            nodes: clips,
++            current: 0,
++        }
+     }
+     /// # Panics
+     ///
+     /// When no clips are present.
+-    fn current(&self) -> Handle<AnimationClip> {
+-        self.clips[self.current].clone_weak()
++    fn current(&self) -> AnimationNodeIndex {
++        self.nodes[self.current]
+     }
+     fn advance_to_next(&mut self) {
+-        self.current = (self.current + 1) % self.clips.len();
++        self.current = (self.current + 1) % self.nodes.len();
+     }
+ }
+ 
+@@ -38,6 +41,7 @@ fn assign_clips(
+     clips: Res<Assets<AnimationClip>>,
+     gltf_assets: Res<Assets<Gltf>>,
+     assets: Res<AssetServer>,
++    mut graphs: ResMut<Assets<AnimationGraph>>,
+     mut commands: Commands,
+     mut setup: Local<bool>,
+ ) {
+@@ -69,7 +73,8 @@ fn assign_clips(
+     // is considered to belong to an animation player if all targets of the clip
+     // refer to entities whose nearest ancestor player is that animation player.
+ 
+-    let mut player_to_clips: EntityHashMap<Vec<_>> = EntityHashMap::default();
++    let mut player_to_graph: EntityHashMap<(AnimationGraph, Vec<AnimationNodeIndex>)> =
++        EntityHashMap::default();
+ 
+     for (clip_id, clip) in clips.iter() {
+         let mut ancestor_player = None;
+@@ -120,23 +125,27 @@ fn assign_clips(
+             continue;
+         };
+ 
+-        player_to_clips
+-            .entry(ancestor_player)
+-            .or_default()
+-            .push(clip_handle);
++        let &mut (ref mut graph, ref mut clip_indices) =
++            player_to_graph.entry(ancestor_player).or_default();
++        let node_index = graph.add_clip(clip_handle, 1.0, graph.root);
++        clip_indices.push(node_index);
+     }
+ 
+     // Now that we've built up a list of all clips that belong to each player,
+     // package them up into a `Clips` component, play the first such animation,
+     // and add that component to the player.
+-    for (player_entity, clips) in player_to_clips {
++    for (player_entity, (graph, clips)) in player_to_graph {
+         let Ok(mut player) = players.get_mut(player_entity) else {
+             warn!("Animation targets referenced a nonexistent player. This shouldn't happen.");
+             continue;
+         };
++        let graph = graphs.add(graph);
+         let animations = Clips::new(clips);
+         player.play(animations.current()).repeat();
+-        commands.entity(player_entity).insert(animations);
++        commands
++            .entity(player_entity)
++            .insert(animations)
++            .insert(graph);
+     }
+ }
+ 
+@@ -150,30 +159,30 @@ fn handle_inputs(
+             None => format!("entity {entity:?}"),
+         };
+         if keyboard_input.just_pressed(KeyCode::Space) {
+-            if player.is_paused() {
+-                info!("resuming animation for {display_entity_name}");
+-                player.resume();
++            if player.all_paused() {
++                info!("resuming animations for {display_entity_name}");
++                player.resume_all();
+             } else {
+                 info!("pausing animation for {display_entity_name}");
+-                player.pause();
++                player.pause_all();
+             }
+         }
+-        if clips.clips.len() <= 1 {
++        if clips.nodes.len() <= 1 {
+             continue;
+         }
+ 
+         if keyboard_input.just_pressed(KeyCode::Enter) {
+             info!("switching to new animation for {display_entity_name}");
+ 
+-            let resume = !player.is_paused();
++            let resume = !player.all_paused();
+             // set the current animation to its start and pause it to reset to its starting state
+-            player.seek_to(0.0).pause();
++            player.rewind_all().pause_all();
+ 
+             clips.advance_to_next();
+             let current_clip = clips.current();
+             player.play(current_clip).repeat();
+             if resume {
+-                player.resume();
++                player.resume_all();
+             }
+         }
+     }

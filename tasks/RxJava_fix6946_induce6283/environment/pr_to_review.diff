@@ -1,0 +1,163 @@
+commit 3281b027c7e46c1f0ab9ec7719b5029285920e37
+Author: David Karnok <akarnokd@gmail.com>
+Date:   Mon Nov 5 11:34:14 2018 +0100
+
+    2.x: Fix Observable.flatMap to sustain concurrency level (#6283)
+
+diff --git a/src/main/java/io/reactivex/internal/operators/observable/ObservableFlatMap.java b/src/main/java/io/reactivex/internal/operators/observable/ObservableFlatMap.java
+index 551ceba28..a4766f389 100644
+--- a/src/main/java/io/reactivex/internal/operators/observable/ObservableFlatMap.java
++++ b/src/main/java/io/reactivex/internal/operators/observable/ObservableFlatMap.java
+@@ -376,7 +376,7 @@ public final class ObservableFlatMap<T, U> extends AbstractObservableWithUpstrea
+                     return;
+                 }
+ 
+-                boolean innerCompleted = false;
++                int innerCompleted = 0;
+                 if (n != 0) {
+                     long startId = lastId;
+                     int index = lastIndex;
+@@ -423,7 +423,7 @@ public final class ObservableFlatMap<T, U> extends AbstractObservableWithUpstrea
+                                         return;
+                                     }
+                                     removeInner(is);
+-                                    innerCompleted = true;
++                                    innerCompleted++;
+                                     j++;
+                                     if (j == n) {
+                                         j = 0;
+@@ -449,7 +449,7 @@ public final class ObservableFlatMap<T, U> extends AbstractObservableWithUpstrea
+                             if (checkTerminate()) {
+                                 return;
+                             }
+-                            innerCompleted = true;
++                            innerCompleted++;
+                         }
+ 
+                         j++;
+@@ -461,17 +461,19 @@ public final class ObservableFlatMap<T, U> extends AbstractObservableWithUpstrea
+                     lastId = inner[j].id;
+                 }
+ 
+-                if (innerCompleted) {
++                if (innerCompleted != 0) {
+                     if (maxConcurrency != Integer.MAX_VALUE) {
+-                        ObservableSource<? extends U> p;
+-                        synchronized (this) {
+-                            p = sources.poll();
+-                            if (p == null) {
+-                                wip--;
+-                                continue;
++                        while (innerCompleted-- != 0) {
++                            ObservableSource<? extends U> p;
++                            synchronized (this) {
++                                p = sources.poll();
++                                if (p == null) {
++                                    wip--;
++                                    continue;
++                                }
+                             }
++                            subscribeInner(p);
+                         }
+-                        subscribeInner(p);
+                     }
+                     continue;
+                 }
+diff --git a/src/test/java/io/reactivex/internal/operators/flowable/FlowableFlatMapTest.java b/src/test/java/io/reactivex/internal/operators/flowable/FlowableFlatMapTest.java
+index bb525b2dd..4c1441775 100644
+--- a/src/test/java/io/reactivex/internal/operators/flowable/FlowableFlatMapTest.java
++++ b/src/test/java/io/reactivex/internal/operators/flowable/FlowableFlatMapTest.java
+@@ -1084,4 +1084,44 @@ public class FlowableFlatMapTest {
+ 
+         assertEquals(1, counter.get());
+     }
++
++    @Test
++    public void maxConcurrencySustained() {
++        final PublishProcessor<Integer> pp1 = PublishProcessor.create();
++        final PublishProcessor<Integer> pp2 = PublishProcessor.create();
++        PublishProcessor<Integer> pp3 = PublishProcessor.create();
++        PublishProcessor<Integer> pp4 = PublishProcessor.create();
++
++        TestSubscriber<Integer> ts = Flowable.just(pp1, pp2, pp3, pp4)
++        .flatMap(new Function<PublishProcessor<Integer>, Flowable<Integer>>() {
++            @Override
++            public Flowable<Integer> apply(PublishProcessor<Integer> v) throws Exception {
++                return v;
++            }
++        }, 2)
++        .doOnNext(new Consumer<Integer>() {
++            @Override
++            public void accept(Integer v) throws Exception {
++                if (v == 1) {
++                    // this will make sure the drain loop detects two completed
++                    // inner sources and replaces them with fresh ones
++                    pp1.onComplete();
++                    pp2.onComplete();
++                }
++            }
++        })
++        .test();
++
++        pp1.onNext(1);
++
++        assertFalse(pp1.hasSubscribers());
++        assertFalse(pp2.hasSubscribers());
++        assertTrue(pp3.hasSubscribers());
++        assertTrue(pp4.hasSubscribers());
++
++        ts.dispose();
++
++        assertFalse(pp3.hasSubscribers());
++        assertFalse(pp4.hasSubscribers());
++    }
+ }
+diff --git a/src/test/java/io/reactivex/internal/operators/observable/ObservableFlatMapTest.java b/src/test/java/io/reactivex/internal/operators/observable/ObservableFlatMapTest.java
+index efee97f33..960722060 100644
+--- a/src/test/java/io/reactivex/internal/operators/observable/ObservableFlatMapTest.java
++++ b/src/test/java/io/reactivex/internal/operators/observable/ObservableFlatMapTest.java
+@@ -1045,4 +1045,44 @@ public class ObservableFlatMapTest {
+ 
+         to.assertValuesOnly(10, 11, 12, 13, 14, 20, 21, 22, 23, 24);
+     }
++
++    @Test
++    public void maxConcurrencySustained() {
++        final PublishSubject<Integer> ps1 = PublishSubject.create();
++        final PublishSubject<Integer> ps2 = PublishSubject.create();
++        PublishSubject<Integer> ps3 = PublishSubject.create();
++        PublishSubject<Integer> ps4 = PublishSubject.create();
++
++        TestObserver<Integer> to = Observable.just(ps1, ps2, ps3, ps4)
++        .flatMap(new Function<PublishSubject<Integer>, ObservableSource<Integer>>() {
++            @Override
++            public ObservableSource<Integer> apply(PublishSubject<Integer> v) throws Exception {
++                return v;
++            }
++        }, 2)
++        .doOnNext(new Consumer<Integer>() {
++            @Override
++            public void accept(Integer v) throws Exception {
++                if (v == 1) {
++                    // this will make sure the drain loop detects two completed
++                    // inner sources and replaces them with fresh ones
++                    ps1.onComplete();
++                    ps2.onComplete();
++                }
++            }
++        })
++        .test();
++
++        ps1.onNext(1);
++
++        assertFalse(ps1.hasObservers());
++        assertFalse(ps2.hasObservers());
++        assertTrue(ps3.hasObservers());
++        assertTrue(ps4.hasObservers());
++
++        to.dispose();
++
++        assertFalse(ps3.hasObservers());
++        assertFalse(ps4.hasObservers());
++    }
+ }

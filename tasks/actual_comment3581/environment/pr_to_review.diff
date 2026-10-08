@@ -1,0 +1,722 @@
+diff --git a/packages/loot-core/src/client/actions/account.ts b/packages/loot-core/src/client/actions/account.ts
+index e10263f6cb0..7c9580f6b70 100644
+--- a/packages/loot-core/src/client/actions/account.ts
++++ b/packages/loot-core/src/client/actions/account.ts
+@@ -97,6 +97,52 @@ export function linkAccountSimpleFin(
+   };
+ }
+ 
++function handleSyncResponse(accountId, res, dispatch) {
++  const { errors, newTransactions, matchedTransactions, updatedAccounts } = res;
++
++  // Mark the account as failed or succeeded (depending on sync output)
++  const [error] = errors;
++  if (error) {
++    // We only want to mark the account as having problem if it
++    // was a real syncing error.
++    if (error.type === 'SyncError') {
++      dispatch(markAccountFailed(accountId, error.category, error.code));
++    }
++  } else {
++    dispatch(markAccountSuccess(accountId));
++  }
++
++  // Dispatch errors (if any)
++  errors.forEach(error => {
++    if (error.type === 'SyncError') {
++      dispatch(
++        addNotification({
++          type: 'error',
++          message: error.message,
++        }),
++      );
++    } else {
++      dispatch(
++        addNotification({
++          type: 'error',
++          message: error.message,
++          internal: error.internal,
++        }),
++      );
++    }
++  });
++
++  // Set new transactions
++  dispatch({
++    type: constants.SET_NEW_TRANSACTIONS,
++    newTransactions,
++    matchedTransactions,
++    updatedAccounts,
++  });
++
++  return newTransactions.length > 0 || matchedTransactions.length > 0;
++}
++
+ export function syncAccounts(id?: string) {
+   return async (dispatch: Dispatch, getState: GetState) => {
+     // Disallow two parallel sync operations
+@@ -104,9 +150,11 @@ export function syncAccounts(id?: string) {
+       return false;
+     }
+ 
++    const batchSync = !id;
++
+     // Build an array of IDs for accounts to sync.. if no `id` provided
+     // then we assume that all accounts should be synced
+-    const accountIdsToSync = id
++    let accountIdsToSync = !batchSync
+       ? [id]
+       : getState()
+           .queries.accounts.filter(
+@@ -121,64 +169,50 @@ export function syncAccounts(id?: string) {
+ 
+     dispatch(setAccountsSyncing(accountIdsToSync));
+ 
++    const accountsData = await send('accounts-get');
++    const simpleFinAccounts = accountsData.filter(
++      a => a.account_sync_source === 'simpleFin',
++    );
++
+     let isSyncSuccess = false;
+ 
++    if (batchSync && simpleFinAccounts.length) {
++      console.log('Using SimpleFin batch sync');
++
++      const res = await send('simplefin-batch-sync', {
++        ids: simpleFinAccounts.map(a => a.id),
++      });
++
++      let isSyncSuccess = false;
++      for (const account of res) {
++        const success = handleSyncResponse(
++          account.accountId,
++          account.res,
++          dispatch,
++        );
++        if (success) isSyncSuccess = true;
++      }
++
++      accountIdsToSync = accountIdsToSync.filter(
++        id => !simpleFinAccounts.find(sfa => sfa.id === id),
++      );
++    }
++
+     // Loop through the accounts and perform sync operation.. one by one
+     for (let idx = 0; idx < accountIdsToSync.length; idx++) {
+       const accountId = accountIdsToSync[idx];
+ 
+       // Perform sync operation
+-      const { errors, newTransactions, matchedTransactions, updatedAccounts } =
+-        await send('accounts-bank-sync', {
+-          id: accountId,
+-        });
+-
+-      // Mark the account as failed or succeeded (depending on sync output)
+-      const [error] = errors;
+-      if (error) {
+-        // We only want to mark the account as having problem if it
+-        // was a real syncing error.
+-        if (error.type === 'SyncError') {
+-          dispatch(markAccountFailed(accountId, error.category, error.code));
+-        }
+-      } else {
+-        dispatch(markAccountSuccess(accountId));
+-      }
+-
+-      // Dispatch errors (if any)
+-      errors.forEach(error => {
+-        if (error.type === 'SyncError') {
+-          dispatch(
+-            addNotification({
+-              type: 'error',
+-              message: error.message,
+-            }),
+-          );
+-        } else {
+-          dispatch(
+-            addNotification({
+-              type: 'error',
+-              message: error.message,
+-              internal: error.internal,
+-            }),
+-          );
+-        }
++      const res = await send('accounts-bank-sync', {
++        id: accountId,
+       });
+ 
+-      // Set new transactions
+-      dispatch({
+-        type: constants.SET_NEW_TRANSACTIONS,
+-        newTransactions,
+-        matchedTransactions,
+-        updatedAccounts,
+-      });
++      const success = handleSyncResponse(accountId, res, dispatch);
++
++      if (success) isSyncSuccess = true;
+ 
+       // Dispatch the ids for the accounts that are yet to be synced
+       dispatch(setAccountsSyncing(accountIdsToSync.slice(idx + 1)));
+-
+-      if (newTransactions.length > 0 || matchedTransactions.length > 0) {
+-        isSyncSuccess = true;
+-      }
+     }
+ 
+     // Rest the sync state back to empty (fallback in case something breaks
+diff --git a/packages/loot-core/src/server/accounts/sync.ts b/packages/loot-core/src/server/accounts/sync.ts
+index 9209026d262..47558e0b7a9 100644
+--- a/packages/loot-core/src/server/accounts/sync.ts
++++ b/packages/loot-core/src/server/accounts/sync.ts
+@@ -23,6 +23,8 @@ import { getStartingBalancePayee } from './payees';
+ import { title } from './title';
+ import { runRules } from './transaction-rules';
+ import { batchUpdateTransactions } from './transactions';
++import { SimpleFinAccount } from 'loot-core/types/models';
++import { RevByMonthOfYearRule } from '@rschedule/core/rules/ByMonthOfYear';
+ 
+ function BankSyncError(type: string, code: string) {
+   return { type: 'BankSyncError', category: type, code };
+@@ -61,6 +63,37 @@ async function updateAccountBalance(id, balance) {
+   ]);
+ }
+ 
++async function getAccountSyncStartDate(id) {
++  // TODO: Handle the case where transactions exist in the future
++  // (that will make start date after end date)
++  const latestTransaction = await db.first(
++    'SELECT * FROM v_transactions WHERE account = ? ORDER BY date DESC LIMIT 1',
++    [id],
++  );
++
++  if (!latestTransaction) return null;
++
++  const startingTransaction = await db.first(
++    'SELECT date FROM v_transactions WHERE account = ? ORDER BY date ASC LIMIT 1',
++    [id],
++  );
++  const startingDate = db.fromDateRepr(startingTransaction.date);
++  // assert(startingTransaction)
++
++  const startDate = monthUtils.dayFromDate(
++    dateFns.max([
++      // Many GoCardless integrations do not support getting more than 90 days
++      // worth of data, so make that the earliest possible limit.
++      monthUtils.parseDate(monthUtils.subDays(monthUtils.currentDay(), 90)),
++
++      // Never download transactions before the starting date.
++      monthUtils.parseDate(startingDate),
++    ]),
++  );
++
++  return startDate;
++}
++
+ export async function getGoCardlessAccounts(userId, userKey, id) {
+   const userToken = await asyncStorage.getItem('user-token');
+   if (!userToken) return;
+@@ -145,6 +178,8 @@ async function downloadSimpleFinTransactions(acctId, since) {
+   const userToken = await asyncStorage.getItem('user-token');
+   if (!userToken) return;
+ 
++  const batchSync = Array.isArray(acctId);
++
+   console.log('Pulling transactions from SimpleFin');
+ 
+   const res = await post(
+@@ -163,19 +198,34 @@ async function downloadSimpleFinTransactions(acctId, since) {
+     throw BankSyncError(res.error_type, res.error_code);
+   }
+ 
+-  const {
+-    transactions: { all },
+-    balances,
+-    startingBalance,
+-  } = res;
++  let accounts = res;
++  if (!batchSync) {
++    accounts = {
++      placeholder: res,
++    };
++  }
+ 
+-  console.log('Response:', res);
++  let retVal = {};
++  for (const [accountId, data] of Object.entries(accounts) as [string, any][]) {
++    const {
++      transactions: { all },
++      balances,
++      startingBalance,
++    } = data;
+ 
+-  return {
+-    transactions: all,
+-    accountBalance: balances,
+-    startingBalance,
+-  };
++    retVal[accountId] = {
++      transactions: all,
++      accountBalance: balances,
++      startingBalance,
++    };
++  }
++
++  if (retVal['placeholder']) {
++    retVal = retVal['placeholder'];
++  }
++
++  console.log('Response:', retVal);
++  return retVal;
+ }
+ 
+ async function resolvePayee(trans, payeeName, payeesToCreate) {
+@@ -643,6 +693,89 @@ export async function addTransactions(
+   return newTransactions;
+ }
+ 
++async function processBankSyncDownload(
++  download,
++  id,
++  acctRow,
++  initialSync = false,
++) {
++  // If syncing an account from sync source it must not use strictIdChecking. This allows
++  // the fuzzy search to match transactions where the import IDs are different. It is a known quirk
++  // that account sync sources can give two different transaction IDs even though it's the same transaction.
++  const useStrictIdChecking = !acctRow.account_sync_source;
++
++  if (initialSync) {
++    const { transactions } = download;
++    let balanceToUse = download.startingBalance;
++
++    if (acctRow.account_sync_source === 'simpleFin') {
++      const currentBalance = download.startingBalance;
++      const previousBalance = transactions.reduce((total, trans) => {
++        return (
++          total - parseInt(trans.transactionAmount.amount.replace('.', ''))
++        );
++      }, currentBalance);
++      balanceToUse = previousBalance;
++    }
++
++    const oldestTransaction = transactions[transactions.length - 1];
++
++    const oldestDate =
++      transactions.length > 0
++        ? oldestTransaction.date
++        : monthUtils.currentDay();
++
++    const payee = await getStartingBalancePayee();
++
++    return runMutator(async () => {
++      const initialId = await db.insertTransaction({
++        account: id,
++        amount: balanceToUse,
++        category: acctRow.offbudget === 0 ? payee.category : null,
++        payee: payee.id,
++        date: oldestDate,
++        cleared: true,
++        starting_balance_flag: true,
++      });
++
++      const result = await reconcileTransactions(
++        id,
++        transactions,
++        true,
++        useStrictIdChecking,
++      );
++      return {
++        ...result,
++        added: [initialId, ...result.added],
++      };
++    });
++  }
++
++  const { transactions: originalTransactions, accountBalance } = download;
++
++  if (originalTransactions.length === 0) {
++    return { added: [], updated: [] };
++  }
++
++  const transactions = originalTransactions.map(trans => ({
++    ...trans,
++    account: id,
++  }));
++
++  return runMutator(async () => {
++    const result = await reconcileTransactions(
++      id,
++      transactions,
++      true,
++      useStrictIdChecking,
++    );
++
++    if (accountBalance) await updateAccountBalance(id, accountBalance);
++
++    return result;
++  });
++}
++
+ export async function syncAccount(
+   userId: string,
+   userKey: string,
+@@ -650,38 +783,10 @@ export async function syncAccount(
+   acctId: string,
+   bankId: string,
+ ) {
+-  // TODO: Handle the case where transactions exist in the future
+-  // (that will make start date after end date)
+-  const latestTransaction = await db.first(
+-    'SELECT * FROM v_transactions WHERE account = ? ORDER BY date DESC LIMIT 1',
+-    [id],
+-  );
+-
+   const acctRow = await db.select('accounts', id);
+-  // If syncing an account from sync source it must not use strictIdChecking. This allows
+-  // the fuzzy search to match transactions where the import IDs are different. It is a known quirk
+-  // that account sync sources can give two different transaction IDs even though it's the same transaction.
+-  const useStrictIdChecking = !acctRow.account_sync_source;
+-
+-  if (latestTransaction) {
+-    const startingTransaction = await db.first(
+-      'SELECT date FROM v_transactions WHERE account = ? ORDER BY date ASC LIMIT 1',
+-      [id],
+-    );
+-    const startingDate = db.fromDateRepr(startingTransaction.date);
+-    // assert(startingTransaction)
+-
+-    const startDate = monthUtils.dayFromDate(
+-      dateFns.max([
+-        // Many GoCardless integrations do not support getting more than 90 days
+-        // worth of data, so make that the earliest possible limit.
+-        monthUtils.parseDate(monthUtils.subDays(monthUtils.currentDay(), 90)),
+-
+-        // Never download transactions before the starting date.
+-        monthUtils.parseDate(startingDate),
+-      ]),
+-    );
++  const startDate = await getAccountSyncStartDate(id);
+ 
++  if (startDate !== null) {
+     let download;
+ 
+     if (acctRow.account_sync_source === 'simpleFin') {
+@@ -701,29 +806,7 @@ export async function syncAccount(
+       );
+     }
+ 
+-    const { transactions: originalTransactions, accountBalance } = download;
+-
+-    if (originalTransactions.length === 0) {
+-      return { added: [], updated: [] };
+-    }
+-
+-    const transactions = originalTransactions.map(trans => ({
+-      ...trans,
+-      account: id,
+-    }));
+-
+-    return runMutator(async () => {
+-      const result = await reconcileTransactions(
+-        id,
+-        transactions,
+-        true,
+-        useStrictIdChecking,
+-      );
+-
+-      if (accountBalance) await updateAccountBalance(id, accountBalance);
+-
+-      return result;
+-    });
++    return processBankSyncDownload(download, id, acctRow);
+   } else {
+     let download;
+ 
+@@ -743,49 +826,46 @@ export async function syncAccount(
+       );
+     }
+ 
+-    const { transactions } = download;
+-    let balanceToUse = download.startingBalance;
++    return processBankSyncDownload(download, id, acctRow, true);
++  }
++}
+ 
+-    if (acctRow.account_sync_source === 'simpleFin') {
+-      const currentBalance = download.startingBalance;
+-      const previousBalance = transactions.reduce((total, trans) => {
+-        return (
+-          total - parseInt(trans.transactionAmount.amount.replace('.', ''))
+-        );
+-      }, currentBalance);
+-      balanceToUse = previousBalance;
+-    }
++export async function SimpleFinBatchSync(
++  userId: string,
++  userKey: string,
++  accounts: { id: string; accountId: string }[],
++) {
++  const startDates = await Promise.all(
++    accounts.map(async a => getAccountSyncStartDate(a.id)),
++  );
+ 
+-    const oldestTransaction = transactions[transactions.length - 1];
++  const res = await downloadSimpleFinTransactions(
++    accounts.map(a => a.accountId),
++    startDates,
++  );
+ 
+-    const oldestDate =
+-      transactions.length > 0
+-        ? oldestTransaction.date
+-        : monthUtils.currentDay();
++  let promises = [];
++  for (let i = 0; i < startDates.length; i++) {
++    const startDate = startDates[i];
++    const account = accounts[i];
++    const download = res[account.accountId];
+ 
+-    const payee = await getStartingBalancePayee();
++    const acctRow = await db.select('accounts', account.id);
+ 
+-    return runMutator(async () => {
+-      const initialId = await db.insertTransaction({
+-        account: id,
+-        amount: balanceToUse,
+-        category: acctRow.offbudget === 0 ? payee.category : null,
+-        payee: payee.id,
+-        date: oldestDate,
+-        cleared: true,
+-        starting_balance_flag: true,
+-      });
++    let promise;
++    if (startDate !== null) {
++      promise = processBankSyncDownload(download, account.id, acctRow);
++    } else {
++      promise = processBankSyncDownload(download, account.id, acctRow, true);
++    }
+ 
+-      const result = await reconcileTransactions(
+-        id,
+-        transactions,
+-        true,
+-        useStrictIdChecking,
+-      );
+-      return {
+-        ...result,
+-        added: [initialId, ...result.added],
+-      };
+-    });
++    promises.push(
++      promise.then(res => ({
++        accountId: account.id,
++        res,
++      })),
++    );
+   }
++
++  return await Promise.all(promises);
+ }
+diff --git a/packages/loot-core/src/server/main.ts b/packages/loot-core/src/server/main.ts
+index c510854948f..c2dc77eac6e 100644
+--- a/packages/loot-core/src/server/main.ts
++++ b/packages/loot-core/src/server/main.ts
+@@ -76,6 +76,8 @@ import { app as toolsApp } from './tools/app';
+ import { withUndo, clearUndo, undo, redo } from './undo';
+ import { updateVersion } from './update';
+ import { uniqueFileName, idFromFileName } from './util/budget-name';
++import { AccountTransactions } from '../../../desktop-client/src/components/mobile/accounts/AccountTransactions';
++import { closeAndDownloadBudget } from 'loot-core/client/actions';
+ 
+ const DEMO_BUDGET_ID = '_demo-budget';
+ const TEST_BUDGET_ID = '_test-budget';
+@@ -1056,6 +1058,51 @@ handlers['gocardless-create-web-token'] = async function ({
+   }
+ };
+ 
++function handleSyncResponse(
++  res,
++  acct,
++  newTransactions,
++  matchedTransactions,
++  updatedAccounts,
++) {
++  const { added, updated } = res;
++
++  newTransactions = newTransactions.concat(added);
++  matchedTransactions = matchedTransactions.concat(updated);
++
++  if (added.length > 0 || updated.length > 0) {
++    updatedAccounts = updatedAccounts.concat(acct.id);
++  }
++}
++
++function handleSyncError(err, acct) {
++  if (err.type === 'BankSyncError') {
++    return {
++      type: 'SyncError',
++      accountId: acct.id,
++      message: 'Failed syncing account “' + acct.name + '.”',
++      category: err.category,
++      code: err.code,
++    };
++  }
++
++  if (err instanceof PostError && err.reason !== 'internal') {
++    return {
++      accountId: acct.id,
++      message: err.reason
++        ? err.reason
++        : `Account “${acct.name}” is not linked properly. Please link it again.`,
++    };
++  }
++
++  return {
++    accountId: acct.id,
++    message:
++      'There was an internal error. Please get in touch https://actualbudget.org/contact for support.',
++    internal: err.stack,
++  };
++}
++
+ handlers['accounts-bank-sync'] = async function ({ id }) {
+   const [[, userId], [, userKey]] = await asyncStorage.multiGet([
+     'user-id',
+@@ -1088,39 +1135,15 @@ handlers['accounts-bank-sync'] = async function ({ id }) {
+           acct.bankId,
+         );
+ 
+-        const { added, updated } = res;
+-
+-        newTransactions = newTransactions.concat(added);
+-        matchedTransactions = matchedTransactions.concat(updated);
+-
+-        if (added.length > 0 || updated.length > 0) {
+-          updatedAccounts = updatedAccounts.concat(acct.id);
+-        }
++        handleSyncResponse(
++          res,
++          acct,
++          newTransactions,
++          matchedTransactions,
++          updatedAccounts,
++        );
+       } catch (err) {
+-        if (err.type === 'BankSyncError') {
+-          errors.push({
+-            type: 'SyncError',
+-            accountId: acct.id,
+-            message: 'Failed syncing account “' + acct.name + '.”',
+-            category: err.category,
+-            code: err.code,
+-          });
+-        } else if (err instanceof PostError && err.reason !== 'internal') {
+-          errors.push({
+-            accountId: acct.id,
+-            message: err.reason
+-              ? err.reason
+-              : `Account “${acct.name}” is not linked properly. Please link it again.`,
+-          });
+-        } else {
+-          errors.push({
+-            accountId: acct.id,
+-            message:
+-              'There was an internal error. Please get in touch https://actualbudget.org/contact for support.',
+-            internal: err.stack,
+-          });
+-        }
+-
++        errors.push(handleSyncError(err, acct));
+         err.message = 'Failed syncing account “' + acct.name + '.”';
+         captureException(err);
+       } finally {
+@@ -1139,6 +1162,67 @@ handlers['accounts-bank-sync'] = async function ({ id }) {
+   return { errors, newTransactions, matchedTransactions, updatedAccounts };
+ };
+ 
++handlers['simplefin-batch-sync'] = async function ({ ids }) {
++  const [[, userId], [, userKey]] = await asyncStorage.multiGet([
++    'user-id',
++    'user-key',
++  ]);
++
++  const accounts = await db.runQuery(
++    `SELECT a.*, b.bank_id as bankId FROM accounts a
++         LEFT JOIN banks b ON a.bank = b.id
++         WHERE a.tombstone = 0 AND a.closed = 0 ${ids.length ? `AND a.id IN (${ids.map(() => '?').join(', ')})` : ''}
++         ORDER BY a.offbudget, a.sort_order`,
++    ids.length ? ids : [],
++    true,
++  );
++
++  let res;
++  try {
++    console.group('Bank Sync operation for all accounts');
++    res = await bankSync.SimpleFinBatchSync(
++      userId,
++      userKey,
++      accounts.map(a => ({
++        id: a.id,
++        accountId: a.account_id,
++      })),
++    );
++  } catch (e) {
++    console.error(e);
++  }
++
++  let retVal = [];
++  for (const account of res) {
++    const errors = [];
++    let newTransactions = [];
++    let matchedTransactions = [];
++    let updatedAccounts = [];
++
++    handleSyncResponse(
++      account.res,
++      accounts.find(a => a.id === account.accountId),
++      newTransactions,
++      matchedTransactions,
++      updatedAccounts,
++    );
++
++    retVal.push({
++      accountId: account.accountId,
++      res: { errors, newTransactions, matchedTransactions, updatedAccounts },
++    });
++  }
++
++  if (!retVal.some(a => a.res.updatedAccounts.length < 1)) {
++    connection.send('sync-event', {
++      type: 'success',
++      tables: ['transactions'],
++    });
++  }
++
++  return retVal;
++};
++
+ handlers['transactions-import'] = mutator(function ({
+   accountId,
+   transactions,
+diff --git a/packages/loot-core/src/types/server-handlers.d.ts b/packages/loot-core/src/types/server-handlers.d.ts
+index 3536dada439..338b5e2f3f1 100644
+--- a/packages/loot-core/src/types/server-handlers.d.ts
++++ b/packages/loot-core/src/types/server-handlers.d.ts
+@@ -193,6 +193,16 @@ export interface ServerHandlers {
+ 
+   'simplefin-accounts': () => Promise<{ accounts: SimpleFinAccount[] }>;
+ 
++  'simplefin-batch-sync': ({ ids }: { ids: string[] }) => Promise<
++    {
++      accountId: string;
++      errors;
++      newTransactions;
++      matchedTransactions;
++      updatedAccounts;
++    }[]
++  >;
++
+   'gocardless-get-banks': (country: string) => Promise<{
+     data: GoCardlessInstitution[];
+     error?: { reason: string };

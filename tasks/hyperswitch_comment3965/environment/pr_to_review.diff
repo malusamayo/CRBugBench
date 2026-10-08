@@ -1,0 +1,1299 @@
+diff --git a/crates/api_models/src/payments.rs b/crates/api_models/src/payments.rs
+index ba0d963b8c1..d021dccedde 100644
+--- a/crates/api_models/src/payments.rs
++++ b/crates/api_models/src/payments.rs
+@@ -2578,6 +2578,13 @@ pub struct PaymentsResponse {
+ 
+     /// Payment Fingerprint
+     pub fingerprint: Option<String>,
++
++    /// Payment Method Id
++    pub payment_method_id: Option<String>,
++
++    /// Payment Method Status
++    #[schema(value_type = Option<PaymentMethodStatus>)]
++    pub payment_method_status: Option<common_enums::PaymentMethodStatus>,
+ }
+ 
+ #[derive(Setter, Clone, Default, Debug, PartialEq, serde::Serialize, ToSchema)]
+diff --git a/crates/common_enums/src/enums.rs b/crates/common_enums/src/enums.rs
+index ae2fb28aae5..0caa67312bc 100644
+--- a/crates/common_enums/src/enums.rs
++++ b/crates/common_enums/src/enums.rs
+@@ -1205,6 +1205,20 @@ pub enum PaymentMethodStatus {
+     Processing,
+ }
+ 
++impl From<AttemptStatus> for PaymentMethodStatus {
++    fn from(attempt_status: AttemptStatus) -> Self {
++        match attempt_status {
++            AttemptStatus::Charged | AttemptStatus::Authorized => Self::Active,
++            AttemptStatus::Failure
++            | AttemptStatus::AuthenticationFailed
++            | AttemptStatus::RouterDeclined
++            | AttemptStatus::VoidFailed
++            | AttemptStatus::CaptureFailed => Self::Inactive,
++            _ => Self::Processing,
++        }
++    }
++}
++
+ /// To indicate the type of payment experience that the customer would go through
+ #[derive(
+     Eq,
+diff --git a/crates/data_models/src/payments/payment_attempt.rs b/crates/data_models/src/payments/payment_attempt.rs
+index 356970fda03..b54418e4ee9 100644
+--- a/crates/data_models/src/payments/payment_attempt.rs
++++ b/crates/data_models/src/payments/payment_attempt.rs
+@@ -323,6 +323,7 @@ pub enum PaymentAttemptUpdate {
+         authentication_id: Option<String>,
+         payment_method_billing_address_id: Option<String>,
+         fingerprint_id: Option<String>,
++        payment_method_id: Option<String>,
+     },
+     RejectUpdate {
+         status: storage_enums::AttemptStatus,
+diff --git a/crates/diesel_models/src/payment_attempt.rs b/crates/diesel_models/src/payment_attempt.rs
+index 284d078252a..9433e650fca 100644
+--- a/crates/diesel_models/src/payment_attempt.rs
++++ b/crates/diesel_models/src/payment_attempt.rs
+@@ -226,6 +226,7 @@ pub enum PaymentAttemptUpdate {
+         fingerprint_id: Option<String>,
+         updated_by: String,
+         merchant_connector_id: Option<String>,
++        payment_method_id: Option<String>,
+         external_three_ds_authentication_attempted: Option<bool>,
+         authentication_connector: Option<String>,
+         authentication_id: Option<String>,
+@@ -574,6 +575,7 @@ impl From<PaymentAttemptUpdate> for PaymentAttemptUpdateInternal {
+                 authentication_id,
+                 payment_method_billing_address_id,
+                 fingerprint_id,
++                payment_method_id,
+             } => Self {
+                 amount: Some(amount),
+                 currency: Some(currency),
+@@ -601,6 +603,7 @@ impl From<PaymentAttemptUpdate> for PaymentAttemptUpdateInternal {
+                 authentication_id,
+                 payment_method_billing_address_id,
+                 fingerprint_id,
++                payment_method_id: payment_method_id.map(Some),
+                 ..Default::default()
+             },
+             PaymentAttemptUpdate::VoidUpdate {
+diff --git a/crates/openapi/src/openapi.rs b/crates/openapi/src/openapi.rs
+index 65c46193442..aaaebee09fc 100644
+--- a/crates/openapi/src/openapi.rs
++++ b/crates/openapi/src/openapi.rs
+@@ -228,6 +228,7 @@ Never share your secret api keys. Keep them guarded and secure.
+         api_models::enums::ReconStatus,
+         api_models::enums::ConnectorStatus,
+         api_models::enums::AuthorizationStatus,
++        api_models::enums::PaymentMethodStatus,
+         api_models::admin::MerchantConnectorCreate,
+         api_models::admin::MerchantConnectorUpdate,
+         api_models::admin::PrimaryBusinessDetails,
+diff --git a/crates/router/src/core/fraud_check/flows/checkout_flow.rs b/crates/router/src/core/fraud_check/flows/checkout_flow.rs
+index 8b3eed45f9e..67684ab4b1a 100644
+--- a/crates/router/src/core/fraud_check/flows/checkout_flow.rs
++++ b/crates/router/src/core/fraud_check/flows/checkout_flow.rs
+@@ -64,6 +64,7 @@ impl ConstructFlowSpecificData<frm_api::Checkout, FraudCheckCheckoutData, FraudC
+             description: None,
+             return_url: None,
+             payment_method_id: None,
++            payment_method_status: None,
+             address: self.address.clone(),
+             auth_type: storage_enums::AuthenticationType::NoThreeDs,
+             connector_meta_data: None,
+diff --git a/crates/router/src/core/fraud_check/flows/fulfillment_flow.rs b/crates/router/src/core/fraud_check/flows/fulfillment_flow.rs
+index 706a0f9142e..ed757a5931f 100644
+--- a/crates/router/src/core/fraud_check/flows/fulfillment_flow.rs
++++ b/crates/router/src/core/fraud_check/flows/fulfillment_flow.rs
+@@ -76,6 +76,7 @@ pub async fn construct_fulfillment_router_data<'a>(
+         auth_type: payment_attempt.authentication_type.unwrap_or_default(),
+         connector_meta_data: merchant_connector_account.get_metadata(),
+         amount_captured: payment_intent.amount_captured,
++        payment_method_status: None,
+         request: FraudCheckFulfillmentData {
+             amount: payment_attempt.amount,
+             order_details: payment_intent.order_details.clone(),
+diff --git a/crates/router/src/core/fraud_check/flows/record_return.rs b/crates/router/src/core/fraud_check/flows/record_return.rs
+index 2de6aaab7c7..1af1e5fc9fd 100644
+--- a/crates/router/src/core/fraud_check/flows/record_return.rs
++++ b/crates/router/src/core/fraud_check/flows/record_return.rs
+@@ -84,6 +84,7 @@ impl ConstructFlowSpecificData<RecordReturn, FraudCheckRecordReturnData, FraudCh
+             payment_method_token: None,
+             connector_customer: None,
+             preprocessing_id: None,
++            payment_method_status: None,
+             connector_request_reference_id: uuid::Uuid::new_v4().to_string(),
+             test_mode: None,
+             recurring_mandate_payment_data: None,
+diff --git a/crates/router/src/core/fraud_check/flows/sale_flow.rs b/crates/router/src/core/fraud_check/flows/sale_flow.rs
+index dfe70570047..1e48ea11e2d 100644
+--- a/crates/router/src/core/fraud_check/flows/sale_flow.rs
++++ b/crates/router/src/core/fraud_check/flows/sale_flow.rs
+@@ -80,6 +80,7 @@ impl ConstructFlowSpecificData<frm_api::Sale, FraudCheckSaleData, FraudCheckResp
+             payment_method_token: None,
+             connector_customer: None,
+             preprocessing_id: None,
++            payment_method_status: None,
+             connector_request_reference_id: uuid::Uuid::new_v4().to_string(),
+             test_mode: None,
+             recurring_mandate_payment_data: None,
+diff --git a/crates/router/src/core/fraud_check/flows/transaction_flow.rs b/crates/router/src/core/fraud_check/flows/transaction_flow.rs
+index a84d9a771b4..28acfd1de54 100644
+--- a/crates/router/src/core/fraud_check/flows/transaction_flow.rs
++++ b/crates/router/src/core/fraud_check/flows/transaction_flow.rs
+@@ -107,6 +107,7 @@ impl
+             connector_http_status_code: None,
+             external_latency: None,
+             connector_api_version: None,
++            payment_method_status: None,
+             apple_pay_flow: None,
+             frm_metadata: None,
+             refund_id: None,
+diff --git a/crates/router/src/core/mandate/utils.rs b/crates/router/src/core/mandate/utils.rs
+index 4863edd6fcb..02bf41bc7b4 100644
+--- a/crates/router/src/core/mandate/utils.rs
++++ b/crates/router/src/core/mandate/utils.rs
+@@ -53,6 +53,7 @@ pub async fn construct_mandate_revoke_router_data(
+         preprocessing_id: None,
+         payment_method_balance: None,
+         connector_api_version: None,
++        payment_method_status: None,
+         request: types::MandateRevokeRequestData {
+             mandate_id: mandate.mandate_id,
+             connector_mandate_id: mandate.connector_mandate_id,
+diff --git a/crates/router/src/core/payment_methods.rs b/crates/router/src/core/payment_methods.rs
+index df1fb1e358d..343d5a987cf 100644
+--- a/crates/router/src/core/payment_methods.rs
++++ b/crates/router/src/core/payment_methods.rs
+@@ -13,11 +13,7 @@ use data_models::payments::{payment_attempt::PaymentAttempt, PaymentIntent};
+ use diesel_models::enums;
+ 
+ use crate::{
+-    core::{
+-        errors::RouterResult,
+-        payments::helpers,
+-        pm_auth::{self as core_pm_auth},
+-    },
++    core::{errors::RouterResult, payments::helpers, pm_auth as core_pm_auth},
+     routes::AppState,
+     types::{
+         api::{self, payments},
+@@ -44,7 +40,7 @@ pub trait PaymentMethodRetrieve {
+         payment_intent: &PaymentIntent,
+         card_token_data: Option<&CardToken>,
+         customer: &Option<domain::Customer>,
+-    ) -> RouterResult<Option<(payments::PaymentMethodData, enums::PaymentMethod)>>;
++    ) -> RouterResult<storage::PaymentMethodDataWithId>;
+ }
+ 
+ #[async_trait::async_trait]
+@@ -128,32 +124,38 @@ impl PaymentMethodRetrieve for Oss {
+         payment_intent: &PaymentIntent,
+         card_token_data: Option<&CardToken>,
+         customer: &Option<domain::Customer>,
+-    ) -> RouterResult<Option<(payments::PaymentMethodData, enums::PaymentMethod)>> {
+-        match token_data {
++    ) -> RouterResult<storage::PaymentMethodDataWithId> {
++        Ok(match token_data {
+             storage::PaymentTokenData::TemporaryGeneric(generic_token) => {
+-                helpers::retrieve_payment_method_with_temporary_token(
+-                    state,
+-                    &generic_token.token,
+-                    payment_intent,
+-                    merchant_key_store,
+-                    card_token_data,
+-                )
+-                .await
++                storage::PaymentMethodDataWithId {
++                    payment_method_data: helpers::retrieve_payment_method_with_temporary_token(
++                        state,
++                        &generic_token.token,
++                        payment_intent,
++                        merchant_key_store,
++                        card_token_data,
++                    )
++                    .await?,
++                    payment_method_id: None,
++                }
+             }
+ 
+             storage::PaymentTokenData::Temporary(generic_token) => {
+-                helpers::retrieve_payment_method_with_temporary_token(
+-                    state,
+-                    &generic_token.token,
+-                    payment_intent,
+-                    merchant_key_store,
+-                    card_token_data,
+-                )
+-                .await
++                storage::PaymentMethodDataWithId {
++                    payment_method_data: helpers::retrieve_payment_method_with_temporary_token(
++                        state,
++                        &generic_token.token,
++                        payment_intent,
++                        merchant_key_store,
++                        card_token_data,
++                    )
++                    .await?,
++                    payment_method_id: None,
++                }
+             }
+ 
+-            storage::PaymentTokenData::Permanent(card_token) => {
+-                helpers::retrieve_card_with_permanent_token(
++            storage::PaymentTokenData::Permanent(card_token) => storage::PaymentMethodDataWithId {
++                payment_method_data: helpers::retrieve_card_with_permanent_token(
+                     state,
+                     card_token.locker_id.as_ref().unwrap_or(&card_token.token),
+                     card_token
+@@ -164,34 +166,54 @@ impl PaymentMethodRetrieve for Oss {
+                     card_token_data,
+                 )
+                 .await
+-                .map(|card| Some((card, enums::PaymentMethod::Card)))
+-            }
+-
+-            storage::PaymentTokenData::PermanentCard(card_token) => {
+-                helpers::retrieve_card_with_permanent_token(
+-                    state,
+-                    card_token.locker_id.as_ref().unwrap_or(&card_token.token),
++                .map(|card| Some((card, enums::PaymentMethod::Card)))?,
++                payment_method_id: Some(
+                     card_token
+                         .payment_method_id
+                         .as_ref()
+-                        .unwrap_or(&card_token.token),
+-                    payment_intent,
+-                    card_token_data,
+-                )
+-                .await
+-                .map(|card| Some((card, enums::PaymentMethod::Card)))
++                        .unwrap_or(&card_token.token)
++                        .to_string(),
++                ),
++            },
++
++            storage::PaymentTokenData::PermanentCard(card_token) => {
++                storage::PaymentMethodDataWithId {
++                    payment_method_data: helpers::retrieve_card_with_permanent_token(
++                        state,
++                        card_token.locker_id.as_ref().unwrap_or(&card_token.token),
++                        card_token
++                            .payment_method_id
++                            .as_ref()
++                            .unwrap_or(&card_token.token),
++                        payment_intent,
++                        card_token_data,
++                    )
++                    .await
++                    .map(|card| Some((card, enums::PaymentMethod::Card)))?,
++
++                    payment_method_id: Some(
++                        card_token
++                            .payment_method_id
++                            .as_ref()
++                            .unwrap_or(&card_token.token)
++                            .to_string(),
++                    ),
++                }
+             }
+ 
+             storage::PaymentTokenData::AuthBankDebit(auth_token) => {
+-                core_pm_auth::retrieve_payment_method_from_auth_service(
+-                    state,
+-                    merchant_key_store,
+-                    auth_token,
+-                    payment_intent,
+-                    customer,
+-                )
+-                .await
++                storage::PaymentMethodDataWithId {
++                    payment_method_data: core_pm_auth::retrieve_payment_method_from_auth_service(
++                        state,
++                        merchant_key_store,
++                        auth_token,
++                        payment_intent,
++                        customer,
++                    )
++                    .await?,
++                    payment_method_id: None,
++                }
+             }
+-        }
++        })
+     }
+ }
+diff --git a/crates/router/src/core/payments.rs b/crates/router/src/core/payments.rs
+index aa44e5db22a..795e96b9d0a 100644
+--- a/crates/router/src/core/payments.rs
++++ b/crates/router/src/core/payments.rs
+@@ -258,6 +258,7 @@ where
+                         None,
+                     )
+                     .await?;
++
+                     let operation = Box::new(PaymentResponse);
+ 
+                     connector_http_status_code = router_data.connector_http_status_code;
+@@ -1924,7 +1925,7 @@ where
+ 
+             let connector_tokenization_action = match payment_method_action {
+                 TokenizationAction::TokenizeInRouter => {
+-                    let (_operation, payment_method_data) = operation
++                    let (_operation, payment_method_data, pm_id) = operation
+                         .to_domain()?
+                         .make_pm_data(
+                             state,
+@@ -1935,12 +1936,14 @@ where
+                         )
+                         .await?;
+                     payment_data.payment_method_data = payment_method_data;
++                    payment_data.payment_attempt.payment_method_id = pm_id;
++
+                     TokenizationAction::SkipConnectorTokenization
+                 }
+ 
+                 TokenizationAction::TokenizeInConnector => TokenizationAction::TokenizeInConnector,
+                 TokenizationAction::TokenizeInConnectorAndRouter => {
+-                    let (_operation, payment_method_data) = operation
++                    let (_operation, payment_method_data, pm_id) = operation
+                         .to_domain()?
+                         .make_pm_data(
+                             state,
+@@ -1952,6 +1955,7 @@ where
+                         .await?;
+ 
+                     payment_data.payment_method_data = payment_method_data;
++                    payment_data.payment_attempt.payment_method_id = pm_id;
+                     TokenizationAction::TokenizeInConnector
+                 }
+                 TokenizationAction::ConnectorToken(token) => {
+@@ -1993,7 +1997,7 @@ where
+ {
+     // On confirm is false and only router related
+     let payment_data = if !is_operation_confirm(operation) {
+-        let (_operation, payment_method_data) = operation
++        let (_operation, payment_method_data, pm_id) = operation
+             .to_domain()?
+             .make_pm_data(
+                 state,
+@@ -2004,6 +2008,7 @@ where
+             )
+             .await?;
+         payment_data.payment_method_data = payment_method_data;
++        payment_data.payment_attempt.payment_method_id = pm_id;
+         payment_data
+     } else {
+         payment_data
+@@ -2073,6 +2078,7 @@ where
+     pub incremental_authorization_details: Option<IncrementalAuthorizationDetails>,
+     pub authorizations: Vec<diesel_models::authorization::Authorization>,
+     pub frm_metadata: Option<serde_json::Value>,
++    pub payment_method_status: Option<common_enums::PaymentMethodStatus>,
+ }
+ 
+ #[derive(Debug, Default, Clone)]
+diff --git a/crates/router/src/core/payments/flows/authorize_flow.rs b/crates/router/src/core/payments/flows/authorize_flow.rs
+index d7d122c3252..a403b03d6af 100644
+--- a/crates/router/src/core/payments/flows/authorize_flow.rs
++++ b/crates/router/src/core/payments/flows/authorize_flow.rs
+@@ -76,7 +76,7 @@ impl Feature<api::Authorize, types::PaymentsAuthorizeData> for types::PaymentsAu
+         if self.should_proceed_with_authorize() {
+             self.decide_authentication_type();
+             logger::debug!(auth_type=?self.auth_type);
+-            let resp = services::execute_connector_processing_step(
++            let mut resp = services::execute_connector_processing_step(
+                 state,
+                 connector_integration,
+                 &self,
+@@ -91,17 +91,22 @@ impl Feature<api::Authorize, types::PaymentsAuthorizeData> for types::PaymentsAu
+             let is_mandate = resp.request.setup_mandate_details.is_some();
+ 
+             if is_mandate {
+-                let payment_method_id = Box::pin(tokenization::save_payment_method(
+-                    state,
+-                    connector,
+-                    resp.to_owned(),
+-                    maybe_customer,
+-                    merchant_account,
+-                    self.request.payment_method_type,
+-                    key_store,
+-                    is_mandate,
+-                ))
+-                .await?;
++                let (payment_method_id, payment_method_status) =
++                    Box::pin(tokenization::save_payment_method(
++                        state,
++                        connector,
++                        resp.to_owned(),
++                        maybe_customer,
++                        merchant_account,
++                        self.request.payment_method_type,
++                        key_store,
++                        is_mandate,
++                    ))
++                    .await?;
++
++                resp.payment_method_id = payment_method_id.clone();
++                resp.payment_method_status = payment_method_status;
++
+                 Ok(mandate::mandate_procedure(
+                     state,
+                     resp,
+@@ -118,12 +123,10 @@ impl Feature<api::Authorize, types::PaymentsAuthorizeData> for types::PaymentsAu
+                 let key_store = key_store.clone();
+                 let state = state.clone();
+ 
+-                logger::info!("Initiating async call to save_payment_method in locker");
+-
+-                tokio::spawn(async move {
+-                    logger::info!("Starting async call to save_payment_method in locker");
++                logger::info!("Call to save_payment_method in locker");
+ 
+-                    let result = Box::pin(tokenization::save_payment_method(
++                let (payment_method_id, payment_method_status) =
++                    Box::pin(tokenization::save_payment_method(
+                         &state,
+                         &connector,
+                         response,
+@@ -133,12 +136,10 @@ impl Feature<api::Authorize, types::PaymentsAuthorizeData> for types::PaymentsAu
+                         &key_store,
+                         is_mandate,
+                     ))
+-                    .await;
++                    .await?;
+ 
+-                    if let Err(err) = result {
+-                        logger::error!("Asynchronously saving card in locker failed : {:?}", err);
+-                    }
+-                });
++                resp.payment_method_id = payment_method_id.clone();
++                resp.payment_method_status = payment_method_status;
+ 
+                 Ok(resp)
+             }
+diff --git a/crates/router/src/core/payments/flows/psync_flow.rs b/crates/router/src/core/payments/flows/psync_flow.rs
+index cb7a764985d..9a73fe0799d 100644
+--- a/crates/router/src/core/payments/flows/psync_flow.rs
++++ b/crates/router/src/core/payments/flows/psync_flow.rs
+@@ -87,7 +87,7 @@ impl Feature<api::PSync, types::PaymentsSyncData>
+             (types::SyncRequestType::MultipleCaptureSync(_), Err(err)) => Err(err),
+             _ => {
+                 // for bulk sync of captures, above logic needs to be handled at connector end
+-                let resp = services::execute_connector_processing_step(
++                let mut resp = services::execute_connector_processing_step(
+                     state,
+                     connector_integration,
+                     &self,
+@@ -96,6 +96,10 @@ impl Feature<api::PSync, types::PaymentsSyncData>
+                 )
+                 .await
+                 .to_payment_failed_response()?;
++                if self.status != resp.status {
++                    resp.payment_method_status =
++                        Some(common_enums::PaymentMethodStatus::from(resp.status));
++                }
+                 Ok(resp)
+             }
+         }
+diff --git a/crates/router/src/core/payments/flows/setup_mandate_flow.rs b/crates/router/src/core/payments/flows/setup_mandate_flow.rs
+index 3f43204b986..5a6c2a24d00 100644
+--- a/crates/router/src/core/payments/flows/setup_mandate_flow.rs
++++ b/crates/router/src/core/payments/flows/setup_mandate_flow.rs
+@@ -109,7 +109,8 @@ impl Feature<api::SetupMandate, types::SetupMandateRequestData> for types::Setup
+                 key_store,
+                 is_mandate,
+             ))
+-            .await?;
++            .await?
++            .0;
+             mandate::mandate_procedure(
+                 state,
+                 resp,
+@@ -246,7 +247,8 @@ impl types::SetupMandateRouterData {
+                     key_store,
+                     is_mandate,
+                 ))
+-                .await?;
++                .await?
++                .0;
+ 
+                 Ok(mandate::mandate_procedure(
+                     state,
+@@ -331,7 +333,8 @@ impl types::SetupMandateRouterData {
+                 key_store,
+                 is_mandate,
+             ))
+-            .await?;
++            .await?
++            .0;
+             let mandate = state
+                 .store
+                 .find_mandate_by_merchant_id_mandate_id(&merchant_account.merchant_id, &mandate_id)
+diff --git a/crates/router/src/core/payments/helpers.rs b/crates/router/src/core/payments/helpers.rs
+index d158a4bc942..288eeb140f1 100644
+--- a/crates/router/src/core/payments/helpers.rs
++++ b/crates/router/src/core/payments/helpers.rs
+@@ -1609,6 +1609,7 @@ pub async fn make_pm_data<'a, F: Clone, R, Ctx: PaymentMethodRetrieve>(
+ ) -> RouterResult<(
+     BoxedOperation<'a, F, R, Ctx>,
+     Option<api::PaymentMethodData>,
++    Option<String>,
+ )> {
+     let request = &payment_data.payment_method_data.clone();
+ 
+@@ -1687,9 +1688,9 @@ pub async fn make_pm_data<'a, F: Clone, R, Ctx: PaymentMethodRetrieve>(
+     };
+ 
+     // TODO: Handle case where payment method and token both are present in request properly.
+-    let payment_method = match (request, hyperswitch_token) {
++    let (payment_method, pm_id) = match (request, hyperswitch_token) {
+         (_, Some(hyperswitch_token)) => {
+-            let payment_method_details = Ctx::retrieve_payment_method_with_token(
++            let pm_data = Ctx::retrieve_payment_method_with_token(
+                 state,
+                 merchant_key_store,
+                 &hyperswitch_token,
+@@ -1697,15 +1698,21 @@ pub async fn make_pm_data<'a, F: Clone, R, Ctx: PaymentMethodRetrieve>(
+                 card_token_data.as_ref(),
+                 customer,
+             )
+-            .await
+-            .attach_printable("in 'make_pm_data'")?;
++            .await;
++
++            let payment_method_details = pm_data.attach_printable("in 'make_pm_data'")?;
+ 
+             Ok::<_, error_stack::Report<errors::ApiErrorResponse>>(
+-                if let Some((payment_method_data, payment_method)) = payment_method_details {
++                if let Some((payment_method_data, payment_method)) =
++                    payment_method_details.payment_method_data
++                {
+                     payment_data.payment_attempt.payment_method = Some(payment_method);
+-                    Some(payment_method_data)
++                    (
++                        Some(payment_method_data),
++                        payment_method_details.payment_method_id,
++                    )
+                 } else {
+-                    None
++                    (None, payment_method_details.payment_method_id)
+                 },
+             )
+         }
+@@ -1722,12 +1729,12 @@ pub async fn make_pm_data<'a, F: Clone, R, Ctx: PaymentMethodRetrieve>(
+ 
+             payment_data.token = payment_method_data.1;
+ 
+-            Ok(payment_method_data.0)
++            Ok((payment_method_data.0, None))
+         }
+-        _ => Ok(None),
++        _ => Ok((None, None)),
+     }?;
+ 
+-    Ok((operation, payment_method))
++    Ok((operation, payment_method, pm_id))
+ }
+ 
+ pub async fn store_in_vault_and_generate_ppmt(
+@@ -2967,7 +2974,7 @@ pub async fn get_merchant_connector_account(
+ /// # Arguments
+ ///
+ /// * `router_data` - original router data
+-/// * `request` - new request
++/// * `request` - new request core/helper
+ /// * `response` - new response
+ pub fn router_data_type_conversion<F1, F2, Req1, Req2, Res1, Res2>(
+     router_data: RouterData<F1, Req1, Res1>,
+@@ -2994,6 +3001,7 @@ pub fn router_data_type_conversion<F1, F2, Req1, Req2, Res1, Res2>(
+         attempt_id: router_data.attempt_id,
+         access_token: router_data.access_token,
+         session_token: router_data.session_token,
++        payment_method_status: router_data.payment_method_status,
+         reference_id: router_data.reference_id,
+         payment_method_token: router_data.payment_method_token,
+         customer_id: router_data.customer_id,
+diff --git a/crates/router/src/core/payments/operations.rs b/crates/router/src/core/payments/operations.rs
+index 379725a04c6..f0e526d2e21 100644
+--- a/crates/router/src/core/payments/operations.rs
++++ b/crates/router/src/core/payments/operations.rs
+@@ -136,6 +136,7 @@ pub trait Domain<F: Clone, R, Ctx: PaymentMethodRetrieve>: Send + Sync {
+     ) -> RouterResult<(
+         BoxedOperation<'a, F, R, Ctx>,
+         Option<api::PaymentMethodData>,
++        Option<String>,
+     )>;
+ 
+     async fn add_task_to_process_tracker<'a>(
+@@ -267,6 +268,7 @@ where
+     ) -> RouterResult<(
+         BoxedOperation<'a, F, api::PaymentsRetrieveRequest, Ctx>,
+         Option<api::PaymentMethodData>,
++        Option<String>,
+     )> {
+         helpers::make_pm_data(
+             Box::new(self),
+@@ -335,8 +337,9 @@ where
+     ) -> RouterResult<(
+         BoxedOperation<'a, F, api::PaymentsCaptureRequest, Ctx>,
+         Option<api::PaymentMethodData>,
++        Option<String>,
+     )> {
+-        Ok((Box::new(self), None))
++        Ok((Box::new(self), None, None))
+     }
+ 
+     async fn get_connector<'a>(
+@@ -408,8 +411,9 @@ where
+     ) -> RouterResult<(
+         BoxedOperation<'a, F, api::PaymentsCancelRequest, Ctx>,
+         Option<api::PaymentMethodData>,
++        Option<String>,
+     )> {
+-        Ok((Box::new(self), None))
++        Ok((Box::new(self), None, None))
+     }
+ 
+     async fn get_connector<'a>(
+@@ -471,8 +475,9 @@ where
+     ) -> RouterResult<(
+         BoxedOperation<'a, F, api::PaymentsRejectRequest, Ctx>,
+         Option<api::PaymentMethodData>,
++        Option<String>,
+     )> {
+-        Ok((Box::new(self), None))
++        Ok((Box::new(self), None, None))
+     }
+ 
+     async fn get_connector<'a>(
+diff --git a/crates/router/src/core/payments/operations/payment_approve.rs b/crates/router/src/core/payments/operations/payment_approve.rs
+index caca29d8e2a..9a0be2e83dc 100644
+--- a/crates/router/src/core/payments/operations/payment_approve.rs
++++ b/crates/router/src/core/payments/operations/payment_approve.rs
+@@ -164,6 +164,7 @@ impl<F: Send + Clone, Ctx: PaymentMethodRetrieve>
+             sessions_token: vec![],
+             card_cvc: None,
+             creds_identifier: None,
++            payment_method_status: None,
+             pm_token: None,
+             connector_customer_id: None,
+             recurring_mandate_payment_data: None,
+diff --git a/crates/router/src/core/payments/operations/payment_cancel.rs b/crates/router/src/core/payments/operations/payment_cancel.rs
+index 097b7ab40e1..25fd2a83fb0 100644
+--- a/crates/router/src/core/payments/operations/payment_cancel.rs
++++ b/crates/router/src/core/payments/operations/payment_cancel.rs
+@@ -173,6 +173,7 @@ impl<F: Send + Clone, Ctx: PaymentMethodRetrieve>
+             card_cvc: None,
+             creds_identifier,
+             pm_token: None,
++            payment_method_status: None,
+             connector_customer_id: None,
+             recurring_mandate_payment_data: None,
+             ephemeral_key: None,
+diff --git a/crates/router/src/core/payments/operations/payment_capture.rs b/crates/router/src/core/payments/operations/payment_capture.rs
+index e9d520e4abc..6db98d5dcdf 100644
+--- a/crates/router/src/core/payments/operations/payment_capture.rs
++++ b/crates/router/src/core/payments/operations/payment_capture.rs
+@@ -216,6 +216,7 @@ impl<F: Send + Clone, Ctx: PaymentMethodRetrieve>
+             sessions_token: vec![],
+             card_cvc: None,
+             creds_identifier,
++            payment_method_status: None,
+             pm_token: None,
+             connector_customer_id: None,
+             recurring_mandate_payment_data: None,
+diff --git a/crates/router/src/core/payments/operations/payment_complete_authorize.rs b/crates/router/src/core/payments/operations/payment_complete_authorize.rs
+index f7e7598cf73..44a34108796 100644
+--- a/crates/router/src/core/payments/operations/payment_complete_authorize.rs
++++ b/crates/router/src/core/payments/operations/payment_complete_authorize.rs
+@@ -266,6 +266,7 @@ impl<F: Send + Clone, Ctx: PaymentMethodRetrieve>
+             multiple_capture_data: None,
+             redirect_response,
+             surcharge_details: None,
++            payment_method_status: None,
+             frm_message: None,
+             payment_link_data: None,
+             incremental_authorization_details: None,
+@@ -332,8 +333,9 @@ impl<F: Clone + Send, Ctx: PaymentMethodRetrieve> Domain<F, api::PaymentsRequest
+     ) -> RouterResult<(
+         BoxedOperation<'a, F, api::PaymentsRequest, Ctx>,
+         Option<api::PaymentMethodData>,
++        Option<String>,
+     )> {
+-        let (op, payment_method_data) = helpers::make_pm_data(
++        let (op, payment_method_data, pm_id) = helpers::make_pm_data(
+             Box::new(self),
+             state,
+             payment_data,
+@@ -341,7 +343,7 @@ impl<F: Clone + Send, Ctx: PaymentMethodRetrieve> Domain<F, api::PaymentsRequest
+             customer,
+         )
+         .await?;
+-        Ok((op, payment_method_data))
++        Ok((op, payment_method_data, pm_id))
+     }
+ 
+     #[instrument(skip_all)]
+diff --git a/crates/router/src/core/payments/operations/payment_confirm.rs b/crates/router/src/core/payments/operations/payment_confirm.rs
+index 111f1bed29c..137bccbd70c 100644
+--- a/crates/router/src/core/payments/operations/payment_confirm.rs
++++ b/crates/router/src/core/payments/operations/payment_confirm.rs
+@@ -557,6 +557,7 @@ impl<F: Send + Clone, Ctx: PaymentMethodRetrieve>
+             card_cvc: request.card_cvc.clone(),
+             creds_identifier,
+             pm_token: None,
++            payment_method_status: None,
+             connector_customer_id: None,
+             recurring_mandate_payment_data,
+             ephemeral_key: None,
+@@ -621,15 +622,16 @@ impl<F: Clone + Send, Ctx: PaymentMethodRetrieve> Domain<F, api::PaymentsRequest
+     ) -> RouterResult<(
+         BoxedOperation<'a, F, api::PaymentsRequest, Ctx>,
+         Option<api::PaymentMethodData>,
++        Option<String>,
+     )> {
+-        let (op, payment_method_data) =
++        let (op, payment_method_data, pm_id) =
+             helpers::make_pm_data(Box::new(self), state, payment_data, key_store, customer).await?;
+ 
+         utils::when(payment_method_data.is_none(), || {
+             Err(errors::ApiErrorResponse::PaymentMethodNotFound)
+         })?;
+ 
+-        Ok((op, payment_method_data))
++        Ok((op, payment_method_data, pm_id))
+     }
+ 
+     #[instrument(skip_all)]
+@@ -802,6 +804,7 @@ impl<F: Clone, Ctx: PaymentMethodRetrieve>
+             .unwrap_or(payment_data.payment_attempt.amount);
+ 
+         let m_payment_data_payment_attempt = payment_data.payment_attempt.clone();
++        let m_payment_method_id = payment_data.payment_attempt.payment_method_id.clone();
+         let m_browser_info = browser_info.clone();
+         let m_connector = connector.clone();
+         let m_payment_token = payment_token.clone();
+@@ -851,6 +854,7 @@ impl<F: Clone, Ctx: PaymentMethodRetrieve>
+                         authentication_id: None,
+                         payment_method_billing_address_id,
+                         fingerprint_id: m_fingerprint_id,
++                        payment_method_id: m_payment_method_id,
+                     },
+                     storage_scheme,
+                 )
+diff --git a/crates/router/src/core/payments/operations/payment_create.rs b/crates/router/src/core/payments/operations/payment_create.rs
+index 3ba7092aeac..90a4a9f8ead 100644
+--- a/crates/router/src/core/payments/operations/payment_create.rs
++++ b/crates/router/src/core/payments/operations/payment_create.rs
+@@ -400,6 +400,7 @@ impl<F: Send + Clone, Ctx: PaymentMethodRetrieve>
+             connector_customer_id: None,
+             recurring_mandate_payment_data,
+             ephemeral_key,
++            payment_method_status: None,
+             multiple_capture_data: None,
+             redirect_response: None,
+             surcharge_details,
+@@ -461,6 +462,7 @@ impl<F: Clone + Send, Ctx: PaymentMethodRetrieve> Domain<F, api::PaymentsRequest
+     ) -> RouterResult<(
+         BoxedOperation<'a, F, api::PaymentsRequest, Ctx>,
+         Option<api::PaymentMethodData>,
++        Option<String>,
+     )> {
+         helpers::make_pm_data(
+             Box::new(self),
+diff --git a/crates/router/src/core/payments/operations/payment_reject.rs b/crates/router/src/core/payments/operations/payment_reject.rs
+index 281ffdd06f7..9fcf2b6f947 100644
+--- a/crates/router/src/core/payments/operations/payment_reject.rs
++++ b/crates/router/src/core/payments/operations/payment_reject.rs
+@@ -169,6 +169,7 @@ impl<F: Send + Clone, Ctx: PaymentMethodRetrieve>
+             surcharge_details: None,
+             frm_message: frm_response.ok(),
+             payment_link_data: None,
++            payment_method_status: None,
+             incremental_authorization_details: None,
+             authorizations: vec![],
+             frm_metadata: None,
+diff --git a/crates/router/src/core/payments/operations/payment_response.rs b/crates/router/src/core/payments/operations/payment_response.rs
+index 33e8ff26edc..33a32c0563c 100644
+--- a/crates/router/src/core/payments/operations/payment_response.rs
++++ b/crates/router/src/core/payments/operations/payment_response.rs
+@@ -616,6 +616,8 @@ async fn payment_response_update_tracker<F: Clone, T: types::Capturable>(
+                         metrics::SUCCESSFUL_PAYMENT.add(&metrics::CONTEXT, 1, &[]);
+                     }
+ 
++                    let payment_method_id = payment_data.payment_attempt.payment_method_id.clone();
++
+                     utils::add_apple_pay_payment_status_metrics(
+                         router_data.status,
+                         router_data.apple_pay_flow.clone(),
+@@ -648,7 +650,7 @@ async fn payment_response_update_tracker<F: Clone, T: types::Capturable>(
+                                 amount_capturable: router_data
+                                     .request
+                                     .get_amount_capturable(&payment_data, updated_attempt_status),
+-                                payment_method_id: Some(router_data.payment_method_id),
++                                payment_method_id: Some(payment_method_id),
+                                 mandate_id: payment_data
+                                     .mandate_id
+                                     .clone()
+@@ -865,6 +867,7 @@ async fn payment_response_update_tracker<F: Clone, T: types::Capturable>(
+     )?;
+ 
+     payment_data.payment_intent = payment_intent;
++    payment_data.payment_method_status = router_data.payment_method_status;
+     Ok(payment_data)
+ }
+ 
+diff --git a/crates/router/src/core/payments/operations/payment_session.rs b/crates/router/src/core/payments/operations/payment_session.rs
+index 966600a5498..c0e60d5c8ac 100644
+--- a/crates/router/src/core/payments/operations/payment_session.rs
++++ b/crates/router/src/core/payments/operations/payment_session.rs
+@@ -185,6 +185,7 @@ impl<F: Send + Clone, Ctx: PaymentMethodRetrieve>
+             sessions_token: vec![],
+             card_cvc: None,
+             creds_identifier,
++            payment_method_status: None,
+             pm_token: None,
+             connector_customer_id: None,
+             recurring_mandate_payment_data: None,
+@@ -326,9 +327,10 @@ where
+     ) -> RouterResult<(
+         BoxedOperation<'b, F, api::PaymentsSessionRequest, Ctx>,
+         Option<api::PaymentMethodData>,
++        Option<String>,
+     )> {
+         //No payment method data for this operation
+-        Ok((Box::new(self), None))
++        Ok((Box::new(self), None, None))
+     }
+ 
+     /// Returns `Vec<SessionConnectorData>`
+diff --git a/crates/router/src/core/payments/operations/payment_start.rs b/crates/router/src/core/payments/operations/payment_start.rs
+index 2ca413b73aa..53502666f5d 100644
+--- a/crates/router/src/core/payments/operations/payment_start.rs
++++ b/crates/router/src/core/payments/operations/payment_start.rs
+@@ -171,6 +171,7 @@ impl<F: Send + Clone, Ctx: PaymentMethodRetrieve>
+             redirect_response: None,
+             surcharge_details: None,
+             frm_message: None,
++            payment_method_status: None,
+             payment_link_data: None,
+             incremental_authorization_details: None,
+             authorizations: vec![],
+@@ -293,6 +294,7 @@ where
+     ) -> RouterResult<(
+         BoxedOperation<'a, F, api::PaymentsStartRequest, Ctx>,
+         Option<api::PaymentMethodData>,
++        Option<String>,
+     )> {
+         if payment_data
+             .payment_attempt
+@@ -310,7 +312,7 @@ where
+             )
+             .await
+         } else {
+-            Ok((Box::new(self), None))
++            Ok((Box::new(self), None, None))
+         }
+     }
+ 
+diff --git a/crates/router/src/core/payments/operations/payment_status.rs b/crates/router/src/core/payments/operations/payment_status.rs
+index aa622b3558b..ee17e7ae88a 100644
+--- a/crates/router/src/core/payments/operations/payment_status.rs
++++ b/crates/router/src/core/payments/operations/payment_status.rs
+@@ -100,6 +100,7 @@ impl<F: Clone + Send, Ctx: PaymentMethodRetrieve> Domain<F, api::PaymentsRequest
+     ) -> RouterResult<(
+         BoxedOperation<'a, F, api::PaymentsRequest, Ctx>,
+         Option<api::PaymentMethodData>,
++        Option<String>,
+     )> {
+         helpers::make_pm_data(
+             Box::new(self),
+@@ -437,6 +438,7 @@ async fn get_tracker_for_sync<
+         card_cvc: None,
+         creds_identifier,
+         pm_token: None,
++        payment_method_status: None,
+         connector_customer_id: None,
+         recurring_mandate_payment_data: None,
+         ephemeral_key: None,
+diff --git a/crates/router/src/core/payments/operations/payment_update.rs b/crates/router/src/core/payments/operations/payment_update.rs
+index 080667f4b48..30cdfe67dd3 100644
+--- a/crates/router/src/core/payments/operations/payment_update.rs
++++ b/crates/router/src/core/payments/operations/payment_update.rs
+@@ -404,6 +404,7 @@ impl<F: Send + Clone, Ctx: PaymentMethodRetrieve>
+             redirect_response: None,
+             surcharge_details,
+             frm_message: None,
++            payment_method_status: None,
+             payment_link_data: None,
+             incremental_authorization_details: None,
+             authorizations: vec![],
+@@ -461,6 +462,7 @@ impl<F: Clone + Send, Ctx: PaymentMethodRetrieve> Domain<F, api::PaymentsRequest
+     ) -> RouterResult<(
+         BoxedOperation<'a, F, api::PaymentsRequest, Ctx>,
+         Option<api::PaymentMethodData>,
++        Option<String>,
+     )> {
+         helpers::make_pm_data(
+             Box::new(self),
+diff --git a/crates/router/src/core/payments/operations/payments_incremental_authorization.rs b/crates/router/src/core/payments/operations/payments_incremental_authorization.rs
+index 24292507c0e..75031150598 100644
+--- a/crates/router/src/core/payments/operations/payments_incremental_authorization.rs
++++ b/crates/router/src/core/payments/operations/payments_incremental_authorization.rs
+@@ -135,6 +135,7 @@ impl<F: Send + Clone, Ctx: PaymentMethodRetrieve>
+             sessions_token: vec![],
+             card_cvc: None,
+             creds_identifier: None,
++            payment_method_status: None,
+             pm_token: None,
+             connector_customer_id: None,
+             recurring_mandate_payment_data: None,
+@@ -315,8 +316,9 @@ impl<F: Clone + Send, Ctx: PaymentMethodRetrieve>
+     ) -> RouterResult<(
+         BoxedOperation<'a, F, PaymentsIncrementalAuthorizationRequest, Ctx>,
+         Option<api::PaymentMethodData>,
++        Option<String>,
+     )> {
+-        Ok((Box::new(self), None))
++        Ok((Box::new(self), None, None))
+     }
+ 
+     async fn get_connector<'a>(
+diff --git a/crates/router/src/core/payments/tokenization.rs b/crates/router/src/core/payments/tokenization.rs
+index 1f793e2e185..cf525c30e57 100644
+--- a/crates/router/src/core/payments/tokenization.rs
++++ b/crates/router/src/core/payments/tokenization.rs
+@@ -35,7 +35,7 @@ pub async fn save_payment_method<F: Clone, FData>(
+     payment_method_type: Option<storage_enums::PaymentMethodType>,
+     key_store: &domain::MerchantKeyStore,
+     is_mandate: bool,
+-) -> RouterResult<Option<String>>
++) -> RouterResult<(Option<String>, Option<common_enums::PaymentMethodStatus>)>
+ where
+     FData: mandate::MandateBehaviour,
+ {
+@@ -76,6 +76,8 @@ where
+                 })
+                 .unwrap_or(false);
+ 
++            let pm_status = common_enums::PaymentMethodStatus::from(resp.status);
++
+             let pm_id = if future_usage_validation {
+                 let customer = maybe_customer.to_owned().get_required_value("customer")?;
+                 let payment_method_create_request = helpers::get_payment_method_create_request(
+@@ -368,9 +370,9 @@ where
+             } else {
+                 None
+             };
+-            Ok(pm_id)
++            Ok((pm_id, Some(pm_status)))
+         }
+-        Err(_) => Ok(None),
++        Err(_) => Ok((None, None)),
+     }
+ }
+ 
+diff --git a/crates/router/src/core/payments/transformers.rs b/crates/router/src/core/payments/transformers.rs
+index 7c7bac80cf0..8bd9d892a4d 100644
+--- a/crates/router/src/core/payments/transformers.rs
++++ b/crates/router/src/core/payments/transformers.rs
+@@ -147,6 +147,7 @@ where
+         access_token: None,
+         session_token: None,
+         reference_id: None,
++        payment_method_status: payment_data.payment_method_status,
+         payment_method_token: payment_data.pm_token.map(types::PaymentMethodToken::Token),
+         connector_customer: payment_data.connector_customer_id,
+         recurring_mandate_payment_data: payment_data.recurring_mandate_payment_data,
+@@ -718,6 +719,8 @@ where
+                         .set_authorization_count(payment_intent.authorization_count)
+                         .set_incremental_authorizations(incremental_authorizations_response)
+                         .set_expires_on(payment_intent.session_expiry)
++                        .set_payment_method_id(payment_attempt.payment_method_id)
++                        .set_payment_method_status(payment_data.payment_method_status)
+                         .to_owned(),
+                     headers,
+                 ))
+diff --git a/crates/router/src/core/utils.rs b/crates/router/src/core/utils.rs
+index 91aa36957af..9750ed85213 100644
+--- a/crates/router/src/core/utils.rs
++++ b/crates/router/src/core/utils.rs
+@@ -149,6 +149,7 @@ pub async fn construct_payout_router_data<'a, F>(
+         auth_type: enums::AuthenticationType::default(),
+         connector_meta_data: merchant_connector_account.get_metadata(),
+         amount_captured: None,
++        payment_method_status: None,
+         request: types::PayoutsData {
+             payout_id: payouts.payout_id.to_owned(),
+             amount: payouts.amount,
+@@ -299,6 +300,7 @@ pub async fn construct_refund_router_data<'a, F>(
+         auth_type: payment_attempt.authentication_type.unwrap_or_default(),
+         connector_meta_data: merchant_connector_account.get_metadata(),
+         amount_captured: payment_intent.amount_captured,
++        payment_method_status: None,
+         request: types::RefundsData {
+             refund_id: refund.refund_id.clone(),
+             connector_transaction_id: refund.connector_transaction_id.clone(),
+@@ -542,6 +544,7 @@ pub async fn construct_accept_dispute_router_data<'a>(
+         auth_type: payment_attempt.authentication_type.unwrap_or_default(),
+         connector_meta_data: merchant_connector_account.get_metadata(),
+         amount_captured: payment_intent.amount_captured,
++        payment_method_status: None,
+         request: types::AcceptDisputeRequestData {
+             dispute_id: dispute.dispute_id.clone(),
+             connector_dispute_id: dispute.connector_dispute_id.clone(),
+@@ -646,6 +649,7 @@ pub async fn construct_submit_evidence_router_data<'a>(
+         recurring_mandate_payment_data: None,
+         preprocessing_id: None,
+         payment_method_balance: None,
++        payment_method_status: None,
+         connector_request_reference_id: get_connector_request_reference_id(
+             &state.conf,
+             &merchant_account.merchant_id,
+@@ -726,6 +730,7 @@ pub async fn construct_upload_file_router_data<'a>(
+         auth_type: payment_attempt.authentication_type.unwrap_or_default(),
+         connector_meta_data: merchant_connector_account.get_metadata(),
+         amount_captured: payment_intent.amount_captured,
++        payment_method_status: None,
+         request: types::UploadFileRequestData {
+             file_key,
+             file: create_file_request.file.clone(),
+@@ -821,6 +826,7 @@ pub async fn construct_defend_dispute_router_data<'a>(
+         auth_type: payment_attempt.authentication_type.unwrap_or_default(),
+         connector_meta_data: merchant_connector_account.get_metadata(),
+         amount_captured: payment_intent.amount_captured,
++        payment_method_status: None,
+         request: types::DefendDisputeRequestData {
+             dispute_id: dispute.dispute_id.clone(),
+             connector_dispute_id: dispute.connector_dispute_id.clone(),
+@@ -908,6 +914,7 @@ pub async fn construct_retrieve_file_router_data<'a>(
+         auth_type: diesel_models::enums::AuthenticationType::default(),
+         connector_meta_data: merchant_connector_account.get_metadata(),
+         amount_captured: None,
++        payment_method_status: None,
+         request: types::RetrieveFileRequestData {
+             provider_file_id: file_metadata
+                 .provider_file_id
+diff --git a/crates/router/src/core/webhooks/utils.rs b/crates/router/src/core/webhooks/utils.rs
+index 75d37f94279..86fd1d31171 100644
+--- a/crates/router/src/core/webhooks/utils.rs
++++ b/crates/router/src/core/webhooks/utils.rs
+@@ -109,6 +109,7 @@ pub async fn construct_webhook_router_data<'a>(
+         quote_id: None,
+         test_mode: None,
+         payment_method_balance: None,
++        payment_method_status: None,
+         connector_api_version: None,
+         connector_http_status_code: None,
+         external_latency: None,
+diff --git a/crates/router/src/types.rs b/crates/router/src/types.rs
+index 07691879d4a..dd86b4c58a5 100644
+--- a/crates/router/src/types.rs
++++ b/crates/router/src/types.rs
+@@ -322,6 +322,7 @@ pub struct RouterData<Flow, Request, Response> {
+ 
+     pub dispute_id: Option<String>,
+     pub refund_id: Option<String>,
++    pub payment_method_status: Option<common_enums::PaymentMethodStatus>,
+ }
+ 
+ #[derive(Debug, Clone, serde::Deserialize)]
+@@ -1465,6 +1466,7 @@ impl<F1, F2, T1, T2> From<(&RouterData<F1, T1, PaymentsResponseData>, T2)>
+             #[cfg(feature = "payouts")]
+             quote_id: data.quote_id.clone(),
+             test_mode: data.test_mode,
++            payment_method_status: None,
+             payment_method_balance: data.payment_method_balance.clone(),
+             connector_api_version: data.connector_api_version.clone(),
+             connector_http_status_code: data.connector_http_status_code,
+@@ -1524,6 +1526,7 @@ impl<F1, F2>
+             quote_id: data.quote_id.clone(),
+             test_mode: data.test_mode,
+             payment_method_balance: None,
++            payment_method_status: None,
+             connector_api_version: None,
+             connector_http_status_code: data.connector_http_status_code,
+             external_latency: data.external_latency,
+diff --git a/crates/router/src/types/api/verify_connector.rs b/crates/router/src/types/api/verify_connector.rs
+index 221d16a8b46..124b5d77a95 100644
+--- a/crates/router/src/types/api/verify_connector.rs
++++ b/crates/router/src/types/api/verify_connector.rs
+@@ -86,6 +86,7 @@ impl VerifyConnectorData {
+             payment_method_token: None,
+             connector_api_version: None,
+             recurring_mandate_payment_data: None,
++            payment_method_status: None,
+             connector_request_reference_id: attempt_id,
+             address: types::PaymentAddress {
+                 shipping: None,
+diff --git a/crates/router/src/types/storage/payment_method.rs b/crates/router/src/types/storage/payment_method.rs
+index a787a4d932c..560d7dfc384 100644
+--- a/crates/router/src/types/storage/payment_method.rs
++++ b/crates/router/src/types/storage/payment_method.rs
+@@ -1,9 +1,12 @@
+ use api_models::payment_methods;
++use diesel_models::enums;
+ pub use diesel_models::payment_method::{
+     PaymentMethod, PaymentMethodNew, PaymentMethodUpdate, PaymentMethodUpdateInternal,
+     TokenizeCoreWorkflow,
+ };
+ 
++use crate::types::api::payments;
++
+ #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+ #[serde(rename_all = "snake_case")]
+ pub enum PaymentTokenKind {
+@@ -18,6 +21,12 @@ pub struct CardTokenData {
+     pub token: String,
+ }
+ 
++#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
++pub struct PaymentMethodDataWithId {
++    pub payment_method_data: Option<(payments::PaymentMethodData, enums::PaymentMethod)>,
++    pub payment_method_id: Option<String>,
++}
++
+ #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+ pub struct GenericTokenData {
+     pub token: String,
+diff --git a/crates/router/tests/connectors/aci.rs b/crates/router/tests/connectors/aci.rs
+index d3f8147fb26..976add58abe 100644
+--- a/crates/router/tests/connectors/aci.rs
++++ b/crates/router/tests/connectors/aci.rs
+@@ -31,6 +31,8 @@ fn construct_payment_router_data() -> types::PaymentsAuthorizeRouterData {
+         connector_auth_type: utils::to_connector_auth_type(auth.into()),
+         description: Some("This is a test".to_string()),
+         return_url: None,
++        payment_method_status: None,
++        payment_method_id: None,
+         request: types::PaymentsAuthorizeData {
+             amount: 1000,
+             currency: enums::Currency::USD,
+@@ -74,7 +76,6 @@ fn construct_payment_router_data() -> types::PaymentsAuthorizeRouterData {
+             metadata: None,
+         },
+         response: Err(types::ErrorResponse::default()),
+-        payment_method_id: None,
+         address: PaymentAddress::default(),
+         connector_meta_data: None,
+         amount_captured: None,
+@@ -115,6 +116,8 @@ fn construct_refund_router_data<F>() -> types::RefundsRouterData<F> {
+         connector: "aci".to_string(),
+         payment_id: uuid::Uuid::new_v4().to_string(),
+         attempt_id: uuid::Uuid::new_v4().to_string(),
++        payment_method_id: None,
++        payment_method_status: None,
+         status: enums::AttemptStatus::default(),
+         payment_method: enums::PaymentMethod::Card,
+         auth_type: enums::AuthenticationType::NoThreeDs,
+@@ -134,7 +137,6 @@ fn construct_refund_router_data<F>() -> types::RefundsRouterData<F> {
+             connector_refund_id: None,
+             browser_info: None,
+         },
+-        payment_method_id: None,
+         response: Err(types::ErrorResponse::default()),
+         address: PaymentAddress::default(),
+         connector_meta_data: None,
+diff --git a/crates/router/tests/connectors/utils.rs b/crates/router/tests/connectors/utils.rs
+index 8f749a0b2ff..89d6132346f 100644
+--- a/crates/router/tests/connectors/utils.rs
++++ b/crates/router/tests/connectors/utils.rs
+@@ -480,6 +480,7 @@ pub trait ConnectorActions: Connector {
+             payment_id: uuid::Uuid::new_v4().to_string(),
+             attempt_id: uuid::Uuid::new_v4().to_string(),
+             status: enums::AttemptStatus::default(),
++            payment_method_id: None,
+             auth_type: info
+                 .clone()
+                 .map_or(enums::AuthenticationType::NoThreeDs, |a| {
+@@ -490,9 +491,9 @@ pub trait ConnectorActions: Connector {
+             connector_auth_type: self.get_auth_token(),
+             description: Some("This is a test".to_string()),
+             return_url: info.clone().and_then(|a| a.return_url),
++            payment_method_status: None,
+             request: req,
+             response: Err(types::ErrorResponse::default()),
+-            payment_method_id: None,
+             address: info
+                 .clone()
+                 .and_then(|a| a.address)
+diff --git a/crates/storage_impl/src/payments/payment_attempt.rs b/crates/storage_impl/src/payments/payment_attempt.rs
+index f2e1fbf16cd..dfec8d244b2 100644
+--- a/crates/storage_impl/src/payments/payment_attempt.rs
++++ b/crates/storage_impl/src/payments/payment_attempt.rs
+@@ -1427,6 +1427,7 @@ impl DataModelExt for PaymentAttemptUpdate {
+                 fingerprint_id,
+                 updated_by,
+                 merchant_connector_id: connector_id,
++                payment_method_id,
+                 external_three_ds_authentication_attempted,
+                 authentication_connector,
+                 authentication_id,
+@@ -1453,6 +1454,7 @@ impl DataModelExt for PaymentAttemptUpdate {
+                 fingerprint_id,
+                 updated_by,
+                 merchant_connector_id: connector_id,
++                payment_method_id,
+                 external_three_ds_authentication_attempted,
+                 authentication_connector,
+                 authentication_id,
+@@ -1720,6 +1722,7 @@ impl DataModelExt for PaymentAttemptUpdate {
+                 fingerprint_id,
+                 updated_by,
+                 merchant_connector_id: connector_id,
++                payment_method_id,
+                 external_three_ds_authentication_attempted,
+                 authentication_connector,
+                 authentication_id,
+@@ -1746,6 +1749,7 @@ impl DataModelExt for PaymentAttemptUpdate {
+                 fingerprint_id,
+                 updated_by,
+                 merchant_connector_id: connector_id,
++                payment_method_id,
+                 external_three_ds_authentication_attempted,
+                 authentication_connector,
+                 authentication_id,
+diff --git a/openapi/openapi_spec.json b/openapi/openapi_spec.json
+index ac90185dacf..e822479e3a7 100644
+--- a/openapi/openapi_spec.json
++++ b/openapi/openapi_spec.json
+@@ -12231,6 +12231,14 @@
+           }
+         }
+       },
++      "PaymentMethodStatus": {
++        "type": "string",
++        "enum": [
++          "active",
++          "inactive",
++          "processing"
++        ]
++      },
+       "PaymentMethodType": {
+         "type": "string",
+         "description": "Indicates the sub type of payment method. Eg: 'google_pay' & 'apple_pay' for wallets.",
+@@ -14199,6 +14207,19 @@
+             "type": "string",
+             "description": "Payment Fingerprint",
+             "nullable": true
++          },
++          "payment_method_id": {
++            "type": "string",
++            "description": "Payment Method Id",
++            "nullable": true
++          },
++          "payment_method_status": {
++            "allOf": [
++              {
++                "$ref": "#/components/schemas/PaymentMethodStatus"
++              }
++            ],
++            "nullable": true
+           }
+         }
+       },

@@ -1,0 +1,386 @@
+commit fe684bcffc5dc947142619c510c23921ba758131
+Author: Marco Gavelli <marcogavelli2@gmail.com>
+Date:   Fri Dec 3 16:05:07 2021 +0100
+
+    Show network shortcuts on the sidebar (#7185)
+
+diff --git a/Common/ShellLinkItem.cs b/Common/ShellLinkItem.cs
+new file mode 100644
+index 000000000..c9c9711af
+--- /dev/null
++++ b/Common/ShellLinkItem.cs
+@@ -0,0 +1,27 @@
++﻿namespace Files.Common
++{
++    public class ShellLinkItem : ShellFileItem
++    {
++        public string TargetPath;
++        public string Arguments;
++        public string WorkingDirectory;
++        public bool RunAsAdmin;
++
++        public ShellLinkItem()
++        {
++        }
++
++        public ShellLinkItem(ShellFileItem baseItem)
++        {
++            this.RecyclePath = baseItem.RecyclePath;
++            this.FileName = baseItem.FileName;
++            this.FilePath = baseItem.FilePath;
++            this.RecycleDate = baseItem.RecycleDate;
++            this.ModifiedDate = baseItem.ModifiedDate;
++            this.CreatedDate = baseItem.CreatedDate;
++            this.FileSize = baseItem.FileSize;
++            this.FileSizeBytes = baseItem.FileSizeBytes;
++            this.FileType = baseItem.FileType;
++        }
++    }
++}
+diff --git a/Files.Launcher/Helpers/ShellFolderHelpers.cs b/Files.Launcher/Helpers/ShellFolderHelpers.cs
+index e2165d5af..133b71293 100644
+--- a/Files.Launcher/Helpers/ShellFolderHelpers.cs
++++ b/Files.Launcher/Helpers/ShellFolderHelpers.cs
+@@ -44,7 +44,7 @@ namespace FilesFullTrust.Helpers
+             folderItem.Properties.TryGetValue<string>(
+                 Ole32.PROPERTYKEY.System.ItemNameDisplay, out var fileName);
+             fileName ??= Path.GetFileName(folderItem.Name); // Original file name
+-            string filePath = folderItem.Name; // Original file path + name (recycle bin only)
++            string filePath = Path.Combine(Path.GetDirectoryName(parsingPath), folderItem.Name); // In recycle bin "Name" contains original file path + name
+             if (!isFolder && !string.IsNullOrEmpty(parsingPath) && Path.GetExtension(parsingPath) is string realExtension && !string.IsNullOrEmpty(realExtension))
+             {
+                 if (!string.IsNullOrEmpty(fileName) && !fileName.EndsWith(realExtension, StringComparison.OrdinalIgnoreCase))
+@@ -72,5 +72,25 @@ namespace FilesFullTrust.Helpers
+                 Ole32.PROPERTYKEY.System.ItemTypeText, out var fileType);
+             return new ShellFileItem(isFolder, parsingPath, fileName, filePath, recycleDate, modifiedDate, createdDate, fileSize, fileSizeBytes ?? 0, fileType);
+         }
++
++        public static ShellLinkItem GetShellLinkItem(ShellLink linkItem)
++        {
++            if (linkItem == null)
++            {
++                return null;
++            }
++            var baseItem = GetShellFileItem(linkItem);
++            if (baseItem == null)
++            {
++                return null;
++            }
++            var link = new ShellLinkItem(baseItem);
++            link.IsFolder = !string.IsNullOrEmpty(link.TargetPath) && linkItem.Target.IsFolder;
++            link.RunAsAdmin = linkItem.RunAsAdministrator;
++            link.Arguments = linkItem.Arguments;
++            link.WorkingDirectory = linkItem.WorkingDirectory;
++            link.TargetPath = linkItem.TargetPath;
++            return link;
++        }
+     }
+ }
+diff --git a/Files.Launcher/MessageHandlers/FileOperationsHandler.cs b/Files.Launcher/MessageHandlers/FileOperationsHandler.cs
+index 7e8d95948..73c17016c 100644
+--- a/Files.Launcher/MessageHandlers/FileOperationsHandler.cs
++++ b/Files.Launcher/MessageHandlers/FileOperationsHandler.cs
+@@ -507,11 +507,7 @@ namespace FilesFullTrust.MessageHandlers
+                             using var link = new ShellLink(linkPath, LinkResolution.NoUIWithMsgPump, null, TimeSpan.FromMilliseconds(100));
+                             await Win32API.SendMessageAsync(connection, new ValueSet()
+                             {
+-                                { "TargetPath", link.TargetPath },
+-                                { "Arguments", link.Arguments },
+-                                { "WorkingDirectory", link.WorkingDirectory },
+-                                { "RunAsAdmin", link.RunAsAdministrator },
+-                                { "IsFolder", !string.IsNullOrEmpty(link.TargetPath) && link.Target.IsFolder }
++                                { "ShortcutInfo", JsonConvert.SerializeObject(ShellFolderExtensions.GetShellLinkItem(link)) }
+                             }, message.Get("RequestID", (string)null));
+                         }
+                         else if (linkPath.EndsWith(".url", StringComparison.OrdinalIgnoreCase))
+@@ -525,11 +521,7 @@ namespace FilesFullTrust.MessageHandlers
+                             });
+                             await Win32API.SendMessageAsync(connection, new ValueSet()
+                             {
+-                                { "TargetPath", linkUrl },
+-                                { "Arguments", null },
+-                                { "WorkingDirectory", null },
+-                                { "RunAsAdmin", false },
+-                                { "IsFolder", false }
++                                { "ShortcutInfo", JsonConvert.SerializeObject(new ShellLinkItem() { TargetPath = linkUrl }) }
+                             }, message.Get("RequestID", (string)null));
+                         }
+                     }
+@@ -539,11 +531,7 @@ namespace FilesFullTrust.MessageHandlers
+                         Program.Logger.Warn(ex, ex.Message);
+                         await Win32API.SendMessageAsync(connection, new ValueSet()
+                         {
+-                            { "TargetPath", null },
+-                            { "Arguments", null },
+-                            { "WorkingDirectory", null },
+-                            { "RunAsAdmin", false },
+-                            { "IsFolder", false }
++                            { "ShortcutInfo", JsonConvert.SerializeObject(null) }
+                         }, message.Get("RequestID", (string)null));
+                     }
+                     break;
+diff --git a/Files.Launcher/MessageHandlers/NetworkDrivesHandler.cs b/Files.Launcher/MessageHandlers/NetworkDrivesHandler.cs
+index 6b9603759..8c2cc3991 100644
+--- a/Files.Launcher/MessageHandlers/NetworkDrivesHandler.cs
++++ b/Files.Launcher/MessageHandlers/NetworkDrivesHandler.cs
+@@ -45,23 +45,31 @@ namespace FilesFullTrust.MessageHandlers
+                 case "GetNetworkLocations":
+                     var networkLocations = await Win32API.StartSTATask(() =>
+                     {
+-                        var netl = new ValueSet();
++                        var locations = new List<ShellLinkItem>();
+                         using (var nethood = new ShellFolder(Shell32.KNOWNFOLDERID.FOLDERID_NetHood))
+                         {
+-                            foreach (var link in nethood)
++                            foreach (var item in nethood)
+                             {
+-                                var linkPath = (string)link.Properties["System.Link.TargetParsingPath"];
+-                                if (linkPath != null)
++                                if (item is ShellLink link)
+                                 {
+-                                    netl.Add(link.Name, linkPath);
++                                    locations.Add(ShellFolderExtensions.GetShellLinkItem(link));
++                                }
++                                else
++                                {
++                                    var linkPath = (string)item.Properties["System.Link.TargetParsingPath"];
++                                    if (linkPath != null)
++                                    {
++                                        var linkItem = ShellFolderExtensions.GetShellFileItem(item);
++                                        locations.Add(new ShellLinkItem(linkItem) { TargetPath = linkPath });
++                                    }
+                                 }
+                             }
+                         }
+-                        return netl;
++                        return locations;
+                     });
+-                    networkLocations ??= new ValueSet();
+-                    networkLocations.Add("Count", networkLocations.Count);
+-                    await Win32API.SendMessageAsync(connection, networkLocations, message.Get("RequestID", (string)null));
++                    var response = new ValueSet();
++                    response.Add("NetworkLocations", JsonConvert.SerializeObject(networkLocations));
++                    await Win32API.SendMessageAsync(connection, response, message.Get("RequestID", (string)null));
+                     break;
+ 
+                 case "OpenMapNetworkDriveDialog":
+diff --git a/Files/App.xaml.cs b/Files/App.xaml.cs
+index a171f5d77..32b9c8b45 100644
+--- a/Files/App.xaml.cs
++++ b/Files/App.xaml.cs
+@@ -203,7 +203,7 @@ namespace Files
+             bool canEnablePrelaunch = ApiInformation.IsMethodPresent("Windows.ApplicationModel.Core.CoreApplication", "EnablePrelaunch");
+ 
+             await EnsureSettingsAndConfigurationAreBootstrapped();
+-            InitializeAppComponentsAsync().ContinueWith(t => Logger.Warn(t.Exception, "Error during LoadOtherStuffAsync()"), TaskContinuationOptions.OnlyOnFaulted);
++            _ = InitializeAppComponentsAsync().ContinueWith(t => Logger.Warn(t.Exception, "Error during InitializeAppComponentsAsync()"), TaskContinuationOptions.OnlyOnFaulted);
+ 
+             var rootFrame = EnsureWindowIsInitialized();
+ 
+@@ -261,7 +261,7 @@ namespace Files
+             SystemInformation.Instance.TrackAppUse(e);
+ 
+             await EnsureSettingsAndConfigurationAreBootstrapped();
+-            InitializeAppComponentsAsync().ContinueWith(t => Logger.Warn(t.Exception, "Error during LoadOtherStuffAsync()"), TaskContinuationOptions.OnlyOnFaulted);
++            _ = InitializeAppComponentsAsync().ContinueWith(t => Logger.Warn(t.Exception, "Error during InitializeAppComponentsAsync()"), TaskContinuationOptions.OnlyOnFaulted);
+ 
+             var rootFrame = EnsureWindowIsInitialized();
+ 
+@@ -327,7 +327,7 @@ namespace Files
+             Logger.Info($"App activated by {args.Kind.ToString()}");
+ 
+             await EnsureSettingsAndConfigurationAreBootstrapped();
+-            InitializeAppComponentsAsync().ContinueWith(t => Logger.Warn(t.Exception, "Error during LoadOtherStuffAsync()"), TaskContinuationOptions.OnlyOnFaulted);
++            _ = InitializeAppComponentsAsync().ContinueWith(t => Logger.Warn(t.Exception, "Error during InitializeAppComponentsAsync()"), TaskContinuationOptions.OnlyOnFaulted);
+ 
+             var rootFrame = EnsureWindowIsInitialized();
+ 
+diff --git a/Files/Filesystem/NetworkDrivesManager.cs b/Files/Filesystem/NetworkDrivesManager.cs
+index 97016d238..639edea6a 100644
+--- a/Files/Filesystem/NetworkDrivesManager.cs
++++ b/Files/Filesystem/NetworkDrivesManager.cs
+@@ -7,6 +7,7 @@ using Files.UserControls;
+ using Microsoft.Toolkit.Mvvm.ComponentModel;
+ using Microsoft.Toolkit.Mvvm.DependencyInjection;
+ using Microsoft.Toolkit.Uwp;
++using Newtonsoft.Json;
+ using System;
+ using System.Collections.Generic;
+ using System.Collections.ObjectModel;
+@@ -68,15 +69,16 @@ namespace Files.Filesystem
+                     { "Arguments", "NetworkDriveOperation" },
+                     { "netdriveop", "GetNetworkLocations" }
+                 });
+-                if (status == AppServiceResponseStatus.Success && response.ContainsKey("Count"))
++                if (status == AppServiceResponseStatus.Success && response.ContainsKey("NetworkLocations"))
+                 {
+-                    foreach (var key in response.Keys
+-                        .Where(k => k != "Count" && k != "RequestID"))
++                    var items = JsonConvert.DeserializeObject<List<ShellLinkItem>>((string)response["NetworkLocations"]);
++                    foreach (var item in items ?? new())
+                     {
+                         var networkItem = new DriveItem()
+                         {
+-                            Text = key,
+-                            Path = (string)response[key],
++                            Text = System.IO.Path.GetFileNameWithoutExtension(item.FileName),
++                            Path = item.TargetPath,
++                            DeviceID = item.FilePath,
+                             Type = DriveType.Network,
+                             ItemType = NavigationControlItemType.Drive
+                         };
+@@ -147,12 +149,16 @@ namespace Files.Filesystem
+                         .OrderByDescending(o => string.Equals(o.Text, "Network".GetLocalized(), StringComparison.OrdinalIgnoreCase))
+                         .ThenBy(o => o.Text))
+                         {
+-                            var resource = await UIHelpers.GetIconResourceInfo(Constants.ImageRes.Folder);
+-                            if (resource != null)
++                            if (!string.IsNullOrEmpty(drive.DeviceID))
+                             {
+-                                drive.IconData = resource.IconDataBytes;
+-                                drive.Icon = await drive.IconData.ToBitmapAsync();
++                                drive.IconData = await FileThumbnailHelper.LoadIconWithoutOverlayAsync(drive.DeviceID, 24);
+                             }
++                            if (drive.IconData == null)
++                            {
++                                var resource = await UIHelpers.GetIconResourceInfo(Constants.ImageRes.Folder);
++                                drive.IconData = resource?.IconDataBytes;
++                            }
++                            drive.Icon = await drive.IconData.ToBitmapAsync();
+                             if (!section.ChildItems.Contains(drive))
+                             {
+                                 section.ChildItems.Add(drive);
+diff --git a/Files/Filesystem/StorageEnumerators/Win32StorageEnumerator.cs b/Files/Filesystem/StorageEnumerators/Win32StorageEnumerator.cs
+index 0a6346090..c44bc5e02 100644
+--- a/Files/Filesystem/StorageEnumerators/Win32StorageEnumerator.cs
++++ b/Files/Filesystem/StorageEnumerators/Win32StorageEnumerator.cs
+@@ -1,4 +1,5 @@
+ ﻿using ByteSizeLib;
++using Files.Common;
+ using Files.Extensions;
+ using Files.Filesystem.StorageItems;
+ using Files.Helpers;
+@@ -6,6 +7,7 @@ using Files.Helpers.FileListCache;
+ using Files.Services;
+ using Microsoft.Toolkit.Mvvm.DependencyInjection;
+ using Microsoft.Toolkit.Uwp;
++using Newtonsoft.Json;
+ using System;
+ using System.Collections.Generic;
+ using System.IO;
+@@ -259,21 +261,20 @@ namespace Files.Filesystem.StorageEnumerators
+                     {
+                         return null;
+                     }
+-                    if (status == AppServiceResponseStatus.Success
+-                        && response.ContainsKey("TargetPath"))
++                    if (status == AppServiceResponseStatus.Success && response.ContainsKey("ShortcutInfo"))
+                     {
+                         var isUrl = findData.cFileName.EndsWith(".url", StringComparison.OrdinalIgnoreCase);
+-                        string target = (string)response["TargetPath"];
++                        var shInfo = JsonConvert.DeserializeObject<ShellLinkItem>((string)response["ShortcutInfo"]);
+ 
+                         return new ShortcutItem(null, dateReturnFormat)
+                         {
+-                            PrimaryItemAttribute = (bool)response["IsFolder"] ? StorageItemTypes.Folder : StorageItemTypes.File,
++                            PrimaryItemAttribute = shInfo.IsFolder ? StorageItemTypes.Folder : StorageItemTypes.File,
+                             FileExtension = itemFileExtension,
+                             IsHiddenItem = isHidden,
+                             Opacity = opacity,
+                             FileImage = null,
+-                            LoadFileIcon = !(bool)response["IsFolder"] && itemThumbnailImgVis,
+-                            LoadWebShortcutGlyph = !(bool)response["IsFolder"] && isUrl && itemEmptyImgVis,
++                            LoadFileIcon = !shInfo.IsFolder && itemThumbnailImgVis,
++                            LoadWebShortcutGlyph = !shInfo.IsFolder && isUrl && itemEmptyImgVis,
+                             ItemNameRaw = itemName,
+                             ItemDateModifiedReal = itemModifiedDate,
+                             ItemDateAccessedReal = itemLastAccessDate,
+@@ -282,10 +283,10 @@ namespace Files.Filesystem.StorageEnumerators
+                             ItemPath = itemPath,
+                             FileSize = itemSize,
+                             FileSizeBytes = itemSizeBytes,
+-                            TargetPath = target,
+-                            Arguments = (string)response["Arguments"],
+-                            WorkingDirectory = (string)response["WorkingDirectory"],
+-                            RunAsAdmin = (bool)response["RunAsAdmin"],
++                            TargetPath = shInfo.TargetPath,
++                            Arguments = shInfo.Arguments,
++                            WorkingDirectory = shInfo.WorkingDirectory,
++                            RunAsAdmin = shInfo.RunAsAdmin,
+                             IsUrl = isUrl,
+                         };
+                     }
+diff --git a/Files/Helpers/NavigationHelpers.cs b/Files/Helpers/NavigationHelpers.cs
+index a53dc4e09..cf83c4873 100644
+--- a/Files/Helpers/NavigationHelpers.cs
++++ b/Files/Helpers/NavigationHelpers.cs
+@@ -7,6 +7,7 @@ using Files.ViewModels;
+ using Files.Views;
+ using Microsoft.Toolkit.Mvvm.DependencyInjection;
+ using Microsoft.Toolkit.Uwp;
++using Newtonsoft.Json;
+ using System;
+ using System.Collections.Generic;
+ using System.Linq;
+@@ -132,7 +133,7 @@ namespace Files.Helpers
+             bool isShortcutItem = path.EndsWith(".lnk", StringComparison.Ordinal) || path.EndsWith(".url", StringComparison.Ordinal);
+             FilesystemResult opened = (FilesystemResult)false;
+ 
+-            var shortcutInfo = new ShortcutItem();
++            var shortcutInfo = new ShellLinkItem();
+             if (itemType == null || isShortcutItem || isHiddenItem || isReparsePoint)
+             {
+                 if (isShortcutItem)
+@@ -149,15 +150,14 @@ namespace Files.Helpers
+                         { "filepath", path }
+                     });
+ 
+-                    if (status == AppServiceResponseStatus.Success)
++                    if (status == AppServiceResponseStatus.Success && response.ContainsKey("ShortcutInfo"))
+                     {
+-                        shortcutInfo.TargetPath = response.Get("TargetPath", string.Empty);
+-                        shortcutInfo.Arguments = response.Get("Arguments", string.Empty);
+-                        shortcutInfo.WorkingDirectory = response.Get("WorkingDirectory", string.Empty);
+-                        shortcutInfo.RunAsAdmin = response.Get("RunAsAdmin", false);
+-                        shortcutInfo.PrimaryItemAttribute = response.Get("IsFolder", false) ? StorageItemTypes.Folder : StorageItemTypes.File;
+-
+-                        itemType = response.Get("IsFolder", false) ? FilesystemItemType.Directory : FilesystemItemType.File;
++                        var shInfo = JsonConvert.DeserializeObject<ShellLinkItem>((string)response["ShortcutInfo"]);
++                        if (shInfo != null)
++                        {
++                            shortcutInfo = shInfo;
++                        }
++                        itemType = shInfo != null && shInfo.IsFolder ? FilesystemItemType.Directory : FilesystemItemType.File;
+                     }
+                     else
+                     {
+@@ -262,7 +262,7 @@ namespace Files.Helpers
+             return opened;
+         }
+ 
+-        private static async Task<FilesystemResult> OpenDirectory(string path, IShellPage associatedInstance, IEnumerable<string> selectItems, ShortcutItem shortcutInfo)
++        private static async Task<FilesystemResult> OpenDirectory(string path, IShellPage associatedInstance, IEnumerable<string> selectItems, ShellLinkItem shortcutInfo)
+         {
+             IUserSettingsService userSettingsService = Ioc.Default.GetService<IUserSettingsService>();
+ 
+@@ -352,7 +352,7 @@ namespace Files.Helpers
+             return opened;
+         }
+ 
+-        private static async Task<FilesystemResult> OpenFile(string path, IShellPage associatedInstance, IEnumerable<string> selectItems, ShortcutItem shortcutInfo, bool openViaApplicationPicker = false, string args = default)
++        private static async Task<FilesystemResult> OpenFile(string path, IShellPage associatedInstance, IEnumerable<string> selectItems, ShellLinkItem shortcutInfo, bool openViaApplicationPicker = false, string args = default)
+         {
+             var opened = (FilesystemResult)false;
+             bool isHiddenItem = NativeFileOperationsHelper.HasFileAttribute(path, System.IO.FileAttributes.Hidden);
+diff --git a/Files/ViewModels/Properties/DriveProperties.cs b/Files/ViewModels/Properties/DriveProperties.cs
+index 21bfd0bef..4465759d1 100644
+--- a/Files/ViewModels/Properties/DriveProperties.cs
++++ b/Files/ViewModels/Properties/DriveProperties.cs
+@@ -52,6 +52,7 @@ namespace Files.ViewModels.Properties
+                 {
+                     ViewModel.IconData = await FileThumbnailHelper.LoadIconWithoutOverlayAsync(Drive.Path, 80);
+                 }
++                ViewModel.IconData ??= await FileThumbnailHelper.LoadIconWithoutOverlayAsync(Drive.DeviceID, 80); // For network shortcuts
+             }
+ 
+             if (diskRoot == null || diskRoot.Properties == null)

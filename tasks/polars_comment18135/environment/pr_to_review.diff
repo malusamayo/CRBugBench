@@ -1,0 +1,220 @@
+diff --git a/crates/polars-plan/src/client/check.rs b/crates/polars-plan/src/client/check.rs
+index 08cbb6cb7319..a01addd9231d 100644
+--- a/crates/polars-plan/src/client/check.rs
++++ b/crates/polars-plan/src/client/check.rs
+@@ -1,30 +1,15 @@
+ use polars_core::error::{polars_err, PolarsResult};
+ use polars_io::path_utils::is_cloud_url;
+ 
+-use crate::dsl::Expr;
+ use crate::plans::options::SinkType;
+-use crate::plans::{DslFunction, DslPlan, FileScan, FunctionIR};
++use crate::plans::{DslPlan, FileScan};
+ 
+ /// Assert that the given [`DslPlan`] is eligible to be executed on Polars Cloud.
+ pub(super) fn assert_cloud_eligible(dsl: &DslPlan) -> PolarsResult<()> {
+-    let mut expr_stack = vec![];
+     for plan_node in dsl.into_iter() {
+         match plan_node {
+-            DslPlan::MapFunction { function, .. } => match function {
+-                DslFunction::FunctionIR(FunctionIR::Opaque { .. }) => {
+-                    return ineligible_error("contains opaque function")
+-                },
+-                #[cfg(feature = "python")]
+-                DslFunction::OpaquePython { .. } => {
+-                    return ineligible_error("contains Python function")
+-                },
+-                _ => (),
+-            },
+             #[cfg(feature = "python")]
+             DslPlan::PythonScan { .. } => return ineligible_error("contains Python scan"),
+-            DslPlan::GroupBy { apply: Some(_), .. } => {
+-                return ineligible_error("contains Python function in group by operation")
+-            },
+             DslPlan::Scan { paths, .. }
+                 if paths.lock().unwrap().0.iter().any(|p| !is_cloud_url(p)) =>
+             {
+@@ -39,23 +24,7 @@ pub(super) fn assert_cloud_eligible(dsl: &DslPlan) -> PolarsResult<()> {
+                     return ineligible_error("contains sink to non-cloud location");
+                 }
+             },
+-            plan => {
+-                plan.get_expr(&mut expr_stack);
+-
+-                for expr in expr_stack.drain(..) {
+-                    for expr_node in expr.into_iter() {
+-                        match expr_node {
+-                            Expr::AnonymousFunction { .. } => {
+-                                return ineligible_error("contains anonymous function")
+-                            },
+-                            Expr::RenameAlias { .. } => {
+-                                return ineligible_error("contains custom name remapping")
+-                            },
+-                            _ => (),
+-                        }
+-                    }
+-                }
+-            },
++            _ => (),
+         }
+     }
+     Ok(())
+@@ -101,47 +70,6 @@ impl DslPlan {
+             PythonScan { .. } => (),
+         }
+     }
+-
+-    fn get_expr<'a>(&'a self, scratch: &mut Vec<&'a Expr>) {
+-        use DslPlan::*;
+-        match self {
+-            Filter { predicate, .. } => scratch.push(predicate),
+-            Scan { predicate, .. } => {
+-                if let Some(expr) = predicate {
+-                    scratch.push(expr)
+-                }
+-            },
+-            DataFrameScan { filter, .. } => {
+-                if let Some(expr) = filter {
+-                    scratch.push(expr)
+-                }
+-            },
+-            Select { expr, .. } => scratch.extend(expr),
+-            HStack { exprs, .. } => scratch.extend(exprs),
+-            Sort { by_column, .. } => scratch.extend(by_column),
+-            GroupBy { keys, aggs, .. } => {
+-                scratch.extend(keys);
+-                scratch.extend(aggs);
+-            },
+-            Join {
+-                left_on, right_on, ..
+-            } => {
+-                scratch.extend(left_on);
+-                scratch.extend(right_on);
+-            },
+-            Cache { .. }
+-            | Distinct { .. }
+-            | Slice { .. }
+-            | MapFunction { .. }
+-            | Union { .. }
+-            | HConcat { .. }
+-            | ExtContext { .. }
+-            | Sink { .. }
+-            | IR { .. } => (),
+-            #[cfg(feature = "python")]
+-            PythonScan { .. } => (),
+-        }
+-    }
+ }
+ 
+ pub struct DslPlanIter<'a> {
+diff --git a/py-polars/tests/unit/cloud/test_prepare_cloud_plan.py b/py-polars/tests/unit/cloud/test_prepare_cloud_plan.py
+index 825c2c130e57..d40065eac074 100644
+--- a/py-polars/tests/unit/cloud/test_prepare_cloud_plan.py
++++ b/py-polars/tests/unit/cloud/test_prepare_cloud_plan.py
+@@ -6,7 +6,7 @@
+ 
+ import polars as pl
+ from polars._utils.cloud import prepare_cloud_plan
+-from polars.exceptions import InvalidOperationError
++from polars.exceptions import ComputeError, InvalidOperationError
+ 
+ CLOUD_SOURCE = "s3://my-nonexistent-bucket/dataset"
+ CLOUD_SINK = "s3://my-nonexistent-bucket/result"
+@@ -29,6 +29,35 @@ def test_prepare_cloud_plan(lf: pl.LazyFrame) -> None:
+     assert isinstance(deserialized, pl.LazyFrame)
+ 
+ 
++@pytest.mark.parametrize(
++    "lf",
++    [
++        pl.LazyFrame({"a": [1, 2], "b": [3, 4]}).select(
++            pl.col("a").map_elements(lambda x: sum(x))
++        ),
++        pl.LazyFrame({"a": [1, 2], "b": [3, 4]}).select(
++            pl.col("b").map_batches(lambda x: sum(x))
++        ),
++        pl.LazyFrame({"a": [1, 2], "b": [3, 4]}).map_batches(lambda x: x),
++        pl.LazyFrame({"a": [1, 2], "b": [3, 4]})
++        .group_by("a")
++        .map_groups(lambda x: x, schema={"b": pl.Int64}),
++        pl.LazyFrame({"a": [1, 2], "b": [3, 4]})
++        .group_by("a")
++        .agg(pl.col("b").map_batches(lambda x: sum(x))),
++        pl.scan_parquet(CLOUD_SOURCE).filter(
++            pl.col("a") < pl.lit(1).map_elements(lambda x: x + 1)
++        ),
++    ],
++)
++def test_prepare_cloud_plan_udf(lf: pl.LazyFrame) -> None:
++    result = prepare_cloud_plan(lf, CLOUD_SINK)
++    assert isinstance(result, bytes)
++
++    deserialized = pl.LazyFrame.deserialize(BytesIO(result))
++    assert isinstance(deserialized, pl.LazyFrame)
++
++
+ def test_prepare_cloud_plan_sink_added() -> None:
+     lf = pl.LazyFrame({"a": [1, 2], "b": [3, 4]})
+ 
+@@ -60,41 +89,6 @@ def test_prepare_cloud_plan_optimization_toggle() -> None:
+     assert isinstance(deserialized, pl.LazyFrame)
+ 
+ 
+-@pytest.mark.parametrize(
+-    "lf",
+-    [
+-        pl.LazyFrame({"a": [1, 2], "b": [3, 4]}).select(
+-            pl.col("a").map_elements(lambda x: sum(x))
+-        ),
+-        pl.LazyFrame({"a": [1, 2], "b": [3, 4]}).select(
+-            pl.col("b").map_batches(lambda x: sum(x))
+-        ),
+-        pl.LazyFrame({"a": [{"x": 1, "y": 2}]}).select(
+-            pl.col("a").name.map(lambda x: x.upper())
+-        ),
+-        pl.LazyFrame({"a": [{"x": 1, "y": 2}]}).select(
+-            pl.col("a").name.map_fields(lambda x: x.upper())
+-        ),
+-        pl.LazyFrame({"a": [1, 2], "b": [3, 4]}).map_batches(lambda x: x),
+-        pl.LazyFrame({"a": [1, 2], "b": [3, 4]})
+-        .group_by("a")
+-        .map_groups(lambda x: x, schema={"b": pl.Int64}),
+-        pl.LazyFrame({"a": [1, 2], "b": [3, 4]})
+-        .group_by("a")
+-        .agg(pl.col("b").map_batches(lambda x: sum(x))),
+-        pl.scan_parquet(CLOUD_SOURCE).filter(
+-            pl.col("a") < pl.lit(1).map_elements(lambda x: x + 1)
+-        ),
+-    ],
+-)
+-def test_prepare_cloud_plan_fail_on_udf(lf: pl.LazyFrame) -> None:
+-    with pytest.raises(
+-        InvalidOperationError,
+-        match="logical plan ineligible for execution on Polars Cloud",
+-    ):
+-        prepare_cloud_plan(lf, CLOUD_SINK)
+-
+-
+ @pytest.mark.parametrize(
+     "lf",
+     [
+@@ -125,3 +119,19 @@ def test_prepare_cloud_plan_fail_on_python_scan(tmp_path: Path) -> None:
+         match="logical plan ineligible for execution on Polars Cloud",
+     ):
+         prepare_cloud_plan(lf, CLOUD_SINK)
++
++
++@pytest.mark.parametrize(
++    "lf",
++    [
++        pl.LazyFrame({"a": [{"x": 1, "y": 2}]}).select(
++            pl.col("a").name.map(lambda x: x.upper())
++        ),
++        pl.LazyFrame({"a": [{"x": 1, "y": 2}]}).select(
++            pl.col("a").name.map_fields(lambda x: x.upper())
++        ),
++    ],
++)
++def test_prepare_cloud_plan_fail_on_serialization(lf: pl.LazyFrame) -> None:
++    with pytest.raises(ComputeError, match="serialize"):
++        prepare_cloud_plan(lf, CLOUD_SINK)

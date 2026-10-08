@@ -1,0 +1,1894 @@
+commit 079aa72475f60dfeb4221ade4e9e4e6e1edfbb59
+Author: David Luzar <luzar.david@gmail.com>
+Date:   Fri Jun 2 17:06:11 2023 +0200
+
+    feat: eye dropper (#6615)
+
+diff --git a/package.json b/package.json
+index 246c785a..91a4400b 100644
+--- a/package.json
++++ b/package.json
+@@ -34,7 +34,7 @@
+     "i18next-browser-languagedetector": "6.1.4",
+     "idb-keyval": "6.0.3",
+     "image-blob-reduce": "3.0.1",
+-    "jotai": "1.6.4",
++    "jotai": "1.13.1",
+     "lodash.throttle": "4.1.1",
+     "nanoid": "3.3.3",
+     "open-color": "1.9.1",
+diff --git a/src/actions/actionProperties.tsx b/src/actions/actionProperties.tsx
+index 6e921d6e..d319337c 100644
+--- a/src/actions/actionProperties.tsx
++++ b/src/actions/actionProperties.tsx
+@@ -119,8 +119,8 @@ const getFormValue = function <T>(
+   elements: readonly ExcalidrawElement[],
+   appState: AppState,
+   getAttribute: (element: ExcalidrawElement) => T,
+-  defaultValue?: T,
+-): T | null {
++  defaultValue: T,
++): T {
+   const editingElement = appState.editingElement;
+   const nonDeletedElements = getNonDeletedElements(elements);
+   return (
+@@ -132,7 +132,7 @@ const getFormValue = function <T>(
+           getAttribute,
+         )
+       : defaultValue) ??
+-    null
++    defaultValue
+   );
+ };
+ 
+@@ -811,6 +811,7 @@ export const actionChangeTextAlign = register({
+     );
+   },
+ });
++
+ export const actionChangeVerticalAlign = register({
+   name: "changeVerticalAlign",
+   trackEvent: { category: "element" },
+@@ -865,16 +866,21 @@ export const actionChangeVerticalAlign = register({
+               testId: "align-bottom",
+             },
+           ]}
+-          value={getFormValue(elements, appState, (element) => {
+-            if (isTextElement(element) && element.containerId) {
+-              return element.verticalAlign;
+-            }
+-            const boundTextElement = getBoundTextElement(element);
+-            if (boundTextElement) {
+-              return boundTextElement.verticalAlign;
+-            }
+-            return null;
+-          })}
++          value={getFormValue(
++            elements,
++            appState,
++            (element) => {
++              if (isTextElement(element) && element.containerId) {
++                return element.verticalAlign;
++              }
++              const boundTextElement = getBoundTextElement(element);
++              if (boundTextElement) {
++                return boundTextElement.verticalAlign;
++              }
++              return null;
++            },
++            VERTICAL_ALIGN.MIDDLE,
++          )}
+           onChange={(value) => updateData(value)}
+         />
+       </fieldset>
+diff --git a/src/colors.ts b/src/colors.ts
+index 198ec12e..7da12839 100644
+--- a/src/colors.ts
++++ b/src/colors.ts
+@@ -164,4 +164,7 @@ export const getAllColorsSpecificShade = (index: 0 | 1 | 2 | 3 | 4) =>
+     COLOR_PALETTE.red[index],
+   ] as const;
+ 
++export const rgbToHex = (r: number, g: number, b: number) =>
++  `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1)}`;
++
+ // -----------------------------------------------------------------------------
+diff --git a/src/components/App.tsx b/src/components/App.tsx
+index 0b730fc4..f4c7689b 100644
+--- a/src/components/App.tsx
++++ b/src/components/App.tsx
+@@ -304,6 +304,7 @@ import { jotaiStore } from "../jotai";
+ import { activeConfirmDialogAtom } from "./ActiveConfirmDialog";
+ import { actionWrapTextInContainer } from "../actions/actionBoundText";
+ import BraveMeasureTextError from "./BraveMeasureTextError";
++import { activeEyeDropperAtom } from "./EyeDropper";
+ 
+ const AppContext = React.createContext<AppClassProperties>(null!);
+ const AppPropsContext = React.createContext<AppProps>(null!);
+@@ -366,8 +367,6 @@ export const useExcalidrawActionManager = () =>
+ 
+ let didTapTwice: boolean = false;
+ let tappedTwiceTimer = 0;
+-let cursorX = 0;
+-let cursorY = 0;
+ let isHoldingSpace: boolean = false;
+ let isPanning: boolean = false;
+ let isDraggingScrollBar: boolean = false;
+@@ -425,7 +424,7 @@ class App extends React.Component<AppProps, AppState> {
+   hitLinkElement?: NonDeletedExcalidrawElement;
+   lastPointerDown: React.PointerEvent<HTMLCanvasElement> | null = null;
+   lastPointerUp: React.PointerEvent<HTMLElement> | PointerEvent | null = null;
+-  lastScenePointer: { x: number; y: number } | null = null;
++  lastViewportPosition = { x: 0, y: 0 };
+ 
+   constructor(props: AppProps) {
+     super(props);
+@@ -634,6 +633,7 @@ class App extends React.Component<AppProps, AppState> {
+                         </LayerUI>
+                         <div className="excalidraw-textEditorContainer" />
+                         <div className="excalidraw-contextMenuContainer" />
++                        <div className="excalidraw-eye-dropper-container" />
+                         {selectedElement.length === 1 &&
+                           !this.state.contextMenu &&
+                           this.state.showHyperlinkPopup && (
+@@ -724,6 +724,49 @@ class App extends React.Component<AppProps, AppState> {
+     }
+   };
+ 
++  private openEyeDropper = ({ type }: { type: "stroke" | "background" }) => {
++    jotaiStore.set(activeEyeDropperAtom, {
++      swapPreviewOnAlt: true,
++      previewType: type === "stroke" ? "strokeColor" : "backgroundColor",
++      onSelect: (color, event) => {
++        const shouldUpdateStrokeColor =
++          (type === "background" && event.altKey) ||
++          (type === "stroke" && !event.altKey);
++        const selectedElements = getSelectedElements(
++          this.scene.getElementsIncludingDeleted(),
++          this.state,
++        );
++        if (
++          !selectedElements.length ||
++          this.state.activeTool.type !== "selection"
++        ) {
++          if (shouldUpdateStrokeColor) {
++            this.setState({
++              currentItemStrokeColor: color,
++            });
++          } else {
++            this.setState({
++              currentItemBackgroundColor: color,
++            });
++          }
++        } else {
++          this.updateScene({
++            elements: this.scene.getElementsIncludingDeleted().map((el) => {
++              if (this.state.selectedElementIds[el.id]) {
++                return newElementWith(el, {
++                  [shouldUpdateStrokeColor ? "strokeColor" : "backgroundColor"]:
++                    color,
++                });
++              }
++              return el;
++            }),
++          });
++        }
++      },
++      keepOpenOnAlt: false,
++    });
++  };
++
+   private syncActionResult = withBatchedUpdates(
+     (actionResult: ActionResult) => {
+       if (this.unmounted || actionResult === false) {
+@@ -1569,7 +1612,10 @@ class App extends React.Component<AppProps, AppState> {
+         return;
+       }
+ 
+-      const elementUnderCursor = document.elementFromPoint(cursorX, cursorY);
++      const elementUnderCursor = document.elementFromPoint(
++        this.lastViewportPosition.x,
++        this.lastViewportPosition.y,
++      );
+       if (
+         event &&
+         (!(elementUnderCursor instanceof HTMLCanvasElement) ||
+@@ -1597,7 +1643,10 @@ class App extends React.Component<AppProps, AppState> {
+       // prefer spreadsheet data over image file (MS Office/Libre Office)
+       if (isSupportedImageFile(file) && !data.spreadsheet) {
+         const { x: sceneX, y: sceneY } = viewportCoordsToSceneCoords(
+-          { clientX: cursorX, clientY: cursorY },
++          {
++            clientX: this.lastViewportPosition.x,
++            clientY: this.lastViewportPosition.y,
++          },
+           this.state,
+         );
+ 
+@@ -1660,13 +1709,13 @@ class App extends React.Component<AppProps, AppState> {
+       typeof opts.position === "object"
+         ? opts.position.clientX
+         : opts.position === "cursor"
+-        ? cursorX
++        ? this.lastViewportPosition.x
+         : this.state.width / 2 + this.state.offsetLeft;
+     const clientY =
+       typeof opts.position === "object"
+         ? opts.position.clientY
+         : opts.position === "cursor"
+-        ? cursorY
++        ? this.lastViewportPosition.y
+         : this.state.height / 2 + this.state.offsetTop;
+ 
+     const { x, y } = viewportCoordsToSceneCoords(
+@@ -1750,7 +1799,10 @@ class App extends React.Component<AppProps, AppState> {
+ 
+   private addTextFromPaste(text: string, isPlainPaste = false) {
+     const { x, y } = viewportCoordsToSceneCoords(
+-      { clientX: cursorX, clientY: cursorY },
++      {
++        clientX: this.lastViewportPosition.x,
++        clientY: this.lastViewportPosition.y,
++      },
+       this.state,
+     );
+ 
+@@ -2083,8 +2135,8 @@ class App extends React.Component<AppProps, AppState> {
+ 
+   private updateCurrentCursorPosition = withBatchedUpdates(
+     (event: MouseEvent) => {
+-      cursorX = event.clientX;
+-      cursorY = event.clientY;
++      this.lastViewportPosition.x = event.clientX;
++      this.lastViewportPosition.y = event.clientY;
+     },
+   );
+ 
+@@ -2342,6 +2394,20 @@ class App extends React.Component<AppProps, AppState> {
+       ) {
+         jotaiStore.set(activeConfirmDialogAtom, "clearCanvas");
+       }
++
++      // eye dropper
++      // -----------------------------------------------------------------------
++      const lowerCased = event.key.toLocaleLowerCase();
++      const isPickingStroke = lowerCased === KEYS.S && event.shiftKey;
++      const isPickingBackground =
++        event.key === KEYS.I || (lowerCased === KEYS.G && event.shiftKey);
++
++      if (isPickingStroke || isPickingBackground) {
++        this.openEyeDropper({
++          type: isPickingStroke ? "stroke" : "background",
++        });
++      }
++      // -----------------------------------------------------------------------
+     },
+   );
+ 
+@@ -2471,8 +2537,8 @@ class App extends React.Component<AppProps, AppState> {
+       this.setState((state) => ({
+         ...getStateForZoom(
+           {
+-            viewportX: cursorX,
+-            viewportY: cursorY,
++            viewportX: this.lastViewportPosition.x,
++            viewportY: this.lastViewportPosition.y,
+             nextZoom: getNormalizedZoom(initialScale * event.scale),
+           },
+           state,
+@@ -6468,8 +6534,8 @@ class App extends React.Component<AppProps, AppState> {
+       this.translateCanvas((state) => ({
+         ...getStateForZoom(
+           {
+-            viewportX: cursorX,
+-            viewportY: cursorY,
++            viewportX: this.lastViewportPosition.x,
++            viewportY: this.lastViewportPosition.y,
+             nextZoom: getNormalizedZoom(newZoom),
+           },
+           state,
+diff --git a/src/components/ColorPicker/ColorInput.tsx b/src/components/ColorPicker/ColorInput.tsx
+index bb9a8551..f179d415 100644
+--- a/src/components/ColorPicker/ColorInput.tsx
++++ b/src/components/ColorPicker/ColorInput.tsx
+@@ -2,15 +2,23 @@ import { useCallback, useEffect, useRef, useState } from "react";
+ import { getColor } from "./ColorPicker";
+ import { useAtom } from "jotai";
+ import { activeColorPickerSectionAtom } from "./colorPickerUtils";
++import { eyeDropperIcon } from "../icons";
++import { jotaiScope } from "../../jotai";
+ import { KEYS } from "../../keys";
++import { activeEyeDropperAtom } from "../EyeDropper";
++import clsx from "clsx";
++import { t } from "../../i18n";
++import { useDevice } from "../App";
++import { getShortcutKey } from "../../utils";
+ 
+ interface ColorInputProps {
+-  color: string | null;
++  color: string;
+   onChange: (color: string) => void;
+   label: string;
+ }
+ 
+ export const ColorInput = ({ color, onChange, label }: ColorInputProps) => {
++  const device = useDevice();
+   const [innerValue, setInnerValue] = useState(color);
+   const [activeSection, setActiveColorPickerSection] = useAtom(
+     activeColorPickerSectionAtom,
+@@ -34,7 +42,7 @@ export const ColorInput = ({ color, onChange, label }: ColorInputProps) => {
+   );
+ 
+   const inputRef = useRef<HTMLInputElement>(null);
+-  const divRef = useRef<HTMLDivElement>(null);
++  const eyeDropperTriggerRef = useRef<HTMLDivElement>(null);
+ 
+   useEffect(() => {
+     if (inputRef.current) {
+@@ -42,8 +50,19 @@ export const ColorInput = ({ color, onChange, label }: ColorInputProps) => {
+     }
+   }, [activeSection]);
+ 
++  const [eyeDropperState, setEyeDropperState] = useAtom(
++    activeEyeDropperAtom,
++    jotaiScope,
++  );
++
++  useEffect(() => {
++    return () => {
++      setEyeDropperState(null);
++    };
++  }, [setEyeDropperState]);
++
+   return (
+-    <label className="color-picker__input-label">
++    <div className="color-picker__input-label">
+       <div className="color-picker__input-hash">#</div>
+       <input
+         ref={activeSection === "hex" ? inputRef : undefined}
+@@ -60,16 +79,48 @@ export const ColorInput = ({ color, onChange, label }: ColorInputProps) => {
+         }}
+         tabIndex={-1}
+         onFocus={() => setActiveColorPickerSection("hex")}
+-        onKeyDown={(e) => {
+-          if (e.key === KEYS.TAB) {
++        onKeyDown={(event) => {
++          if (event.key === KEYS.TAB) {
+             return;
++          } else if (event.key === KEYS.ESCAPE) {
++            eyeDropperTriggerRef.current?.focus();
+           }
+-          if (e.key === KEYS.ESCAPE) {
+-            divRef.current?.focus();
+-          }
+-          e.stopPropagation();
++          event.stopPropagation();
+         }}
+       />
+-    </label>
++      {/* TODO reenable on mobile with a better UX */}
++      {!device.isMobile && (
++        <>
++          <div
++            style={{
++              width: "1px",
++              height: "1.25rem",
++              backgroundColor: "var(--default-border-color)",
++            }}
++          />
++          <div
++            ref={eyeDropperTriggerRef}
++            className={clsx("excalidraw-eye-dropper-trigger", {
++              selected: eyeDropperState,
++            })}
++            onClick={() =>
++              setEyeDropperState((s) =>
++                s
++                  ? null
++                  : {
++                      keepOpenOnAlt: false,
++                      onSelect: (color) => onChange(color),
++                    },
++              )
++            }
++            title={`${t(
++              "labels.eyeDropper",
++            )} — ${KEYS.I.toLocaleUpperCase()} or ${getShortcutKey("Alt")} `}
++          >
++            {eyeDropperIcon}
++          </div>
++        </>
++      )}
++    </div>
+   );
+ };
+diff --git a/src/components/ColorPicker/ColorPicker.scss b/src/components/ColorPicker/ColorPicker.scss
+index bc7146b6..815e8e59 100644
+--- a/src/components/ColorPicker/ColorPicker.scss
++++ b/src/components/ColorPicker/ColorPicker.scss
+@@ -204,6 +204,7 @@
+     display: flex;
+     flex-direction: column;
+     gap: 0.75rem;
++    outline: none;
+   }
+ 
+   .color-picker-content--default {
+diff --git a/src/components/ColorPicker/ColorPicker.tsx b/src/components/ColorPicker/ColorPicker.tsx
+index c470cc08..cec9ef9a 100644
+--- a/src/components/ColorPicker/ColorPicker.tsx
++++ b/src/components/ColorPicker/ColorPicker.tsx
+@@ -1,4 +1,4 @@
+-import { isTransparent } from "../../utils";
++import { isTransparent, isWritableElement } from "../../utils";
+ import { ExcalidrawElement } from "../../element/types";
+ import { AppState } from "../../types";
+ import { TopPicks } from "./TopPicks";
+@@ -12,12 +12,14 @@ import {
+ import { useDevice, useExcalidrawContainer } from "../App";
+ import { ColorTuple, COLOR_PALETTE, ColorPaletteCustom } from "../../colors";
+ import PickerHeading from "./PickerHeading";
+-import { ColorInput } from "./ColorInput";
+ import { t } from "../../i18n";
+ import clsx from "clsx";
++import { jotaiScope } from "../../jotai";
++import { ColorInput } from "./ColorInput";
++import { useRef } from "react";
++import { activeEyeDropperAtom } from "../EyeDropper";
+ 
+ import "./ColorPicker.scss";
+-import React from "react";
+ 
+ const isValidColor = (color: string) => {
+   const style = new Option().style;
+@@ -40,9 +42,9 @@ export const getColor = (color: string): string | null => {
+     : null;
+ };
+ 
+-export interface ColorPickerProps {
++interface ColorPickerProps {
+   type: ColorPickerType;
+-  color: string | null;
++  color: string;
+   onChange: (color: string) => void;
+   label: string;
+   elements: readonly ExcalidrawElement[];
+@@ -72,6 +74,11 @@ const ColorPickerPopupContent = ({
+ >) => {
+   const [, setActiveColorPickerSection] = useAtom(activeColorPickerSectionAtom);
+ 
++  const [eyeDropperState, setEyeDropperState] = useAtom(
++    activeEyeDropperAtom,
++    jotaiScope,
++  );
++
+   const { container } = useExcalidrawContainer();
+   const { isMobile, isLandscape } = useDevice();
+ 
+@@ -87,23 +94,42 @@ const ColorPickerPopupContent = ({
+       />
+     </div>
+   );
++  const popoverRef = useRef<HTMLDivElement>(null);
++
++  const focusPickerContent = () => {
++    popoverRef.current
++      ?.querySelector<HTMLDivElement>(".color-picker-content")
++      ?.focus();
++  };
+ 
+   return (
+     <Popover.Portal container={container}>
+       <Popover.Content
++        ref={popoverRef}
+         className="focus-visible-none"
+         data-prevent-outside-click
++        onFocusOutside={(event) => {
++          focusPickerContent();
++          event.preventDefault();
++        }}
++        onPointerDownOutside={(event) => {
++          if (eyeDropperState) {
++            // prevent from closing if we click outside the popover
++            // while eyedropping (e.g. click when clicking the sidebar;
++            // the eye-dropper-backdrop is prevented downstream)
++            event.preventDefault();
++          }
++        }}
+         onCloseAutoFocus={(e) => {
++          e.preventDefault();
++          e.stopPropagation();
++
+           // return focus to excalidraw container
+           if (container) {
+             container.focus();
+           }
+ 
+           updateData({ openPopup: null });
+-
+-          e.preventDefault();
+-          e.stopPropagation();
+-
+           setActiveColorPickerSection(null);
+         }}
+         side={isMobile && !isLandscape ? "bottom" : "right"}
+@@ -126,10 +152,38 @@ const ColorPickerPopupContent = ({
+         {palette ? (
+           <Picker
+             palette={palette}
+-            color={color || null}
++            color={color}
+             onChange={(changedColor) => {
+               onChange(changedColor);
+             }}
++            onEyeDropperToggle={(force) => {
++              setEyeDropperState((state) => {
++                if (force) {
++                  state = state || {
++                    keepOpenOnAlt: true,
++                    onSelect: onChange,
++                  };
++                  state.keepOpenOnAlt = true;
++                  return state;
++                }
++
++                return force === false || state
++                  ? null
++                  : {
++                      keepOpenOnAlt: false,
++                      onSelect: onChange,
++                    };
++              });
++            }}
++            onEscape={(event) => {
++              if (eyeDropperState) {
++                setEyeDropperState(null);
++              } else if (isWritableElement(event.target)) {
++                focusPickerContent();
++              } else {
++                updateData({ openPopup: null });
++              }
++            }}
+             label={label}
+             type={type}
+             elements={elements}
+@@ -158,7 +212,7 @@ const ColorPickerTrigger = ({
+   color,
+   type,
+ }: {
+-  color: string | null;
++  color: string;
+   label: string;
+   type: ColorPickerType;
+ }) => {
+diff --git a/src/components/ColorPicker/CustomColorList.tsx b/src/components/ColorPicker/CustomColorList.tsx
+index f606482b..b028dcc7 100644
+--- a/src/components/ColorPicker/CustomColorList.tsx
++++ b/src/components/ColorPicker/CustomColorList.tsx
+@@ -6,7 +6,7 @@ import HotkeyLabel from "./HotkeyLabel";
+ 
+ interface CustomColorListProps {
+   colors: string[];
+-  color: string | null;
++  color: string;
+   onChange: (color: string) => void;
+   label: string;
+ }
+diff --git a/src/components/ColorPicker/Picker.tsx b/src/components/ColorPicker/Picker.tsx
+index be6410e1..a2e17526 100644
+--- a/src/components/ColorPicker/Picker.tsx
++++ b/src/components/ColorPicker/Picker.tsx
+@@ -12,7 +12,7 @@ import PickerHeading from "./PickerHeading";
+ import {
+   ColorPickerType,
+   activeColorPickerSectionAtom,
+-  getColorNameAndShadeFromHex,
++  getColorNameAndShadeFromColor,
+   getMostUsedCustomColors,
+   isCustomColor,
+ } from "./colorPickerUtils";
+@@ -21,9 +21,11 @@ import {
+   DEFAULT_ELEMENT_BACKGROUND_COLOR_INDEX,
+   DEFAULT_ELEMENT_STROKE_COLOR_INDEX,
+ } from "../../colors";
++import { KEYS } from "../../keys";
++import { EVENT } from "../../constants";
+ 
+ interface PickerProps {
+-  color: string | null;
++  color: string;
+   onChange: (color: string) => void;
+   label: string;
+   type: ColorPickerType;
+@@ -31,6 +33,8 @@ interface PickerProps {
+   palette: ColorPaletteCustom;
+   updateData: (formData?: any) => void;
+   children?: React.ReactNode;
++  onEyeDropperToggle: (force?: boolean) => void;
++  onEscape: (event: React.KeyboardEvent | KeyboardEvent) => void;
+ }
+ 
+ export const Picker = ({
+@@ -42,6 +46,8 @@ export const Picker = ({
+   palette,
+   updateData,
+   children,
++  onEyeDropperToggle,
++  onEscape,
+ }: PickerProps) => {
+   const [customColors] = React.useState(() => {
+     if (type === "canvasBackground") {
+@@ -54,16 +60,15 @@ export const Picker = ({
+     activeColorPickerSectionAtom,
+   );
+ 
+-  const colorObj = getColorNameAndShadeFromHex({
+-    hex: color || "transparent",
++  const colorObj = getColorNameAndShadeFromColor({
++    color,
+     palette,
+   });
+ 
+   useEffect(() => {
+     if (!activeColorPickerSection) {
+       const isCustom = isCustomColor({ color, palette });
+-      const isCustomButNotInList =
+-        isCustom && !customColors.includes(color || "");
++      const isCustomButNotInList = isCustom && !customColors.includes(color);
+ 
+       setActiveColorPickerSection(
+         isCustomButNotInList
+@@ -95,26 +100,43 @@ export const Picker = ({
+     if (colorObj?.shade != null) {
+       setActiveShade(colorObj.shade);
+     }
+-  }, [colorObj]);
++
++    const keyup = (event: KeyboardEvent) => {
++      if (event.key === KEYS.ALT) {
++        onEyeDropperToggle(false);
++      }
++    };
++    document.addEventListener(EVENT.KEYUP, keyup, { capture: true });
++    return () => {
++      document.removeEventListener(EVENT.KEYUP, keyup, { capture: true });
++    };
++  }, [colorObj, onEyeDropperToggle]);
++
++  const pickerRef = React.useRef<HTMLDivElement>(null);
+ 
+   return (
+     <div role="dialog" aria-modal="true" aria-label={t("labels.colorPicker")}>
+       <div
+-        onKeyDown={(e) => {
+-          e.preventDefault();
+-          e.stopPropagation();
+-
+-          colorPickerKeyNavHandler({
+-            e,
++        ref={pickerRef}
++        onKeyDown={(event) => {
++          const handled = colorPickerKeyNavHandler({
++            event,
+             activeColorPickerSection,
+             palette,
+-            hex: color,
++            color,
+             onChange,
++            onEyeDropperToggle,
+             customColors,
+             setActiveColorPickerSection,
+             updateData,
+             activeShade,
++            onEscape,
+           });
++
++          if (handled) {
++            event.preventDefault();
++            event.stopPropagation();
++          }
+         }}
+         className="color-picker-content"
+         // to allow focusing by clicking but not by tabbing
+diff --git a/src/components/ColorPicker/PickerColorList.tsx b/src/components/ColorPicker/PickerColorList.tsx
+index bd2d2bfc..2491afba 100644
+--- a/src/components/ColorPicker/PickerColorList.tsx
++++ b/src/components/ColorPicker/PickerColorList.tsx
+@@ -4,7 +4,7 @@ import { useEffect, useRef } from "react";
+ import {
+   activeColorPickerSectionAtom,
+   colorPickerHotkeyBindings,
+-  getColorNameAndShadeFromHex,
++  getColorNameAndShadeFromColor,
+ } from "./colorPickerUtils";
+ import HotkeyLabel from "./HotkeyLabel";
+ import { ColorPaletteCustom } from "../../colors";
+@@ -12,7 +12,7 @@ import { t } from "../../i18n";
+ 
+ interface PickerColorListProps {
+   palette: ColorPaletteCustom;
+-  color: string | null;
++  color: string;
+   onChange: (color: string) => void;
+   label: string;
+   activeShade: number;
+@@ -25,8 +25,8 @@ const PickerColorList = ({
+   label,
+   activeShade,
+ }: PickerColorListProps) => {
+-  const colorObj = getColorNameAndShadeFromHex({
+-    hex: color || "transparent",
++  const colorObj = getColorNameAndShadeFromColor({
++    color: color || "transparent",
+     palette,
+   });
+   const [activeColorPickerSection, setActiveColorPickerSection] = useAtom(
+diff --git a/src/components/ColorPicker/ShadeList.tsx b/src/components/ColorPicker/ShadeList.tsx
+index 96c353e3..81ddaab2 100644
+--- a/src/components/ColorPicker/ShadeList.tsx
++++ b/src/components/ColorPicker/ShadeList.tsx
+@@ -3,21 +3,21 @@ import { useAtom } from "jotai";
+ import { useEffect, useRef } from "react";
+ import {
+   activeColorPickerSectionAtom,
+-  getColorNameAndShadeFromHex,
++  getColorNameAndShadeFromColor,
+ } from "./colorPickerUtils";
+ import HotkeyLabel from "./HotkeyLabel";
+ import { t } from "../../i18n";
+ import { ColorPaletteCustom } from "../../colors";
+ 
+ interface ShadeListProps {
+-  hex: string | null;
++  hex: string;
+   onChange: (color: string) => void;
+   palette: ColorPaletteCustom;
+ }
+ 
+ export const ShadeList = ({ hex, onChange, palette }: ShadeListProps) => {
+-  const colorObj = getColorNameAndShadeFromHex({
+-    hex: hex || "transparent",
++  const colorObj = getColorNameAndShadeFromColor({
++    color: hex || "transparent",
+     palette,
+   });
+ 
+diff --git a/src/components/ColorPicker/TopPicks.tsx b/src/components/ColorPicker/TopPicks.tsx
+index 3345632e..ae420c3f 100644
+--- a/src/components/ColorPicker/TopPicks.tsx
++++ b/src/components/ColorPicker/TopPicks.tsx
+@@ -9,7 +9,7 @@ import {
+ interface TopPicksProps {
+   onChange: (color: string) => void;
+   type: ColorPickerType;
+-  activeColor: string | null;
++  activeColor: string;
+   topPicks?: readonly string[];
+ }
+ 
+diff --git a/src/components/ColorPicker/colorPickerUtils.ts b/src/components/ColorPicker/colorPickerUtils.ts
+index 4c4075b2..37e5c88a 100644
+--- a/src/components/ColorPicker/colorPickerUtils.ts
++++ b/src/components/ColorPicker/colorPickerUtils.ts
+@@ -6,23 +6,23 @@ import {
+   MAX_CUSTOM_COLORS_USED_IN_CANVAS,
+ } from "../../colors";
+ 
+-export const getColorNameAndShadeFromHex = ({
++export const getColorNameAndShadeFromColor = ({
+   palette,
+-  hex,
++  color,
+ }: {
+   palette: ColorPaletteCustom;
+-  hex: string;
++  color: string;
+ }): {
+   colorName: ColorPickerColor;
+   shade: number | null;
+ } | null => {
+   for (const [colorName, colorVal] of Object.entries(palette)) {
+     if (Array.isArray(colorVal)) {
+-      const shade = colorVal.indexOf(hex);
++      const shade = colorVal.indexOf(color);
+       if (shade > -1) {
+         return { colorName: colorName as ColorPickerColor, shade };
+       }
+-    } else if (colorVal === hex) {
++    } else if (colorVal === color) {
+       return { colorName: colorName as ColorPickerColor, shade: null };
+     }
+   }
+@@ -39,12 +39,9 @@ export const isCustomColor = ({
+   color,
+   palette,
+ }: {
+-  color: string | null;
++  color: string;
+   palette: ColorPaletteCustom;
+ }) => {
+-  if (!color) {
+-    return false;
+-  }
+   const paletteValues = Object.values(palette).flat();
+   return !paletteValues.includes(color);
+ };
+diff --git a/src/components/ColorPicker/keyboardNavHandlers.ts b/src/components/ColorPicker/keyboardNavHandlers.ts
+index 4ed539ce..95ee7bee 100644
+--- a/src/components/ColorPicker/keyboardNavHandlers.ts
++++ b/src/components/ColorPicker/keyboardNavHandlers.ts
+@@ -1,3 +1,4 @@
++import { KEYS } from "../../keys";
+ import {
+   ColorPickerColor,
+   ColorPalette,
+@@ -5,12 +6,11 @@ import {
+   COLORS_PER_ROW,
+   COLOR_PALETTE,
+ } from "../../colors";
+-import { KEYS } from "../../keys";
+ import { ValueOf } from "../../utility-types";
+ import {
+   ActiveColorPickerSectionAtomType,
+   colorPickerHotkeyBindings,
+-  getColorNameAndShadeFromHex,
++  getColorNameAndShadeFromColor,
+ } from "./colorPickerUtils";
+ 
+ const arrowHandler = (
+@@ -55,6 +55,9 @@ interface HotkeyHandlerProps {
+   activeShade: number;
+ }
+ 
++/**
++ * @returns true if the event was handled
++ */
+ const hotkeyHandler = ({
+   e,
+   colorObj,
+@@ -63,7 +66,7 @@ const hotkeyHandler = ({
+   customColors,
+   setActiveColorPickerSection,
+   activeShade,
+-}: HotkeyHandlerProps) => {
++}: HotkeyHandlerProps): boolean => {
+   if (colorObj?.shade != null) {
+     // shift + numpad is extremely messed up on windows apparently
+     if (
+@@ -73,6 +76,7 @@ const hotkeyHandler = ({
+       const newShade = Number(e.code.slice(-1)) - 1;
+       onChange(palette[colorObj.colorName][newShade]);
+       setActiveColorPickerSection("shades");
++      return true;
+     }
+   }
+ 
+@@ -81,6 +85,7 @@ const hotkeyHandler = ({
+     if (c) {
+       onChange(customColors[Number(e.key) - 1]);
+       setActiveColorPickerSection("custom");
++      return true;
+     }
+   }
+ 
+@@ -93,14 +98,16 @@ const hotkeyHandler = ({
+       : paletteValue;
+     onChange(r);
+     setActiveColorPickerSection("baseColors");
++    return true;
+   }
++  return false;
+ };
+ 
+ interface ColorPickerKeyNavHandlerProps {
+-  e: React.KeyboardEvent;
++  event: React.KeyboardEvent;
+   activeColorPickerSection: ActiveColorPickerSectionAtomType;
+   palette: ColorPaletteCustom;
+-  hex: string | null;
++  color: string;
+   onChange: (color: string) => void;
+   customColors: string[];
+   setActiveColorPickerSection: (
+@@ -108,27 +115,49 @@ interface ColorPickerKeyNavHandlerProps {
+   ) => void;
+   updateData: (formData?: any) => void;
+   activeShade: number;
++  onEyeDropperToggle: (force?: boolean) => void;
++  onEscape: (event: React.KeyboardEvent | KeyboardEvent) => void;
+ }
+ 
++/**
++ * @returns true if the event was handled
++ */
+ export const colorPickerKeyNavHandler = ({
+-  e,
++  event,
+   activeColorPickerSection,
+   palette,
+-  hex,
++  color,
+   onChange,
+   customColors,
+   setActiveColorPickerSection,
+   updateData,
+   activeShade,
+-}: ColorPickerKeyNavHandlerProps) => {
+-  if (e.key === KEYS.ESCAPE || !hex) {
+-    updateData({ openPopup: null });
+-    return;
++  onEyeDropperToggle,
++  onEscape,
++}: ColorPickerKeyNavHandlerProps): boolean => {
++  if (event[KEYS.CTRL_OR_CMD]) {
++    return false;
++  }
++
++  if (event.key === KEYS.ESCAPE) {
++    onEscape(event);
++    return true;
+   }
+ 
+-  const colorObj = getColorNameAndShadeFromHex({ hex, palette });
++  // checkt using `key` to ignore combos with Alt modifier
++  if (event.key === KEYS.ALT) {
++    onEyeDropperToggle(true);
++    return true;
++  }
++
++  if (event.key === KEYS.I) {
++    onEyeDropperToggle();
++    return true;
++  }
+ 
+-  if (e.key === KEYS.TAB) {
++  const colorObj = getColorNameAndShadeFromColor({ color, palette });
++
++  if (event.key === KEYS.TAB) {
+     const sectionsMap: Record<
+       NonNullable<ActiveColorPickerSectionAtomType>,
+       boolean
+@@ -147,7 +176,7 @@ export const colorPickerKeyNavHandler = ({
+     }, [] as ActiveColorPickerSectionAtomType[]);
+ 
+     const activeSectionIndex = sections.indexOf(activeColorPickerSection);
+-    const indexOffset = e.shiftKey ? -1 : 1;
++    const indexOffset = event.shiftKey ? -1 : 1;
+     const nextSectionIndex =
+       activeSectionIndex + indexOffset > sections.length - 1
+         ? 0
+@@ -168,8 +197,8 @@ export const colorPickerKeyNavHandler = ({
+         Object.entries(palette) as [string, ValueOf<ColorPalette>][]
+       ).find(([name, shades]) => {
+         if (Array.isArray(shades)) {
+-          return shades.includes(hex);
+-        } else if (shades === hex) {
++          return shades.includes(color);
++        } else if (shades === color) {
+           return name;
+         }
+         return null;
+@@ -180,29 +209,34 @@ export const colorPickerKeyNavHandler = ({
+       }
+     }
+ 
+-    e.preventDefault();
+-    e.stopPropagation();
++    event.preventDefault();
++    event.stopPropagation();
+ 
+-    return;
++    return true;
+   }
+ 
+-  hotkeyHandler({
+-    e,
+-    colorObj,
+-    onChange,
+-    palette,
+-    customColors,
+-    setActiveColorPickerSection,
+-    activeShade,
+-  });
++  if (
++    hotkeyHandler({
++      e: event,
++      colorObj,
++      onChange,
++      palette,
++      customColors,
++      setActiveColorPickerSection,
++      activeShade,
++    })
++  ) {
++    return true;
++  }
+ 
+   if (activeColorPickerSection === "shades") {
+     if (colorObj) {
+       const { shade } = colorObj;
+-      const newShade = arrowHandler(e.key, shade, COLORS_PER_ROW);
++      const newShade = arrowHandler(event.key, shade, COLORS_PER_ROW);
+ 
+       if (newShade !== undefined) {
+         onChange(palette[colorObj.colorName][newShade]);
++        return true;
+       }
+     }
+   }
+@@ -214,7 +248,7 @@ export const colorPickerKeyNavHandler = ({
+       const indexOfColorName = colorNames.indexOf(colorName);
+ 
+       const newColorIndex = arrowHandler(
+-        e.key,
++        event.key,
+         indexOfColorName,
+         colorNames.length,
+       );
+@@ -228,15 +262,16 @@ export const colorPickerKeyNavHandler = ({
+             ? newColorNameValue[activeShade]
+             : newColorNameValue,
+         );
++        return true;
+       }
+     }
+   }
+ 
+   if (activeColorPickerSection === "custom") {
+-    const indexOfColor = customColors.indexOf(hex);
++    const indexOfColor = customColors.indexOf(color);
+ 
+     const newColorIndex = arrowHandler(
+-      e.key,
++      event.key,
+       indexOfColor,
+       customColors.length,
+     );
+@@ -244,6 +279,9 @@ export const colorPickerKeyNavHandler = ({
+     if (newColorIndex !== undefined) {
+       const newColor = customColors[newColorIndex];
+       onChange(newColor);
++      return true;
+     }
+   }
++
++  return false;
+ };
+diff --git a/src/components/Dialog.tsx b/src/components/Dialog.tsx
+index a76f65e4..161d1805 100644
+--- a/src/components/Dialog.tsx
++++ b/src/components/Dialog.tsx
+@@ -12,7 +12,6 @@ import "./Dialog.scss";
+ import { back, CloseIcon } from "./icons";
+ import { Island } from "./Island";
+ import { Modal } from "./Modal";
+-import { AppState } from "../types";
+ import { queryFocusableElements } from "../utils";
+ import { useSetAtom } from "jotai";
+ import { isLibraryMenuOpenAtom } from "./LibraryMenu";
+@@ -25,7 +24,6 @@ export interface DialogProps {
+   onCloseRequest(): void;
+   title: React.ReactNode | false;
+   autofocus?: boolean;
+-  theme?: AppState["theme"];
+   closeOnClickOutside?: boolean;
+ }
+ 
+@@ -91,7 +89,6 @@ export const Dialog = (props: DialogProps) => {
+         props.size === "wide" ? 1024 : props.size === "small" ? 550 : 800
+       }
+       onCloseRequest={onClose}
+-      theme={props.theme}
+       closeOnClickOutside={props.closeOnClickOutside}
+     >
+       <Island ref={setIslandNode}>
+diff --git a/src/components/EyeDropper.scss b/src/components/EyeDropper.scss
+new file mode 100644
+index 00000000..3273e4d7
+--- /dev/null
++++ b/src/components/EyeDropper.scss
+@@ -0,0 +1,48 @@
++.excalidraw {
++  .excalidraw-eye-dropper-container,
++  .excalidraw-eye-dropper-backdrop {
++    position: absolute;
++    width: 100%;
++    height: 100%;
++    z-index: 2;
++    touch-action: none;
++  }
++
++  .excalidraw-eye-dropper-container {
++    pointer-events: none;
++  }
++
++  .excalidraw-eye-dropper-backdrop {
++    pointer-events: all;
++  }
++
++  .excalidraw-eye-dropper-preview {
++    pointer-events: none;
++    width: 3rem;
++    height: 3rem;
++    position: fixed;
++    z-index: 999999;
++    border-radius: 1rem;
++    border: 1px solid var(--default-border-color);
++    filter: var(--theme-filter);
++  }
++
++  .excalidraw-eye-dropper-trigger {
++    width: 1.25rem;
++    height: 1.25rem;
++    cursor: pointer;
++    padding: 4px;
++    margin-right: -4px;
++    margin-left: -2px;
++    border-radius: 0.5rem;
++    color: var(--icon-fill-color);
++
++    &:hover {
++      background: var(--button-hover-bg);
++    }
++    &.selected {
++      color: var(--color-primary);
++      background: var(--color-primary-light);
++    }
++  }
++}
+diff --git a/src/components/EyeDropper.tsx b/src/components/EyeDropper.tsx
+new file mode 100644
+index 00000000..e24b8d40
+--- /dev/null
++++ b/src/components/EyeDropper.tsx
+@@ -0,0 +1,215 @@
++import { atom } from "jotai";
++import { useEffect, useRef } from "react";
++import { createPortal } from "react-dom";
++import { COLOR_PALETTE, rgbToHex } from "../colors";
++import { EVENT } from "../constants";
++import { useUIAppState } from "../context/ui-appState";
++import { mutateElement } from "../element/mutateElement";
++import { useCreatePortalContainer } from "../hooks/useCreatePortalContainer";
++import { useOutsideClick } from "../hooks/useOutsideClick";
++import { KEYS } from "../keys";
++import { invalidateShapeForElement } from "../renderer/renderElement";
++import { getSelectedElements } from "../scene";
++import Scene from "../scene/Scene";
++import { useApp, useExcalidrawContainer, useExcalidrawElements } from "./App";
++
++import "./EyeDropper.scss";
++
++type EyeDropperProperties = {
++  keepOpenOnAlt: boolean;
++  swapPreviewOnAlt?: boolean;
++  onSelect?: (color: string, event: PointerEvent) => void;
++  previewType?: "strokeColor" | "backgroundColor";
++};
++
++export const activeEyeDropperAtom = atom<null | EyeDropperProperties>(null);
++
++export const EyeDropper: React.FC<{
++  onCancel: () => void;
++  onSelect: Required<EyeDropperProperties>["onSelect"];
++  swapPreviewOnAlt?: EyeDropperProperties["swapPreviewOnAlt"];
++  previewType?: EyeDropperProperties["previewType"];
++}> = ({
++  onCancel,
++  onSelect,
++  swapPreviewOnAlt,
++  previewType = "backgroundColor",
++}) => {
++  const eyeDropperContainer = useCreatePortalContainer({
++    className: "excalidraw-eye-dropper-backdrop",
++    parentSelector: ".excalidraw-eye-dropper-container",
++  });
++  const appState = useUIAppState();
++  const elements = useExcalidrawElements();
++  const app = useApp();
++
++  const selectedElements = getSelectedElements(elements, appState);
++
++  const metaStuffRef = useRef({ selectedElements, app });
++  metaStuffRef.current.selectedElements = selectedElements;
++  metaStuffRef.current.app = app;
++
++  const { container: excalidrawContainer } = useExcalidrawContainer();
++
++  useEffect(() => {
++    const colorPreviewDiv = ref.current;
++
++    if (!colorPreviewDiv || !app.canvas || !eyeDropperContainer) {
++      return;
++    }
++
++    let currentColor = COLOR_PALETTE.black;
++    let isHoldingPointerDown = false;
++
++    const ctx = app.canvas.getContext("2d")!;
++
++    const mouseMoveListener = ({
++      clientX,
++      clientY,
++      altKey,
++    }: {
++      clientX: number;
++      clientY: number;
++      altKey: boolean;
++    }) => {
++      // FIXME swap offset when the preview gets outside viewport
++      colorPreviewDiv.style.top = `${clientY + 20}px`;
++      colorPreviewDiv.style.left = `${clientX + 20}px`;
++
++      const pixel = ctx.getImageData(
++        clientX * window.devicePixelRatio,
++        clientY * window.devicePixelRatio,
++        1,
++        1,
++      ).data;
++
++      currentColor = rgbToHex(pixel[0], pixel[1], pixel[2]);
++
++      if (isHoldingPointerDown) {
++        for (const element of metaStuffRef.current.selectedElements) {
++          mutateElement(
++            element,
++            {
++              [altKey && swapPreviewOnAlt
++                ? previewType === "strokeColor"
++                  ? "backgroundColor"
++                  : "strokeColor"
++                : previewType]: currentColor,
++            },
++            false,
++          );
++          invalidateShapeForElement(element);
++        }
++        Scene.getScene(
++          metaStuffRef.current.selectedElements[0],
++        )?.informMutation();
++      }
++
++      colorPreviewDiv.style.background = currentColor;
++    };
++
++    const pointerDownListener = (event: PointerEvent) => {
++      isHoldingPointerDown = true;
++      // NOTE we can't event.preventDefault() as that would stop
++      // pointermove events
++      event.stopImmediatePropagation();
++    };
++
++    const pointerUpListener = (event: PointerEvent) => {
++      isHoldingPointerDown = false;
++
++      // since we're not preventing default on pointerdown, the focus would
++      // goes back to `body` so we want to refocus the editor container instead
++      excalidrawContainer?.focus();
++
++      event.stopImmediatePropagation();
++      event.preventDefault();
++
++      onSelect(currentColor, event);
++    };
++
++    const keyDownListener = (event: KeyboardEvent) => {
++      if (event.key === KEYS.ESCAPE) {
++        event.preventDefault();
++        event.stopImmediatePropagation();
++        onCancel();
++      }
++    };
++
++    // -------------------------------------------------------------------------
++
++    eyeDropperContainer.tabIndex = -1;
++    // focus container so we can listen on keydown events
++    eyeDropperContainer.focus();
++
++    // init color preview else it would show only after the first mouse move
++    mouseMoveListener({
++      clientX: metaStuffRef.current.app.lastViewportPosition.x,
++      clientY: metaStuffRef.current.app.lastViewportPosition.y,
++      altKey: false,
++    });
++
++    eyeDropperContainer.addEventListener(EVENT.KEYDOWN, keyDownListener);
++    eyeDropperContainer.addEventListener(
++      EVENT.POINTER_DOWN,
++      pointerDownListener,
++    );
++    eyeDropperContainer.addEventListener(EVENT.POINTER_UP, pointerUpListener);
++    window.addEventListener("pointermove", mouseMoveListener, {
++      passive: true,
++    });
++    window.addEventListener(EVENT.BLUR, onCancel);
++
++    return () => {
++      isHoldingPointerDown = false;
++      eyeDropperContainer.removeEventListener(EVENT.KEYDOWN, keyDownListener);
++      eyeDropperContainer.removeEventListener(
++        EVENT.POINTER_DOWN,
++        pointerDownListener,
++      );
++      eyeDropperContainer.removeEventListener(
++        EVENT.POINTER_UP,
++        pointerUpListener,
++      );
++      window.removeEventListener("pointermove", mouseMoveListener);
++      window.removeEventListener(EVENT.BLUR, onCancel);
++    };
++  }, [
++    app.canvas,
++    eyeDropperContainer,
++    onCancel,
++    onSelect,
++    swapPreviewOnAlt,
++    previewType,
++    excalidrawContainer,
++  ]);
++
++  const ref = useRef<HTMLDivElement>(null);
++
++  useOutsideClick(
++    ref,
++    () => {
++      onCancel();
++    },
++    (event) => {
++      if (
++        event.target.closest(
++          ".excalidraw-eye-dropper-trigger, .excalidraw-eye-dropper-backdrop",
++        )
++      ) {
++        return true;
++      }
++      // consider all other clicks as outside
++      return false;
++    },
++  );
++
++  if (!eyeDropperContainer) {
++    return null;
++  }
++
++  return createPortal(
++    <div ref={ref} className="excalidraw-eye-dropper-preview" />,
++    eyeDropperContainer,
++  );
++};
+diff --git a/src/components/HelpDialog.tsx b/src/components/HelpDialog.tsx
+index bd2f3841..da43330f 100644
+--- a/src/components/HelpDialog.tsx
++++ b/src/components/HelpDialog.tsx
+@@ -164,6 +164,10 @@ export const HelpDialog = ({ onClose }: { onClose?: () => void }) => {
+               label={t("toolBar.eraser")}
+               shortcuts={[KEYS.E, KEYS["0"]]}
+             />
++            <Shortcut
++              label={t("labels.eyeDropper")}
++              shortcuts={[KEYS.I, "Shift+S", "Shift+G"]}
++            />
+             <Shortcut
+               label={t("helpDialog.editLineArrowPoints")}
+               shortcuts={[getShortcutKey("CtrlOrCmd+Enter")]}
+diff --git a/src/components/LayerUI.tsx b/src/components/LayerUI.tsx
+index f05f5df1..bf64bf5c 100644
+--- a/src/components/LayerUI.tsx
++++ b/src/components/LayerUI.tsx
+@@ -38,7 +38,7 @@ import { actionToggleStats } from "../actions/actionToggleStats";
+ import Footer from "./footer/Footer";
+ import { isSidebarDockedAtom } from "./Sidebar/Sidebar";
+ import { jotaiScope } from "../jotai";
+-import { Provider, useAtomValue } from "jotai";
++import { Provider, useAtom, useAtomValue } from "jotai";
+ import MainMenu from "./main-menu/MainMenu";
+ import { ActiveConfirmDialog } from "./ActiveConfirmDialog";
+ import { HandButton } from "./HandButton";
+@@ -47,6 +47,7 @@ import { TunnelsContext, useInitializeTunnels } from "../context/tunnels";
+ import { LibraryIcon } from "./icons";
+ import { UIAppStateContext } from "../context/ui-appState";
+ import { DefaultSidebar } from "./DefaultSidebar";
++import { EyeDropper, activeEyeDropperAtom } from "./EyeDropper";
+ 
+ import "./LayerUI.scss";
+ import "./Toolbar.scss";
+@@ -120,6 +121,11 @@ const LayerUI = ({
+   const device = useDevice();
+   const tunnels = useInitializeTunnels();
+ 
++  const [eyeDropperState, setEyeDropperState] = useAtom(
++    activeEyeDropperAtom,
++    jotaiScope,
++  );
++
+   const renderJSONExportDialog = () => {
+     if (!UIOptions.canvasActions.export) {
+       return null;
+@@ -350,6 +356,21 @@ const LayerUI = ({
+           {appState.errorMessage}
+         </ErrorDialog>
+       )}
++      {eyeDropperState && !device.isMobile && (
++        <EyeDropper
++          swapPreviewOnAlt={eyeDropperState.swapPreviewOnAlt}
++          previewType={eyeDropperState.previewType}
++          onCancel={() => {
++            setEyeDropperState(null);
++          }}
++          onSelect={(color, event) => {
++            setEyeDropperState((state) => {
++              return state?.keepOpenOnAlt && event.altKey ? state : null;
++            });
++            eyeDropperState?.onSelect?.(color, event);
++          }}
++        />
++      )}
+       {appState.openDialog === "help" && (
+         <HelpDialog
+           onClose={() => {
+@@ -371,7 +392,7 @@ const LayerUI = ({
+           }
+         />
+       )}
+-      {device.isMobile && (
++      {device.isMobile && !eyeDropperState && (
+         <MobileMenu
+           appState={appState}
+           elements={elements}
+diff --git a/src/components/Modal.tsx b/src/components/Modal.tsx
+index 30a4e6fd..3dd737e4 100644
+--- a/src/components/Modal.tsx
++++ b/src/components/Modal.tsx
+@@ -1,12 +1,11 @@
+ import "./Modal.scss";
+ 
+-import React, { useState, useLayoutEffect, useRef } from "react";
++import React from "react";
+ import { createPortal } from "react-dom";
+ import clsx from "clsx";
+ import { KEYS } from "../keys";
+-import { useExcalidrawContainer, useDevice } from "./App";
+ import { AppState } from "../types";
+-import { THEME } from "../constants";
++import { useCreatePortalContainer } from "../hooks/useCreatePortalContainer";
+ 
+ export const Modal: React.FC<{
+   className?: string;
+@@ -17,8 +16,10 @@ export const Modal: React.FC<{
+   theme?: AppState["theme"];
+   closeOnClickOutside?: boolean;
+ }> = (props) => {
+-  const { theme = THEME.LIGHT, closeOnClickOutside = true } = props;
+-  const modalRoot = useBodyRoot(theme);
++  const { closeOnClickOutside = true } = props;
++  const modalRoot = useCreatePortalContainer({
++    className: "excalidraw-modal-container",
++  });
+ 
+   if (!modalRoot) {
+     return null;
+@@ -56,43 +57,3 @@ export const Modal: React.FC<{
+     modalRoot,
+   );
+ };
+-
+-const useBodyRoot = (theme: AppState["theme"]) => {
+-  const [div, setDiv] = useState<HTMLDivElement | null>(null);
+-
+-  const device = useDevice();
+-  const isMobileRef = useRef(device.isMobile);
+-  isMobileRef.current = device.isMobile;
+-
+-  const { container: excalidrawContainer } = useExcalidrawContainer();
+-
+-  useLayoutEffect(() => {
+-    if (div) {
+-      div.classList.toggle("excalidraw--mobile", device.isMobile);
+-    }
+-  }, [div, device.isMobile]);
+-
+-  useLayoutEffect(() => {
+-    const isDarkTheme =
+-      !!excalidrawContainer?.classList.contains("theme--dark") ||
+-      theme === "dark";
+-    const div = document.createElement("div");
+-
+-    div.classList.add("excalidraw", "excalidraw-modal-container");
+-    div.classList.toggle("excalidraw--mobile", isMobileRef.current);
+-
+-    if (isDarkTheme) {
+-      div.classList.add("theme--dark");
+-      div.classList.add("theme--dark-background-none");
+-    }
+-    document.body.appendChild(div);
+-
+-    setDiv(div);
+-
+-    return () => {
+-      document.body.removeChild(div);
+-    };
+-  }, [excalidrawContainer, theme]);
+-
+-  return div;
+-};
+diff --git a/src/components/Sidebar/Sidebar.tsx b/src/components/Sidebar/Sidebar.tsx
+index c03682fb..ee94beca 100644
+--- a/src/components/Sidebar/Sidebar.tsx
++++ b/src/components/Sidebar/Sidebar.tsx
+@@ -6,7 +6,6 @@ import React, {
+   forwardRef,
+   useImperativeHandle,
+   useCallback,
+-  RefObject,
+ } from "react";
+ import { Island } from ".././Island";
+ import { atom, useSetAtom } from "jotai";
+@@ -27,38 +26,10 @@ import { SidebarTabTriggers } from "./SidebarTabTriggers";
+ import { SidebarTabTrigger } from "./SidebarTabTrigger";
+ import { SidebarTabs } from "./SidebarTabs";
+ import { SidebarTab } from "./SidebarTab";
+-
+-import "./Sidebar.scss";
+ import { useUIAppState } from "../../context/ui-appState";
++import { useOutsideClick } from "../../hooks/useOutsideClick";
+ 
+-// FIXME replace this with the implem from ColorPicker once it's merged
+-const useOnClickOutside = (
+-  ref: RefObject<HTMLElement>,
+-  cb: (event: MouseEvent) => void,
+-) => {
+-  useEffect(() => {
+-    const listener = (event: MouseEvent) => {
+-      if (!ref.current) {
+-        return;
+-      }
+-
+-      if (
+-        event.target instanceof Element &&
+-        (ref.current.contains(event.target) ||
+-          !document.body.contains(event.target))
+-      ) {
+-        return;
+-      }
+-
+-      cb(event);
+-    };
+-    document.addEventListener("pointerdown", listener, false);
+-
+-    return () => {
+-      document.removeEventListener("pointerdown", listener);
+-    };
+-  }, [ref, cb]);
+-};
++import "./Sidebar.scss";
+ 
+ /**
+  * Flags whether the currently rendered Sidebar is docked or not, for use
+@@ -133,7 +104,7 @@ export const SidebarInner = forwardRef(
+       setAppState({ openSidebar: null });
+     }, [setAppState]);
+ 
+-    useOnClickOutside(
++    useOutsideClick(
+       islandRef,
+       useCallback(
+         (event) => {
+diff --git a/src/components/dropdownMenu/DropdownMenuContent.tsx b/src/components/dropdownMenu/DropdownMenuContent.tsx
+index 7585649c..c80b5bc0 100644
+--- a/src/components/dropdownMenu/DropdownMenuContent.tsx
++++ b/src/components/dropdownMenu/DropdownMenuContent.tsx
+@@ -1,11 +1,10 @@
+-import { useOutsideClick } from "../../hooks/useOutsideClick";
+ import { Island } from "../Island";
+-
+ import { useDevice } from "../App";
+ import clsx from "clsx";
+ import Stack from "../Stack";
+-import React from "react";
++import React, { useRef } from "react";
+ import { DropdownMenuContentPropsContext } from "./common";
++import { useOutsideClick } from "../../hooks/useOutsideClick";
+ 
+ const MenuContent = ({
+   children,
+@@ -24,7 +23,9 @@ const MenuContent = ({
+   style?: React.CSSProperties;
+ }) => {
+   const device = useDevice();
+-  const menuRef = useOutsideClick(() => {
++  const menuRef = useRef<HTMLDivElement>(null);
++
++  useOutsideClick(menuRef, () => {
+     onClickOutside?.();
+   });
+ 
+diff --git a/src/components/icons.tsx b/src/components/icons.tsx
+index 543248a1..ee71fb7b 100644
+--- a/src/components/icons.tsx
++++ b/src/components/icons.tsx
+@@ -1607,3 +1607,12 @@ export const tablerCheckIcon = createIcon(
+   </>,
+   tablerIconProps,
+ );
++
++export const eyeDropperIcon = createIcon(
++  <g strokeWidth={1.25}>
++    <path stroke="none" d="M0 0h24v24H0z" fill="none"></path>
++    <path d="M11 7l6 6"></path>
++    <path d="M4 16l11.7 -11.7a1 1 0 0 1 1.4 0l2.6 2.6a1 1 0 0 1 0 1.4l-11.7 11.7h-4v-4z"></path>
++  </g>,
++  tablerIconProps,
++);
+diff --git a/src/constants.ts b/src/constants.ts
+index 3b21dd40..cb63a4d4 100644
+--- a/src/constants.ts
++++ b/src/constants.ts
+@@ -59,6 +59,7 @@ export enum EVENT {
+   GESTURE_START = "gesturestart",
+   GESTURE_CHANGE = "gesturechange",
+   POINTER_MOVE = "pointermove",
++  POINTER_DOWN = "pointerdown",
+   POINTER_UP = "pointerup",
+   STATE_CHANGE = "statechange",
+   WHEEL = "wheel",
+diff --git a/src/excalidraw-app/collab/Collab.tsx b/src/excalidraw-app/collab/Collab.tsx
+index e48484ab..eb12952d 100644
+--- a/src/excalidraw-app/collab/Collab.tsx
++++ b/src/excalidraw-app/collab/Collab.tsx
+@@ -834,7 +834,6 @@ class Collab extends PureComponent<Props, CollabState> {
+             setErrorMessage={(errorMessage) => {
+               this.setState({ errorMessage });
+             }}
+-            theme={this.excalidrawAPI.getAppState().theme}
+           />
+         )}
+         {errorMessage && (
+diff --git a/src/excalidraw-app/collab/RoomDialog.tsx b/src/excalidraw-app/collab/RoomDialog.tsx
+index daec8cfe..6b070627 100644
+--- a/src/excalidraw-app/collab/RoomDialog.tsx
++++ b/src/excalidraw-app/collab/RoomDialog.tsx
+@@ -2,7 +2,6 @@ import { useRef, useState } from "react";
+ import * as Popover from "@radix-ui/react-popover";
+ 
+ import { copyTextToSystemClipboard } from "../../clipboard";
+-import { AppState } from "../../types";
+ import { trackEvent } from "../../analytics";
+ import { getFrame } from "../../utils";
+ import { useI18n } from "../../i18n";
+@@ -46,7 +45,6 @@ export type RoomModalProps = {
+   onRoomCreate: () => void;
+   onRoomDestroy: () => void;
+   setErrorMessage: (message: string) => void;
+-  theme: AppState["theme"];
+ };
+ 
+ export const RoomModal = ({
+@@ -210,12 +208,7 @@ export const RoomModal = ({
+ 
+ const RoomDialog = (props: RoomModalProps) => {
+   return (
+-    <Dialog
+-      size="small"
+-      onCloseRequest={props.handleClose}
+-      title={false}
+-      theme={props.theme}
+-    >
++    <Dialog size="small" onCloseRequest={props.handleClose} title={false}>
+       <div className="RoomDialog">
+         <RoomModal {...props} />
+       </div>
+diff --git a/src/hooks/useCreatePortalContainer.ts b/src/hooks/useCreatePortalContainer.ts
+new file mode 100644
+index 00000000..f56011ed
+--- /dev/null
++++ b/src/hooks/useCreatePortalContainer.ts
+@@ -0,0 +1,49 @@
++import { useState, useRef, useLayoutEffect } from "react";
++import { useDevice, useExcalidrawContainer } from "../components/App";
++import { useUIAppState } from "../context/ui-appState";
++
++export const useCreatePortalContainer = (opts?: {
++  className?: string;
++  parentSelector?: string;
++}) => {
++  const [div, setDiv] = useState<HTMLDivElement | null>(null);
++
++  const device = useDevice();
++  const { theme } = useUIAppState();
++  const isMobileRef = useRef(device.isMobile);
++  isMobileRef.current = device.isMobile;
++
++  const { container: excalidrawContainer } = useExcalidrawContainer();
++
++  useLayoutEffect(() => {
++    if (div) {
++      div.classList.toggle("excalidraw--mobile", device.isMobile);
++    }
++  }, [div, device.isMobile]);
++
++  useLayoutEffect(() => {
++    const container = opts?.parentSelector
++      ? excalidrawContainer?.querySelector(opts.parentSelector)
++      : document.body;
++
++    if (!container) {
++      return;
++    }
++
++    const div = document.createElement("div");
++
++    div.classList.add("excalidraw", ...(opts?.className?.split(/\s+/) || []));
++    div.classList.toggle("excalidraw--mobile", isMobileRef.current);
++    div.classList.toggle("theme--dark", theme === "dark");
++
++    container.appendChild(div);
++
++    setDiv(div);
++
++    return () => {
++      container.removeChild(div);
++    };
++  }, [excalidrawContainer, theme, opts?.className, opts?.parentSelector]);
++
++  return div;
++};
+diff --git a/src/hooks/useOutsideClick.ts b/src/hooks/useOutsideClick.ts
+index cda7e50d..c720a836 100644
+--- a/src/hooks/useOutsideClick.ts
++++ b/src/hooks/useOutsideClick.ts
+@@ -1,42 +1,86 @@
+-import { useEffect, useRef } from "react";
+-
+-export const useOutsideClick = (handler: (event: Event) => void) => {
+-  const ref = useRef(null);
+-
+-  useEffect(
+-    () => {
+-      const listener = (event: Event) => {
+-        const current = ref.current as HTMLElement | null;
+-
+-        // Do nothing if clicking ref's element or descendent elements
+-        if (
+-          !current ||
+-          current.contains(event.target as Node) ||
+-          [...document.querySelectorAll("[data-prevent-outside-click]")].some(
+-            (el) => el.contains(event.target as Node),
+-          )
+-        ) {
+-          return;
+-        }
+-
+-        handler(event);
+-      };
+-
+-      document.addEventListener("pointerdown", listener);
+-      document.addEventListener("touchstart", listener);
+-      return () => {
+-        document.removeEventListener("pointerdown", listener);
+-        document.removeEventListener("touchstart", listener);
+-      };
+-    },
+-    // Add ref and handler to effect dependencies
+-    // It's worth noting that because passed in handler is a new ...
+-    // ... function on every render that will cause this effect ...
+-    // ... callback/cleanup to run every render. It's not a big deal ...
+-    // ... but to optimize you can wrap handler in useCallback before ...
+-    // ... passing it into this hook.
+-    [ref, handler],
+-  );
+-
+-  return ref;
+-};
++import { useEffect } from "react";
++import { EVENT } from "../constants";
++
++export function useOutsideClick<T extends HTMLElement>(
++  ref: React.RefObject<T>,
++  /** if performance is of concern, memoize the callback */
++  callback: (event: Event) => void,
++  /**
++   * Optional callback which is called on every click.
++   *
++   * Should return `true` if click should be considered as inside the container,
++   * and `false` if it falls outside and should call the `callback`.
++   *
++   * Returning `true` overrides the default behavior and `callback` won't be
++   * called.
++   *
++   * Returning `undefined` will fallback to the default behavior.
++   */
++  isInside?: (
++    event: Event & { target: HTMLElement },
++    /** the element of the passed ref */
++    container: T,
++  ) => boolean | undefined,
++) {
++  useEffect(() => {
++    function onOutsideClick(event: Event) {
++      const _event = event as Event & { target: T };
++
++      if (!ref.current) {
++        return;
++      }
++
++      const isInsideOverride = isInside?.(_event, ref.current);
++
++      if (isInsideOverride === true) {
++        return;
++      } else if (isInsideOverride === false) {
++        return callback(_event);
++      }
++
++      // clicked element is in the descenendant of the target container
++      if (
++        ref.current.contains(_event.target) ||
++        // target is detached from DOM (happens when the element is removed
++        // on a pointerup event fired *before* this handler's pointerup is
++        // dispatched)
++        !document.documentElement.contains(_event.target)
++      ) {
++        return;
++      }
++
++      const isClickOnRadixPortal =
++        _event.target.closest("[data-radix-portal]") ||
++        // when radix popup is in "modal" mode, it disables pointer events on
++        // the `body` element, so the target element is going to be the `html`
++        // (note: this won't work if we selectively re-enable pointer events on
++        // specific elements as we do with navbar or excalidraw UI elements)
++        (_event.target === document.documentElement &&
++          document.body.style.pointerEvents === "none");
++
++      // if clicking on radix portal, assume it's a popup that
++      // should be considered as part of the UI. Obviously this is a terrible
++      // hack you can end up click on radix popups that outside the tree,
++      // but it works for most cases and the downside is minimal for now
++      if (isClickOnRadixPortal) {
++        return;
++      }
++
++      // clicking on a container that ignores outside clicks
++      if (_event.target.closest("[data-prevent-outside-click]")) {
++        return;
++      }
++
++      callback(_event);
++    }
++
++    // note: don't use `click` because it often reports incorrect `event.target`
++    document.addEventListener(EVENT.POINTER_DOWN, onOutsideClick);
++    document.addEventListener(EVENT.TOUCH_START, onOutsideClick);
++
++    return () => {
++      document.removeEventListener(EVENT.POINTER_DOWN, onOutsideClick);
++      document.removeEventListener(EVENT.TOUCH_START, onOutsideClick);
++    };
++  }, [ref, callback, isInside]);
++}
+diff --git a/src/locales/en.json b/src/locales/en.json
+index 66b635d4..f751353a 100644
+--- a/src/locales/en.json
++++ b/src/locales/en.json
+@@ -123,7 +123,8 @@
+       "unlockAll": "Unlock all"
+     },
+     "statusPublished": "Published",
+-    "sidebarLock": "Keep sidebar open"
++    "sidebarLock": "Keep sidebar open",
++    "eyeDropper": "Pick color from canvas"
+   },
+   "library": {
+     "noItems": "No items added yet...",
+diff --git a/src/types.ts b/src/types.ts
+index 52a75b61..8354ced9 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -439,6 +439,7 @@ export type AppClassProperties = {
+   id: App["id"];
+   onInsertElements: App["onInsertElements"];
+   onExportImage: App["onExportImage"];
++  lastViewportPosition: App["lastViewportPosition"];
+ };
+ 
+ export type PointerDownState = Readonly<{

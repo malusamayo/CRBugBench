@@ -1,0 +1,403 @@
+commit 0750234fbead723138d6d1ebb0635a55c82923e0
+Author: Dario Nieuwenhuis <dirbaio@dirbaio.net>
+Date:   Tue Dec 29 00:05:52 2020 +0100
+
+    WIP owned irqs
+
+diff --git a/embassy-macros/src/lib.rs b/embassy-macros/src/lib.rs
+index b11fc4ae9..091e08cfa 100644
+--- a/embassy-macros/src/lib.rs
++++ b/embassy-macros/src/lib.rs
+@@ -98,3 +98,65 @@ pub fn task(args: TokenStream, item: TokenStream) -> TokenStream {
+     };
+     result.into()
+ }
++
++#[proc_macro]
++pub fn interrupt_declare(item: TokenStream) -> TokenStream {
++    let name = syn::parse_macro_input!(item as syn::Ident);
++    let name = format_ident!("{}", name);
++    let name_interrupt = format_ident!("{}Interrupt", name);
++    let name_handler = format!("__EMBASSY_{}_HANDLER", name);
++
++    let result = quote! {
++        #[allow(non_camel_case_types)]
++        pub struct #name_interrupt(());
++        unsafe impl OwnedInterrupt for #name_interrupt {
++            type Priority = Priority;
++            fn number(&self) -> u8 {
++                Interrupt::#name as u8
++            }
++            unsafe fn __handler(&self) -> &'static ::core::sync::atomic::AtomicPtr<u32> {
++                #[export_name = #name_handler]
++                static HANDLER: ::core::sync::atomic::AtomicPtr<u32> = ::core::sync::atomic::AtomicPtr::new(::core::ptr::null_mut());
++                &HANDLER
++            }
++        }
++    };
++    result.into()
++}
++
++#[proc_macro]
++pub fn interrupt_take(item: TokenStream) -> TokenStream {
++    let name = syn::parse_macro_input!(item as syn::Ident);
++    let name = format!("{}", name);
++    let name_interrupt = format_ident!("{}Interrupt", name);
++    let name_handler = format!("__EMBASSY_{}_HANDLER", name);
++
++    let result = quote! {
++        {
++            #[allow(non_snake_case)]
++            #[export_name = #name]
++            pub unsafe extern "C" fn trampoline() {
++                extern "C" {
++                    #[link_name = #name_handler]
++                    static HANDLER: ::core::sync::atomic::AtomicPtr<u32>;
++                }
++
++                let p = HANDLER.load(::core::sync::atomic::Ordering::Acquire);
++                if !p.is_null() {
++                    let f: fn() = ::core::mem::transmute(p);
++                    f()
++                }
++            }
++
++            static TAKEN: ::core::sync::atomic::AtomicBool = ::core::sync::atomic::AtomicBool::new(false);
++
++            if TAKEN.compare_and_swap(false, true, ::core::sync::atomic::Ordering::AcqRel) {
++                panic!("IRQ Already taken");
++            }
++
++            let irq: interrupt::#name_interrupt = unsafe { ::core::mem::transmute(()) };
++            irq
++        }
++    };
++    result.into()
++}
+diff --git a/embassy-nrf/src/interrupt.rs b/embassy-nrf/src/interrupt.rs
+index 17fc9ab34..3afded553 100644
+--- a/embassy-nrf/src/interrupt.rs
++++ b/embassy-nrf/src/interrupt.rs
+@@ -5,12 +5,13 @@
+ 
+ use core::sync::atomic::{compiler_fence, Ordering};
+ 
+-use crate::pac::{NVIC, NVIC_PRIO_BITS};
++use crate::pac::NVIC_PRIO_BITS;
+ 
+ // Re-exports
+ pub use crate::pac::Interrupt;
+ pub use crate::pac::Interrupt::*; // needed for cortex-m-rt #[interrupt]
+ pub use cortex_m::interrupt::{CriticalSection, Mutex};
++pub use embassy::interrupt::{declare, take, OwnedInterrupt};
+ 
+ #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
+ #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+@@ -26,14 +27,8 @@ pub enum Priority {
+     Level7 = 7,
+ }
+ 
+-impl Priority {
+-    #[inline]
+-    fn to_nvic(self) -> u8 {
+-        (self as u8) << (8 - NVIC_PRIO_BITS)
+-    }
+-
+-    #[inline]
+-    fn from_nvic(priority: u8) -> Self {
++impl From<u8> for Priority {
++    fn from(priority: u8) -> Self {
+         match priority >> (8 - NVIC_PRIO_BITS) {
+             0 => Self::Level0,
+             1 => Self::Level1,
+@@ -48,6 +43,12 @@ impl Priority {
+     }
+ }
+ 
++impl From<Priority> for u8 {
++    fn from(p: Priority) -> Self {
++        (p as u8) << (8 - NVIC_PRIO_BITS)
++    }
++}
++
+ #[inline]
+ pub fn free<F, R>(f: F) -> R
+ where
+@@ -77,53 +78,46 @@ where
+     }
+ }
+ 
+-#[inline]
+-pub fn enable(irq: Interrupt) {
+-    unsafe {
+-        NVIC::unmask(irq);
+-    }
+-}
+-
+-#[inline]
+-pub fn disable(irq: Interrupt) {
+-    NVIC::mask(irq);
+-}
+-
+-#[inline]
+-pub fn is_active(irq: Interrupt) -> bool {
+-    NVIC::is_active(irq)
+-}
+-
+-#[inline]
+-pub fn is_enabled(irq: Interrupt) -> bool {
+-    NVIC::is_enabled(irq)
+-}
+-
+-#[inline]
+-pub fn is_pending(irq: Interrupt) -> bool {
+-    NVIC::is_pending(irq)
+-}
+-
+-#[inline]
+-pub fn pend(irq: Interrupt) {
+-    NVIC::pend(irq)
+-}
+-
+-#[inline]
+-pub fn unpend(irq: Interrupt) {
+-    NVIC::unpend(irq)
+-}
+-
+-#[inline]
+-pub fn get_priority(irq: Interrupt) -> Priority {
+-    Priority::from_nvic(NVIC::get_priority(irq))
+-}
+-
+-#[inline]
+-pub fn set_priority(irq: Interrupt, prio: Priority) {
+-    unsafe {
+-        cortex_m::peripheral::Peripherals::steal()
+-            .NVIC
+-            .set_priority(irq, prio.to_nvic())
+-    }
+-}
++declare!(POWER_CLOCK);
++declare!(RADIO);
++declare!(UARTE0_UART0);
++declare!(SPIM0_SPIS0_TWIM0_TWIS0_SPI0_TWI0);
++declare!(SPIM1_SPIS1_TWIM1_TWIS1_SPI1_TWI1);
++declare!(NFCT);
++declare!(GPIOTE);
++declare!(SAADC);
++declare!(TIMER0);
++declare!(TIMER1);
++declare!(TIMER2);
++declare!(RTC0);
++declare!(TEMP);
++declare!(RNG);
++declare!(ECB);
++declare!(CCM_AAR);
++declare!(WDT);
++declare!(RTC1);
++declare!(QDEC);
++declare!(COMP_LPCOMP);
++declare!(SWI0_EGU0);
++declare!(SWI1_EGU1);
++declare!(SWI2_EGU2);
++declare!(SWI3_EGU3);
++declare!(SWI4_EGU4);
++declare!(SWI5_EGU5);
++declare!(TIMER3);
++declare!(TIMER4);
++declare!(PWM0);
++declare!(PDM);
++declare!(MWU);
++declare!(PWM1);
++declare!(PWM2);
++declare!(SPIM2_SPIS2_SPI2);
++declare!(RTC2);
++declare!(I2S);
++declare!(FPU);
++declare!(USBD);
++declare!(UARTE1);
++declare!(QSPI);
++declare!(CRYPTOCELL);
++declare!(PWM3);
++declare!(SPIM3);
+diff --git a/embassy-nrf/src/lib.rs b/embassy-nrf/src/lib.rs
+index 0ca328138..ccfcc0681 100644
+--- a/embassy-nrf/src/lib.rs
++++ b/embassy-nrf/src/lib.rs
+@@ -51,11 +51,11 @@ pub use nrf52840_hal as hal;
+ // This mod MUST go first, so that the others see its macros.
+ pub(crate) mod fmt;
+ 
+-pub mod buffered_uarte;
+-pub mod gpiote;
++//pub mod buffered_uarte;
++//pub mod gpiote;
+ pub mod interrupt;
+ #[cfg(feature = "52840")]
+ pub mod qspi;
+-pub mod rtc;
++//pub mod rtc;
+ 
+ pub use cortex_m_rt::interrupt;
+diff --git a/embassy-nrf/src/qspi.rs b/embassy-nrf/src/qspi.rs
+index 79fc7029c..8833afbdc 100644
+--- a/embassy-nrf/src/qspi.rs
++++ b/embassy-nrf/src/qspi.rs
+@@ -2,6 +2,7 @@ use crate::fmt::{assert, assert_eq, panic, *};
+ use core::future::Future;
+ 
+ use crate::hal::gpio::{Output, Pin as GpioPin, Port as GpioPort, PushPull};
++use crate::interrupt::{OwnedInterrupt, QSPIInterrupt};
+ use crate::pac::{Interrupt, QSPI};
+ 
+ pub use crate::pac::qspi::ifconfig0::ADDRMODE_A as AddressMode;
+@@ -59,7 +60,7 @@ fn port_bit(port: GpioPort) -> bool {
+ }
+ 
+ impl Qspi {
+-    pub fn new(qspi: QSPI, config: Config) -> Self {
++    pub fn new(qspi: QSPI, irq: QSPIInterrupt, config: Config) -> Self {
+         qspi.psel.sck.write(|w| {
+             let pin = &config.pins.sck;
+             let w = unsafe { w.pin().bits(pin.pin()) };
+@@ -146,9 +147,10 @@ impl Qspi {
+         // Enable READY interrupt
+         SIGNAL.reset();
+         qspi.intenset.write(|w| w.ready().set());
+-        interrupt::set_priority(Interrupt::QSPI, interrupt::Priority::Level7);
+-        interrupt::unpend(Interrupt::QSPI);
+-        interrupt::enable(Interrupt::QSPI);
++
++        irq.set_handler(irq_handler);
++        irq.unpend();
++        irq.enable();
+ 
+         Self { inner: qspi }
+     }
+@@ -347,8 +349,7 @@ impl Flash for Qspi {
+ 
+ static SIGNAL: Signal<()> = Signal::new();
+ 
+-#[interrupt]
+-unsafe fn QSPI() {
++unsafe fn irq_handler() {
+     let p = crate::pac::Peripherals::steal().QSPI;
+     if p.events_ready.read().events_ready().bit_is_set() {
+         p.events_ready.reset();
+diff --git a/embassy/src/interrupt.rs b/embassy/src/interrupt.rs
+new file mode 100644
+index 000000000..fee52b326
+--- /dev/null
++++ b/embassy/src/interrupt.rs
+@@ -0,0 +1,76 @@
++use core::mem;
++use core::ptr;
++use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
++use cortex_m::peripheral::NVIC;
++
++pub use embassy_macros::interrupt_declare as declare;
++pub use embassy_macros::interrupt_take as take;
++
++struct NrWrap(u8);
++unsafe impl cortex_m::interrupt::Nr for NrWrap {
++    fn nr(&self) -> u8 {
++        self.0
++    }
++}
++
++pub unsafe trait OwnedInterrupt {
++    type Priority: From<u8> + Into<u8> + Copy;
++    fn number(&self) -> u8;
++    #[doc(hidden)]
++    unsafe fn __handler(&self) -> &'static AtomicPtr<u32>;
++
++    fn set_handler(&self, handler: unsafe fn()) {
++        unsafe { self.__handler() }.store(handler as *mut u32, Ordering::Release);
++    }
++
++    #[inline]
++    fn enable(&self) {
++        unsafe {
++            NVIC::unmask(NrWrap(self.number()));
++        }
++    }
++
++    #[inline]
++    fn disable(&self) {
++        NVIC::mask(NrWrap(self.number()));
++    }
++
++    #[inline]
++    fn is_active(&self) -> bool {
++        NVIC::is_active(NrWrap(self.number()))
++    }
++
++    #[inline]
++    fn is_enabled(&self) -> bool {
++        NVIC::is_enabled(NrWrap(self.number()))
++    }
++
++    #[inline]
++    fn is_pending(&self) -> bool {
++        NVIC::is_pending(NrWrap(self.number()))
++    }
++
++    #[inline]
++    fn pend(&self) {
++        NVIC::pend(NrWrap(self.number()))
++    }
++
++    #[inline]
++    fn unpend(&self) {
++        NVIC::unpend(NrWrap(self.number()))
++    }
++
++    #[inline]
++    fn get_priority(&self) -> Self::Priority {
++        Self::Priority::from(NVIC::get_priority(NrWrap(self.number())))
++    }
++
++    #[inline]
++    fn set_priority(&self, prio: Self::Priority) {
++        unsafe {
++            cortex_m::peripheral::Peripherals::steal()
++                .NVIC
++                .set_priority(NrWrap(self.number()), prio.into())
++        }
++    }
++}
+diff --git a/embassy/src/lib.rs b/embassy/src/lib.rs
+index 49ba8eea8..bc06ebd13 100644
+--- a/embassy/src/lib.rs
++++ b/embassy/src/lib.rs
+@@ -9,6 +9,7 @@ pub(crate) mod fmt;
+ 
+ pub mod executor;
+ pub mod flash;
++pub mod interrupt;
+ pub mod io;
+ pub mod rand;
+ pub mod time;
+diff --git a/examples/src/bin/qspi.rs b/examples/src/bin/qspi.rs
+index 644018e2d..a7d47f79c 100644
+--- a/examples/src/bin/qspi.rs
++++ b/examples/src/bin/qspi.rs
+@@ -13,7 +13,7 @@ use nrf52840_hal::gpio;
+ use embassy::executor::{task, Executor};
+ use embassy::flash::Flash;
+ use embassy::util::Forever;
+-use embassy_nrf::qspi;
++use embassy_nrf::{interrupt, qspi};
+ 
+ const PAGE_SIZE: usize = 4096;
+ 
+@@ -68,7 +68,8 @@ async fn run() {
+         deep_power_down: None,
+     };
+ 
+-    let mut q = qspi::Qspi::new(p.QSPI, config);
++    let irq = interrupt::take!(QSPI);
++    let mut q = qspi::Qspi::new(p.QSPI, irq, config);
+ 
+     let mut id = [1; 3];
+     q.custom_instruction(0x9F, &[], &mut id).await.unwrap();

@@ -1,0 +1,410 @@
+diff --git a/flink-table/flink-sql-gateway/src/main/java/org/apache/flink/table/gateway/service/operation/OperationExecutor.java b/flink-table/flink-sql-gateway/src/main/java/org/apache/flink/table/gateway/service/operation/OperationExecutor.java
+index 5d11c6235d5ee3..20c5695b15c241 100644
+--- a/flink-table/flink-sql-gateway/src/main/java/org/apache/flink/table/gateway/service/operation/OperationExecutor.java
++++ b/flink-table/flink-sql-gateway/src/main/java/org/apache/flink/table/gateway/service/operation/OperationExecutor.java
+@@ -29,6 +29,7 @@
+ import org.apache.flink.configuration.CheckpointingOptions;
+ import org.apache.flink.configuration.Configuration;
+ import org.apache.flink.core.execution.SavepointFormatType;
++import org.apache.flink.runtime.client.JobStatusMessage;
+ import org.apache.flink.table.api.CatalogNotExistException;
+ import org.apache.flink.table.api.DataTypes;
+ import org.apache.flink.table.api.internal.TableEnvironmentInternal;
+@@ -64,10 +65,12 @@
+ import org.apache.flink.table.operations.command.AddJarOperation;
+ import org.apache.flink.table.operations.command.ResetOperation;
+ import org.apache.flink.table.operations.command.SetOperation;
++import org.apache.flink.table.operations.command.ShowJobsOperation;
+ import org.apache.flink.table.operations.command.StopJobOperation;
+ import org.apache.flink.table.operations.ddl.AlterOperation;
+ import org.apache.flink.table.operations.ddl.CreateOperation;
+ import org.apache.flink.table.operations.ddl.DropOperation;
++import org.apache.flink.table.utils.DateTimeUtils;
+ import org.apache.flink.util.CollectionUtil;
+ import org.apache.flink.util.FlinkException;
+ import org.apache.flink.util.Preconditions;
+@@ -77,6 +80,7 @@
+ 
+ import java.time.Duration;
+ import java.util.Arrays;
++import java.util.Collection;
+ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -89,9 +93,12 @@
+ 
+ import static org.apache.flink.table.gateway.service.utils.Constants.COMPLETION_HINTS;
+ import static org.apache.flink.table.gateway.service.utils.Constants.JOB_ID;
++import static org.apache.flink.table.gateway.service.utils.Constants.JOB_NAME;
+ import static org.apache.flink.table.gateway.service.utils.Constants.SAVEPOINT_PATH;
+ import static org.apache.flink.table.gateway.service.utils.Constants.SET_KEY;
+ import static org.apache.flink.table.gateway.service.utils.Constants.SET_VALUE;
++import static org.apache.flink.table.gateway.service.utils.Constants.START_TIME;
++import static org.apache.flink.table.gateway.service.utils.Constants.STATUS;
+ import static org.apache.flink.util.Preconditions.checkArgument;
+ 
+ /** An executor to execute the {@link Operation}. */
+@@ -316,6 +323,8 @@ private ResultFetcher executeOperation(
+             return new ResultFetcher(handle, result.getResolvedSchema(), result.collectInternal());
+         } else if (op instanceof StopJobOperation) {
+             return callStopJobOperation(handle, (StopJobOperation) op);
++        } else if (op instanceof ShowJobsOperation) {
++            return callShowJobsOperation(handle, (ShowJobsOperation) op);
+         } else {
+             return callOperation(tableEnv, handle, op);
+         }
+@@ -524,6 +533,47 @@ private ResultFetcher buildOkResultFetcher(OperationHandle handle) {
+                         TableResultInternal.TABLE_RESULT_OK.collectInternal()));
+     }
+ 
++    public ResultFetcher callShowJobsOperation(
++            OperationHandle operationHandle, ShowJobsOperation showJobsOperation)
++            throws SqlExecutionException {
++        try {
++            Collection<JobStatusMessage> jobs =
++                    runClusterAction(
++                            operationHandle,
++                            clusterClient -> {
++                                try {
++                                    return clusterClient.listJobs().get();
++                                } catch (Exception e) {
++                                    throw new FlinkException(e);
++                                }
++                            });
++            List<RowData> resultRows =
++                    jobs.stream()
++                            .map(
++                                    job ->
++                                            GenericRowData.of(
++                                                    StringData.fromString(
++                                                            job.getJobId().toString()),
++                                                    StringData.fromString(job.getJobName()),
++                                                    StringData.fromString(
++                                                            job.getJobState().toString()),
++                                                    DateTimeUtils.toTimestampData(
++                                                            job.getStartTime(), 3)))
++                            .collect(Collectors.toList());
++            return new ResultFetcher(
++                    operationHandle,
++                    ResolvedSchema.of(
++                            Column.physical(JOB_ID, DataTypes.STRING()),
++                            Column.physical(JOB_NAME, DataTypes.STRING()),
++                            Column.physical(STATUS, DataTypes.STRING()),
++                            Column.physical(
++                                    START_TIME, DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE())),
++                    resultRows);
++        } catch (FlinkException | RuntimeException e) {
++            throw new SqlExecutionException("Failed to list jobs in the cluster.", e);
++        }
++    }
++
+     /**
+      * Retrieves the {@link ClusterClient} from the session and runs the given {@link ClusterAction}
+      * against it.
+diff --git a/flink-table/flink-sql-gateway/src/main/java/org/apache/flink/table/gateway/service/utils/Constants.java b/flink-table/flink-sql-gateway/src/main/java/org/apache/flink/table/gateway/service/utils/Constants.java
+index 2f40d74b5b4cc1..c3006b666f003b 100644
+--- a/flink-table/flink-sql-gateway/src/main/java/org/apache/flink/table/gateway/service/utils/Constants.java
++++ b/flink-table/flink-sql-gateway/src/main/java/org/apache/flink/table/gateway/service/utils/Constants.java
+@@ -22,6 +22,9 @@
+ public class Constants {
+ 
+     public static final String JOB_ID = "job id";
++    public static final String JOB_NAME = "job name";
++    public static final String STATUS = "status";
++    public static final String START_TIME = "start_time";
+     public static final String SET_KEY = "key";
+     public static final String SET_VALUE = "value";
+     public static final String COMPLETION_HINTS = "hints";
+diff --git a/flink-table/flink-sql-gateway/src/test/java/org/apache/flink/table/gateway/service/SqlGatewayServiceITCase.java b/flink-table/flink-sql-gateway/src/test/java/org/apache/flink/table/gateway/service/SqlGatewayServiceITCase.java
+index d95d7d486c35b1..8ca23f7307165f 100644
+--- a/flink-table/flink-sql-gateway/src/test/java/org/apache/flink/table/gateway/service/SqlGatewayServiceITCase.java
++++ b/flink-table/flink-sql-gateway/src/test/java/org/apache/flink/table/gateway/service/SqlGatewayServiceITCase.java
+@@ -22,6 +22,7 @@
+ import org.apache.flink.client.program.rest.RestClusterClient;
+ import org.apache.flink.configuration.CheckpointingOptions;
+ import org.apache.flink.configuration.Configuration;
++import org.apache.flink.configuration.PipelineOptions;
+ import org.apache.flink.core.testutils.CommonTestUtils;
+ import org.apache.flink.core.testutils.FlinkAssertions;
+ import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
+@@ -121,7 +122,7 @@ public class SqlGatewayServiceITCase extends AbstractTestBase {
+     public static final MiniClusterExtension MINI_CLUSTER =
+             new MiniClusterExtension(
+                     new MiniClusterResourceConfiguration.Builder()
+-                            .setNumberTaskManagers(1)
++                            .setNumberTaskManagers(2)
+                             .build());
+ 
+     @RegisterExtension
+@@ -456,6 +457,53 @@ public void testGetOperationSchemaUntilOperationIsReady() throws Exception {
+                 task -> assertThat(task.get()).isEqualTo(getDefaultResultSet().getResultSchema()));
+     }
+ 
++    @Test
++    public void testShowJobsOperation(@InjectClusterClient RestClusterClient<?> restClusterClient)
++            throws Exception {
++        SessionHandle sessionHandle = service.openSession(defaultSessionEnvironment);
++        Configuration configuration = new Configuration(MINI_CLUSTER.getClientConfiguration());
++
++        String pipelineName = "test-job";
++        configuration.setString(PipelineOptions.NAME, pipelineName);
++
++        // running jobs
++        String sourceDdl = "CREATE TABLE source (a STRING) WITH ('connector'='datagen');";
++        String sinkDdl = "CREATE TABLE sink (a STRING) WITH ('connector'='blackhole');";
++        String insertSql = "INSERT INTO sink SELECT * FROM source;";
++
++        service.executeStatement(sessionHandle, sourceDdl, -1, configuration);
++        service.executeStatement(sessionHandle, sinkDdl, -1, configuration);
++
++        long timeOpStart = System.currentTimeMillis();
++        OperationHandle insertsOperationHandle =
++                service.executeStatement(sessionHandle, insertSql, -1, configuration);
++        String jobId =
++                fetchAllResults(sessionHandle, insertsOperationHandle)
++                        .get(0)
++                        .getString(0)
++                        .toString();
++
++        TestUtils.waitUntilAllTasksAreRunning(restClusterClient, JobID.fromHexString(jobId));
++        long timeOpSucceed = System.currentTimeMillis();
++
++        OperationHandle showJobsOperationHandle1 =
++                service.executeStatement(sessionHandle, "SHOW JOBS", -1, configuration);
++
++        List<RowData> result = fetchAllResults(sessionHandle, showJobsOperationHandle1);
++        RowData jobRow =
++                result.stream()
++                        .filter(row -> jobId.equals(row.getString(0).toString()))
++                        .findFirst()
++                        .orElseThrow(
++                                () ->
++                                        new IllegalStateException(
++                                                "Test job " + jobId + " not found."));
++        assertThat(jobRow.getString(1).toString()).isEqualTo(pipelineName);
++        assertThat(jobRow.getString(2).toString()).isEqualTo("RUNNING");
++        assertThat(jobRow.getTimestamp(3, 3).getMillisecond())
++                .isBetween(timeOpStart, timeOpSucceed);
++    }
++
+     // --------------------------------------------------------------------------------------------
+     // Catalog API tests
+     // --------------------------------------------------------------------------------------------
+diff --git a/flink-table/flink-sql-parser/src/main/codegen/data/Parser.tdd b/flink-table/flink-sql-parser/src/main/codegen/data/Parser.tdd
+index 378c3c6f0a1617..d68ec34ddf6abe 100644
+--- a/flink-table/flink-sql-parser/src/main/codegen/data/Parser.tdd
++++ b/flink-table/flink-sql-parser/src/main/codegen/data/Parser.tdd
+@@ -104,6 +104,7 @@
+     "org.apache.flink.sql.parser.dql.SqlUnloadModule"
+     "org.apache.flink.sql.parser.expr.SqlUnresolvedTryCastFunction"
+     "org.apache.flink.sql.parser.ddl.SqlStopJob"
++    "org.apache.flink.sql.parser.dql.SqlShowJobs"
+     "org.apache.flink.sql.parser.type.ExtendedSqlCollectionTypeNameSpec"
+     "org.apache.flink.sql.parser.type.ExtendedSqlRowTypeNameSpec"
+     "org.apache.flink.sql.parser.type.SqlMapTypeNameSpec"
+@@ -144,6 +145,7 @@
+     "JAR"
+     "JARS"
+     "JOB"
++    "JOBS"
+     "LOAD"
+     "METADATA"
+     "MODIFY"
+@@ -566,6 +568,7 @@
+     "SqlReset()"
+     "SqlAnalyzeTable()"
+     "SqlStopJob()"
++    "SqlShowJobs()"
+   ]
+ 
+   # List of methods for parsing custom literals.
+diff --git a/flink-table/flink-sql-parser/src/main/codegen/includes/parserImpls.ftl b/flink-table/flink-sql-parser/src/main/codegen/includes/parserImpls.ftl
+index 57424abc495673..e359dc5a47fba9 100644
+--- a/flink-table/flink-sql-parser/src/main/codegen/includes/parserImpls.ftl
++++ b/flink-table/flink-sql-parser/src/main/codegen/includes/parserImpls.ftl
+@@ -2333,6 +2333,19 @@ SqlNode SqlAnalyzeTable():
+     }
+ }
+ 
++/**
++* Parse a "SHOW JOBS" statement.
++*/
++SqlShowJobs SqlShowJobs() :
++{
++}
++{
++    <SHOW> <JOBS>
++    {
++        return new SqlShowJobs(getPos());
++    }
++}
++
+ /**
+ * Parses a STOP JOB statement:
+ * STOP JOB <JOB_ID> [<WITH SAVEPOINT>] [<WITH DRAIN>];
+diff --git a/flink-table/flink-sql-parser/src/main/java/org/apache/flink/sql/parser/dql/SqlShowJobs.java b/flink-table/flink-sql-parser/src/main/java/org/apache/flink/sql/parser/dql/SqlShowJobs.java
+new file mode 100644
+index 00000000000000..5294564fb3a92f
+--- /dev/null
++++ b/flink-table/flink-sql-parser/src/main/java/org/apache/flink/sql/parser/dql/SqlShowJobs.java
+@@ -0,0 +1,56 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.sql.parser.dql;
++
++import org.apache.calcite.sql.SqlCall;
++import org.apache.calcite.sql.SqlKind;
++import org.apache.calcite.sql.SqlNode;
++import org.apache.calcite.sql.SqlOperator;
++import org.apache.calcite.sql.SqlSpecialOperator;
++import org.apache.calcite.sql.SqlWriter;
++import org.apache.calcite.sql.parser.SqlParserPos;
++
++import java.util.Collections;
++import java.util.List;
++
++/** The command to list running flink jobs in a cluster. */
++public class SqlShowJobs extends SqlCall {
++
++    public static final SqlSpecialOperator OPERATOR =
++            new SqlSpecialOperator("SHOW JOBS", SqlKind.OTHER);
++
++    public SqlShowJobs(SqlParserPos pos) {
++        super(pos);
++    }
++
++    @Override
++    public SqlOperator getOperator() {
++        return OPERATOR;
++    }
++
++    @Override
++    public List<SqlNode> getOperandList() {
++        return Collections.emptyList();
++    }
++
++    @Override
++    public void unparse(SqlWriter writer, int leftPrec, int rightPrec) {
++        writer.keyword("SHOW JOBS");
++    }
++}
+diff --git a/flink-table/flink-sql-parser/src/test/java/org/apache/flink/sql/parser/FlinkSqlParserImplTest.java b/flink-table/flink-sql-parser/src/test/java/org/apache/flink/sql/parser/FlinkSqlParserImplTest.java
+index fea81a9fe2dc58..b017142a7e1d23 100644
+--- a/flink-table/flink-sql-parser/src/test/java/org/apache/flink/sql/parser/FlinkSqlParserImplTest.java
++++ b/flink-table/flink-sql-parser/src/test/java/org/apache/flink/sql/parser/FlinkSqlParserImplTest.java
+@@ -2047,6 +2047,11 @@ void testCreateTableAsSelectWithPartitionKey() {
+                                         "CREATE TABLE AS SELECT syntax does not support to create partitioned table yet."));
+     }
+ 
++    @Test
++    void testShowJobs() {
++        sql("show jobs").ok("SHOW JOBS");
++    }
++
+     @Test
+     void testStopJob() {
+         sql("STOP JOB 'myjob'").ok("STOP JOB 'myjob'");
+diff --git a/flink-table/flink-table-api-java/src/main/java/org/apache/flink/table/operations/command/ShowJobsOperation.java b/flink-table/flink-table-api-java/src/main/java/org/apache/flink/table/operations/command/ShowJobsOperation.java
+new file mode 100644
+index 00000000000000..fb8458cab80514
+--- /dev/null
++++ b/flink-table/flink-table-api-java/src/main/java/org/apache/flink/table/operations/command/ShowJobsOperation.java
+@@ -0,0 +1,30 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.table.operations.command;
++
++import org.apache.flink.table.operations.Operation;
++
++/** Operation to describe a SHOW JOBS statement. */
++public class ShowJobsOperation implements Operation {
++
++    @Override
++    public String asSummaryString() {
++        return "SHOW JOBS";
++    }
++}
+diff --git a/flink-table/flink-table-planner/src/main/java/org/apache/flink/table/planner/operations/SqlToOperationConverter.java b/flink-table/flink-table-planner/src/main/java/org/apache/flink/table/planner/operations/SqlToOperationConverter.java
+index 3ae34126d337cd..8c41e4c9a8fa35 100644
+--- a/flink-table/flink-table-planner/src/main/java/org/apache/flink/table/planner/operations/SqlToOperationConverter.java
++++ b/flink-table/flink-table-planner/src/main/java/org/apache/flink/table/planner/operations/SqlToOperationConverter.java
+@@ -80,6 +80,7 @@
+ import org.apache.flink.sql.parser.dql.SqlShowDatabases;
+ import org.apache.flink.sql.parser.dql.SqlShowFunctions;
+ import org.apache.flink.sql.parser.dql.SqlShowJars;
++import org.apache.flink.sql.parser.dql.SqlShowJobs;
+ import org.apache.flink.sql.parser.dql.SqlShowModules;
+ import org.apache.flink.sql.parser.dql.SqlShowPartitions;
+ import org.apache.flink.sql.parser.dql.SqlShowTables;
+@@ -157,6 +158,7 @@
+ import org.apache.flink.table.operations.command.ResetOperation;
+ import org.apache.flink.table.operations.command.SetOperation;
+ import org.apache.flink.table.operations.command.ShowJarsOperation;
++import org.apache.flink.table.operations.command.ShowJobsOperation;
+ import org.apache.flink.table.operations.command.StopJobOperation;
+ import org.apache.flink.table.operations.ddl.AddPartitionsOperation;
+ import org.apache.flink.table.operations.ddl.AlterCatalogFunctionOperation;
+@@ -358,6 +360,8 @@ private static Optional<Operation> convertValidatedSqlNode(
+             return Optional.of(converter.convertRemoveJar((SqlRemoveJar) validated));
+         } else if (validated instanceof SqlShowJars) {
+             return Optional.of(converter.convertShowJars((SqlShowJars) validated));
++        } else if (validated instanceof SqlShowJobs) {
++            return Optional.of(converter.convertShowJobs((SqlShowJobs) validated));
+         } else if (validated instanceof RichSqlInsert) {
+             return Optional.of(converter.convertSqlInsert((RichSqlInsert) validated));
+         } else if (validated instanceof SqlBeginStatementSet) {
+@@ -1507,6 +1511,10 @@ private ValueLiteralExpression getPartitionValueExpr(
+         return new ValueLiteralExpression(value, dataType.notNull());
+     }
+ 
++    private Operation convertShowJobs(SqlShowJobs sqlStopJob) {
++        return new ShowJobsOperation();
++    }
++
+     private Operation convertStopJob(SqlStopJob sqlStopJob) {
+         return new StopJobOperation(
+                 sqlStopJob.getId(), sqlStopJob.isWithSavepoint(), sqlStopJob.isWithDrain());
+diff --git a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/planner/calcite/FlinkPlannerImpl.scala b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/planner/calcite/FlinkPlannerImpl.scala
+index 84735f5f337f68..9a1e5996f693c2 100644
+--- a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/planner/calcite/FlinkPlannerImpl.scala
++++ b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/planner/calcite/FlinkPlannerImpl.scala
+@@ -140,6 +140,7 @@ class FlinkPlannerImpl(
+         || sqlNode.isInstanceOf[SqlShowViews]
+         || sqlNode.isInstanceOf[SqlShowColumns]
+         || sqlNode.isInstanceOf[SqlShowPartitions]
++        || sqlNode.isInstanceOf[SqlShowJobs]
+         || sqlNode.isInstanceOf[SqlRichDescribeTable]
+         || sqlNode.isInstanceOf[SqlUnloadModule]
+         || sqlNode.isInstanceOf[SqlUseModules]

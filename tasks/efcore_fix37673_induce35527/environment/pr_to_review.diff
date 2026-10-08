@@ -1,0 +1,718 @@
+commit 9627833651c2d43e256a04b88b7d34749b76a2a8
+Author: Andriy Svyryd <AndriySvyryd@users.noreply.github.com>
+Date:   Thu Jun 5 14:22:11 2025 -0700
+
+    Use AssemblyLoadContext to load EFC.Design (#35527)
+    
+    Improve the --nativeaot description
+    
+    Fixes #35265
+
+diff --git a/src/EFCore.Tasks/Tasks/Internal/MsBuildUtilities.cs b/src/EFCore.Tasks/Tasks/Internal/MsBuildUtilities.cs
+index d329cc74df..5501224ff1 100644
+--- a/src/EFCore.Tasks/Tasks/Internal/MsBuildUtilities.cs
++++ b/src/EFCore.Tasks/Tasks/Internal/MsBuildUtilities.cs
+@@ -1,7 +1,7 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+-#if NET472
++#if !NET
+ using System.Configuration;
+ #endif
+ 
+diff --git a/src/EFCore.Tasks/Tasks/Internal/OperationTaskBase.cs b/src/EFCore.Tasks/Tasks/Internal/OperationTaskBase.cs
+index 6849955bdc..830d4ca98e 100644
+--- a/src/EFCore.Tasks/Tasks/Internal/OperationTaskBase.cs
++++ b/src/EFCore.Tasks/Tasks/Internal/OperationTaskBase.cs
+@@ -30,6 +30,11 @@ public abstract class OperationTaskBase : ToolTask
+     /// </summary>
+     public ITaskItem? StartupAssembly { get; set; }
+ 
++    /// <summary>
++    ///     The location of Microsoft.EntityFrameworkCore.Design.dll
++    /// </summary>
++    public ITaskItem? DesignAssembly { get; set; }
++
+     /// <summary>
+     ///     The target framework moniker.
+     /// </summary>
+@@ -188,13 +193,18 @@ public abstract class OperationTaskBase : ToolTask
+             args.Add(runtimeFrameworkVersion);
+         }
+ 
++#if NET472
++#elif NET10_0
++#else
++#error Target framework needs to be updated here
++#endif
+         args.Add(
+             Path.Combine(
+                 Path.GetDirectoryName(typeof(OperationTaskBase).Assembly.Location)!,
+                 "..",
+                 "..",
+                 "tools",
+-                "netcoreapp2.0",
++                "net10.0",
+                 "ef.dll"));
+ 
+         args.AddRange(AdditionalArguments);
+@@ -207,6 +217,12 @@ public abstract class OperationTaskBase : ToolTask
+             args.Add(Path.ChangeExtension(StartupAssembly.ItemSpec, ".dll"));
+         }
+ 
++        if (DesignAssembly != null)
++        {
++            args.Add("--design-assembly");
++            args.Add(DesignAssembly.ItemSpec);
++        }
++
+         if (Project != null)
+         {
+             args.Add("--project");
+diff --git a/src/EFCore.Tasks/buildTransitive/Microsoft.EntityFrameworkCore.Tasks.targets b/src/EFCore.Tasks/buildTransitive/Microsoft.EntityFrameworkCore.Tasks.targets
+index 25463696b4..759688a46c 100644
+--- a/src/EFCore.Tasks/buildTransitive/Microsoft.EntityFrameworkCore.Tasks.targets
++++ b/src/EFCore.Tasks/buildTransitive/Microsoft.EntityFrameworkCore.Tasks.targets
+@@ -76,7 +76,7 @@ For Publish:
+              Properties="Configuration=$(Configuration);Platform=$(Platform);_EFGenerationStage=$(_EFGenerationStage)" />
+   </Target>
+ 
+-  <Target Name="OptimizeDbContext">
++  <Target Name="OptimizeDbContext" DependsOnTargets="ResolvePackageAssets">
+     <PropertyGroup>
+       <EFRootNamespace Condition="'$(EFRootNamespace)'==''">$(RootNamespace)</EFRootNamespace>
+       <EFRootNamespace Condition="'$(EFRootNamespace)'==''">$(AssemblyName)</EFRootNamespace>
+@@ -90,9 +90,14 @@ For Publish:
+       <EFNullable Condition="'$(EFNullable)'==''">false</EFNullable>
+     </PropertyGroup>
+ 
++    <ItemGroup>
++      <DesignAssembly Include="@(RuntimeCopyLocalItems)" Condition="$([System.String]::Copy('%(FullPath)').EndsWith('Microsoft.EntityFrameworkCore.Design.dll'))" />
++    </ItemGroup>
++
+     <OptimizeDbContext Assembly="$(_AssemblyFullName)"
+                        StartupAssembly="$(EFStartupAssembly)"
+                        ProjectAssetsFile="$(ProjectAssetsFile)"
++                       DesignAssembly="@(DesignAssembly->'%(FullPath)')"
+                        RuntimeFrameworkVersion="$(RuntimeFrameworkVersion)"
+                        TargetFrameworkMoniker="$(TargetFrameworkMoniker)"
+                        DbContextType="$(DbContextType)"
+diff --git a/src/EFCore.Tools/tools/EntityFrameworkCore.psm1 b/src/EFCore.Tools/tools/EntityFrameworkCore.psm1
+index 772cc11971..ce63472efc 100644
+--- a/src/EFCore.Tools/tools/EntityFrameworkCore.psm1
++++ b/src/EFCore.Tools/tools/EntityFrameworkCore.psm1
+@@ -1329,6 +1329,15 @@ function EF($project, $startupProject, $params, $applicationArgs, [switch] $skip
+         $params += '--nullable'
+     }
+ 
++    # NB: -join is here to support ConvertFrom-Json on PowerShell 3.0
++    $references = (dotnet build $startupProject.FullName /t:ResolvePackageAssets /getItem:RuntimeCopyLocalItems) -join "`n" | ConvertFrom-Json
++
++    $designReference = $references.Items.RuntimeCopyLocalItems | ? { $_.FullPath.EndsWith('Microsoft.EntityFrameworkCore.Design.dll') }
++    if ($designReference -ne $null)
++    {
++        $params += '--design-assembly', $designReference.FullPath
++    }
++
+     $arguments = ToArguments $params
+     if ($applicationArgs)
+     {
+diff --git a/src/dotnet-ef/Project.cs b/src/dotnet-ef/Project.cs
+index 0d8ccfa012..f176c26e63 100644
+--- a/src/dotnet-ef/Project.cs
++++ b/src/dotnet-ef/Project.cs
+@@ -29,6 +29,7 @@ internal class Project
+     public string ProjectName { get; }
+ 
+     public string? AssemblyName { get; set; }
++    public string? DesignAssembly { get; set; }
+     public string? Language { get; set; }
+     public string? OutputPath { get; set; }
+     public string? PlatformTarget { get; set; }
+@@ -51,9 +52,9 @@ internal class Project
+         Debug.Assert(!string.IsNullOrEmpty(file), "file is null or empty.");
+ 
+         var args = new List<string>
+-        {
+-            "msbuild",
+-        };
++            {
++                "msbuild",
++            };
+ 
+         if (framework != null)
+         {
+@@ -77,6 +78,9 @@ internal class Project
+ 
+         args.Add("/getProperty:Platform");
+ 
++        args.Add("/t:ResolvePackageAssets");
++        args.Add("/getItem:RuntimeCopyLocalItems");
++
+         args.Add(file);
+ 
+         var output = new StringBuilder();
+@@ -87,32 +91,44 @@ internal class Project
+             throw new CommandException(Resources.GetMetadataFailed);
+         }
+ 
+-        var metadata = JsonSerializer.Deserialize<Dictionary<string, Dictionary<string, string>>>(output.ToString())!["Properties"];
++        var metadata = JsonSerializer.Deserialize<ProjectMetadata>(output.ToString())!;
++
++        var designAssembly = metadata.Items["RuntimeCopyLocalItems"]
++            .Select(i => i["FullPath"])
++            .FirstOrDefault(i => i.Contains("Microsoft.EntityFrameworkCore.Design", StringComparison.InvariantCulture));
++        var properties = metadata.Properties;
+ 
+-        var platformTarget = metadata[nameof(PlatformTarget)];
++        var platformTarget = properties[nameof(PlatformTarget)];
+         if (platformTarget.Length == 0)
+         {
+-            platformTarget = metadata["Platform"];
++            platformTarget = properties["Platform"];
+         }
+ 
+         return new Project(file, framework, configuration, runtime)
+         {
+-            AssemblyName = metadata[nameof(AssemblyName)],
+-            Language = metadata[nameof(Language)],
+-            OutputPath = metadata[nameof(OutputPath)],
++            AssemblyName = properties[nameof(AssemblyName)],
++            DesignAssembly = designAssembly,
++            Language = properties[nameof(Language)],
++            OutputPath = properties[nameof(OutputPath)],
+             PlatformTarget = platformTarget,
+-            ProjectAssetsFile = metadata[nameof(ProjectAssetsFile)],
+-            ProjectDir = metadata[nameof(ProjectDir)],
+-            RootNamespace = metadata[nameof(RootNamespace)],
+-            RuntimeFrameworkVersion = metadata[nameof(RuntimeFrameworkVersion)],
+-            TargetFileName = metadata[nameof(TargetFileName)],
+-            TargetFrameworkMoniker = metadata[nameof(TargetFrameworkMoniker)],
+-            Nullable = metadata[nameof(Nullable)],
+-            TargetFramework = metadata[nameof(TargetFramework)],
+-            TargetPlatformIdentifier = metadata[nameof(TargetPlatformIdentifier)]
++            ProjectAssetsFile = properties[nameof(ProjectAssetsFile)],
++            ProjectDir = properties[nameof(ProjectDir)],
++            RootNamespace = properties[nameof(RootNamespace)],
++            RuntimeFrameworkVersion = properties[nameof(RuntimeFrameworkVersion)],
++            TargetFileName = properties[nameof(TargetFileName)],
++            TargetFrameworkMoniker = properties[nameof(TargetFrameworkMoniker)],
++            Nullable = properties[nameof(Nullable)],
++            TargetFramework = properties[nameof(TargetFramework)],
++            TargetPlatformIdentifier = properties[nameof(TargetPlatformIdentifier)]
+         };
+     }
+ 
++    private record class ProjectMetadata
++    {
++        public Dictionary<string, string> Properties { get; set; } = null!;
++        public Dictionary<string, Dictionary<string, string>[]> Items { get; set; } = null!;
++    }
++
+     public void Build(IEnumerable<string>? additionalArgs)
+     {
+         var args = new List<string> { "build" };
+diff --git a/src/dotnet-ef/Properties/Resources.resx b/src/dotnet-ef/Properties/Resources.resx
+index 6000f72735..38d2f89eed 100644
+--- a/src/dotnet-ef/Properties/Resources.resx
++++ b/src/dotnet-ef/Properties/Resources.resx
+@@ -268,7 +268,7 @@
+     <value>The namespace to use. Matches the directory by default.</value>
+   </data>
+   <data name="NativeAotDescription" xml:space="preserve">
+-    <value>Additionally generate all the code required for NativeAOT compilation and precompiled queries (experimental).</value>
++    <value>Generate additional code in the compiled model required for NativeAOT compilation and precompiled queries (experimental).</value>
+   </data>
+   <data name="NativeAotWarning" xml:space="preserve">
+     <value>NativeAOT support is experimental and can change in the future.</value>
+diff --git a/src/dotnet-ef/RootCommand.cs b/src/dotnet-ef/RootCommand.cs
+index 9bb6ed5f46..412a4d37be 100644
+--- a/src/dotnet-ef/RootCommand.cs
++++ b/src/dotnet-ef/RootCommand.cs
+@@ -200,6 +200,13 @@ internal class RootCommand : CommandBase
+         args.Add("--framework");
+         args.Add(startupProject.TargetFramework!);
+ 
++        var designAssembly = startupProject.DesignAssembly;
++        if (!string.IsNullOrEmpty(designAssembly))
++        {
++            args.Add("--design-assembly");
++            args.Add(designAssembly);
++        }
++
+         if (_configuration.HasValue())
+         {
+             args.Add("--configuration");
+diff --git a/src/ef/AppDomainOperationExecutor.cs b/src/ef/AppDomainOperationExecutor.cs
+index f90cc8a8a9..4d08e78786 100644
+--- a/src/ef/AppDomainOperationExecutor.cs
++++ b/src/ef/AppDomainOperationExecutor.cs
+@@ -1,10 +1,8 @@
+ // Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+-#if NET472
+-using System;
++#if !NET
+ using System.Collections;
+-using System.IO;
+ using System.Reflection;
+ using Microsoft.EntityFrameworkCore.Design;
+ using Microsoft.EntityFrameworkCore.Design.Internal;
+@@ -18,11 +16,13 @@ namespace Microsoft.EntityFrameworkCore.Tools
+         private readonly object _executor;
+         private readonly AppDomain _domain;
+         private bool _disposed;
++        private string? _efcoreVersion;
+         private const string ReportHandlerTypeName = "Microsoft.EntityFrameworkCore.Design.OperationReportHandler";
+ 
+         public AppDomainOperationExecutor(
+             string assembly,
+             string? startupAssembly,
++            string? designAssembly,
+             string? project,
+             string? projectDir,
+             string? dataDirectory,
+@@ -31,7 +31,7 @@ namespace Microsoft.EntityFrameworkCore.Tools
+             bool nullable,
+             string[] remainingArguments,
+             IOperationReportHandler reportHandler)
+-            : base(assembly, startupAssembly, project, projectDir, rootNamespace, language, nullable, remainingArguments, reportHandler)
++            : base(assembly, startupAssembly, designAssembly, project, projectDir, rootNamespace, language, nullable, remainingArguments, reportHandler)
+         {
+             var info = new AppDomainSetup { ApplicationBase = AppBasePath };
+ 
+@@ -66,6 +66,15 @@ namespace Microsoft.EntityFrameworkCore.Tools
+                 null,
+                 null);
+ 
++            if (DesignAssemblyPath != null)
++            {
++                _domain.AssemblyResolve += (object? sender, ResolveEventArgs args) =>
++                {
++                    var assemblyPath = Path.Combine(Path.GetDirectoryName(DesignAssemblyPath)!, args.Name + ".dll");
++                    return File.Exists(assemblyPath) ? Assembly.LoadFrom(assemblyPath) : null;
++                };
++            }
++
+             _executor = _domain.CreateInstanceAndUnwrap(
+                 DesignAssemblyName,
+                 ExecutorTypeName,
+@@ -91,6 +100,22 @@ namespace Microsoft.EntityFrameworkCore.Tools
+                 null);
+         }
+ 
++        public override string? EFCoreVersion
++        {
++            get
++            {
++                if (_efcoreVersion != null)
++                {
++                    return _efcoreVersion;
++                }
++
++                var designAssembly = _domain.GetAssemblies().Single(assembly => assembly.GetName().Name == DesignAssemblyName);
++                _efcoreVersion = designAssembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()
++                        ?.InformationalVersion;
++                return _efcoreVersion;
++            }
++        }
++
+         protected override object CreateResultHandler()
+             => new OperationResultHandler();
+ 
+diff --git a/src/ef/Commands/DbContextOptimizeCommand.cs b/src/ef/Commands/DbContextOptimizeCommand.cs
+index acd388902c..9bb7a18ee5 100644
+--- a/src/ef/Commands/DbContextOptimizeCommand.cs
++++ b/src/ef/Commands/DbContextOptimizeCommand.cs
+@@ -32,12 +32,18 @@ internal partial class DbContextOptimizeCommand
+ 
+     protected override int Execute(string[] args)
+     {
+-        if (new SemanticVersionComparer().Compare(EFCoreVersion, "6.0.0") < 0)
++        using var executor = CreateExecutor(args);
++        if (new SemanticVersionComparer().Compare(executor.EFCoreVersion, "6.0.0") < 0)
+         {
+             throw new CommandException(Resources.VersionRequired("6.0.0"));
+         }
+ 
+-        using var executor = CreateExecutor(args);
++        if ((_precompileQueries!.HasValue() || _nativeAot!.HasValue())
++            && new SemanticVersionComparer().Compare(executor.EFCoreVersion, "9.0.0") < 0)
++        {
++            throw new CommandException(Resources.VersionRequired("9.0.0"));
++        }
++
+         var result = executor.OptimizeContext(
+             _outputDir!.Value(),
+             _namespace!.Value(),
+diff --git a/src/ef/Commands/MigrationsBundleCommand.cs b/src/ef/Commands/MigrationsBundleCommand.cs
+index d07c940621..0626b709ae 100644
+--- a/src/ef/Commands/MigrationsBundleCommand.cs
++++ b/src/ef/Commands/MigrationsBundleCommand.cs
+@@ -29,20 +29,22 @@ internal partial class MigrationsBundleCommand
+         }
+     }
+ 
+-#if NET472
++#if !NET
+     protected override int Execute(string[] args)
+         => throw new CommandException(Resources.VersionRequired("6.0.0"));
+ #else
+     protected override int Execute(string[] args)
+     {
+-        if (new SemanticVersionComparer().Compare(EFCoreVersion, "6.0.0") < 0)
+-        {
+-            throw new CommandException(Resources.VersionRequired("6.0.0"));
+-        }
+-
++        string? version;
+         string context;
+         using (var executor = CreateExecutor(args))
+         {
++            version = executor.EFCoreVersion;
++            if (new SemanticVersionComparer().Compare(version, "6.0.0") < 0)
++            {
++                throw new CommandException(Resources.VersionRequired("6.0.0"));
++            }
++
+             context = (string)executor.GetContextInfo(Context!.Value())["Type"]!;
+         }
+ 
+@@ -53,7 +55,7 @@ internal partial class MigrationsBundleCommand
+             Session = new Dictionary<string, object>
+             {
+                 ["TargetFramework"] = Framework!.Value()!,
+-                ["EFCoreVersion"] = EFCoreVersion!,
++                ["EFCoreVersion"] = version!,
+                 ["Project"] = Project!.Value()!,
+                 ["StartupProject"] = StartupProject!.Value()!
+             }
+diff --git a/src/ef/Commands/MigrationsHasPendingModelChangesCommand.cs b/src/ef/Commands/MigrationsHasPendingModelChangesCommand.cs
+index f552a82ce3..bfb9567c4a 100644
+--- a/src/ef/Commands/MigrationsHasPendingModelChangesCommand.cs
++++ b/src/ef/Commands/MigrationsHasPendingModelChangesCommand.cs
+@@ -10,13 +10,12 @@ internal partial class MigrationsHasPendingModelChangesCommand
+ {
+     protected override int Execute(string[] args)
+     {
+-        if (new SemanticVersionComparer().Compare(EFCoreVersion, "8.0.0") < 0)
++        using var executor = CreateExecutor(args);
++        if (new SemanticVersionComparer().Compare(executor.EFCoreVersion, "8.0.0") < 0)
+         {
+             throw new CommandException(Resources.VersionRequired("8.0.0"));
+         }
+ 
+-        using var executor = CreateExecutor(args);
+-
+         executor.HasPendingModelChanges(Context!.Value());
+ 
+         return base.Execute(args);
+diff --git a/src/ef/Commands/ProjectCommandBase.cs b/src/ef/Commands/ProjectCommandBase.cs
+index 02fc113eef..1ee22436bf 100644
+--- a/src/ef/Commands/ProjectCommandBase.cs
++++ b/src/ef/Commands/ProjectCommandBase.cs
+@@ -5,8 +5,9 @@ using System.Reflection;
+ using Microsoft.DotNet.Cli.CommandLine;
+ using Microsoft.EntityFrameworkCore.Design;
+ using Microsoft.EntityFrameworkCore.Tools.Properties;
+-#if NET472
+-using System;
++#if NET
++using System.Runtime.Loader;
++#else
+ using System.Configuration;
+ #endif
+ 
+@@ -19,7 +20,7 @@ namespace Microsoft.EntityFrameworkCore.Tools.Commands
+         private CommandOption? _rootNamespace;
+         private CommandOption? _language;
+         private CommandOption? _nullable;
+-        private string? _efcoreVersion;
++        private CommandOption? _designAssembly;
+ 
+         protected CommandOption? Assembly { get; private set; }
+         protected CommandOption? Project { get; private set; }
+@@ -29,10 +30,6 @@ namespace Microsoft.EntityFrameworkCore.Tools.Commands
+         protected CommandOption? Framework { get; private set; }
+         protected CommandOption? Configuration { get; private set; }
+ 
+-        protected string? EFCoreVersion
+-            => _efcoreVersion ??= System.Reflection.Assembly.Load("Microsoft.EntityFrameworkCore.Design")
+-                .GetCustomAttribute<AssemblyInformationalVersionAttribute>()
+-                ?.InformationalVersion;
+ 
+         public override void Configure(CommandLineApplication command)
+         {
+@@ -50,6 +47,7 @@ namespace Microsoft.EntityFrameworkCore.Tools.Commands
+             WorkingDir = command.Option("--working-dir <PATH>", Resources.WorkingDirDescription);
+             Framework = command.Option("--framework <FRAMEWORK>", Resources.FrameworkDescription);
+             Configuration = command.Option("--configuration <CONFIGURATION>", Resources.ConfigurationDescription);
++            _designAssembly = command.Option("--design-assembly <PATH>", Resources.DesignAssemblyDescription);
+ 
+             base.Configure(command);
+         }
+@@ -83,12 +81,13 @@ namespace Microsoft.EntityFrameworkCore.Tools.Commands
+                         Reporter.WriteWarning,
+                         Reporter.WriteInformation,
+                         Reporter.WriteVerbose);
+-#if NET472
++#if !NET
+                 try
+                 {
+                     return new AppDomainOperationExecutor(
+                         Assembly!.Value()!,
+                         StartupAssembly!.Value(),
++                        _designAssembly!.Value(),
+                         Project!.Value(),
+                         _projectDir!.Value(),
+                         _dataDir!.Value(),
+@@ -126,6 +125,7 @@ namespace Microsoft.EntityFrameworkCore.Tools.Commands
+                 return new ReflectionOperationExecutor(
+                     Assembly!.Value()!,
+                     StartupAssembly!.Value(),
++                    _designAssembly!.Value(),
+                     Project!.Value(),
+                     _projectDir!.Value(),
+                     _dataDir!.Value(),
+diff --git a/src/ef/IOperationExecutor.cs b/src/ef/IOperationExecutor.cs
+index f29f33e3b3..42fd73882b 100644
+--- a/src/ef/IOperationExecutor.cs
++++ b/src/ef/IOperationExecutor.cs
+@@ -7,6 +7,8 @@ namespace Microsoft.EntityFrameworkCore.Tools;
+ 
+ internal interface IOperationExecutor : IDisposable
+ {
++    string? EFCoreVersion { get; }
++
+     IDictionary AddMigration(string name, string? outputDir, string? contextType, string? @namespace);
+     IDictionary RemoveMigration(string? contextType, bool force);
+     IEnumerable<IDictionary> GetMigrations(string? contextType, string? connectionString, bool noConnect);
+diff --git a/src/ef/OperationExecutorBase.cs b/src/ef/OperationExecutorBase.cs
+index 28ac4861c5..f007f9cf65 100644
+--- a/src/ef/OperationExecutorBase.cs
++++ b/src/ef/OperationExecutorBase.cs
+@@ -16,8 +16,9 @@ internal abstract class OperationExecutorBase : IOperationExecutor
+     private static readonly IDictionary EmptyArguments = new Dictionary<string, object>(0);
+     public string AppBasePath { get; }
+ 
+-    protected string AssemblyFileName { get; set; }
+-    protected string StartupAssemblyFileName { get; set; }
++    protected string AssemblyFileName { get; }
++    protected string StartupAssemblyFileName { get; }
++    protected string? DesignAssemblyPath { get; }
+     protected string ProjectDirectory { get; }
+     protected string Project { get; }
+     protected string RootNamespace { get; }
+@@ -28,6 +29,7 @@ internal abstract class OperationExecutorBase : IOperationExecutor
+     protected OperationExecutorBase(
+         string assembly,
+         string? startupAssembly,
++        string? designAssembly,
+         string? project,
+         string? projectDir,
+         string? rootNamespace,
+@@ -40,6 +42,7 @@ internal abstract class OperationExecutorBase : IOperationExecutor
+         StartupAssemblyFileName = startupAssembly == null
+             ? AssemblyFileName
+             : Path.GetFileNameWithoutExtension(startupAssembly);
++        DesignAssemblyPath = designAssembly;
+ 
+         AppBasePath = Path.GetFullPath(
+             Path.Combine(Directory.GetCurrentDirectory(), Path.GetDirectoryName(startupAssembly ?? assembly)!));
+@@ -61,6 +64,8 @@ internal abstract class OperationExecutorBase : IOperationExecutor
+         reporter.WriteVerbose(Resources.RemainingArguments(string.Join(",", RemainingArguments.Select(s => "'" + s + "'"))));
+     }
+ 
++    public abstract string? EFCoreVersion { get; }
++
+     public virtual void Dispose()
+     {
+     }
+diff --git a/src/ef/Properties/Resources.resx b/src/ef/Properties/Resources.resx
+index 5506c7c483..0aabe9da48 100644
+--- a/src/ef/Properties/Resources.resx
++++ b/src/ef/Properties/Resources.resx
+@@ -210,6 +210,9 @@
+   <data name="DbContextType" xml:space="preserve">
+     <value>Type: {type}</value>
+   </data>
++  <data name="DesignAssemblyDescription" xml:space="preserve">
++    <value>The location of the referenced Microsoft.EntityFrameworkCore.Design assembly.</value>
++  </data>
+   <data name="DesignNotFound" xml:space="preserve">
+     <value>Your startup project '{startupProject}' doesn't reference Microsoft.EntityFrameworkCore.Design. This package is required for the Entity Framework Core Tools to work. Ensure your startup project is correct, install the package, and try again.</value>
+   </data>
+@@ -298,7 +301,7 @@
+     <value>The namespace to use. Matches the directory by default.</value>
+   </data>
+   <data name="NativeAotDescription" xml:space="preserve">
+-    <value>Additionally generate all the code required for NativeAOT compilation and precompiled queries (experimental).</value>
++    <value>Generate additional code in the compiled model required for NativeAOT compilation and precompiled queries (experimental).</value>
+   </data>
+   <data name="NativeAotWarning" xml:space="preserve">
+     <value>NativeAOT support is experimental and can change in the future.</value>
+diff --git a/src/ef/ReflectionOperationExecutor.cs b/src/ef/ReflectionOperationExecutor.cs
+index a8cd7306bc..9e56991ce0 100644
+--- a/src/ef/ReflectionOperationExecutor.cs
++++ b/src/ef/ReflectionOperationExecutor.cs
+@@ -3,6 +3,9 @@
+ 
+ using System.Collections;
+ using System.Reflection;
++#if NET
++using System.Runtime.Loader;
++#endif
+ using Microsoft.EntityFrameworkCore.Design;
+ using Microsoft.EntityFrameworkCore.Design.Internal;
+ using Microsoft.EntityFrameworkCore.Infrastructure;
+@@ -17,10 +20,15 @@ internal class ReflectionOperationExecutor : OperationExecutorBase
+     private const string ReportHandlerTypeName = "Microsoft.EntityFrameworkCore.Design.OperationReportHandler";
+     private const string ResultHandlerTypeName = "Microsoft.EntityFrameworkCore.Design.OperationResultHandler";
+     private readonly Type _resultHandlerType;
++    private string? _efcoreVersion;
++#if NET
++    private AssemblyLoadContext? _assemblyLoadContext;
++#endif
+ 
+     public ReflectionOperationExecutor(
+         string assembly,
+         string? startupAssembly,
++        string? designAssembly,
+         string? project,
+         string? projectDir,
+         string? dataDirectory,
+@@ -29,7 +37,7 @@ internal class ReflectionOperationExecutor : OperationExecutorBase
+         bool nullable,
+         string[] remainingArguments,
+         IOperationReportHandler reportHandler)
+-        : base(assembly, startupAssembly, project, projectDir, rootNamespace, language, nullable, remainingArguments, reportHandler)
++        : base(assembly, startupAssembly, designAssembly, project, projectDir, rootNamespace, language, nullable, remainingArguments, reportHandler)
+     {
+         var reporter = new OperationReporter(reportHandler);
+         var configurationFile = (startupAssembly ?? assembly) + ".config";
+@@ -47,7 +55,20 @@ internal class ReflectionOperationExecutor : OperationExecutorBase
+ 
+         AppDomain.CurrentDomain.AssemblyResolve += ResolveAssembly;
+ 
+-        _commandsAssembly = Assembly.Load(new AssemblyName { Name = DesignAssemblyName });
++#if NET
++        _commandsAssembly = AssemblyLoadContext.LoadFromAssemblyName(new AssemblyName(DesignAssemblyName));
++#else
++        if (DesignAssemblyPath != null)
++        {
++            var assemblyPath = Path.GetDirectoryName(DesignAssemblyPath);
++            assemblyPath = Path.Combine(assemblyPath, DesignAssemblyName + ".dll");
++            _commandsAssembly = Assembly.LoadFrom(assemblyPath);
++        }
++        else
++        {
++            _commandsAssembly = Assembly.Load(DesignAssemblyName);
++        }
++#endif
+         var reportHandlerType = _commandsAssembly.GetType(ReportHandlerTypeName, throwOnError: true, ignoreCase: false)!;
+ 
+         var designReportHandler = Activator.CreateInstance(
+@@ -76,6 +97,62 @@ internal class ReflectionOperationExecutor : OperationExecutorBase
+         _resultHandlerType = _commandsAssembly.GetType(ResultHandlerTypeName, throwOnError: true, ignoreCase: false)!;
+     }
+ 
++#if NET
++    protected AssemblyLoadContext AssemblyLoadContext
++    {
++        get
++        {
++            if (_assemblyLoadContext != null)
++            {
++                return _assemblyLoadContext;
++            }
++
++            if (DesignAssemblyPath != null)
++            {
++                AssemblyLoadContext.Default.Resolving += (context, name) =>
++                {
++                    var assemblyPath = Path.GetDirectoryName(DesignAssemblyPath)!;
++                    assemblyPath = Path.Combine(assemblyPath, name.Name + ".dll");
++                    return File.Exists(assemblyPath) ? context.LoadFromAssemblyPath(assemblyPath) : null;
++                };
++                _assemblyLoadContext = AssemblyLoadContext.Default;
++            }
++
++            return AssemblyLoadContext.Default;
++        }
++    }
++#endif
++
++    public override string? EFCoreVersion
++    {
++        get
++        {
++            if (_efcoreVersion != null)
++            {
++                return _efcoreVersion;
++            }
++
++            Assembly? assembly = null;
++#if NET
++            assembly = AssemblyLoadContext.LoadFromAssemblyName(new AssemblyName(DesignAssemblyName));
++#else
++            if (DesignAssemblyPath != null)
++            {
++                var assemblyPath = Path.GetDirectoryName(DesignAssemblyPath);
++                assemblyPath = Path.Combine(assemblyPath, DesignAssemblyName + ".dll");
++                assembly = Assembly.LoadFrom(assemblyPath);
++            }
++            else
++            {
++                assembly = Assembly.Load(DesignAssemblyName);
++            }
++#endif
++            _efcoreVersion = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()
++                    ?.InformationalVersion;
++            return _efcoreVersion;
++        }
++    }
++
+     protected override object CreateResultHandler()
+         => Activator.CreateInstance(_resultHandlerType)!;
+ 
+diff --git a/src/ef/Utilities/CallContext.cs b/src/ef/Utilities/CallContext.cs
+index 33a34a967a..814defc97b 100644
+--- a/src/ef/Utilities/CallContext.cs
++++ b/src/ef/Utilities/CallContext.cs
+@@ -1,7 +1,7 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+-#if !NET472
++#if NET
+ namespace System.Runtime.Remoting.Messaging
+ {
+     internal static class CallContext
+diff --git a/src/ef/Utilities/CompilerError.cs b/src/ef/Utilities/CompilerError.cs
+index 76f18ec798..f70f7a201e 100644
+--- a/src/ef/Utilities/CompilerError.cs
++++ b/src/ef/Utilities/CompilerError.cs
+@@ -1,7 +1,7 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+-#if !NET472
++#if NET
+ namespace System.CodeDom.Compiler
+ {
+     internal class CompilerError
+diff --git a/src/ef/Utilities/CompilerErrorCollection.cs b/src/ef/Utilities/CompilerErrorCollection.cs
+index 4398f9d700..864604c1ef 100644
+--- a/src/ef/Utilities/CompilerErrorCollection.cs
++++ b/src/ef/Utilities/CompilerErrorCollection.cs
+@@ -1,7 +1,7 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+-#if !NET472
++#if NET
+ namespace System.CodeDom.Compiler
+ {
+     internal class CompilerErrorCollection

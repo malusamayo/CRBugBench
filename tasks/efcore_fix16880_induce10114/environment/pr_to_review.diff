@@ -1,0 +1,3073 @@
+commit a59cbb6c824116adf05816805785d6fb7f0fad76
+Author: Arthur Vickers <ajcvickers@hotmail.com>
+Date:   Sun Jan 13 14:50:10 2019 -0800
+
+    Allow cascade delete timing to be configured
+    
+    Fixes #10114
+    
+    Allows timing cascade delete (i.e. delete of dependent on principal deletion) and delete orphans (i.e. delete of dependent on severing its relationship to the principal) to be configured as:
+    * Immediate: Dependents changed to Deleted immediately, or at least at the next DetectChanges
+    * OnSaveChanges: Dependents are not changed to Deleted until SaveChanges is called
+    * Never: Cascades don't happen automatically. They can be triggered by a new method: `context.ChangeTracker.CascadeChanges()`
+    
+    The default for both has been changed to `Immediate` which is a breaking change, but likely a better default because:
+    * Auditing in overridden SaveChanges will now report anything that will be deleted
+    * Data binding will reflect the changes immediately
+    
+    However, deleting orphans can be more difficult. This doesn't appear to be a major problem in EF Core because we don't aggressively graph shred, we don't typically have entities that handle their own fixup, and conceptual nulls still exist to allow transitionary states.
+    
+    Note that EF6 does not support deleting orphans, which means the behavior here with both set to Immediate is not quite the same as the default behavior of EF6.
+
+diff --git a/src/EFCore/ChangeTracking/CascadeTiming.cs b/src/EFCore/ChangeTracking/CascadeTiming.cs
+new file mode 100644
+index 0000000000..26e7e0b81e
+--- /dev/null
++++ b/src/EFCore/ChangeTracking/CascadeTiming.cs
+@@ -0,0 +1,29 @@
++// Copyright (c) .NET Foundation. All rights reserved.
++// Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
++
++namespace Microsoft.EntityFrameworkCore.ChangeTracking
++{
++    /// <summary>
++    ///     Defines different strategies for when cascading actions will be performed.
++    ///     See <see cref="ChangeTracker.CascadeDeleteTiming" /> and <see cref="ChangeTracker.DeleteOrphansTiming" />.
++    /// </summary>
++    public enum CascadeTiming
++    {
++        /// <summary>
++        ///     Cascading actions are made to dependent/child entities as soon as the principal/parent
++        ///     entity changes.
++        /// </summary>
++        Immediate,
++
++        /// <summary>
++        ///     Cascading actions are made to dependent/child entities as part of <see cref="DbContext.SaveChanges()" />.
++        /// </summary>
++        OnSaveChanges,
++
++        /// <summary>
++        ///     Cascading actions are never made automatically to dependent/child entities, but must instead
++        ///     be triggered by an explicit call.
++        /// </summary>
++        Never
++    }
++}
+diff --git a/src/EFCore/ChangeTracking/ChangeTracker.cs b/src/EFCore/ChangeTracking/ChangeTracker.cs
+index 79d2aa4fcc..00329c54bc 100644
+--- a/src/EFCore/ChangeTracking/ChangeTracker.cs
++++ b/src/EFCore/ChangeTracking/ChangeTracker.cs
+@@ -109,6 +109,35 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking
+             set => _queryTrackingBehavior = value;
+         }
+ 
++        /// <summary>
++        ///     <para>
++        ///         Gets or sets a value indicating when a dependent/child entity will have its state
++        ///         set to <see cref="EntityState.Deleted" /> once severed from a parent/principal entity
++        ///         through either a navigation or foreign key property being set to null. The default
++        ///         value is <see cref="CascadeTiming.Immediate" />.
++        ///     </para>
++        ///     <para>
++        ///         Dependent/child entities are only deleted automatically when the relationship
++        ///         is configured with <see cref="DeleteBehavior.Cascade" />. This is set by default
++        ///         for required relationships.
++        ///     </para>
++        /// </summary>
++        public virtual CascadeTiming DeleteOrphansTiming { get; set; } = CascadeTiming.Immediate;
++
++        /// <summary>
++        ///     <para>
++        ///         Gets or sets a value indicating when a dependent/child entity will have its state
++        ///         set to <see cref="EntityState.Deleted" /> once its parent/principal entity has been marked
++        ///         as <see cref="EntityState.Deleted" />. The default value is<see cref="CascadeTiming.Immediate" />.
++        ///     </para>
++        ///     <para>
++        ///         Dependent/child entities are only deleted automatically when the relationship
++        ///         is configured with <see cref="DeleteBehavior.Cascade" />. This is set by default
++        ///         for required relationships.
++        ///     </para>
++        /// </summary>
++        public virtual CascadeTiming CascadeDeleteTiming { get; set; } = CascadeTiming.Immediate;
++
+         /// <summary>
+         ///     Gets an <see cref="EntityEntry" /> for each entity being tracked by the context.
+         ///     The entries provide access to change tracking information and operations for each entity.
+@@ -313,22 +342,50 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking
+             remove => StateManager.StateChanged -= value;
+         }
+ 
+-        #region Hidden System.Object members
+-
+         /// <summary>
+-        ///     Returns a string that represents the current object.
++        ///     <para>
++        ///         Forces immediate cascading deletion of child/dependent entities when they are either
++        ///         severed from a required parent/principal entity, or the required parent/principal entity
++        ///         is itself deleted. See <see cref="DeleteBehavior" />.
++        ///     </para>
++        ///     <para>
++        ///         This method is usually used when <see cref="CascadeDeleteTiming" /> and/or
++        ///         <see cref="DeleteOrphansTiming" /> have been set to <see cref="CascadeTiming.Never" />
++        ///         to manually force the deletes to have at a time controlled by the application.
++        ///     </para>
++        ///     <para>
++        ///         If <see cref="AutoDetectChangesEnabled"/> is <code>true</code> then this method
++        ///         will call <see cref="DetectChanges"/>.
++        ///     </para>
+         /// </summary>
+-        /// <returns> A string that represents the current object. </returns>
+-        [EditorBrowsable(EditorBrowsableState.Never)]
+-        public override string ToString() => base.ToString();
++        public virtual void CascadeChanges()
++        {
++            if (AutoDetectChangesEnabled)
++            {
++                DetectChanges();
++            }
++
++            StateManager.CascadeChanges(force: true);
++        }
+ 
+         void IResettableService.ResetState()
+         {
+             _queryTrackingBehavior = _defaultQueryTrackingBehavior;
+             AutoDetectChangesEnabled = true;
+             LazyLoadingEnabled = true;
++            CascadeDeleteTiming = CascadeTiming.Immediate;
++            DeleteOrphansTiming = CascadeTiming.Immediate;
+         }
+ 
++        #region Hidden System.Object members
++
++        /// <summary>
++        ///     Returns a string that represents the current object.
++        /// </summary>
++        /// <returns> A string that represents the current object. </returns>
++        [EditorBrowsable(EditorBrowsableState.Never)]
++        public override string ToString() => base.ToString();
++
+         /// <summary>
+         ///     Determines whether the specified object is equal to the current object.
+         /// </summary>
+diff --git a/src/EFCore/ChangeTracking/Internal/IStateManager.cs b/src/EFCore/ChangeTracking/Internal/IStateManager.cs
+index 2eb82a9cf9..17b5d705cd 100644
+--- a/src/EFCore/ChangeTracking/Internal/IStateManager.cs
++++ b/src/EFCore/ChangeTracking/Internal/IStateManager.cs
+@@ -267,6 +267,18 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+         /// </summary>
+         bool SensitiveLoggingEnabled { get; }
+ 
++        /// <summary>
++        ///     This API supports the Entity Framework Core infrastructure and is not intended to be used
++        ///     directly from your code. This API may change or be removed in future releases.
++        /// </summary>
++        void CascadeChanges(bool force);
++
++        /// <summary>
++        ///     This API supports the Entity Framework Core infrastructure and is not intended to be used
++        ///     directly from your code. This API may change or be removed in future releases.
++        /// </summary>
++        void CascadeDelete([NotNull] InternalEntityEntry entry, bool force);
++
+         /// <summary>
+         ///     This API supports the Entity Framework Core infrastructure and is not intended to be used
+         ///     directly from your code. This API may change or be removed in future releases.
+diff --git a/src/EFCore/ChangeTracking/Internal/InternalEntityEntry.cs b/src/EFCore/ChangeTracking/Internal/InternalEntityEntry.cs
+index 1dc7cc0099..791207a4f7 100644
+--- a/src/EFCore/ChangeTracking/Internal/InternalEntityEntry.cs
++++ b/src/EFCore/ChangeTracking/Internal/InternalEntityEntry.cs
+@@ -273,6 +273,12 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+             }
+ 
+             FireStateChanged(oldState);
++
++            if (newState == EntityState.Deleted
++                && StateManager.Context.ChangeTracker.CascadeDeleteTiming == CascadeTiming.Immediate)
++            {
++                StateManager.CascadeDelete(this, force: false);
++            }
+         }
+ 
+         private void FireStateChanged(EntityState oldState)
+@@ -519,7 +525,7 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+                     CoreStrings.TempValue(property.Name, EntityType.DisplayName()));
+             }
+ 
+-            SetProperty(property, value, setModified, CurrentValueType.Temporary);
++            SetProperty(property, value, setModified, isCascadeDelete: false, CurrentValueType.Temporary);
+         }
+ 
+         /// <summary>
+@@ -534,7 +540,7 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+                     CoreStrings.StoreGenValue(property.Name, EntityType.DisplayName()));
+             }
+ 
+-            SetProperty(property, value, setModified: true, CurrentValueType.StoreGenerated);
++            SetProperty(property, value, setModified: true, isCascadeDelete: false, CurrentValueType.StoreGenerated);
+         }
+ 
+         /// <summary>
+@@ -909,13 +915,15 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+         public virtual void SetProperty(
+             [NotNull] IPropertyBase propertyBase,
+             [CanBeNull] object value,
+-            bool setModified = true)
+-            => SetProperty(propertyBase, value, setModified, CurrentValueType.Normal);
++            bool setModified = true,
++            bool isCascadeDelete = false)
++            => SetProperty(propertyBase, value, setModified, isCascadeDelete, CurrentValueType.Normal);
+ 
+         private void SetProperty(
+             [NotNull] IPropertyBase propertyBase,
+             [CanBeNull] object value,
+             bool setModified,
++            bool isCascadeDelete,
+             CurrentValueType valueType)
+         {
+             var currentValue = this[propertyBase];
+@@ -968,6 +976,15 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+                                     asProperty, changeState: true, isModified: true,
+                                     isConceptualNull: true);
+                             }
++
++                            if (!isCascadeDelete
++                                && StateManager.Context.ChangeTracker.DeleteOrphansTiming == CascadeTiming.Immediate)
++                            {
++                                HandleConceptualNulls(
++                                    StateManager.SensitiveLoggingEnabled,
++                                    force: false,
++                                    isCascadeDelete: false);
++                            }
+                         }
+ 
+                         writeValue = false;
+@@ -1134,7 +1151,7 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+         ///     This API supports the Entity Framework Core infrastructure and is not intended to be used
+         ///     directly from your code. This API may change or be removed in future releases.
+         /// </summary>
+-        public virtual void HandleConceptualNulls(bool sensitiveLoggingEnabled)
++        public virtual void HandleConceptualNulls(bool sensitiveLoggingEnabled, bool force, bool isCascadeDelete)
+         {
+             var fks = new List<IForeignKey>();
+             foreach (var foreignKey in EntityType.GetForeignKeys())
+@@ -1172,7 +1189,10 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+             }
+ 
+             var cascadeFk = fks.FirstOrDefault(fk => fk.DeleteBehavior == DeleteBehavior.Cascade);
+-            if (cascadeFk != null)
++            if (cascadeFk != null
++                && (force
++                    || (!isCascadeDelete
++                        && StateManager.Context.ChangeTracker.DeleteOrphansTiming != CascadeTiming.Never)))
+             {
+                 var cascadeState = EntityState == EntityState.Added
+                     ? EntityState.Detached
+@@ -1193,18 +1213,20 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+             }
+             else if (fks.Count > 0)
+             {
++                var foreignKey = fks.First();
++
+                 if (sensitiveLoggingEnabled)
+                 {
+                     throw new InvalidOperationException(
+                         CoreStrings.RelationshipConceptualNullSensitive(
+-                            fks.First().PrincipalEntityType.DisplayName(),
++                            foreignKey.PrincipalEntityType.DisplayName(),
+                             EntityType.DisplayName(),
+-                            this.BuildOriginalValuesString(EntityType.FindPrimaryKey().Properties)));
++                            this.BuildOriginalValuesString(foreignKey.Properties)));
+                 }
+ 
+                 throw new InvalidOperationException(
+                     CoreStrings.RelationshipConceptualNull(
+-                        fks.First().PrincipalEntityType.DisplayName(),
++                        foreignKey.PrincipalEntityType.DisplayName(),
+                         EntityType.DisplayName()));
+             }
+             else
+@@ -1222,7 +1244,7 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+                             CoreStrings.PropertyConceptualNullSensitive(
+                                 property.Name,
+                                 EntityType.DisplayName(),
+-                                this.BuildOriginalValuesString(EntityType.FindPrimaryKey().Properties)));
++                                this.BuildOriginalValuesString(new[] { property })));
+                     }
+ 
+                     throw new InvalidOperationException(
+diff --git a/src/EFCore/ChangeTracking/Internal/StateManager.cs b/src/EFCore/ChangeTracking/Internal/StateManager.cs
+index c2672ffd07..b6b2690d76 100644
+--- a/src/EFCore/ChangeTracking/Internal/StateManager.cs
++++ b/src/EFCore/ChangeTracking/Internal/StateManager.cs
+@@ -811,31 +811,46 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+         ///     directly from your code. This API may change or be removed in future releases.
+         /// </summary>
+         public virtual IReadOnlyList<InternalEntityEntry> GetInternalEntriesToSave()
++        {
++            CascadeChanges(force: false);
++
++            return Entries
++                .Where(
++                    e => e.EntityState == EntityState.Added
++                         || e.EntityState == EntityState.Modified
++                         || e.EntityState == EntityState.Deleted)
++                .Select(e => e.PrepareToSave())
++                .ToList();
++        }
++
++        /// <summary>
++        ///     This API supports the Entity Framework Core infrastructure and is not intended to be used
++        ///     directly from your code. This API may change or be removed in future releases.
++        /// </summary>
++        public virtual void CascadeChanges(bool force)
+         {
+             foreach (var entry in Entries.Where(
+                 e => (e.EntityState == EntityState.Modified
+                       || e.EntityState == EntityState.Added)
+                      && e.HasConceptualNull).ToList())
+             {
+-                entry.HandleConceptualNulls(SensitiveLoggingEnabled);
++                entry.HandleConceptualNulls(SensitiveLoggingEnabled, force, isCascadeDelete: false);
+             }
+ 
+             foreach (var entry in Entries.Where(e => e.EntityState == EntityState.Deleted).ToList())
+             {
+-                CascadeDelete(entry);
++                CascadeDelete(entry, force);
+             }
+-
+-            return Entries
+-                .Where(
+-                    e => e.EntityState == EntityState.Added
+-                         || e.EntityState == EntityState.Modified
+-                         || e.EntityState == EntityState.Deleted)
+-                .Select(e => e.PrepareToSave())
+-                .ToList();
+         }
+ 
+-        private void CascadeDelete(InternalEntityEntry entry)
++        /// <summary>
++        ///     This API supports the Entity Framework Core infrastructure and is not intended to be used
++        ///     directly from your code. This API may change or be removed in future releases.
++        /// </summary>
++        public virtual void CascadeDelete(InternalEntityEntry entry, bool force)
+         {
++            var doCascadeDelete = force || Context.ChangeTracker.CascadeDeleteTiming != CascadeTiming.Never;
++
+             foreach (var fk in entry.EntityType.GetReferencingForeignKeys())
+             {
+                 foreach (var dependent in (GetDependentsFromNavigation(entry, fk)
+@@ -847,7 +862,8 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+                         && (dependent.EntityState == EntityState.Added
+                             || KeysEqual(entry, fk, dependent)))
+                     {
+-                        if (fk.DeleteBehavior == DeleteBehavior.Cascade)
++                        if (fk.DeleteBehavior == DeleteBehavior.Cascade
++                            && doCascadeDelete)
+                         {
+                             var cascadeState = dependent.EntityState == EntityState.Added
+                                 ? EntityState.Detached
+@@ -864,18 +880,18 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+ 
+                             dependent.SetEntityState(cascadeState);
+ 
+-                            CascadeDelete(dependent);
++                            CascadeDelete(dependent, force);
+                         }
+                         else
+                         {
+                             foreach (var dependentProperty in fk.Properties)
+                             {
+-                                dependent[dependentProperty] = null;
++                                dependent.SetProperty(dependentProperty, null, setModified: true, isCascadeDelete: true);
+                             }
+ 
+                             if (dependent.HasConceptualNull)
+                             {
+-                                dependent.HandleConceptualNulls(SensitiveLoggingEnabled);
++                                dependent.HandleConceptualNulls(SensitiveLoggingEnabled, force, isCascadeDelete: true);
+                             }
+                         }
+                     }
+@@ -895,7 +911,6 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+                     entry[principalProperty],
+                     dependent[dependentProperty]))
+                 {
+-                    //dependent[dependentProperty] = null;
+                     return false;
+                 }
+             }
+diff --git a/src/EFCore/DbContext.cs b/src/EFCore/DbContext.cs
+index 80f3323d64..71fcfa9b85 100644
+--- a/src/EFCore/DbContext.cs
++++ b/src/EFCore/DbContext.cs
+@@ -577,7 +577,9 @@ namespace Microsoft.EntityFrameworkCore
+                 _changeTracker?.AutoDetectChangesEnabled,
+                 _changeTracker?.QueryTrackingBehavior,
+                 _database?.AutoTransactionsEnabled,
+-                _changeTracker?.LazyLoadingEnabled);
++                _changeTracker?.LazyLoadingEnabled,
++                _changeTracker?.CascadeDeleteTiming,
++                _changeTracker?.DeleteOrphansTiming);
+ 
+         void IDbContextPoolable.Resurrect(DbContextPoolConfigurationSnapshot configurationSnapshot)
+         {
+@@ -587,10 +589,14 @@ namespace Microsoft.EntityFrameworkCore
+             {
+                 Debug.Assert(configurationSnapshot.QueryTrackingBehavior.HasValue);
+                 Debug.Assert(configurationSnapshot.LazyLoadingEnabled.HasValue);
++                Debug.Assert(configurationSnapshot.CascadeDeleteTiming.HasValue);
++                Debug.Assert(configurationSnapshot.DeleteOrphansTiming.HasValue);
+ 
+                 ChangeTracker.AutoDetectChangesEnabled = configurationSnapshot.AutoDetectChangesEnabled.Value;
+                 ChangeTracker.QueryTrackingBehavior = configurationSnapshot.QueryTrackingBehavior.Value;
+                 ChangeTracker.LazyLoadingEnabled = configurationSnapshot.LazyLoadingEnabled.Value;
++                ChangeTracker.CascadeDeleteTiming = configurationSnapshot.CascadeDeleteTiming.Value;
++                ChangeTracker.DeleteOrphansTiming = configurationSnapshot.DeleteOrphansTiming.Value;
+             }
+             else
+             {
+diff --git a/src/EFCore/DeleteBehavior.cs b/src/EFCore/DeleteBehavior.cs
+index 730e0e7ba3..94f6ceb29c 100644
+--- a/src/EFCore/DeleteBehavior.cs
++++ b/src/EFCore/DeleteBehavior.cs
+@@ -50,8 +50,7 @@ namespace Microsoft.EntityFrameworkCore
+         ///         For entities being tracked by the <see cref="DbContext" />, the values of foreign key properties in
+         ///         dependent entities are not changed. This can result in an inconsistent graph of entities
+         ///         where the values of foreign key properties do not match the relationships in the
+-        ///         graph. If a property remains in this state when <see cref="DbContext.SaveChanges()" />
+-        ///         is called, then an exception will be thrown.
++        ///         graph.
+         ///     </para>
+         ///     <para>
+         ///         If the database has been created from the model using Entity Framework Migrations or the
+diff --git a/src/EFCore/Internal/DbContextPoolConfigurationSnapshot.cs b/src/EFCore/Internal/DbContextPoolConfigurationSnapshot.cs
+index a7cc9cf48c..0cd193aaaf 100644
+--- a/src/EFCore/Internal/DbContextPoolConfigurationSnapshot.cs
++++ b/src/EFCore/Internal/DbContextPoolConfigurationSnapshot.cs
+@@ -1,6 +1,8 @@
+ ﻿// Copyright (c) .NET Foundation. All rights reserved.
+ // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
+ 
++using Microsoft.EntityFrameworkCore.ChangeTracking;
++
+ namespace Microsoft.EntityFrameworkCore.Internal
+ {
+     /// <summary>
+@@ -17,12 +19,16 @@ namespace Microsoft.EntityFrameworkCore.Internal
+             bool? autoDetectChangesEnabled,
+             QueryTrackingBehavior? queryTrackingBehavior,
+             bool? autoTransactionsEnabled,
+-            bool? lazyLoadingEnabled)
++            bool? lazyLoadingEnabled,
++            CascadeTiming? cascadeDeleteTiming,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             AutoDetectChangesEnabled = autoDetectChangesEnabled;
+             QueryTrackingBehavior = queryTrackingBehavior;
+             AutoTransactionsEnabled = autoTransactionsEnabled;
+             LazyLoadingEnabled = lazyLoadingEnabled;
++            CascadeDeleteTiming = cascadeDeleteTiming;
++            DeleteOrphansTiming = deleteOrphansTiming;
+         }
+ 
+         /// <summary>
+@@ -37,6 +43,18 @@ namespace Microsoft.EntityFrameworkCore.Internal
+         /// </summary>
+         public virtual bool? LazyLoadingEnabled { get; }
+ 
++        /// <summary>
++        ///     This API supports the Entity Framework Core infrastructure and is not intended to be used
++        ///     directly from your code. This API may change or be removed in future releases.
++        /// </summary>
++        public virtual CascadeTiming? CascadeDeleteTiming { get; }
++
++        /// <summary>
++        ///     This API supports the Entity Framework Core infrastructure and is not intended to be used
++        ///     directly from your code. This API may change or be removed in future releases.
++        /// </summary>
++        public virtual CascadeTiming? DeleteOrphansTiming { get; }
++
+         /// <summary>
+         ///     This API supports the Entity Framework Core infrastructure and is not intended to be used
+         ///     directly from your code. This API may change or be removed in future releases.
+diff --git a/test/EFCore.InMemory.FunctionalTests/GraphUpdatesInMemoryTest.cs b/test/EFCore.InMemory.FunctionalTests/GraphUpdatesInMemoryTest.cs
+index 8b1f6f5255..047a61a487 100644
+--- a/test/EFCore.InMemory.FunctionalTests/GraphUpdatesInMemoryTest.cs
++++ b/test/EFCore.InMemory.FunctionalTests/GraphUpdatesInMemoryTest.cs
+@@ -2,6 +2,7 @@
+ // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
+ 
+ using System;
++using Microsoft.EntityFrameworkCore.ChangeTracking;
+ using Microsoft.EntityFrameworkCore.Diagnostics;
+ using Microsoft.EntityFrameworkCore.TestUtilities;
+ 
+@@ -15,158 +16,209 @@ namespace Microsoft.EntityFrameworkCore
+         {
+         }
+ 
+-        public override DbUpdateException Optional_One_to_one_relationships_are_one_to_one()
++        public override DbUpdateException Optional_One_to_one_relationships_are_one_to_one(
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // FK uniqueness not enforced in in-memory database
+             return null;
+         }
+ 
+-        public override DbUpdateException Required_One_to_one_relationships_are_one_to_one()
++        public override DbUpdateException Required_One_to_one_relationships_are_one_to_one(
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // FK uniqueness not enforced in in-memory database
+             return null;
+         }
+ 
+-        public override DbUpdateException Optional_One_to_one_with_AK_relationships_are_one_to_one()
++        public override DbUpdateException Optional_One_to_one_with_AK_relationships_are_one_to_one(
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // FK uniqueness not enforced in in-memory database
+             return null;
+         }
+ 
+-        public override DbUpdateException Required_One_to_one_with_AK_relationships_are_one_to_one()
++        public override DbUpdateException Required_One_to_one_with_AK_relationships_are_one_to_one(
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // FK uniqueness not enforced in in-memory database
+             return null;
+         }
+ 
+         public override void Save_required_one_to_one_changed_by_reference_with_alternate_key(
+-            ChangeMechanism changeMechanism, bool useExistingEntities)
++            ChangeMechanism changeMechanism,
++            bool useExistingEntities,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade delete not supported by in-memory database
+         }
+ 
+         public override void Save_required_non_PK_one_to_one_changed_by_reference_with_alternate_key(
+-            ChangeMechanism changeMechanism, bool useExistingEntities)
++            ChangeMechanism changeMechanism,
++            bool useExistingEntities,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade delete not supported by in-memory database
+         }
+ 
+-        public override DbUpdateException Save_required_one_to_one_changed_by_reference(ChangeMechanism changeMechanism)
++        public override DbUpdateException Save_required_one_to_one_changed_by_reference(
++            ChangeMechanism changeMechanism,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade delete not supported by in-memory database
+             return null;
+         }
+ 
+-        public override void Save_removed_required_many_to_one_dependents(ChangeMechanism changeMechanism)
++        public override void Save_removed_required_many_to_one_dependents(
++            ChangeMechanism changeMechanism,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade delete not supported by in-memory database
+         }
+ 
+-        public override void Save_required_non_PK_one_to_one_changed_by_reference(ChangeMechanism changeMechanism, bool useExistingEntities)
++        public override void Save_required_non_PK_one_to_one_changed_by_reference(
++            ChangeMechanism changeMechanism,
++            bool useExistingEntities,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade delete not supported by in-memory database
+         }
+ 
+-        public override void Sever_required_one_to_one_with_alternate_key(ChangeMechanism changeMechanism)
++        public override void Sever_required_one_to_one_with_alternate_key(
++            ChangeMechanism changeMechanism,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade delete not supported by in-memory database
+         }
+ 
+-        public override DbUpdateException Sever_required_one_to_one(ChangeMechanism changeMechanism)
++        public override DbUpdateException Sever_required_one_to_one(
++            ChangeMechanism changeMechanism,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade delete not supported by in-memory database
+             return null;
+         }
+ 
+-        public override void Sever_required_non_PK_one_to_one(ChangeMechanism changeMechanism)
++        public override void Sever_required_non_PK_one_to_one(
++            ChangeMechanism changeMechanism,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade delete not supported by in-memory database
+         }
+ 
+-        public override void Sever_required_non_PK_one_to_one_with_alternate_key(ChangeMechanism changeMechanism)
++        public override void Sever_required_non_PK_one_to_one_with_alternate_key(
++            ChangeMechanism changeMechanism,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade delete not supported by in-memory database
+         }
+ 
+-        public override DbUpdateException Required_many_to_one_dependents_are_cascade_deleted_in_store()
++        public override DbUpdateException Required_many_to_one_dependents_are_cascade_deleted_in_store(
++            CascadeTiming? cascadeDeleteTiming,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade delete not supported by in-memory database
+             return null;
+         }
+ 
+-        public override DbUpdateException Required_one_to_one_are_cascade_deleted_in_store()
++        public override DbUpdateException Required_one_to_one_are_cascade_deleted_in_store(
++            CascadeTiming? cascadeDeleteTiming,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade delete not supported by in-memory database
+             return null;
+         }
+ 
+-        public override DbUpdateException Required_non_PK_one_to_one_are_cascade_deleted_in_store()
++        public override DbUpdateException Required_non_PK_one_to_one_are_cascade_deleted_in_store(
++            CascadeTiming? cascadeDeleteTiming,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade delete not supported by in-memory database
+             return null;
+         }
+ 
+-        public override DbUpdateException Required_many_to_one_dependents_with_alternate_key_are_cascade_deleted_in_store()
++        public override DbUpdateException Required_many_to_one_dependents_with_alternate_key_are_cascade_deleted_in_store(
++            CascadeTiming? cascadeDeleteTiming,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade delete not supported by in-memory database
+             return null;
+         }
+ 
+-        public override DbUpdateException Required_one_to_one_with_alternate_key_are_cascade_deleted_in_store()
++        public override DbUpdateException Required_one_to_one_with_alternate_key_are_cascade_deleted_in_store(
++            CascadeTiming? cascadeDeleteTiming,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade delete not supported by in-memory database
+             return null;
+         }
+ 
+-        public override DbUpdateException Required_non_PK_one_to_one_with_alternate_key_are_cascade_deleted_in_store()
++        public override DbUpdateException Required_non_PK_one_to_one_with_alternate_key_are_cascade_deleted_in_store(
++            CascadeTiming? cascadeDeleteTiming,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade delete not supported by in-memory database
+             return null;
+         }
+ 
+-        public override DbUpdateException Optional_many_to_one_dependents_are_orphaned_in_store()
++        public override DbUpdateException Optional_many_to_one_dependents_are_orphaned_in_store(
++            CascadeTiming? cascadeDeleteTiming,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade nulls not supported by in-memory database
+             return null;
+         }
+ 
+-        public override DbUpdateException Optional_one_to_one_are_orphaned_in_store()
++        public override DbUpdateException Optional_one_to_one_are_orphaned_in_store(
++            CascadeTiming? cascadeDeleteTiming,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade nulls not supported by in-memory database
+             return null;
+         }
+ 
+-        public override DbUpdateException Optional_many_to_one_dependents_with_alternate_key_are_orphaned_in_store()
++        public override DbUpdateException Optional_many_to_one_dependents_with_alternate_key_are_orphaned_in_store(
++            CascadeTiming? cascadeDeleteTiming,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade nulls not supported by in-memory database
+             return null;
+         }
+ 
+-        public override DbUpdateException Optional_one_to_one_with_alternate_key_are_orphaned_in_store()
++        public override DbUpdateException Optional_one_to_one_with_alternate_key_are_orphaned_in_store(
++            CascadeTiming? cascadeDeleteTiming,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade nulls not supported by in-memory database
+             return null;
+         }
+ 
+-        public override DbUpdateException Required_non_PK_one_to_one_with_alternate_key_are_cascade_detached_when_Added()
++        public override DbUpdateException Required_non_PK_one_to_one_with_alternate_key_are_cascade_detached_when_Added(
++            CascadeTiming? cascadeDeleteTiming,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade nulls not supported by in-memory database
+             return null;
+         }
+ 
+-        public override DbUpdateException Required_one_to_one_are_cascade_detached_when_Added()
++        public override DbUpdateException Required_one_to_one_are_cascade_detached_when_Added(
++            CascadeTiming? cascadeDeleteTiming,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade nulls not supported by in-memory database
+             return null;
+         }
+ 
+-        public override DbUpdateException Required_one_to_one_with_alternate_key_are_cascade_detached_when_Added()
++        public override DbUpdateException Required_one_to_one_with_alternate_key_are_cascade_detached_when_Added(
++            CascadeTiming? cascadeDeleteTiming,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade nulls not supported by in-memory database
+             return null;
+         }
+ 
+-        public override DbUpdateException Required_non_PK_one_to_one_are_cascade_detached_when_Added()
++        public override DbUpdateException Required_non_PK_one_to_one_are_cascade_detached_when_Added(
++            CascadeTiming? cascadeDeleteTiming,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             // Cascade nulls not supported by in-memory database
+             return null;
+diff --git a/test/EFCore.InMemory.FunctionalTests/ProxyGraphUpdatesInMemoryTest.cs b/test/EFCore.InMemory.FunctionalTests/ProxyGraphUpdatesInMemoryTest.cs
+index cd2d6ae44c..159d3f9825 100644
+--- a/test/EFCore.InMemory.FunctionalTests/ProxyGraphUpdatesInMemoryTest.cs
++++ b/test/EFCore.InMemory.FunctionalTests/ProxyGraphUpdatesInMemoryTest.cs
+@@ -2,6 +2,7 @@
+ // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
+ 
+ using System;
++using Microsoft.EntityFrameworkCore.ChangeTracking;
+ using Microsoft.EntityFrameworkCore.Diagnostics;
+ using Microsoft.EntityFrameworkCore.TestUtilities;
+ using Microsoft.Extensions.DependencyInjection;
+@@ -32,15 +33,21 @@ namespace Microsoft.EntityFrameworkCore
+             {
+             }
+ 
+-            public override void Optional_many_to_one_dependents_with_alternate_key_are_orphaned_in_store()
++            public override void Optional_many_to_one_dependents_with_alternate_key_are_orphaned_in_store(
++                CascadeTiming cascadeDeleteTiming,
++                CascadeTiming deleteOrphansTiming)
+             {
+             }
+ 
+-            public override void Optional_many_to_one_dependents_are_orphaned_in_store()
++            public override void Optional_many_to_one_dependents_are_orphaned_in_store(
++                CascadeTiming cascadeDeleteTiming,
++                CascadeTiming deleteOrphansTiming)
+             {
+             }
+ 
+-            public override void Required_one_to_one_are_cascade_detached_when_Added()
++            public override void Required_one_to_one_are_cascade_detached_when_Added(
++                CascadeTiming cascadeDeleteTiming,
++                CascadeTiming deleteOrphansTiming)
+             {
+             }
+ 
+@@ -52,27 +59,39 @@ namespace Microsoft.EntityFrameworkCore
+             {
+             }
+ 
+-            public override void Required_one_to_one_with_alternate_key_are_cascade_detached_when_Added()
++            public override void Required_one_to_one_with_alternate_key_are_cascade_detached_when_Added(
++                CascadeTiming cascadeDeleteTiming,
++                CascadeTiming deleteOrphansTiming)
+             {
+             }
+ 
+-            public override void Required_one_to_one_with_alternate_key_are_cascade_deleted_in_store()
++            public override void Required_one_to_one_with_alternate_key_are_cascade_deleted_in_store(
++                CascadeTiming cascadeDeleteTiming,
++                CascadeTiming deleteOrphansTiming)
+             {
+             }
+ 
+-            public override void Required_many_to_one_dependents_are_cascade_deleted_in_store()
++            public override void Required_many_to_one_dependents_are_cascade_deleted_in_store(
++                CascadeTiming cascadeDeleteTiming,
++                CascadeTiming deleteOrphansTiming)
+             {
+             }
+ 
+-            public override void Required_many_to_one_dependents_with_alternate_key_are_cascade_deleted_in_store()
++            public override void Required_many_to_one_dependents_with_alternate_key_are_cascade_deleted_in_store(
++                CascadeTiming cascadeDeleteTiming,
++                CascadeTiming deleteOrphansTiming)
+             {
+             }
+ 
+-            public override void Required_non_PK_one_to_one_are_cascade_detached_when_Added()
++            public override void Required_non_PK_one_to_one_are_cascade_detached_when_Added(
++                CascadeTiming cascadeDeleteTiming,
++                CascadeTiming deleteOrphansTiming)
+             {
+             }
+ 
+-            public override void Required_non_PK_one_to_one_with_alternate_key_are_cascade_detached_when_Added()
++            public override void Required_non_PK_one_to_one_with_alternate_key_are_cascade_detached_when_Added(
++                CascadeTiming cascadeDeleteTiming,
++                CascadeTiming deleteOrphansTiming)
+             {
+             }
+ 
+diff --git a/test/EFCore.Specification.Tests/DatabindingTestBase.cs b/test/EFCore.Specification.Tests/DatabindingTestBase.cs
+index d26edf6f71..4c6e6dc39a 100644
+--- a/test/EFCore.Specification.Tests/DatabindingTestBase.cs
++++ b/test/EFCore.Specification.Tests/DatabindingTestBase.cs
+@@ -4,6 +4,7 @@
+ using System.Collections.Generic;
+ using System.ComponentModel;
+ using System.Linq;
++using Microsoft.EntityFrameworkCore.ChangeTracking;
+ using Microsoft.EntityFrameworkCore.TestModels.ConcurrencyModel;
+ using Xunit;
+ 
+@@ -930,11 +931,17 @@ namespace Microsoft.EntityFrameworkCore
+             }
+         }
+ 
+-        [Fact]
+-        public virtual void Entity_removed_from_navigation_property_binding_list_is_removed_from_nav_property_but_not_marked_Deleted()
++        [Theory]
++        [InlineData(CascadeTiming.Immediate)]
++        [InlineData(CascadeTiming.OnSaveChanges)]
++        [InlineData(CascadeTiming.Never)]
++        public virtual void Entity_removed_from_navigation_property_binding_list_is_removed_from_nav_property_but_not_marked_Deleted(
++            CascadeTiming deleteOrphansTiming)
+         {
+             using (var context = CreateF1Context())
+             {
++                context.ChangeTracker.DeleteOrphansTiming = deleteOrphansTiming;
++
+                 var ferrari = context.Teams.Single(t => t.Id == Team.Ferrari);
+ 
+                 var navBindingList = ((IListSource)ferrari.Drivers).GetList();
+@@ -947,7 +954,14 @@ namespace Microsoft.EntityFrameworkCore
+ 
+                 context.ChangeTracker.DetectChanges();
+ 
+-                Assert.True(localDrivers.Contains(alonso)); // Because it is not marked as Deleted
++                if (deleteOrphansTiming == CascadeTiming.Immediate)
++                {
++                    Assert.False(localDrivers.Contains(alonso));
++                }
++                else
++                {
++                    Assert.True(localDrivers.Contains(alonso)); // Because it is not marked as Deleted
++                }
+ 
+                 Assert.False(ferrari.Drivers.Contains(alonso)); // But has been removed from nav prop
+             }
+diff --git a/test/EFCore.Specification.Tests/LazyLoadProxyTestBase.cs b/test/EFCore.Specification.Tests/LazyLoadProxyTestBase.cs
+index 75292cc973..988f79c119 100644
+--- a/test/EFCore.Specification.Tests/LazyLoadProxyTestBase.cs
++++ b/test/EFCore.Specification.Tests/LazyLoadProxyTestBase.cs
+@@ -6,6 +6,7 @@ using System.Collections.Generic;
+ using System.ComponentModel.DataAnnotations.Schema;
+ using System.Linq;
+ using System.Threading.Tasks;
++using Microsoft.EntityFrameworkCore.ChangeTracking;
+ using Microsoft.EntityFrameworkCore.ChangeTracking.Internal;
+ using Microsoft.EntityFrameworkCore.Diagnostics;
+ using Microsoft.EntityFrameworkCore.Infrastructure;
+@@ -754,13 +755,18 @@ namespace Microsoft.EntityFrameworkCore
+         }
+ 
+         [Theory]
+-        [InlineData(EntityState.Unchanged)]
+-        [InlineData(EntityState.Modified)]
+-        [InlineData(EntityState.Deleted)]
+-        public virtual void Lazy_load_collection_already_loaded(EntityState state)
++        [InlineData(EntityState.Unchanged, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, CascadeTiming.Immediate)]
++        public virtual void Lazy_load_collection_already_loaded(EntityState state, CascadeTiming cascadeDeleteTiming)
+         {
+             using (var context = CreateContext(lazyLoadingEnabled: true))
+             {
++                context.ChangeTracker.CascadeDeleteTiming = cascadeDeleteTiming;
++
+                 var changeDetector = (ChangeDetectorProxy)context.GetService<IChangeDetector>();
+ 
+                 var parent = context.Set<Parent>().Include(e => e.Children).Single();
+@@ -785,20 +791,37 @@ namespace Microsoft.EntityFrameworkCore
+                 context.ChangeTracker.LazyLoadingEnabled = false;
+ 
+                 Assert.Equal(2, parent.Children.Count());
+-                Assert.All(parent.Children.Select(e => e.Parent), c => Assert.Same(parent, c));
++
++                if (state == EntityState.Deleted
++                    && cascadeDeleteTiming == CascadeTiming.Immediate)
++                {
++                    Assert.All(parent.Children.Select(e => e.Parent), c => Assert.Null(c));
++                }
++                else
++                {
++                    Assert.All(parent.Children.Select(e => e.Parent), c => Assert.Same(parent, c));
++                }
+ 
+                 Assert.Equal(3, context.ChangeTracker.Entries().Count());
+             }
+         }
+ 
+         [Theory]
+-        [InlineData(EntityState.Unchanged)]
+-        [InlineData(EntityState.Modified)]
+-        [InlineData(EntityState.Deleted)]
+-        public virtual void Lazy_load_many_to_one_reference_to_principal_already_loaded(EntityState state)
++        [InlineData(EntityState.Unchanged, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Unchanged, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, CascadeTiming.Never)]
++        [InlineData(EntityState.Modified, CascadeTiming.Never)]
++        [InlineData(EntityState.Deleted, CascadeTiming.Never)]
++        public virtual void Lazy_load_many_to_one_reference_to_principal_already_loaded(EntityState state, CascadeTiming cascadeDeleteTiming)
+         {
+             using (var context = CreateContext(lazyLoadingEnabled: true))
+             {
++                context.ChangeTracker.CascadeDeleteTiming = cascadeDeleteTiming;
++
+                 var changeDetector = (ChangeDetectorProxy)context.GetService<IChangeDetector>();
+ 
+                 var child = context.Set<Child>().Include(e => e.Parent).Single(e => e.Id == 12);
+@@ -872,13 +895,22 @@ namespace Microsoft.EntityFrameworkCore
+         }
+ 
+         [Theory]
+-        [InlineData(EntityState.Unchanged)]
+-        [InlineData(EntityState.Modified)]
+-        [InlineData(EntityState.Deleted)]
+-        public virtual void Lazy_load_one_to_one_reference_to_dependent_already_loaded(EntityState state)
++        [InlineData(EntityState.Unchanged, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Unchanged, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, CascadeTiming.Never)]
++        [InlineData(EntityState.Modified, CascadeTiming.Never)]
++        [InlineData(EntityState.Deleted, CascadeTiming.Never)]
++        public virtual void Lazy_load_one_to_one_reference_to_dependent_already_loaded(
++            EntityState state, CascadeTiming cascadeDeleteTiming)
+         {
+             using (var context = CreateContext(lazyLoadingEnabled: true))
+             {
++                context.ChangeTracker.CascadeDeleteTiming = cascadeDeleteTiming;
++
+                 var changeDetector = (ChangeDetectorProxy)context.GetService<IChangeDetector>();
+ 
+                 var parent = context.Set<Parent>().Include(e => e.Single).Single();
+@@ -907,7 +939,17 @@ namespace Microsoft.EntityFrameworkCore
+                 var single = context.ChangeTracker.Entries<Single>().Single().Entity;
+ 
+                 Assert.Same(single, parent.Single);
+-                Assert.Same(parent, single.Parent);
++
++                if (cascadeDeleteTiming == CascadeTiming.Immediate
++                    && state == EntityState.Deleted)
++                {
++                    // No fixup to Deleted entity.
++                    Assert.Null(single.Parent);
++                }
++                else
++                {
++                    Assert.Same(parent, single.Parent);
++                }
+             }
+         }
+ 
+diff --git a/test/EFCore.Specification.Tests/LoadTestBase.cs b/test/EFCore.Specification.Tests/LoadTestBase.cs
+index 22c46edbb8..790680e31c 100644
+--- a/test/EFCore.Specification.Tests/LoadTestBase.cs
++++ b/test/EFCore.Specification.Tests/LoadTestBase.cs
+@@ -6,6 +6,7 @@ using System.Collections.Generic;
+ using System.ComponentModel.DataAnnotations.Schema;
+ using System.Linq;
+ using System.Threading.Tasks;
++using Microsoft.EntityFrameworkCore.ChangeTracking;
+ using Microsoft.EntityFrameworkCore.ChangeTracking.Internal;
+ using Microsoft.EntityFrameworkCore.Diagnostics;
+ using Microsoft.EntityFrameworkCore.Infrastructure;
+@@ -512,13 +513,18 @@ namespace Microsoft.EntityFrameworkCore
+         }
+ 
+         [Theory]
+-        [InlineData(EntityState.Unchanged)]
+-        [InlineData(EntityState.Modified)]
+-        [InlineData(EntityState.Deleted)]
+-        public virtual void Lazy_load_collection_already_loaded(EntityState state)
++        [InlineData(EntityState.Unchanged, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, CascadeTiming.OnSaveChanges)]
++        public virtual void Lazy_load_collection_already_loaded(EntityState state, CascadeTiming deleteOrphansTiming)
+         {
+             using (var context = CreateContext(lazyLoadingEnabled: true))
+             {
++                context.ChangeTracker.DeleteOrphansTiming = deleteOrphansTiming;
++
+                 var changeDetector = (ChangeDetectorProxy)context.GetService<IChangeDetector>();
+ 
+                 var parent = context.Set<Parent>().Include(e => e.Children).Single();
+@@ -543,7 +549,16 @@ namespace Microsoft.EntityFrameworkCore
+                 context.ChangeTracker.LazyLoadingEnabled = false;
+ 
+                 Assert.Equal(2, parent.Children.Count());
+-                Assert.All(parent.Children.Select(e => e.Parent), c => Assert.Same(parent, c));
++
++                if (state == EntityState.Deleted
++                    && deleteOrphansTiming != CascadeTiming.Never)
++                {
++                    Assert.All(parent.Children.Select(e => e.Parent), c => Assert.Null(c));
++                }
++                else
++                {
++                    Assert.All(parent.Children.Select(e => e.Parent), c => Assert.Same(parent, c));
++                }
+ 
+                 Assert.Equal(3, context.ChangeTracker.Entries().Count());
+             }
+@@ -630,13 +645,18 @@ namespace Microsoft.EntityFrameworkCore
+         }
+ 
+         [Theory]
+-        [InlineData(EntityState.Unchanged)]
+-        [InlineData(EntityState.Modified)]
+-        [InlineData(EntityState.Deleted)]
+-        public virtual void Lazy_load_one_to_one_reference_to_dependent_already_loaded(EntityState state)
++        [InlineData(EntityState.Unchanged, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, CascadeTiming.OnSaveChanges)]
++        public virtual void Lazy_load_one_to_one_reference_to_dependent_already_loaded(EntityState state, CascadeTiming deleteOrphansTiming)
+         {
+             using (var context = CreateContext(lazyLoadingEnabled: true))
+             {
++                context.ChangeTracker.DeleteOrphansTiming = deleteOrphansTiming;
++
+                 var changeDetector = (ChangeDetectorProxy)context.GetService<IChangeDetector>();
+ 
+                 var parent = context.Set<Parent>().Include(e => e.Single).Single();
+@@ -665,7 +685,16 @@ namespace Microsoft.EntityFrameworkCore
+                 var single = context.ChangeTracker.Entries<Single>().Single().Entity;
+ 
+                 Assert.Same(single, parent.Single);
+-                Assert.Same(parent, single.Parent);
++
++                if (state == EntityState.Deleted
++                    && deleteOrphansTiming != CascadeTiming.Never)
++                {
++                    Assert.Null(single.Parent);
++                }
++                else
++                {
++                    Assert.Same(parent, single.Parent);
++                }
+             }
+         }
+ 
+@@ -2498,16 +2527,24 @@ namespace Microsoft.EntityFrameworkCore
+         }
+ 
+         [Theory]
+-        [InlineData(EntityState.Unchanged, true)]
+-        [InlineData(EntityState.Unchanged, false)]
+-        [InlineData(EntityState.Modified, true)]
+-        [InlineData(EntityState.Modified, false)]
+-        [InlineData(EntityState.Deleted, true)]
+-        [InlineData(EntityState.Deleted, false)]
+-        public virtual async Task Load_collection_already_loaded(EntityState state, bool async)
++        [InlineData(EntityState.Unchanged, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Unchanged, false, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, false, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, false, CascadeTiming.OnSaveChanges)]
++        public virtual async Task Load_collection_already_loaded(EntityState state, bool async, CascadeTiming deleteOrphansTiming)
+         {
+             using (var context = CreateContext())
+             {
++                context.ChangeTracker.DeleteOrphansTiming = deleteOrphansTiming;
++
+                 var parent = context.Set<Parent>().Include(e => e.Children).Single();
+ 
+                 ClearLog();
+@@ -2532,7 +2569,16 @@ namespace Microsoft.EntityFrameworkCore
+                 RecordLog();
+ 
+                 Assert.Equal(2, parent.Children.Count());
+-                Assert.All(parent.Children.Select(e => e.Parent), c => Assert.Same(parent, c));
++
++                if (state == EntityState.Deleted
++                    && deleteOrphansTiming != CascadeTiming.Never)
++                {
++                    Assert.All(parent.Children.Select(e => e.Parent), c => Assert.Null(c));
++                }
++                else
++                {
++                    Assert.All(parent.Children.Select(e => e.Parent), c => Assert.Same(parent, c));
++                }
+ 
+                 Assert.Equal(3, context.ChangeTracker.Entries().Count());
+             }
+@@ -2582,16 +2628,24 @@ namespace Microsoft.EntityFrameworkCore
+         }
+ 
+         [Theory]
+-        [InlineData(EntityState.Unchanged, true)]
+-        [InlineData(EntityState.Unchanged, false)]
+-        [InlineData(EntityState.Modified, true)]
+-        [InlineData(EntityState.Modified, false)]
+-        [InlineData(EntityState.Deleted, true)]
+-        [InlineData(EntityState.Deleted, false)]
+-        public virtual async Task Load_one_to_one_reference_to_principal_already_loaded(EntityState state, bool async)
++        [InlineData(EntityState.Unchanged, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Unchanged, false, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, false, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, false, CascadeTiming.OnSaveChanges)]
++        public virtual async Task Load_one_to_one_reference_to_principal_already_loaded(EntityState state, bool async, CascadeTiming deleteOrphansTiming)
+         {
+             using (var context = CreateContext())
+             {
++                context.ChangeTracker.DeleteOrphansTiming = deleteOrphansTiming;
++
+                 var single = context.Set<Single>().Include(e => e.Parent).Single();
+ 
+                 ClearLog();
+@@ -2625,16 +2679,24 @@ namespace Microsoft.EntityFrameworkCore
+         }
+ 
+         [Theory]
+-        [InlineData(EntityState.Unchanged, true)]
+-        [InlineData(EntityState.Unchanged, false)]
+-        [InlineData(EntityState.Modified, true)]
+-        [InlineData(EntityState.Modified, false)]
+-        [InlineData(EntityState.Deleted, true)]
+-        [InlineData(EntityState.Deleted, false)]
+-        public virtual async Task Load_one_to_one_reference_to_dependent_already_loaded(EntityState state, bool async)
++        [InlineData(EntityState.Unchanged, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Unchanged, false, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, false, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, false, CascadeTiming.OnSaveChanges)]
++        public virtual async Task Load_one_to_one_reference_to_dependent_already_loaded(EntityState state, bool async, CascadeTiming deleteOrphansTiming)
+         {
+             using (var context = CreateContext())
+             {
++                context.ChangeTracker.DeleteOrphansTiming = deleteOrphansTiming;
++
+                 var parent = context.Set<Parent>().Include(e => e.Single).Single();
+ 
+                 ClearLog();
+@@ -2663,7 +2725,16 @@ namespace Microsoft.EntityFrameworkCore
+                 var single = context.ChangeTracker.Entries<Single>().Single().Entity;
+ 
+                 Assert.Same(single, parent.Single);
+-                Assert.Same(parent, single.Parent);
++
++                if (state == EntityState.Deleted
++                    && deleteOrphansTiming != CascadeTiming.Never)
++                {
++                    Assert.Null(single.Parent);
++                }
++                else
++                {
++                    Assert.Same(parent, single.Parent);
++                }
+             }
+         }
+ 
+@@ -2754,16 +2825,25 @@ namespace Microsoft.EntityFrameworkCore
+         }
+ 
+         [Theory]
+-        [InlineData(EntityState.Unchanged, true)]
+-        [InlineData(EntityState.Unchanged, false)]
+-        [InlineData(EntityState.Modified, true)]
+-        [InlineData(EntityState.Modified, false)]
+-        [InlineData(EntityState.Deleted, true)]
+-        [InlineData(EntityState.Deleted, false)]
+-        public virtual async Task Load_collection_using_Query_already_loaded(EntityState state, bool async)
++        [InlineData(EntityState.Unchanged, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Unchanged, false, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, false, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, false, CascadeTiming.OnSaveChanges)]
++        public virtual async Task Load_collection_using_Query_already_loaded(EntityState state, bool async, CascadeTiming deleteOrphansTiming)
+         {
+             using (var context = CreateContext())
+             {
++                context.ChangeTracker.DeleteOrphansTiming = deleteOrphansTiming;
++                context.ChangeTracker.CascadeDeleteTiming = CascadeTiming.OnSaveChanges;
++
+                 var parent = context.Set<Parent>().Include(e => e.Children).Single();
+ 
+                 ClearLog();
+@@ -2786,7 +2866,6 @@ namespace Microsoft.EntityFrameworkCore
+                 Assert.Equal(2, parent.Children.Count());
+                 Assert.All(children.Select(e => e.Parent), c => Assert.Same(parent, c));
+                 Assert.All(children, p => Assert.Contains(p, parent.Children));
+-
+                 Assert.Equal(3, context.ChangeTracker.Entries().Count());
+             }
+         }
+@@ -2866,16 +2945,25 @@ namespace Microsoft.EntityFrameworkCore
+         }
+ 
+         [Theory]
+-        [InlineData(EntityState.Unchanged, true)]
+-        [InlineData(EntityState.Unchanged, false)]
+-        [InlineData(EntityState.Modified, true)]
+-        [InlineData(EntityState.Modified, false)]
+-        [InlineData(EntityState.Deleted, true)]
+-        [InlineData(EntityState.Deleted, false)]
+-        public virtual async Task Load_one_to_one_reference_to_dependent_using_Query_already_loaded(EntityState state, bool async)
++        [InlineData(EntityState.Unchanged, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Unchanged, false, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, false, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, false, CascadeTiming.OnSaveChanges)]
++        public virtual async Task Load_one_to_one_reference_to_dependent_using_Query_already_loaded(EntityState state, bool async, CascadeTiming deleteOrphansTiming)
+         {
+             using (var context = CreateContext())
+             {
++                context.ChangeTracker.DeleteOrphansTiming = deleteOrphansTiming;
++                context.ChangeTracker.CascadeDeleteTiming = CascadeTiming.OnSaveChanges;
++
+                 var parent = context.Set<Parent>().Include(e => e.Single).Single();
+ 
+                 ClearLog();
+@@ -2897,7 +2985,6 @@ namespace Microsoft.EntityFrameworkCore
+                 Assert.NotNull(single);
+                 Assert.Same(single, parent.Single);
+                 Assert.Same(parent, single.Parent);
+-
+                 Assert.Equal(2, context.ChangeTracker.Entries().Count());
+             }
+         }
+@@ -3638,16 +3725,24 @@ namespace Microsoft.EntityFrameworkCore
+         }
+ 
+         [Theory]
+-        [InlineData(EntityState.Unchanged, true)]
+-        [InlineData(EntityState.Unchanged, false)]
+-        [InlineData(EntityState.Modified, true)]
+-        [InlineData(EntityState.Modified, false)]
+-        [InlineData(EntityState.Deleted, true)]
+-        [InlineData(EntityState.Deleted, false)]
+-        public virtual async Task Load_collection_already_loaded_untyped(EntityState state, bool async)
++        [InlineData(EntityState.Unchanged, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Unchanged, false, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, false, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, false, CascadeTiming.OnSaveChanges)]
++        public virtual async Task Load_collection_already_loaded_untyped(EntityState state, bool async, CascadeTiming deleteOrphansTiming)
+         {
+             using (var context = CreateContext())
+             {
++                context.ChangeTracker.DeleteOrphansTiming = deleteOrphansTiming;
++
+                 var parent = context.Set<Parent>().Include(e => e.Children).Single();
+ 
+                 ClearLog();
+@@ -3672,7 +3767,16 @@ namespace Microsoft.EntityFrameworkCore
+                 RecordLog();
+ 
+                 Assert.Equal(2, parent.Children.Count());
+-                Assert.All(parent.Children.Select(e => e.Parent), c => Assert.Same(parent, c));
++
++                if (state == EntityState.Deleted
++                    && deleteOrphansTiming != CascadeTiming.Never)
++                {
++                    Assert.All(parent.Children.Select(e => e.Parent), c => Assert.Null(c));
++                }
++                else
++                {
++                    Assert.All(parent.Children.Select(e => e.Parent), c => Assert.Same(parent, c));
++                }
+ 
+                 Assert.Equal(3, context.ChangeTracker.Entries().Count());
+             }
+@@ -3765,16 +3869,24 @@ namespace Microsoft.EntityFrameworkCore
+         }
+ 
+         [Theory]
+-        [InlineData(EntityState.Unchanged, true)]
+-        [InlineData(EntityState.Unchanged, false)]
+-        [InlineData(EntityState.Modified, true)]
+-        [InlineData(EntityState.Modified, false)]
+-        [InlineData(EntityState.Deleted, true)]
+-        [InlineData(EntityState.Deleted, false)]
+-        public virtual async Task Load_one_to_one_reference_to_dependent_already_loaded_untyped(EntityState state, bool async)
++        [InlineData(EntityState.Unchanged, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Unchanged, false, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, false, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, false, CascadeTiming.OnSaveChanges)]
++        public virtual async Task Load_one_to_one_reference_to_dependent_already_loaded_untyped(EntityState state, bool async, CascadeTiming deleteOrphansTiming)
+         {
+             using (var context = CreateContext())
+             {
++                context.ChangeTracker.DeleteOrphansTiming = deleteOrphansTiming;
++
+                 var parent = context.Set<Parent>().Include(e => e.Single).Single();
+ 
+                 ClearLog();
+@@ -3803,21 +3915,39 @@ namespace Microsoft.EntityFrameworkCore
+                 var single = context.ChangeTracker.Entries<Single>().Single().Entity;
+ 
+                 Assert.Same(single, parent.Single);
+-                Assert.Same(parent, single.Parent);
++
++                if (state == EntityState.Deleted
++                    && deleteOrphansTiming != CascadeTiming.Never)
++                {
++                    Assert.Null(single.Parent);
++                }
++                else
++                {
++                    Assert.Same(parent, single.Parent);
++                }
+             }
+         }
+ 
+         [Theory]
+-        [InlineData(EntityState.Unchanged, true)]
+-        [InlineData(EntityState.Unchanged, false)]
+-        [InlineData(EntityState.Modified, true)]
+-        [InlineData(EntityState.Modified, false)]
+-        [InlineData(EntityState.Deleted, true)]
+-        [InlineData(EntityState.Deleted, false)]
+-        public virtual async Task Load_collection_using_Query_already_loaded_untyped(EntityState state, bool async)
++        [InlineData(EntityState.Unchanged, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Unchanged, false, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, false, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, false, CascadeTiming.OnSaveChanges)]
++        public virtual async Task Load_collection_using_Query_already_loaded_untyped(EntityState state, bool async, CascadeTiming deleteOrphansTiming)
+         {
+             using (var context = CreateContext())
+             {
++                context.ChangeTracker.DeleteOrphansTiming = deleteOrphansTiming;
++                context.ChangeTracker.CascadeDeleteTiming = CascadeTiming.OnSaveChanges;
++
+                 var parent = context.Set<Parent>().Include(e => e.Children).Single();
+ 
+                 ClearLog();
+@@ -3840,7 +3970,6 @@ namespace Microsoft.EntityFrameworkCore
+                 Assert.Equal(2, parent.Children.Count());
+                 Assert.All(children.Select(e => ((Child)e).Parent), c => Assert.Same(parent, c));
+                 Assert.All(children, p => Assert.Contains(p, parent.Children));
+-
+                 Assert.Equal(3, context.ChangeTracker.Entries().Count());
+             }
+         }
+@@ -3920,16 +4049,25 @@ namespace Microsoft.EntityFrameworkCore
+         }
+ 
+         [Theory]
+-        [InlineData(EntityState.Unchanged, true)]
+-        [InlineData(EntityState.Unchanged, false)]
+-        [InlineData(EntityState.Modified, true)]
+-        [InlineData(EntityState.Modified, false)]
+-        [InlineData(EntityState.Deleted, true)]
+-        [InlineData(EntityState.Deleted, false)]
+-        public virtual async Task Load_one_to_one_reference_to_dependent_using_Query_already_loaded_untyped(EntityState state, bool async)
++        [InlineData(EntityState.Unchanged, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Modified, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, true, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Deleted, false, CascadeTiming.Immediate)]
++        [InlineData(EntityState.Unchanged, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Unchanged, false, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Modified, false, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, true, CascadeTiming.OnSaveChanges)]
++        [InlineData(EntityState.Deleted, false, CascadeTiming.OnSaveChanges)]
++        public virtual async Task Load_one_to_one_reference_to_dependent_using_Query_already_loaded_untyped(EntityState state, bool async, CascadeTiming deleteOrphansTiming)
+         {
+             using (var context = CreateContext())
+             {
++                context.ChangeTracker.DeleteOrphansTiming = deleteOrphansTiming;
++                context.ChangeTracker.CascadeDeleteTiming = CascadeTiming.OnSaveChanges;
++
+                 var parent = context.Set<Parent>().Include(e => e.Single).Single();
+ 
+                 ClearLog();
+@@ -3950,6 +4088,7 @@ namespace Microsoft.EntityFrameworkCore
+ 
+                 Assert.NotNull(single);
+                 Assert.Same(single, parent.Single);
++
+                 Assert.Same(parent, ((Single)single).Parent);
+ 
+                 Assert.Equal(2, context.ChangeTracker.Entries().Count());
+diff --git a/test/EFCore.Specification.Tests/PropertyValuesTestBase.cs b/test/EFCore.Specification.Tests/PropertyValuesTestBase.cs
+index a0a62045d7..29e927aec4 100644
+--- a/test/EFCore.Specification.Tests/PropertyValuesTestBase.cs
++++ b/test/EFCore.Specification.Tests/PropertyValuesTestBase.cs
+@@ -3,6 +3,7 @@
+ 
+ using System;
+ using System.Collections.Generic;
++using System.Globalization;
+ using System.Linq;
+ using System.Threading.Tasks;
+ using Microsoft.EntityFrameworkCore.ChangeTracking;
+@@ -1658,42 +1659,74 @@ namespace Microsoft.EntityFrameworkCore
+             }
+         }
+ 
+-        [Fact]
+-        public virtual void Non_nullable_property_in_current_values_results_in_conceptual_null()
++        [Theory]
++        [InlineData(CascadeTiming.Immediate)]
++        [InlineData(CascadeTiming.OnSaveChanges)]
++        [InlineData(CascadeTiming.Never)]
++        public virtual void Non_nullable_property_in_current_values_results_in_conceptual_null(CascadeTiming deleteOrphansTiming)
+         {
+             using (var context = CreateContext())
+             {
++                context.ChangeTracker.DeleteOrphansTiming = deleteOrphansTiming;
++
+                 var building = context.Set<Building>().Single(b => b.Name == "Building One");
+                 var entry = context.Entry(building);
+                 var values = entry.CurrentValues;
++                var originalValue = values["Value"];
+ 
+                 Assert.False(entry.GetInfrastructure().HasConceptualNull);
+ 
+-                values["Value"] = null;
++                if (deleteOrphansTiming == CascadeTiming.Immediate)
++                {
++                    Assert.Equal(
++                        CoreStrings.PropertyConceptualNullSensitive(
++                            "Value",
++                            nameof(Building),
++                            "{Value: " + Convert.ToString(originalValue, CultureInfo.InvariantCulture) + "}"),
++                        Assert.Throws<InvalidOperationException>(() => values["Value"] = null).Message);
++                }
++                else
++                {
++                    values["Value"] = null;
+ 
+-                Assert.True(entry.GetInfrastructure().HasConceptualNull);
++                    Assert.True(entry.GetInfrastructure().HasConceptualNull);
+ 
+-                Assert.Equal(1500000m, values["Value"]);
+-                Assert.Equal(1500000m, building.Value);
++                    Assert.Equal(1500000m, values["Value"]);
++                    Assert.Equal(1500000m, building.Value);
++                }
+             }
+         }
+ 
+-        [Fact]
+-        public virtual void Non_nullable_shadow_property_in_current_values_results_in_conceptual_null()
++        [Theory]
++        [InlineData(CascadeTiming.Immediate)]
++        [InlineData(CascadeTiming.OnSaveChanges)]
++        [InlineData(CascadeTiming.Never)]
++        public virtual void Non_nullable_shadow_property_in_current_values_results_in_conceptual_null(CascadeTiming deleteOrphansTiming)
+         {
+             using (var context = CreateContext())
+             {
++                context.ChangeTracker.DeleteOrphansTiming = deleteOrphansTiming;
++
+                 var building = context.Set<Building>().Single(b => b.Name == "Building One");
+                 var entry = context.Entry(building);
+                 var values = entry.CurrentValues;
+ 
+                 Assert.False(entry.GetInfrastructure().HasConceptualNull);
+ 
+-                values["Shadow1"] = null;
++                if (deleteOrphansTiming == CascadeTiming.Immediate)
++                {
++                    Assert.Equal(
++                        CoreStrings.PropertyConceptualNullSensitive("Shadow1", nameof(Building), "{Shadow1: 11}"),
++                        Assert.Throws<InvalidOperationException>(() => values["Shadow1"] = null).Message);
++                }
++                else
++                {
++                    values["Shadow1"] = null;
+ 
+-                Assert.True(entry.GetInfrastructure().HasConceptualNull);
++                    Assert.True(entry.GetInfrastructure().HasConceptualNull);
+ 
+-                Assert.Equal(11, values["Shadow1"]);
++                    Assert.Equal(11, values["Shadow1"]);
++                }
+             }
+         }
+ 
+diff --git a/test/EFCore.Specification.Tests/StoreGeneratedFixupTestBase.cs b/test/EFCore.Specification.Tests/StoreGeneratedFixupTestBase.cs
+index 5d5a5078ea..4f4ebc0fd5 100644
+--- a/test/EFCore.Specification.Tests/StoreGeneratedFixupTestBase.cs
++++ b/test/EFCore.Specification.Tests/StoreGeneratedFixupTestBase.cs
+@@ -4,6 +4,7 @@
+ using System;
+ using System.Collections.Generic;
+ using System.Linq;
++using Microsoft.EntityFrameworkCore.ChangeTracking;
+ using Microsoft.EntityFrameworkCore.ChangeTracking.Internal;
+ using Microsoft.EntityFrameworkCore.Infrastructure;
+ using Microsoft.EntityFrameworkCore.Storage;
+@@ -4003,6 +4004,8 @@ namespace Microsoft.EntityFrameworkCore
+         {
+             using (var context = CreateContext())
+             {
++                context.ChangeTracker.DeleteOrphansTiming = CascadeTiming.OnSaveChanges;
++
+                 var game = new Game { Id = Guid77 };
+                 var level = new Level { Game = game };
+                 var item = new Item { Level = level };
+diff --git a/test/EFCore.SqlServer.FunctionalTests/DbContextPoolingTest.cs b/test/EFCore.SqlServer.FunctionalTests/DbContextPoolingTest.cs
+index 531d12164b..3093057ad4 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/DbContextPoolingTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/DbContextPoolingTest.cs
+@@ -6,6 +6,7 @@ using System.Diagnostics;
+ using System.Linq;
+ using System.Threading;
+ using System.Threading.Tasks;
++using Microsoft.EntityFrameworkCore.ChangeTracking;
+ using Microsoft.EntityFrameworkCore.Internal;
+ using Microsoft.EntityFrameworkCore.Query;
+ using Microsoft.EntityFrameworkCore.TestUtilities;
+@@ -74,6 +75,8 @@ namespace Microsoft.EntityFrameworkCore
+                 ChangeTracker.AutoDetectChangesEnabled = false;
+                 ChangeTracker.LazyLoadingEnabled = false;
+                 Database.AutoTransactionsEnabled = false;
++                ChangeTracker.CascadeDeleteTiming = CascadeTiming.Never;
++                ChangeTracker.DeleteOrphansTiming= CascadeTiming.Never;
+             }
+ 
+             protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
+@@ -289,6 +292,8 @@ namespace Microsoft.EntityFrameworkCore
+             context1.ChangeTracker.AutoDetectChangesEnabled = true;
+             context1.ChangeTracker.LazyLoadingEnabled = true;
+             context1.ChangeTracker.QueryTrackingBehavior = QueryTrackingBehavior.NoTracking;
++            context1.ChangeTracker.CascadeDeleteTiming = CascadeTiming.Immediate;
++            context1.ChangeTracker.DeleteOrphansTiming= CascadeTiming.Immediate;
+             context1.Database.AutoTransactionsEnabled = true;
+ 
+             serviceScope.Dispose();
+@@ -305,6 +310,8 @@ namespace Microsoft.EntityFrameworkCore
+             Assert.False(context2.ChangeTracker.AutoDetectChangesEnabled);
+             Assert.False(context2.ChangeTracker.LazyLoadingEnabled);
+             Assert.Equal(QueryTrackingBehavior.TrackAll, context2.ChangeTracker.QueryTrackingBehavior);
++            Assert.Equal(CascadeTiming.Never, context2.ChangeTracker.CascadeDeleteTiming);
++            Assert.Equal(CascadeTiming.Never, context2.ChangeTracker.DeleteOrphansTiming);
+             Assert.False(context2.Database.AutoTransactionsEnabled);
+         }
+ 
+@@ -322,6 +329,8 @@ namespace Microsoft.EntityFrameworkCore
+             context1.ChangeTracker.LazyLoadingEnabled = false;
+             context1.ChangeTracker.QueryTrackingBehavior = QueryTrackingBehavior.NoTracking;
+             context1.Database.AutoTransactionsEnabled = false;
++            context1.ChangeTracker.CascadeDeleteTiming = CascadeTiming.Immediate;
++            context1.ChangeTracker.DeleteOrphansTiming= CascadeTiming.Immediate;
+ 
+             serviceScope.Dispose();
+ 
+@@ -335,6 +344,8 @@ namespace Microsoft.EntityFrameworkCore
+             Assert.True(context2.ChangeTracker.AutoDetectChangesEnabled);
+             Assert.True(context2.ChangeTracker.LazyLoadingEnabled);
+             Assert.Equal(QueryTrackingBehavior.TrackAll, context2.ChangeTracker.QueryTrackingBehavior);
++            Assert.Equal(CascadeTiming.Immediate, context2.ChangeTracker.CascadeDeleteTiming);
++            Assert.Equal(CascadeTiming.Immediate, context2.ChangeTracker.DeleteOrphansTiming);
+             Assert.True(context2.Database.AutoTransactionsEnabled);
+         }
+ 
+diff --git a/test/EFCore.SqlServer.FunctionalTests/GraphUpdatesSqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/GraphUpdatesSqlServerTest.cs
+index 0d93a03126..6328401b11 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/GraphUpdatesSqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/GraphUpdatesSqlServerTest.cs
+@@ -2,6 +2,7 @@
+ // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
+ 
+ using System.Linq;
++using Microsoft.EntityFrameworkCore.ChangeTracking;
+ using Microsoft.EntityFrameworkCore.Infrastructure;
+ using Microsoft.EntityFrameworkCore.Metadata.Internal;
+ using Microsoft.EntityFrameworkCore.Storage;
+@@ -56,9 +57,10 @@ namespace Microsoft.EntityFrameworkCore
+             {
+             }
+ 
+-            public override DbUpdateException Optional_One_to_one_relationships_are_one_to_one()
++            public override DbUpdateException Optional_One_to_one_relationships_are_one_to_one(
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Optional_One_to_one_relationships_are_one_to_one();
++                var updateException = base.Optional_One_to_one_relationships_are_one_to_one(deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("IX_OptionalSingle1_RootId", updateException.InnerException.Message);
+@@ -66,9 +68,10 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_One_to_one_relationships_are_one_to_one()
++            public override DbUpdateException Required_One_to_one_relationships_are_one_to_one(
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_One_to_one_relationships_are_one_to_one();
++                var updateException = base.Required_One_to_one_relationships_are_one_to_one(deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("PK_RequiredSingle1", updateException.InnerException.Message);
+@@ -76,9 +79,10 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Optional_One_to_one_with_AK_relationships_are_one_to_one()
++            public override DbUpdateException Optional_One_to_one_with_AK_relationships_are_one_to_one(
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Optional_One_to_one_with_AK_relationships_are_one_to_one();
++                var updateException = base.Optional_One_to_one_with_AK_relationships_are_one_to_one(deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("IX_OptionalSingleAk1_RootId", updateException.InnerException.Message);
+@@ -86,9 +90,10 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_One_to_one_with_AK_relationships_are_one_to_one()
++            public override DbUpdateException Required_One_to_one_with_AK_relationships_are_one_to_one(
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_One_to_one_with_AK_relationships_are_one_to_one();
++                var updateException = base.Required_One_to_one_with_AK_relationships_are_one_to_one(deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("IX_RequiredSingleAk1_RootId", updateException.InnerException.Message);
+@@ -96,9 +101,11 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Save_required_one_to_one_changed_by_reference(ChangeMechanism changeMechanism)
++            public override DbUpdateException Save_required_one_to_one_changed_by_reference(
++                ChangeMechanism changeMechanism,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Save_required_one_to_one_changed_by_reference(changeMechanism);
++                var updateException = base.Save_required_one_to_one_changed_by_reference(changeMechanism, deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredSingle2_RequiredSingle1_Id", updateException.InnerException.Message);
+@@ -106,9 +113,11 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Sever_required_one_to_one(ChangeMechanism changeMechanism)
++            public override DbUpdateException Sever_required_one_to_one(
++                ChangeMechanism changeMechanism,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Sever_required_one_to_one(changeMechanism);
++                var updateException = base.Sever_required_one_to_one(changeMechanism, deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredSingle2_RequiredSingle1_Id", updateException.InnerException.Message);
+@@ -116,9 +125,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_many_to_one_dependents_are_cascade_deleted()
++            public override DbUpdateException Required_many_to_one_dependents_are_cascade_deleted(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_many_to_one_dependents_are_cascade_deleted();
++                var updateException = base.Required_many_to_one_dependents_are_cascade_deleted(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_Required2_Required1_ParentId", updateException.InnerException.Message);
+@@ -126,9 +139,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Optional_many_to_one_dependents_are_orphaned()
++            public override DbUpdateException Optional_many_to_one_dependents_are_orphaned(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Optional_many_to_one_dependents_are_orphaned();
++                var updateException = base.Optional_many_to_one_dependents_are_orphaned(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_Optional2_Optional1_ParentId", updateException.InnerException.Message);
+@@ -136,9 +153,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Optional_one_to_one_are_orphaned()
++            public override DbUpdateException Optional_one_to_one_are_orphaned(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Optional_one_to_one_are_orphaned();
++                var updateException = base.Optional_one_to_one_are_orphaned(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_OptionalSingle2_OptionalSingle1_BackId", updateException.InnerException.Message);
+@@ -146,9 +167,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_one_to_one_are_cascade_deleted()
++            public override DbUpdateException Required_one_to_one_are_cascade_deleted(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_one_to_one_are_cascade_deleted();
++                var updateException = base.Required_one_to_one_are_cascade_deleted(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredSingle2_RequiredSingle1_Id", updateException.InnerException.Message);
+@@ -156,9 +181,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_non_PK_one_to_one_are_cascade_deleted()
++            public override DbUpdateException Required_non_PK_one_to_one_are_cascade_deleted(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_non_PK_one_to_one_are_cascade_deleted();
++                var updateException = base.Required_non_PK_one_to_one_are_cascade_deleted(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredNonPkSingle2_RequiredNonPkSingle1_BackId", updateException.InnerException.Message);
+@@ -166,9 +195,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Optional_many_to_one_dependents_with_alternate_key_are_orphaned()
++            public override DbUpdateException Optional_many_to_one_dependents_with_alternate_key_are_orphaned(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Optional_many_to_one_dependents_with_alternate_key_are_orphaned();
++                var updateException = base.Optional_many_to_one_dependents_with_alternate_key_are_orphaned(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_OptionalAk2_OptionalAk1_ParentId", updateException.InnerException.Message);
+@@ -176,9 +209,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_many_to_one_dependents_with_alternate_key_are_cascade_deleted()
++            public override DbUpdateException Required_many_to_one_dependents_with_alternate_key_are_cascade_deleted(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_many_to_one_dependents_with_alternate_key_are_cascade_deleted();
++                var updateException = base.Required_many_to_one_dependents_with_alternate_key_are_cascade_deleted(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredAk2_RequiredAk1_ParentId", updateException.InnerException.Message);
+@@ -186,9 +223,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Optional_one_to_one_with_alternate_key_are_orphaned()
++            public override DbUpdateException Optional_one_to_one_with_alternate_key_are_orphaned(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Optional_one_to_one_with_alternate_key_are_orphaned();
++                var updateException = base.Optional_one_to_one_with_alternate_key_are_orphaned(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_OptionalSingleAk2_OptionalSingleAk1_BackId", updateException.InnerException.Message);
+@@ -196,9 +237,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_one_to_one_with_alternate_key_are_cascade_deleted()
++            public override DbUpdateException Required_one_to_one_with_alternate_key_are_cascade_deleted(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_one_to_one_with_alternate_key_are_cascade_deleted();
++                var updateException = base.Required_one_to_one_with_alternate_key_are_cascade_deleted(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredSingleAk2_RequiredSingleAk1_BackId", updateException.InnerException.Message);
+@@ -206,9 +251,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_non_PK_one_to_one_with_alternate_key_are_cascade_deleted()
++            public override DbUpdateException Required_non_PK_one_to_one_with_alternate_key_are_cascade_deleted(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_non_PK_one_to_one_with_alternate_key_are_cascade_deleted();
++                var updateException = base.Required_non_PK_one_to_one_with_alternate_key_are_cascade_deleted(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredNonPkSingleAk2_RequiredNonPkSingleAk1_BackId", updateException.InnerException.Message);
+@@ -216,9 +265,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_many_to_one_dependents_are_cascade_deleted_in_store()
++            public override DbUpdateException Required_many_to_one_dependents_are_cascade_deleted_in_store(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_many_to_one_dependents_are_cascade_deleted_in_store();
++                var updateException = base.Required_many_to_one_dependents_are_cascade_deleted_in_store(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_Required2_Required1_ParentId", updateException.InnerException.Message);
+@@ -226,9 +279,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_one_to_one_are_cascade_deleted_in_store()
++            public override DbUpdateException Required_one_to_one_are_cascade_deleted_in_store(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_one_to_one_are_cascade_deleted_in_store();
++                var updateException = base.Required_one_to_one_are_cascade_deleted_in_store(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredSingle2_RequiredSingle1_Id", updateException.InnerException.Message);
+@@ -236,9 +293,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_non_PK_one_to_one_are_cascade_deleted_in_store()
++            public override DbUpdateException Required_non_PK_one_to_one_are_cascade_deleted_in_store(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_non_PK_one_to_one_are_cascade_deleted_in_store();
++                var updateException = base.Required_non_PK_one_to_one_are_cascade_deleted_in_store(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredNonPkSingle2_RequiredNonPkSingle1_BackId", updateException.InnerException.Message);
+@@ -246,9 +307,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_many_to_one_dependents_with_alternate_key_are_cascade_deleted_in_store()
++            public override DbUpdateException Required_many_to_one_dependents_with_alternate_key_are_cascade_deleted_in_store(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_many_to_one_dependents_with_alternate_key_are_cascade_deleted_in_store();
++                var updateException = base.Required_many_to_one_dependents_with_alternate_key_are_cascade_deleted_in_store(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredAk2_RequiredAk1_ParentId", updateException.InnerException.Message);
+@@ -256,9 +321,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_one_to_one_with_alternate_key_are_cascade_deleted_in_store()
++            public override DbUpdateException Required_one_to_one_with_alternate_key_are_cascade_deleted_in_store(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_one_to_one_with_alternate_key_are_cascade_deleted_in_store();
++                var updateException = base.Required_one_to_one_with_alternate_key_are_cascade_deleted_in_store(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredSingleAk2_RequiredSingleAk1_BackId", updateException.InnerException.Message);
+@@ -266,9 +335,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_non_PK_one_to_one_with_alternate_key_are_cascade_deleted_in_store()
++            public override DbUpdateException Required_non_PK_one_to_one_with_alternate_key_are_cascade_deleted_in_store(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_non_PK_one_to_one_with_alternate_key_are_cascade_deleted_in_store();
++                var updateException = base.Required_non_PK_one_to_one_with_alternate_key_are_cascade_deleted_in_store(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredNonPkSingleAk2_RequiredNonPkSingleAk1_BackId", updateException.InnerException.Message);
+@@ -276,9 +349,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Optional_many_to_one_dependents_are_orphaned_in_store()
++            public override DbUpdateException Optional_many_to_one_dependents_are_orphaned_in_store(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Optional_many_to_one_dependents_are_orphaned_in_store();
++                var updateException = base.Optional_many_to_one_dependents_are_orphaned_in_store(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_Optional2_Optional1_ParentId", updateException.InnerException.Message);
+@@ -286,9 +363,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Optional_one_to_one_are_orphaned_in_store()
++            public override DbUpdateException Optional_one_to_one_are_orphaned_in_store(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Optional_one_to_one_are_orphaned_in_store();
++                var updateException = base.Optional_one_to_one_are_orphaned_in_store(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_OptionalSingle2_OptionalSingle1_BackId", updateException.InnerException.Message);
+@@ -296,9 +377,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Optional_many_to_one_dependents_with_alternate_key_are_orphaned_in_store()
++            public override DbUpdateException Optional_many_to_one_dependents_with_alternate_key_are_orphaned_in_store(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Optional_many_to_one_dependents_with_alternate_key_are_orphaned_in_store();
++                var updateException = base.Optional_many_to_one_dependents_with_alternate_key_are_orphaned_in_store(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_OptionalAk2_OptionalAk1_ParentId", updateException.InnerException.Message);
+@@ -306,9 +391,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Optional_one_to_one_with_alternate_key_are_orphaned_in_store()
++            public override DbUpdateException Optional_one_to_one_with_alternate_key_are_orphaned_in_store(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Optional_one_to_one_with_alternate_key_are_orphaned_in_store();
++                var updateException = base.Optional_one_to_one_with_alternate_key_are_orphaned_in_store(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_OptionalSingleAk2_OptionalSingleAk1_BackId", updateException.InnerException.Message);
+@@ -316,9 +405,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_many_to_one_dependents_are_cascade_deleted_starting_detached()
++            public override DbUpdateException Required_many_to_one_dependents_are_cascade_deleted_starting_detached(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_many_to_one_dependents_are_cascade_deleted_starting_detached();
++                var updateException = base.Required_many_to_one_dependents_are_cascade_deleted_starting_detached(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_Required2_Required1_ParentId", updateException.InnerException.Message);
+@@ -326,9 +419,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Optional_many_to_one_dependents_are_orphaned_starting_detached()
++            public override DbUpdateException Optional_many_to_one_dependents_are_orphaned_starting_detached(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Optional_many_to_one_dependents_are_orphaned_starting_detached();
++                var updateException = base.Optional_many_to_one_dependents_are_orphaned_starting_detached(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_Optional2_Optional1_ParentId", updateException.InnerException.Message);
+@@ -336,9 +433,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Optional_one_to_one_are_orphaned_starting_detached()
++            public override DbUpdateException Optional_one_to_one_are_orphaned_starting_detached(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Optional_one_to_one_are_orphaned_starting_detached();
++                var updateException = base.Optional_one_to_one_are_orphaned_starting_detached(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_OptionalSingle2_OptionalSingle1_BackId", updateException.InnerException.Message);
+@@ -346,9 +447,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_one_to_one_are_cascade_deleted_starting_detached()
++            public override DbUpdateException Required_one_to_one_are_cascade_deleted_starting_detached(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_one_to_one_are_cascade_deleted_starting_detached();
++                var updateException = base.Required_one_to_one_are_cascade_deleted_starting_detached(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredSingle2_RequiredSingle1_Id", updateException.InnerException.Message);
+@@ -356,9 +461,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_non_PK_one_to_one_are_cascade_deleted_starting_detached()
++            public override DbUpdateException Required_non_PK_one_to_one_are_cascade_deleted_starting_detached(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_non_PK_one_to_one_are_cascade_deleted_starting_detached();
++                var updateException = base.Required_non_PK_one_to_one_are_cascade_deleted_starting_detached(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredNonPkSingle2_RequiredNonPkSingle1_BackId", updateException.InnerException.Message);
+@@ -366,9 +475,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Optional_many_to_one_dependents_with_alternate_key_are_orphaned_starting_detached()
++            public override DbUpdateException Optional_many_to_one_dependents_with_alternate_key_are_orphaned_starting_detached(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Optional_many_to_one_dependents_with_alternate_key_are_orphaned_starting_detached();
++                var updateException = base.Optional_many_to_one_dependents_with_alternate_key_are_orphaned_starting_detached(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_OptionalAk2_OptionalAk1_ParentId", updateException.InnerException.Message);
+@@ -376,9 +489,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_many_to_one_dependents_with_alternate_key_are_cascade_deleted_starting_detached()
++            public override DbUpdateException Required_many_to_one_dependents_with_alternate_key_are_cascade_deleted_starting_detached(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_many_to_one_dependents_with_alternate_key_are_cascade_deleted_starting_detached();
++                var updateException = base.Required_many_to_one_dependents_with_alternate_key_are_cascade_deleted_starting_detached(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredAk2_RequiredAk1_ParentId", updateException.InnerException.Message);
+@@ -386,9 +503,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Optional_one_to_one_with_alternate_key_are_orphaned_starting_detached()
++            public override DbUpdateException Optional_one_to_one_with_alternate_key_are_orphaned_starting_detached(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Optional_one_to_one_with_alternate_key_are_orphaned_starting_detached();
++                var updateException = base.Optional_one_to_one_with_alternate_key_are_orphaned_starting_detached(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_OptionalSingleAk2_OptionalSingleAk1_BackId", updateException.InnerException.Message);
+@@ -396,9 +517,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_one_to_one_with_alternate_key_are_cascade_deleted_starting_detached()
++            public override DbUpdateException Required_one_to_one_with_alternate_key_are_cascade_deleted_starting_detached(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_one_to_one_with_alternate_key_are_cascade_deleted_starting_detached();
++                var updateException = base.Required_one_to_one_with_alternate_key_are_cascade_deleted_starting_detached(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredSingleAk2_RequiredSingleAk1_BackId", updateException.InnerException.Message);
+@@ -406,9 +531,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_non_PK_one_to_one_with_alternate_key_are_cascade_deleted_starting_detached()
++            public override DbUpdateException Required_non_PK_one_to_one_with_alternate_key_are_cascade_deleted_starting_detached(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_non_PK_one_to_one_with_alternate_key_are_cascade_deleted_starting_detached();
++                var updateException = base.Required_non_PK_one_to_one_with_alternate_key_are_cascade_deleted_starting_detached(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredNonPkSingleAk2_RequiredNonPkSingleAk1_BackId", updateException.InnerException.Message);
+@@ -416,9 +545,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_many_to_one_dependents_are_cascade_detached_when_Added()
++            public override DbUpdateException Required_many_to_one_dependents_are_cascade_detached_when_Added(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_many_to_one_dependents_are_cascade_detached_when_Added();
++                var updateException = base.Required_many_to_one_dependents_are_cascade_detached_when_Added(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_Required2_Required1_ParentId", updateException.InnerException.Message);
+@@ -426,9 +559,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_one_to_one_are_cascade_detached_when_Added()
++            public override DbUpdateException Required_one_to_one_are_cascade_detached_when_Added(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_one_to_one_are_cascade_detached_when_Added();
++                var updateException = base.Required_one_to_one_are_cascade_detached_when_Added(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredSingle2_RequiredSingle1_Id", updateException.InnerException.Message);
+@@ -436,9 +573,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_non_PK_one_to_one_are_cascade_detached_when_Added()
++            public override DbUpdateException Required_non_PK_one_to_one_are_cascade_detached_when_Added(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_non_PK_one_to_one_are_cascade_detached_when_Added();
++                var updateException = base.Required_non_PK_one_to_one_are_cascade_detached_when_Added(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredNonPkSingle2_RequiredNonPkSingle1_BackId", updateException.InnerException.Message);
+@@ -446,9 +587,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_many_to_one_dependents_with_alternate_key_are_cascade_detached_when_Added()
++            public override DbUpdateException Required_many_to_one_dependents_with_alternate_key_are_cascade_detached_when_Added(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_many_to_one_dependents_with_alternate_key_are_cascade_detached_when_Added();
++                var updateException = base.Required_many_to_one_dependents_with_alternate_key_are_cascade_detached_when_Added(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredAk2_RequiredAk1_ParentId", updateException.InnerException.Message);
+@@ -456,9 +601,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_one_to_one_with_alternate_key_are_cascade_detached_when_Added()
++            public override DbUpdateException Required_one_to_one_with_alternate_key_are_cascade_detached_when_Added(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_one_to_one_with_alternate_key_are_cascade_detached_when_Added();
++                var updateException = base.Required_one_to_one_with_alternate_key_are_cascade_detached_when_Added(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredSingleAk2_RequiredSingleAk1_BackId", updateException.InnerException.Message);
+@@ -466,9 +615,13 @@ namespace Microsoft.EntityFrameworkCore
+                 return updateException;
+             }
+ 
+-            public override DbUpdateException Required_non_PK_one_to_one_with_alternate_key_are_cascade_detached_when_Added()
++            public override DbUpdateException Required_non_PK_one_to_one_with_alternate_key_are_cascade_detached_when_Added(
++                CascadeTiming? cascadeDeleteTiming,
++                CascadeTiming? deleteOrphansTiming)
+             {
+-                var updateException = base.Required_non_PK_one_to_one_with_alternate_key_are_cascade_detached_when_Added();
++                var updateException = base.Required_non_PK_one_to_one_with_alternate_key_are_cascade_detached_when_Added(
++                    cascadeDeleteTiming,
++                    deleteOrphansTiming);
+ 
+                 // Disabled check -- see issue #11031
+                 //Assert.Contains("FK_RequiredNonPkSingleAk2_RequiredNonPkSingleAk1_BackId", updateException.InnerException.Message);
+diff --git a/test/EFCore.SqlServer.FunctionalTests/LazyLoadProxySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/LazyLoadProxySqlServerTest.cs
+index d18d2e8911..1330608fcb 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/LazyLoadProxySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/LazyLoadProxySqlServerTest.cs
+@@ -2,6 +2,7 @@
+ // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
+ 
+ using System.Threading.Tasks;
++using Microsoft.EntityFrameworkCore.ChangeTracking;
+ using Microsoft.EntityFrameworkCore.Diagnostics;
+ using Microsoft.EntityFrameworkCore.TestUtilities;
+ using Xunit;
+@@ -170,16 +171,16 @@ WHERE [e].[ParentId] = @__p_0",
+                 ignoreLineEndingDifferences: true);
+         }
+ 
+-        public override void Lazy_load_collection_already_loaded(EntityState state)
++        public override void Lazy_load_collection_already_loaded(EntityState state, CascadeTiming cascadeDeleteTiming)
+         {
+-            base.Lazy_load_collection_already_loaded(state);
++            base.Lazy_load_collection_already_loaded(state, cascadeDeleteTiming);
+ 
+             Assert.Equal("", Sql);
+         }
+ 
+-        public override void Lazy_load_many_to_one_reference_to_principal_already_loaded(EntityState state)
++        public override void Lazy_load_many_to_one_reference_to_principal_already_loaded(EntityState state, CascadeTiming cascadeDeleteTiming)
+         {
+-            base.Lazy_load_many_to_one_reference_to_principal_already_loaded(state);
++            base.Lazy_load_many_to_one_reference_to_principal_already_loaded(state, cascadeDeleteTiming);
+ 
+             Assert.Equal("", Sql);
+         }
+@@ -191,9 +192,9 @@ WHERE [e].[ParentId] = @__p_0",
+             Assert.Equal("", Sql);
+         }
+ 
+-        public override void Lazy_load_one_to_one_reference_to_dependent_already_loaded(EntityState state)
++        public override void Lazy_load_one_to_one_reference_to_dependent_already_loaded(EntityState state, CascadeTiming cascadeDeleteTiming)
+         {
+-            base.Lazy_load_one_to_one_reference_to_dependent_already_loaded(state);
++            base.Lazy_load_one_to_one_reference_to_dependent_already_loaded(state, cascadeDeleteTiming);
+ 
+             Assert.Equal("", Sql);
+         }
+diff --git a/test/EFCore.SqlServer.FunctionalTests/LoadSqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/LoadSqlServerTest.cs
+index 1f8d1fb6e3..1d11b8d683 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/LoadSqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/LoadSqlServerTest.cs
+@@ -2,6 +2,7 @@
+ // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
+ 
+ using System.Threading.Tasks;
++using Microsoft.EntityFrameworkCore.ChangeTracking;
+ using Microsoft.EntityFrameworkCore.Diagnostics;
+ using Microsoft.EntityFrameworkCore.TestUtilities;
+ using Xunit;
+@@ -170,9 +171,9 @@ WHERE [e].[ParentId] = @__p_0",
+                 ignoreLineEndingDifferences: true);
+         }
+ 
+-        public override void Lazy_load_collection_already_loaded(EntityState state)
++        public override void Lazy_load_collection_already_loaded(EntityState state, CascadeTiming cascadeDeleteTiming)
+         {
+-            base.Lazy_load_collection_already_loaded(state);
++            base.Lazy_load_collection_already_loaded(state, cascadeDeleteTiming);
+ 
+             Assert.Equal("", Sql);
+         }
+@@ -191,9 +192,9 @@ WHERE [e].[ParentId] = @__p_0",
+             Assert.Equal("", Sql);
+         }
+ 
+-        public override void Lazy_load_one_to_one_reference_to_dependent_already_loaded(EntityState state)
++        public override void Lazy_load_one_to_one_reference_to_dependent_already_loaded(EntityState state, CascadeTiming cascadeDeleteTiming)
+         {
+-            base.Lazy_load_one_to_one_reference_to_dependent_already_loaded(state);
++            base.Lazy_load_one_to_one_reference_to_dependent_already_loaded(state, cascadeDeleteTiming);
+ 
+             Assert.Equal("", Sql);
+         }
+@@ -802,9 +803,9 @@ WHERE [e].[ParentId] = @__p_0",
+             }
+         }
+ 
+-        public override async Task Load_collection_already_loaded(EntityState state, bool async)
++        public override async Task Load_collection_already_loaded(EntityState state, bool async, CascadeTiming cascadeDeleteTiming)
+         {
+-            await base.Load_collection_already_loaded(state, async);
++            await base.Load_collection_already_loaded(state, async, cascadeDeleteTiming);
+ 
+             if (!async)
+             {
+@@ -822,9 +823,9 @@ WHERE [e].[ParentId] = @__p_0",
+             }
+         }
+ 
+-        public override async Task Load_one_to_one_reference_to_principal_already_loaded(EntityState state, bool async)
++        public override async Task Load_one_to_one_reference_to_principal_already_loaded(EntityState state, bool async, CascadeTiming cascadeDeleteTiming)
+         {
+-            await base.Load_one_to_one_reference_to_principal_already_loaded(state, async);
++            await base.Load_one_to_one_reference_to_principal_already_loaded(state, async, cascadeDeleteTiming);
+ 
+             if (!async)
+             {
+@@ -832,9 +833,9 @@ WHERE [e].[ParentId] = @__p_0",
+             }
+         }
+ 
+-        public override async Task Load_one_to_one_reference_to_dependent_already_loaded(EntityState state, bool async)
++        public override async Task Load_one_to_one_reference_to_dependent_already_loaded(EntityState state, bool async, CascadeTiming cascadeDeleteTiming)
+         {
+-            await base.Load_one_to_one_reference_to_dependent_already_loaded(state, async);
++            await base.Load_one_to_one_reference_to_dependent_already_loaded(state, async, cascadeDeleteTiming);
+ 
+             if (!async)
+             {
+@@ -862,9 +863,9 @@ WHERE [e].[ParentId] = @__p_0",
+             }
+         }
+ 
+-        public override async Task Load_collection_using_Query_already_loaded(EntityState state, bool async)
++        public override async Task Load_collection_using_Query_already_loaded(EntityState state, bool async, CascadeTiming cascadeDeleteTiming)
+         {
+-            await base.Load_collection_using_Query_already_loaded(state, async);
++            await base.Load_collection_using_Query_already_loaded(state, async, cascadeDeleteTiming);
+ 
+             if (!async)
+             {
+@@ -913,9 +914,9 @@ WHERE [e].[Id] = @__p_0",
+             }
+         }
+ 
+-        public override async Task Load_one_to_one_reference_to_dependent_using_Query_already_loaded(EntityState state, bool async)
++        public override async Task Load_one_to_one_reference_to_dependent_using_Query_already_loaded(EntityState state, bool async, CascadeTiming cascadeDeleteTiming)
+         {
+-            await base.Load_one_to_one_reference_to_dependent_using_Query_already_loaded(state, async);
++            await base.Load_one_to_one_reference_to_dependent_using_Query_already_loaded(state, async, cascadeDeleteTiming);
+ 
+             if (!async)
+             {
+@@ -1236,9 +1237,9 @@ WHERE [e].[ParentId] = @__p_0",
+             }
+         }
+ 
+-        public override async Task Load_collection_already_loaded_untyped(EntityState state, bool async)
++        public override async Task Load_collection_already_loaded_untyped(EntityState state, bool async, CascadeTiming cascadeDeleteTiming)
+         {
+-            await base.Load_collection_already_loaded_untyped(state, async);
++            await base.Load_collection_already_loaded_untyped(state, async, cascadeDeleteTiming);
+ 
+             if (!async)
+             {
+@@ -1266,9 +1267,9 @@ WHERE [e].[ParentId] = @__p_0",
+             }
+         }
+ 
+-        public override async Task Load_one_to_one_reference_to_dependent_already_loaded_untyped(EntityState state, bool async)
++        public override async Task Load_one_to_one_reference_to_dependent_already_loaded_untyped(EntityState state, bool async, CascadeTiming cascadeDeleteTiming)
+         {
+-            await base.Load_one_to_one_reference_to_dependent_already_loaded_untyped(state, async);
++            await base.Load_one_to_one_reference_to_dependent_already_loaded_untyped(state, async, cascadeDeleteTiming);
+ 
+             if (!async)
+             {
+@@ -1276,9 +1277,9 @@ WHERE [e].[ParentId] = @__p_0",
+             }
+         }
+ 
+-        public override async Task Load_collection_using_Query_already_loaded_untyped(EntityState state, bool async)
++        public override async Task Load_collection_using_Query_already_loaded_untyped(EntityState state, bool async, CascadeTiming cascadeDeleteTiming)
+         {
+-            await base.Load_collection_using_Query_already_loaded_untyped(state, async);
++            await base.Load_collection_using_Query_already_loaded_untyped(state, async, cascadeDeleteTiming);
+ 
+             if (!async)
+             {
+@@ -1327,9 +1328,9 @@ WHERE [e].[Id] = @__p_0",
+             }
+         }
+ 
+-        public override async Task Load_one_to_one_reference_to_dependent_using_Query_already_loaded_untyped(EntityState state, bool async)
++        public override async Task Load_one_to_one_reference_to_dependent_using_Query_already_loaded_untyped(EntityState state, bool async, CascadeTiming cascadeDeleteTiming)
+         {
+-            await base.Load_one_to_one_reference_to_dependent_using_Query_already_loaded_untyped(state, async);
++            await base.Load_one_to_one_reference_to_dependent_using_Query_already_loaded_untyped(state, async, cascadeDeleteTiming);
+ 
+             if (!async)
+             {
+diff --git a/test/EFCore.Tests/ChangeTracking/ChangeTrackerTest.cs b/test/EFCore.Tests/ChangeTracking/ChangeTrackerTest.cs
+index 1c805828ed..aed76d0180 100644
+--- a/test/EFCore.Tests/ChangeTracking/ChangeTrackerTest.cs
++++ b/test/EFCore.Tests/ChangeTracking/ChangeTrackerTest.cs
+@@ -353,58 +353,243 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking
+         }
+ 
+         [Theory]
+-        [InlineData(false)]
+-        [InlineData(true)]
+-        public void Cascade_delete_is_logged(bool sensitive)
++        [InlineData(false, CascadeTiming.OnSaveChanges, CascadeTiming.OnSaveChanges)]
++        [InlineData(false, CascadeTiming.OnSaveChanges, CascadeTiming.Immediate)]
++        [InlineData(false, CascadeTiming.OnSaveChanges, CascadeTiming.Never)]
++        [InlineData(false, CascadeTiming.OnSaveChanges, null)]
++        [InlineData(false, CascadeTiming.Immediate, CascadeTiming.OnSaveChanges)]
++        [InlineData(false, CascadeTiming.Immediate, CascadeTiming.Immediate)]
++        [InlineData(false, CascadeTiming.Immediate, CascadeTiming.Never)]
++        [InlineData(false, CascadeTiming.Immediate, null)]
++        [InlineData(false, CascadeTiming.Never, CascadeTiming.OnSaveChanges)]
++        [InlineData(false, CascadeTiming.Never, CascadeTiming.Immediate)]
++        [InlineData(false, CascadeTiming.Never, CascadeTiming.Never)]
++        [InlineData(false, CascadeTiming.Never, null)]
++        [InlineData(false, null, CascadeTiming.OnSaveChanges)]
++        [InlineData(false, null, CascadeTiming.Immediate)]
++        [InlineData(false, null, CascadeTiming.Never)]
++        [InlineData(false, null, null)]
++        [InlineData(true, CascadeTiming.OnSaveChanges, CascadeTiming.OnSaveChanges)]
++        [InlineData(true, CascadeTiming.OnSaveChanges, CascadeTiming.Immediate)]
++        [InlineData(true, CascadeTiming.OnSaveChanges, CascadeTiming.Never)]
++        [InlineData(true, CascadeTiming.OnSaveChanges, null)]
++        [InlineData(true, CascadeTiming.Immediate, CascadeTiming.OnSaveChanges)]
++        [InlineData(true, CascadeTiming.Immediate, CascadeTiming.Immediate)]
++        [InlineData(true, CascadeTiming.Immediate, CascadeTiming.Never)]
++        [InlineData(true, CascadeTiming.Immediate, null)]
++        [InlineData(true, CascadeTiming.Never, CascadeTiming.OnSaveChanges)]
++        [InlineData(true, CascadeTiming.Never, CascadeTiming.Immediate)]
++        [InlineData(true, CascadeTiming.Never, CascadeTiming.Never)]
++        [InlineData(true, CascadeTiming.Never, null)]
++        [InlineData(true, null, CascadeTiming.OnSaveChanges)]
++        [InlineData(true, null, CascadeTiming.Immediate)]
++        [InlineData(true, null, CascadeTiming.Never)]
++        [InlineData(true, null, null)]
++        public void Cascade_delete_is_logged(
++            bool sensitive,
++            CascadeTiming? cascadeDeleteTiming,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             Seed(sensitive);
+ 
+             using (var context = sensitive ? new LikeAZooContextSensitive() : new LikeAZooContext())
+             {
++                if (cascadeDeleteTiming.HasValue)
++                {
++                    context.ChangeTracker.CascadeDeleteTiming = cascadeDeleteTiming.Value;
++                }
++
++                if (deleteOrphansTiming.HasValue)
++                {
++                    context.ChangeTracker.DeleteOrphansTiming = deleteOrphansTiming.Value;
++                }
++
+                 var cat = context.Cats.Include(e => e.Hats).Single(e => e.Id == 1);
+ 
+-                context.Entry(cat).State = EntityState.Deleted;
++                LogLevel? cascadeDeleteLevel = null;
++                string cascadeDeleteMessage = null;
++                string deleteOrphansMessage = null;
+ 
+-                _loggerFactory.Log.Clear();
++                void CaptureMessages()
++                {
++                    (cascadeDeleteLevel, _, cascadeDeleteMessage, _, _) = _loggerFactory.Log.FirstOrDefault(e => e.Id.Id == CoreEventId.CascadeDelete.Id);
++                    (_, _, deleteOrphansMessage, _, _) = _loggerFactory.Log.FirstOrDefault(e => e.Id.Id == CoreEventId.CascadeDeleteOrphan.Id);
++                }
+ 
+-                context.SaveChanges();
++                void ClearMessages()
++                {
++                    _loggerFactory.Log.Clear();
++                }
+ 
+-                var (level, _, message, _, _) = _loggerFactory.Log.Single(e => e.Id.Id == CoreEventId.CascadeDelete.Id);
+-                Assert.Equal(LogLevel.Debug, level);
+-                Assert.Equal(
+-                    sensitive
+-                        ? CoreStrings.LogCascadeDeleteSensitive.GenerateMessage(
+-                            nameof(Hat), "{Id: 77}", EntityState.Deleted, nameof(Cat), "{Id: 1}")
+-                        : CoreStrings.LogCascadeDelete.GenerateMessage(nameof(Hat), EntityState.Deleted, nameof(Cat)),
+-                    message);
++                switch (cascadeDeleteTiming)
++                {
++                    case CascadeTiming.Immediate:
++                    case null:
++                        ClearMessages();
++
++                        context.Entry(cat).State = EntityState.Deleted;
++
++                        CaptureMessages();
++
++                        context.SaveChanges();
++                        break;
++                    case CascadeTiming.OnSaveChanges:
++                        context.Entry(cat).State = EntityState.Deleted;
++
++                        ClearMessages();
++
++                        context.SaveChanges();
++
++                        CaptureMessages();
++                        break;
++                    case CascadeTiming.Never:
++                        ClearMessages();
++
++                        context.Entry(cat).State = EntityState.Deleted;
++
++                        Assert.Throws<InvalidOperationException>(() => context.SaveChanges());
++
++                        CaptureMessages();
++                        break;
++                }
++
++                Assert.Null(deleteOrphansMessage);
++
++                if (cascadeDeleteTiming == CascadeTiming.Never)
++                {
++                    Assert.Null(cascadeDeleteMessage);
++                }
++                else
++                {
++                    Assert.Equal(LogLevel.Debug, cascadeDeleteLevel);
++                    Assert.Equal(
++                        sensitive
++                            ? CoreStrings.LogCascadeDeleteSensitive.GenerateMessage(nameof(Hat), "{Id: 77}", EntityState.Deleted, nameof(Cat), "{Id: 1}")
++                            : CoreStrings.LogCascadeDelete.GenerateMessage(nameof(Hat), EntityState.Deleted, nameof(Cat)),
++                        cascadeDeleteMessage);
++                }
+             }
+         }
+ 
+         [Theory]
+-        [InlineData(false)]
+-        [InlineData(true)]
+-        public void Cascade_delete_orphan_is_logged(bool sensitive)
++        [InlineData(false, CascadeTiming.OnSaveChanges, CascadeTiming.OnSaveChanges)]
++        [InlineData(false, CascadeTiming.OnSaveChanges, CascadeTiming.Immediate)]
++        [InlineData(false, CascadeTiming.OnSaveChanges, CascadeTiming.Never)]
++        [InlineData(false, CascadeTiming.OnSaveChanges, null)]
++        [InlineData(false, CascadeTiming.Immediate, CascadeTiming.OnSaveChanges)]
++        [InlineData(false, CascadeTiming.Immediate, CascadeTiming.Immediate)]
++        [InlineData(false, CascadeTiming.Immediate, CascadeTiming.Never)]
++        [InlineData(false, CascadeTiming.Immediate, null)]
++        [InlineData(false, CascadeTiming.Never, CascadeTiming.OnSaveChanges)]
++        [InlineData(false, CascadeTiming.Never, CascadeTiming.Immediate)]
++        [InlineData(false, CascadeTiming.Never, CascadeTiming.Never)]
++        [InlineData(false, CascadeTiming.Never, null)]
++        [InlineData(false, null, CascadeTiming.OnSaveChanges)]
++        [InlineData(false, null, CascadeTiming.Immediate)]
++        [InlineData(false, null, CascadeTiming.Never)]
++        [InlineData(false, null, null)]
++        [InlineData(true, CascadeTiming.OnSaveChanges, CascadeTiming.OnSaveChanges)]
++        [InlineData(true, CascadeTiming.OnSaveChanges, CascadeTiming.Immediate)]
++        [InlineData(true, CascadeTiming.OnSaveChanges, CascadeTiming.Never)]
++        [InlineData(true, CascadeTiming.OnSaveChanges, null)]
++        [InlineData(true, CascadeTiming.Immediate, CascadeTiming.OnSaveChanges)]
++        [InlineData(true, CascadeTiming.Immediate, CascadeTiming.Immediate)]
++        [InlineData(true, CascadeTiming.Immediate, CascadeTiming.Never)]
++        [InlineData(true, CascadeTiming.Immediate, null)]
++        [InlineData(true, CascadeTiming.Never, CascadeTiming.OnSaveChanges)]
++        [InlineData(true, CascadeTiming.Never, CascadeTiming.Immediate)]
++        [InlineData(true, CascadeTiming.Never, CascadeTiming.Never)]
++        [InlineData(true, CascadeTiming.Never, null)]
++        [InlineData(true, null, CascadeTiming.OnSaveChanges)]
++        [InlineData(true, null, CascadeTiming.Immediate)]
++        [InlineData(true, null, CascadeTiming.Never)]
++        [InlineData(true, null, null)]
++        public void Cascade_delete_orphan_is_logged(
++            bool sensitive,
++            CascadeTiming? cascadeDeleteTiming,
++            CascadeTiming? deleteOrphansTiming)
+         {
+             Seed(sensitive);
+ 
+             using (var context = sensitive ? new LikeAZooContextSensitive() : new LikeAZooContext())
+             {
++                if (cascadeDeleteTiming.HasValue)
++                {
++                    context.ChangeTracker.CascadeDeleteTiming = cascadeDeleteTiming.Value;
++                }
++
++                if (deleteOrphansTiming.HasValue)
++                {
++                    context.ChangeTracker.DeleteOrphansTiming = deleteOrphansTiming.Value;
++                }
++
+                 var cat = context.Cats.Include(e => e.Hats).Single(e => e.Id == 1);
+ 
+-                cat.Hats.Clear();
++                LogLevel? deleteOrphansLevel = null;
++                string cascadeDeleteMessage = null;
++                string deleteOrphansMessage = null;
+ 
+-                _loggerFactory.Log.Clear();
++                void CaptureMessages()
++                {
++                    (_, _, cascadeDeleteMessage, _, _) = _loggerFactory.Log.FirstOrDefault(e => e.Id.Id == CoreEventId.CascadeDelete.Id);
++                    (deleteOrphansLevel, _, deleteOrphansMessage, _, _) = _loggerFactory.Log.FirstOrDefault(e => e.Id.Id == CoreEventId.CascadeDeleteOrphan.Id);
++                }
+ 
+-                context.SaveChanges();
++                void ClearMessages()
++                {
++                    _loggerFactory.Log.Clear();
++                }
+ 
+-                var (level, _, message, _, _) = _loggerFactory.Log.Single(e => e.Id.Id == CoreEventId.CascadeDeleteOrphan.Id);
+-                Assert.Equal(LogLevel.Debug, level);
+-                Assert.Equal(
+-                    sensitive
+-                        ? CoreStrings.LogCascadeDeleteOrphanSensitive.GenerateMessage(
+-                            nameof(Hat), "{Id: 77}", EntityState.Deleted, nameof(Cat))
+-                        : CoreStrings.LogCascadeDeleteOrphan.GenerateMessage(nameof(Hat), EntityState.Deleted, nameof(Cat)),
+-                    message);
++                switch (deleteOrphansTiming)
++                {
++                    case CascadeTiming.Immediate:
++                    case null:
++                        ClearMessages();
++
++                        cat.Hats.Clear();
++                        context.ChangeTracker.DetectChanges();
++
++                        CaptureMessages();
++
++                        context.SaveChanges();
++                        break;
++                    case CascadeTiming.OnSaveChanges:
++                        cat.Hats.Clear();
++                        context.ChangeTracker.DetectChanges();
++
++                        ClearMessages();
++
++                        context.SaveChanges();
++
++                        CaptureMessages();
++                        break;
++                    case CascadeTiming.Never:
++                        ClearMessages();
++
++                        cat.Hats.Clear();
++                        context.ChangeTracker.DetectChanges();
++
++                        Assert.Throws<InvalidOperationException>(() => context.SaveChanges());
++
++                        CaptureMessages();
++                        break;
++                }
++
++                Assert.Null(cascadeDeleteMessage);
++
++                if (deleteOrphansTiming == CascadeTiming.Never)
++                {
++                    Assert.Null(deleteOrphansMessage);
++                }
++                else
++                {
++                    Assert.Equal(LogLevel.Debug, deleteOrphansLevel);
++                    Assert.Equal(
++                        sensitive
++                            ? CoreStrings.LogCascadeDeleteOrphanSensitive.GenerateMessage(nameof(Hat), "{Id: 77}", EntityState.Deleted, nameof(Cat))
++                            : CoreStrings.LogCascadeDeleteOrphan.GenerateMessage(nameof(Hat), EntityState.Deleted, nameof(Cat)),
++                        deleteOrphansMessage);
++                }
+             }
+         }
+ 
+diff --git a/test/EFCore.Tests/ChangeTracking/Internal/FixupTest.cs b/test/EFCore.Tests/ChangeTracking/Internal/FixupTest.cs
+index cb52318f73..28972dd203 100644
+--- a/test/EFCore.Tests/ChangeTracking/Internal/FixupTest.cs
++++ b/test/EFCore.Tests/ChangeTracking/Internal/FixupTest.cs
+@@ -2127,6 +2127,8 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+         {
+             using (var context = new FixupContext())
+             {
++                context.ChangeTracker.DeleteOrphansTiming = CascadeTiming.OnSaveChanges;
++
+                 var principal = new Parent(77);
+                 var oldDependent = new Child(78, principal.Id);
+                 oldDependent.SetParent(principal);
+@@ -2218,6 +2220,8 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+         {
+             using (var context = new FixupContext())
+             {
++                context.ChangeTracker.DeleteOrphansTiming = CascadeTiming.OnSaveChanges;
++
+                 var principal = new ParentPN
+                 {
+                     Id = 77
+@@ -2312,6 +2316,8 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+         {
+             using (var context = new FixupContext())
+             {
++                context.ChangeTracker.DeleteOrphansTiming = CascadeTiming.OnSaveChanges;
++
+                 var principal = new ParentDN
+                 {
+                     Id = 77
+@@ -2369,6 +2375,8 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+         {
+             using (var context = new FixupContext())
+             {
++                context.ChangeTracker.DeleteOrphansTiming = CascadeTiming.OnSaveChanges;
++
+                 var principal = new ParentNN
+                 {
+                     Id = 77
+diff --git a/test/EFCore.Tests/ChangeTracking/Internal/InternalEntityEntryTestBase.cs b/test/EFCore.Tests/ChangeTracking/Internal/InternalEntityEntryTestBase.cs
+index 2cf90f00af..b2dbc466e2 100644
+--- a/test/EFCore.Tests/ChangeTracking/Internal/InternalEntityEntryTestBase.cs
++++ b/test/EFCore.Tests/ChangeTracking/Internal/InternalEntityEntryTestBase.cs
+@@ -1250,7 +1250,7 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+             entry.SetEntityState(EntityState.Unchanged);
+ 
+             entry[fkProperty] = null;
+-            entry.HandleConceptualNulls(false);
++            entry.HandleConceptualNulls(false, force: false, isCascadeDelete: false);
+ 
+             Assert.Equal(EntityState.Deleted, entry.EntityState);
+         }
+@@ -1268,7 +1268,7 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+             entry.SetEntityState(EntityState.Added);
+ 
+             entry[fkProperty] = null;
+-            entry.HandleConceptualNulls(false);
++            entry.HandleConceptualNulls(false, force: false, isCascadeDelete: false);
+ 
+             Assert.Equal(EntityState.Detached, entry.EntityState);
+         }
+@@ -1291,7 +1291,7 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+             entry.SetEntityState(EntityState.Unchanged);
+ 
+             entry[fkProperty1] = null;
+-            entry.HandleConceptualNulls(false);
++            entry.HandleConceptualNulls(false, force: false, isCascadeDelete: false);
+ 
+             Assert.Equal(EntityState.Deleted, entry.EntityState);
+         }
+@@ -1314,7 +1314,7 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+             entry.SetEntityState(EntityState.Unchanged);
+ 
+             entry[fkProperty1] = null;
+-            entry.HandleConceptualNulls(false);
++            entry.HandleConceptualNulls(false, force: false, isCascadeDelete: false);
+ 
+             Assert.Equal(EntityState.Modified, entry.EntityState);
+ 
+@@ -1322,81 +1322,6 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+             Assert.Null(entry[fkProperty2]);
+         }
+ 
+-        [Theory]
+-        [InlineData(true)]
+-        [InlineData(false)]
+-        public void Unchanged_entity_with_conceptually_null_FK_without_cascade_delete_throws(bool sensitiveLoggingEnabled)
+-        {
+-            var model = BuildModel();
+-            var entityType = model.FindEntityType(typeof(SomeDependentEntity).FullName);
+-            var keyProperties = new[] { entityType.FindProperty("Id1"), entityType.FindProperty("Id2") };
+-            var fkProperty = entityType.FindProperty("SomeEntityId");
+-            var configuration = InMemoryTestHelpers.Instance.CreateContextServices(model);
+-
+-            var entry = CreateInternalEntry(configuration, entityType, new SomeDependentEntity());
+-            entry.SetOriginalValue(keyProperties[0], 77);
+-            entry.SetOriginalValue(keyProperties[1], "ReadySalted");
+-            entry[keyProperties[0]] = 77;
+-            entry[keyProperties[1]] = "ReadySalted";
+-            entry[fkProperty] = 99;
+-
+-            entry.SetEntityState(EntityState.Unchanged);
+-            entry[fkProperty] = null;
+-
+-            var exception = Assert.Throws<InvalidOperationException>(() => entry.HandleConceptualNulls(sensitiveLoggingEnabled)).Message;
+-            if (sensitiveLoggingEnabled)
+-            {
+-                Assert.Equal(
+-                    CoreStrings.RelationshipConceptualNullSensitive(
+-                        model.FindEntityType(typeof(SomeEntity).FullName).DisplayName(),
+-                        entityType.DisplayName(),
+-                        "{Id1: 77, Id2: ReadySalted}"), exception);
+-            }
+-            else
+-            {
+-                Assert.Equal(
+-                    CoreStrings.RelationshipConceptualNull(
+-                        model.FindEntityType(typeof(SomeEntity).FullName).DisplayName(),
+-                        entityType.DisplayName()), exception);
+-            }
+-        }
+-
+-        [Theory]
+-        [InlineData(true)]
+-        [InlineData(false)]
+-        public void Unchanged_entity_with_conceptually_null_non_FK_property_throws(bool sensitiveLoggingEnabled)
+-        {
+-            var model = BuildModel();
+-            var entityType = model.FindEntityType(typeof(SomeDependentEntity).FullName);
+-            var keyProperties = new[] { entityType.FindProperty("Id1"), entityType.FindProperty("Id2") };
+-            var property = entityType.FindProperty("JustAProperty");
+-            var configuration = InMemoryTestHelpers.Instance.CreateContextServices(model);
+-
+-            var entry = CreateInternalEntry(configuration, entityType, new SomeDependentEntity());
+-            entry.SetOriginalValue(keyProperties[0], 77);
+-            entry.SetOriginalValue(keyProperties[1], "ReadySalted");
+-            entry[keyProperties[0]] = 77;
+-            entry[keyProperties[1]] = "ReadySalted";
+-            entry[property] = 99;
+-
+-            entry.SetEntityState(EntityState.Unchanged);
+-            entry[property] = null;
+-
+-            var exception = Assert.Throws<InvalidOperationException>(() => entry.HandleConceptualNulls(sensitiveLoggingEnabled)).Message;
+-            if (sensitiveLoggingEnabled)
+-            {
+-                Assert.Equal(
+-                    CoreStrings.PropertyConceptualNullSensitive("JustAProperty", entityType.DisplayName(), "{Id1: 77, Id2: ReadySalted}"),
+-                    exception);
+-            }
+-            else
+-            {
+-                Assert.Equal(
+-                    CoreStrings.PropertyConceptualNull("JustAProperty", entityType.DisplayName()),
+-                    exception);
+-            }
+-        }
+-
+         // ReSharper disable once ClassNeverInstantiated.Local
+         private class Root
+         {
+diff --git a/test/EFCore.Tests/ChangeTracking/Internal/NavigationFixerTest.cs b/test/EFCore.Tests/ChangeTracking/Internal/NavigationFixerTest.cs
+index 3bd5e5d22b..9d074ae6a9 100644
+--- a/test/EFCore.Tests/ChangeTracking/Internal/NavigationFixerTest.cs
++++ b/test/EFCore.Tests/ChangeTracking/Internal/NavigationFixerTest.cs
+@@ -1445,11 +1445,11 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+ 
+             principalEntry1.SetEntityState(EntityState.Deleted);
+ 
+-            Assert.Same(principal1, dependent1.AlternateProduct);
++            Assert.Null(dependent1.AlternateProduct);
+             Assert.Same(dependent1, principal1.OriginalProduct);
+             Assert.Same(principal2, dependent2.AlternateProduct);
+             Assert.Same(dependent2, principal2.OriginalProduct);
+-            Assert.Equal(dependent1.AlternateProductId, principal1.Id);
++            Assert.Null(dependent1.AlternateProductId);
+             Assert.Equal(dependent2.AlternateProductId, principal2.Id);
+ 
+             principalEntry1.SetEntityState(EntityState.Detached);
+@@ -1458,7 +1458,7 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
+             Assert.Same(dependent1, principal1.OriginalProduct);
+             Assert.Same(principal2, dependent2.AlternateProduct);
+             Assert.Same(dependent2, principal2.OriginalProduct);
+-            Assert.Equal(dependent1.AlternateProductId, principal1.Id);
++            Assert.Null(dependent1.AlternateProductId);
+             Assert.Equal(dependent2.AlternateProductId, principal2.Id);
+         }
+ 
+diff --git a/test/EFCore.Tests/DbContextTrackingTest.cs b/test/EFCore.Tests/DbContextTrackingTest.cs
+index 82a2e353c6..7b82fd879a 100644
+--- a/test/EFCore.Tests/DbContextTrackingTest.cs
++++ b/test/EFCore.Tests/DbContextTrackingTest.cs
+@@ -98,15 +98,13 @@ namespace Microsoft.EntityFrameworkCore
+                 Assert.Same(relatedDependent, relatedDependentEntry.Entity);
+                 Assert.Same(dependent, dependentEntry.Entity);
+ 
+-                var expectedRelatedState = expectedState == EntityState.Deleted ? EntityState.Unchanged : expectedState;
+-
+                 Assert.Same(principal, principalEntry.Entity);
+                 Assert.Equal(expectedState, principalEntry.State);
+                 Assert.Same(relatedPrincipal, relatedPrincipalEntry.Entity);
+-                Assert.Equal(expectedRelatedState, relatedPrincipalEntry.State);
++                Assert.Equal(expectedState == EntityState.Deleted ? EntityState.Unchanged : expectedState, relatedPrincipalEntry.State);
+ 
+                 Assert.Same(relatedDependent, relatedDependentEntry.Entity);
+-                Assert.Equal(expectedRelatedState, relatedDependentEntry.State);
++                Assert.Equal(expectedState, relatedDependentEntry.State);
+                 Assert.Same(dependent, dependentEntry.Entity);
+                 Assert.Equal(expectedState, dependentEntry.State);
+ 
+@@ -200,15 +198,13 @@ namespace Microsoft.EntityFrameworkCore
+                 Assert.Same(relatedDependent, context.Entry(relatedDependent).Entity);
+                 Assert.Same(dependent, context.Entry(dependent).Entity);
+ 
+-                var expectedRelatedState = expectedState == EntityState.Deleted ? EntityState.Unchanged : expectedState;
+-
+                 Assert.Same(principal, context.Entry(principal).Entity);
+                 Assert.Equal(expectedState, context.Entry(principal).State);
+                 Assert.Same(relatedPrincipal, context.Entry(relatedPrincipal).Entity);
+-                Assert.Equal(expectedRelatedState, context.Entry(relatedPrincipal).State);
++                Assert.Equal(expectedState == EntityState.Deleted ? EntityState.Unchanged : expectedState, context.Entry(relatedPrincipal).State);
+ 
+                 Assert.Same(relatedDependent, context.Entry(relatedDependent).Entity);
+-                Assert.Equal(expectedRelatedState, context.Entry(relatedDependent).State);
++                Assert.Equal(expectedState, context.Entry(relatedDependent).State);
+                 Assert.Same(dependent, context.Entry(dependent).Entity);
+                 Assert.Equal(expectedState, context.Entry(dependent).State);
+             }
+@@ -498,15 +494,13 @@ namespace Microsoft.EntityFrameworkCore
+                 Assert.Same(relatedDependent, relatedDependentEntry.Entity);
+                 Assert.Same(dependent, dependentEntry.Entity);
+ 
+-                var expectedRelatedState = expectedState == EntityState.Deleted ? EntityState.Unchanged : expectedState;
+-
+                 Assert.Same(principal, principalEntry.Entity);
+                 Assert.Equal(expectedState, principalEntry.State);
+                 Assert.Same(relatedPrincipal, relatedPrincipalEntry.Entity);
+-                Assert.Equal(expectedRelatedState, relatedPrincipalEntry.State);
++                Assert.Equal(expectedState == EntityState.Deleted ? EntityState.Unchanged : expectedState, relatedPrincipalEntry.State);
+ 
+                 Assert.Same(relatedDependent, relatedDependentEntry.Entity);
+-                Assert.Equal(expectedRelatedState, relatedDependentEntry.State);
++                Assert.Equal(expectedState, relatedDependentEntry.State);
+                 Assert.Same(dependent, dependentEntry.Entity);
+                 Assert.Equal(expectedState, dependentEntry.State);
+ 
+@@ -600,15 +594,13 @@ namespace Microsoft.EntityFrameworkCore
+                 Assert.Same(relatedDependent, context.Entry(relatedDependent).Entity);
+                 Assert.Same(dependent, context.Entry(dependent).Entity);
+ 
+-                var expectedRelatedState = expectedState == EntityState.Deleted ? EntityState.Unchanged : expectedState;
+-
+                 Assert.Same(principal, context.Entry(principal).Entity);
+                 Assert.Equal(expectedState, context.Entry(principal).State);
+                 Assert.Same(relatedPrincipal, context.Entry(relatedPrincipal).Entity);
+-                Assert.Equal(expectedRelatedState, context.Entry(relatedPrincipal).State);
++                Assert.Equal(expectedState == EntityState.Deleted ? EntityState.Unchanged : expectedState, context.Entry(relatedPrincipal).State);
+ 
+                 Assert.Same(relatedDependent, context.Entry(relatedDependent).Entity);
+-                Assert.Equal(expectedRelatedState, context.Entry(relatedDependent).State);
++                Assert.Equal(expectedState, context.Entry(relatedDependent).State);
+                 Assert.Same(dependent, context.Entry(dependent).Entity);
+                 Assert.Equal(expectedState, context.Entry(dependent).State);
+             }
+diff --git a/test/EFCore.Tests/TestUtilities/FakeStateManager.cs b/test/EFCore.Tests/TestUtilities/FakeStateManager.cs
+index 604f9cf201..cf5b1bb0db 100644
+--- a/test/EFCore.Tests/TestUtilities/FakeStateManager.cs
++++ b/test/EFCore.Tests/TestUtilities/FakeStateManager.cs
+@@ -114,6 +114,8 @@ namespace Microsoft.EntityFrameworkCore.TestUtilities
+         public event EventHandler<EntityStateChangedEventArgs> StateChanged;
+         public void OnStateChanged(InternalEntityEntry internalEntityEntry, EntityState oldState) => StateChanged?.Invoke(null, null);
+         public bool SensitiveLoggingEnabled { get; }
++        public void CascadeChanges(bool force) => throw new NotImplementedException();
++        public void CascadeDelete(InternalEntityEntry entry, bool force) => throw new NotImplementedException();
+         public IDiagnosticsLogger<DbLoggerCategory.Update> UpdateLogger { get; }
+     }
+ }

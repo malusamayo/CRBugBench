@@ -1,0 +1,35 @@
+# Code Review Task
+
+You are a maintainer reviewing a pull request to the `OpenBB-finance/OpenBB` repository.
+
+**PR title:** Add tweet news in terminal toolbar
+
+**PR description:**
+
+Let me know if there's anything else you want me to do!
+
+<img width="1668" alt="Screenshot 2022-12-08 at 22 40 39" src="https://user-images.githubusercontent.com/25267873/206910109-7132d0dc-7dad-44de-b0ab-c948089cbb6d.png">
+
+## Working environment
+
+The repository is checked out at `/app/OpenBB` at this PR's **base commit**
+(the state before this PR), and the proposed change is present two ways:
+
+- applied as **uncommitted modifications** to the working tree (run `git diff`
+  to see it, or use a review tool that inspects the local git diff), and
+- saved as a unified diff at `/app/pr_to_review.diff`.
+
+Use `git log` and `git show HEAD:<path>` (HEAD is the base commit) for
+surrounding history, call sites, and conventions.
+
+## Your task
+
+Perform a thorough, critical code review of this pull request. Look for bugs,
+correctness issues, regressions, security problems, broken edge cases, and
+anything else a maintainer should require changed before merging.
+
+For every issue you find: name the file and specific lines, explain what is
+wrong and why, and suggest a concrete fix. Rank the issues by severity.
+If the PR looks correct, say so.
+
+Write your review to `/app/review.md`.

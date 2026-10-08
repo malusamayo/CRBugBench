@@ -1,0 +1,491 @@
+commit c34ec12c309695e4c14d8e50b5f3f54198f70775
+Author: Christian Duerr <contact@christianduerr.com>
+Date:   Fri Jan 10 01:51:37 2020 +0000
+
+    Bump glutin to 0.22.0
+    
+    Fixes #3165.
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 423d1a98..c9f99edb 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,12 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ ### Changed
+ 
+ - Pressing additional modifiers for mouse bindings will no longer trigger them
++- Renamed `WINIT_HIDPI_FACTOR` environment variable to `WINIT_X11_SCALE_FACTOR`
+ 
+ ### Fixed
+ 
+ - Incorrect default config path in `--help` on Windows and macOS
+ - Semantic selection stopping at full-width glyphs
+ - Full-width glyphs cut off in last column
++- Crash when starting on some X11 systems
+ 
+ ## 0.4.1
+ 
+diff --git a/Cargo.toml b/Cargo.toml
+index bb50a3d6..2e8fd4db 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -14,4 +14,3 @@ incremental = false
+ 
+ [patch.crates-io]
+ servo-freetype-sys = { path = "servo-freetype-proxy" }
+-winit = { git = "https://github.com/rust-windowing/winit", rev = "d1c6506865c7bddbb5fb4d80a613e43ddc1370b5" }
+diff --git a/alacritty/Cargo.toml b/alacritty/Cargo.toml
+index 72015788..8dc85542 100644
+--- a/alacritty/Cargo.toml
++++ b/alacritty/Cargo.toml
+@@ -18,7 +18,7 @@ fnv = "1"
+ serde = { version = "1", features = ["derive"] }
+ serde_yaml = "0.8"
+ serde_json = "1"
+-glutin = { version = "0.22.0-alpha5", features = ["serde"] }
++glutin = { version = "0.22.0", features = ["serde"] }
+ notify = "4"
+ libc = "0.2"
+ unicode-width = "0.1"
+diff --git a/alacritty/src/display.rs b/alacritty/src/display.rs
+index e02381e7..cd526d97 100644
+--- a/alacritty/src/display.rs
++++ b/alacritty/src/display.rs
+@@ -124,7 +124,7 @@ impl Display {
+     pub fn new(config: &Config, event_loop: &EventLoop<Event>) -> Result<Display, Error> {
+         // Guess DPR based on first monitor
+         let estimated_dpr =
+-            event_loop.available_monitors().next().map(|m| m.hidpi_factor()).unwrap_or(1.);
++            event_loop.available_monitors().next().map(|m| m.scale_factor()).unwrap_or(1.);
+ 
+         // Guess the target window dimensions
+         let metrics = GlyphCache::static_metrics(config.font.clone(), estimated_dpr)?;
+@@ -137,16 +137,16 @@ impl Display {
+         debug!("Estimated Dimensions: {:?}", dimensions);
+ 
+         // Create the window where Alacritty will be displayed
+-        let logical = dimensions.map(|d| PhysicalSize::new(d.0, d.1).to_logical(estimated_dpr));
++        let size = dimensions.map(|(width, height)| PhysicalSize::new(width, height));
+ 
+         // Spawn window
+-        let mut window = Window::new(event_loop, &config, logical)?;
++        let mut window = Window::new(event_loop, &config, size)?;
+ 
+-        let dpr = window.hidpi_factor();
++        let dpr = window.scale_factor();
+         info!("Device pixel ratio: {}", dpr);
+ 
+         // get window properties for initializing the other subsystems
+-        let mut viewport_size = window.inner_size().to_physical(dpr);
++        let viewport_size = window.inner_size();
+ 
+         // Create renderer
+         let mut renderer = QuadRenderer::new()?;
+@@ -160,12 +160,11 @@ impl Display {
+         if let Some((width, height)) =
+             GlyphCache::calculate_dimensions(config, dpr, cell_width, cell_height)
+         {
+-            let PhysicalSize { width: w, height: h } = window.inner_size().to_physical(dpr);
+-            if (w - width).abs() < f64::EPSILON && (h - height).abs() < f64::EPSILON {
++            let PhysicalSize { width: w, height: h } = window.inner_size();
++            if w == width && h == height {
+                 info!("Estimated DPR correctly, skipping resize");
+             } else {
+-                viewport_size = PhysicalSize::new(width, height);
+-                window.set_inner_size(viewport_size.to_logical(dpr));
++                window.set_inner_size(PhysicalSize::new(width, height));
+             }
+         } else if config.window.dynamic_padding {
+             // Make sure additional padding is spread evenly
+@@ -217,9 +216,7 @@ impl Display {
+         // TODO: replace `set_position` with `with_position` once available
+         // Upstream issue: https://github.com/tomaka/winit/issues/806
+         if let Some(position) = config.window.position {
+-            let physical = PhysicalPosition::from((position.x, position.y));
+-            let logical = physical.to_logical(dpr);
+-            window.set_outer_position(logical);
++            window.set_outer_position(PhysicalPosition::from((position.x, position.y)));
+         }
+ 
+         #[allow(clippy::single_match)]
+@@ -341,8 +338,7 @@ impl Display {
+         terminal.resize(&pty_size);
+ 
+         // Resize renderer
+-        let physical =
+-            PhysicalSize::new(f64::from(self.size_info.width), f64::from(self.size_info.height));
++        let physical = PhysicalSize::new(self.size_info.width as u32, self.size_info.height as u32);
+         self.window.resize(physical);
+         self.renderer.resize(&self.size_info);
+     }
+diff --git a/alacritty/src/event.rs b/alacritty/src/event.rs
+index d03c4390..74ba88bb 100644
+--- a/alacritty/src/event.rs
++++ b/alacritty/src/event.rs
+@@ -6,11 +6,12 @@ use std::env;
+ use std::fs;
+ use std::fs::File;
+ use std::io::Write;
++use std::mem;
+ use std::sync::Arc;
+ use std::time::Instant;
+ 
+ use glutin::dpi::PhysicalSize;
+-use glutin::event::{ElementState, Event as GlutinEvent, ModifiersState, MouseButton};
++use glutin::event::{ElementState, Event as GlutinEvent, ModifiersState, MouseButton, WindowEvent};
+ use glutin::event_loop::{ControlFlow, EventLoop, EventLoopProxy};
+ use glutin::platform::desktop::EventLoopExtDesktop;
+ use log::{debug, info, warn};
+@@ -42,7 +43,7 @@ use crate::window::Window;
+ 
+ #[derive(Default, Clone, Debug, PartialEq)]
+ pub struct DisplayUpdate {
+-    pub dimensions: Option<PhysicalSize>,
++    pub dimensions: Option<PhysicalSize<u32>>,
+     pub message_buffer: Option<()>,
+     pub font: Option<Font>,
+ }
+@@ -349,7 +350,12 @@ impl<N: Notify + OnResize> Processor<N> {
+                 info!("glutin event: {:?}", event);
+             }
+ 
+-            match &event {
++            // Ignore all events we do not care about
++            if Self::skip_event(&event) {
++                return;
++            }
++
++            match event {
+                 // Check for shutdown
+                 GlutinEvent::UserEvent(Event::Exit) => {
+                     *control_flow = ControlFlow::Exit;
+@@ -363,12 +369,22 @@ impl<N: Notify + OnResize> Processor<N> {
+                         return;
+                     }
+                 },
+-                // Buffer events
+-                _ => {
++                // Remap DPR change event to remove lifetime
++                GlutinEvent::WindowEvent {
++                    event: WindowEvent::ScaleFactorChanged { scale_factor, new_inner_size },
++                    ..
++                } => {
+                     *control_flow = ControlFlow::Poll;
+-                    if !Self::skip_event(&event) {
+-                        event_queue.push(event);
+-                    }
++                    let size = (new_inner_size.width, new_inner_size.height);
++                    let event = GlutinEvent::UserEvent(Event::DPRChanged(scale_factor, size));
++                    event_queue.push(event);
++                    return;
++                },
++                // Transmute to extend lifetime, which exists only for `ScaleFactorChanged` event.
++                // Since we remap that event to remove the lifetime, this is safe.
++                event => unsafe {
++                    *control_flow = ControlFlow::Poll;
++                    event_queue.push(mem::transmute(event));
+                     return;
+                 },
+             }
+@@ -443,6 +459,18 @@ impl<N: Notify + OnResize> Processor<N> {
+     {
+         match event {
+             GlutinEvent::UserEvent(event) => match event {
++                Event::DPRChanged(scale_factor, (width, height)) => {
++                    let display_update_pending = &mut processor.ctx.display_update_pending;
++
++                    // Push current font to update its DPR
++                    display_update_pending.font = Some(processor.ctx.config.font.clone());
++
++                    // Resize to event's dimensions, since no resize event is emitted on Wayland
++                    display_update_pending.dimensions = Some(PhysicalSize::new(width, height));
++
++                    processor.ctx.size_info.dpr = scale_factor;
++                    processor.ctx.terminal.dirty = true;
++                },
+                 Event::Title(title) => processor.ctx.window.set_title(&title),
+                 Event::Wakeup => processor.ctx.terminal.dirty = true,
+                 Event::Urgent => {
+@@ -483,20 +511,19 @@ impl<N: Notify + OnResize> Processor<N> {
+                 use glutin::event::WindowEvent::*;
+                 match event {
+                     CloseRequested => processor.ctx.terminal.exit(),
+-                    Resized(lsize) => {
++                    Resized(size) => {
+                         #[cfg(windows)]
+                         {
+                             // Minimizing the window sends a Resize event with zero width and
+                             // height. But there's no need to ever actually resize to this.
+                             // Both WinPTY & ConPTY have issues when resizing down to zero size
+                             // and back.
+-                            if lsize.width == 0.0 && lsize.height == 0.0 {
++                            if size.width == 0 && size.height == 0 {
+                                 return;
+                             }
+                         }
+ 
+-                        let psize = lsize.to_physical(processor.ctx.size_info.dpr);
+-                        processor.ctx.display_update_pending.dimensions = Some(psize);
++                        processor.ctx.display_update_pending.dimensions = Some(size);
+                         processor.ctx.terminal.dirty = true;
+                     },
+                     KeyboardInput { input, .. } => {
+@@ -516,10 +543,10 @@ impl<N: Notify + OnResize> Processor<N> {
+                             processor.ctx.terminal.dirty = true;
+                         }
+                     },
+-                    CursorMoved { position: lpos, .. } => {
+-                        let (x, y) = lpos.to_physical(processor.ctx.size_info.dpr).into();
+-                        let x: i32 = limit(x, 0, processor.ctx.size_info.width as i32);
+-                        let y: i32 = limit(y, 0, processor.ctx.size_info.height as i32);
++                    CursorMoved { position, .. } => {
++                        let (x, y) = position.into();
++                        let x = limit(x, 0, processor.ctx.size_info.width as i32);
++                        let y = limit(y, 0, processor.ctx.size_info.height as i32);
+ 
+                         processor.ctx.window.set_mouse_visible(true);
+                         processor.mouse_moved(x as usize, y as usize);
+@@ -546,26 +573,6 @@ impl<N: Notify + OnResize> Processor<N> {
+                         let path: String = path.to_string_lossy().into();
+                         processor.ctx.write_to_pty(path.into_bytes());
+                     },
+-                    HiDpiFactorChanged(dpr) => {
+-                        let dpr_change = (dpr / processor.ctx.size_info.dpr) as f32;
+-                        let display_update_pending = &mut processor.ctx.display_update_pending;
+-
+-                        // Push current font to update its DPR
+-                        display_update_pending.font = Some(processor.ctx.config.font.clone());
+-
+-                        // Scale window dimensions with new DPR
+-                        let old_width = processor.ctx.size_info.width;
+-                        let old_height = processor.ctx.size_info.height;
+-                        let dimensions =
+-                            display_update_pending.dimensions.get_or_insert_with(|| {
+-                                PhysicalSize::new(f64::from(old_width), f64::from(old_height))
+-                            });
+-                        dimensions.width *= f64::from(dpr_change);
+-                        dimensions.height *= f64::from(dpr_change);
+-
+-                        processor.ctx.terminal.dirty = true;
+-                        processor.ctx.size_info.dpr = dpr;
+-                    },
+                     CursorLeft { .. } => {
+                         processor.ctx.mouse.inside_grid = false;
+ 
+@@ -574,6 +581,7 @@ impl<N: Notify + OnResize> Processor<N> {
+                         }
+                     },
+                     TouchpadPressure { .. }
++                    | ScaleFactorChanged { .. }
+                     | CursorEntered { .. }
+                     | AxisMotion { .. }
+                     | HoveredFileCancelled
+@@ -602,7 +610,6 @@ impl<N: Notify + OnResize> Processor<N> {
+     /// Check if an event is irrelevant and can be skipped
+     fn skip_event(event: &GlutinEvent<Event>) -> bool {
+         match event {
+-            GlutinEvent::UserEvent(Event::Exit) => true,
+             GlutinEvent::WindowEvent { event, .. } => {
+                 use glutin::event::WindowEvent::*;
+                 match event {
+@@ -617,13 +624,6 @@ impl<N: Notify + OnResize> Processor<N> {
+                     _ => false,
+                 }
+             },
+-            GlutinEvent::DeviceEvent { event, .. } => {
+-                use glutin::event::DeviceEvent::*;
+-                match event {
+-                    ModifiersChanged { .. } => false,
+-                    _ => true,
+-                }
+-            },
+             GlutinEvent::Suspended { .. }
+             | GlutinEvent::NewEvents { .. }
+             | GlutinEvent::MainEventsCleared
+diff --git a/alacritty/src/input.rs b/alacritty/src/input.rs
+index c15c66d6..018140a9 100644
+--- a/alacritty/src/input.rs
++++ b/alacritty/src/input.rs
+@@ -972,6 +972,7 @@ mod tests {
+                 let urls = Urls::new();
+                 let mut processor = Processor::new(context, &urls, &None);
+ 
++                let event: Event::<'_, TerminalEvent> = $input;
+                 if let Event::WindowEvent {
+                     event: WindowEvent::MouseInput {
+                         state,
+@@ -979,7 +980,7 @@ mod tests {
+                         ..
+                     },
+                     ..
+-                } = $input
++                } = event
+                 {
+                     processor.mouse_input(state, button);
+                 };
+@@ -1015,7 +1016,7 @@ mod tests {
+         name: single_click,
+         initial_state: ClickState::None,
+         initial_button: MouseButton::Other(0),
+-        input: Event::<TerminalEvent>::WindowEvent {
++        input: Event::WindowEvent {
+             event: WindowEvent::MouseInput {
+                 state: ElementState::Pressed,
+                 button: MouseButton::Left,
+@@ -1032,7 +1033,7 @@ mod tests {
+         name: double_click,
+         initial_state: ClickState::Click,
+         initial_button: MouseButton::Left,
+-        input: Event::<TerminalEvent>::WindowEvent {
++        input: Event::WindowEvent {
+             event: WindowEvent::MouseInput {
+                 state: ElementState::Pressed,
+                 button: MouseButton::Left,
+@@ -1049,7 +1050,7 @@ mod tests {
+         name: triple_click,
+         initial_state: ClickState::DoubleClick,
+         initial_button: MouseButton::Left,
+-        input: Event::<TerminalEvent>::WindowEvent {
++        input: Event::WindowEvent {
+             event: WindowEvent::MouseInput {
+                 state: ElementState::Pressed,
+                 button: MouseButton::Left,
+@@ -1066,7 +1067,7 @@ mod tests {
+         name: multi_click_separate_buttons,
+         initial_state: ClickState::DoubleClick,
+         initial_button: MouseButton::Left,
+-        input: Event::<TerminalEvent>::WindowEvent {
++        input: Event::WindowEvent {
+             event: WindowEvent::MouseInput {
+                 state: ElementState::Pressed,
+                 button: MouseButton::Right,
+diff --git a/alacritty/src/renderer/mod.rs b/alacritty/src/renderer/mod.rs
+index 60847234..d5d48b43 100644
+--- a/alacritty/src/renderer/mod.rs
++++ b/alacritty/src/renderer/mod.rs
+@@ -358,7 +358,7 @@ impl GlyphCache {
+         dpr: f64,
+         cell_width: f32,
+         cell_height: f32,
+-    ) -> Option<(f64, f64)> {
++    ) -> Option<(u32, u32)> {
+         let dimensions = config.window.dimensions;
+ 
+         if dimensions.columns_u32() == 0
+@@ -378,7 +378,7 @@ impl GlyphCache {
+         let width = padding_x.mul_add(2., f64::from(grid_width)).floor();
+         let height = padding_y.mul_add(2., f64::from(grid_height)).floor();
+ 
+-        Some((width, height))
++        Some((width as u32, height as u32))
+     }
+ }
+ 
+diff --git a/alacritty/src/window.rs b/alacritty/src/window.rs
+index 33594741..4d1a8ead 100644
+--- a/alacritty/src/window.rs
++++ b/alacritty/src/window.rs
+@@ -18,9 +18,7 @@ use std::fmt::{self, Display, Formatter};
+ #[cfg(not(any(target_os = "macos", windows)))]
+ use std::os::raw::c_ulong;
+ 
+-#[cfg(not(windows))]
+-use glutin::dpi::PhysicalPosition;
+-use glutin::dpi::{LogicalPosition, LogicalSize, PhysicalSize};
++use glutin::dpi::{PhysicalPosition, PhysicalSize};
+ use glutin::event_loop::EventLoop;
+ #[cfg(target_os = "macos")]
+ use glutin::platform::macos::{RequestUserAttentionType, WindowBuilderExtMacOS, WindowExtMacOS};
+@@ -105,7 +103,7 @@ fn create_gl_window(
+     mut window: WindowBuilder,
+     event_loop: &EventLoop<Event>,
+     srgb: bool,
+-    dimensions: Option<LogicalSize>,
++    dimensions: Option<PhysicalSize<u32>>,
+ ) -> Result<WindowedContext<PossiblyCurrent>> {
+     if let Some(dimensions) = dimensions {
+         window = window.with_inner_size(dimensions);
+@@ -139,12 +137,12 @@ impl Window {
+     pub fn new(
+         event_loop: &EventLoop<Event>,
+         config: &Config,
+-        logical: Option<LogicalSize>,
++        size: Option<PhysicalSize<u32>>,
+     ) -> Result<Window> {
+         let window_builder = Window::get_platform_window(&config.window.title, &config.window);
+         let windowed_context =
+-            create_gl_window(window_builder.clone(), &event_loop, false, logical)
+-                .or_else(|_| create_gl_window(window_builder, &event_loop, true, logical))?;
++            create_gl_window(window_builder.clone(), &event_loop, false, size)
++                .or_else(|_| create_gl_window(window_builder, &event_loop, true, size))?;
+ 
+         // Text cursor
+         let current_mouse_cursor = CursorIcon::Text;
+@@ -166,16 +164,16 @@ impl Window {
+         Ok(Self { current_mouse_cursor, mouse_visible: true, windowed_context })
+     }
+ 
+-    pub fn set_inner_size(&mut self, size: LogicalSize) {
++    pub fn set_inner_size(&mut self, size: PhysicalSize<u32>) {
+         self.window().set_inner_size(size);
+     }
+ 
+-    pub fn inner_size(&self) -> LogicalSize {
++    pub fn inner_size(&self) -> PhysicalSize<u32> {
+         self.window().inner_size()
+     }
+ 
+-    pub fn hidpi_factor(&self) -> f64 {
+-        self.window().hidpi_factor()
++    pub fn scale_factor(&self) -> f64 {
++        self.window().scale_factor()
+     }
+ 
+     #[inline]
+@@ -301,7 +299,7 @@ impl Window {
+     #[cfg(windows)]
+     pub fn set_urgent(&self, _is_urgent: bool) {}
+ 
+-    pub fn set_outer_position(&self, pos: LogicalPosition) {
++    pub fn set_outer_position(&self, pos: PhysicalPosition<u32>) {
+         self.window().set_outer_position(pos);
+     }
+ 
+@@ -367,20 +365,19 @@ impl Window {
+     #[cfg(not(windows))]
+     pub fn update_ime_position<T>(&mut self, terminal: &Term<T>, size_info: &SizeInfo) {
+         let point = terminal.cursor().point;
+-        let SizeInfo { cell_width: cw, cell_height: ch, padding_x: px, padding_y: py, dpr, .. } =
+-            size_info;
++        let SizeInfo { cell_width, cell_height, padding_x, padding_y, .. } = size_info;
+ 
+-        let nspot_x = f64::from(px + point.col.0 as f32 * cw);
+-        let nspot_y = f64::from(py + (point.line.0 + 1) as f32 * ch);
++        let nspot_x = f64::from(padding_x + point.col.0 as f32 * cell_width);
++        let nspot_y = f64::from(padding_y + (point.line.0 + 1) as f32 * cell_height);
+ 
+-        self.window().set_ime_position(PhysicalPosition::from((nspot_x, nspot_y)).to_logical(*dpr));
++        self.window().set_ime_position(PhysicalPosition::new(nspot_x, nspot_y));
+     }
+ 
+     pub fn swap_buffers(&self) {
+         self.windowed_context.swap_buffers().expect("swap buffers");
+     }
+ 
+-    pub fn resize(&self, size: PhysicalSize) {
++    pub fn resize(&self, size: PhysicalSize<u32>) {
+         self.windowed_context.resize(size);
+     }
+ 
+diff --git a/alacritty_terminal/src/event.rs b/alacritty_terminal/src/event.rs
+index 2d43e9dd..c8edae1e 100644
+--- a/alacritty_terminal/src/event.rs
++++ b/alacritty_terminal/src/event.rs
+@@ -6,6 +6,7 @@ use crate::term::SizeInfo;
+ 
+ #[derive(Clone, Debug, PartialEq)]
+ pub enum Event {
++    DPRChanged(f64, (u32, u32)),
+     ConfigReload(PathBuf),
+     MouseCursorDirty,
+     Message(Message),

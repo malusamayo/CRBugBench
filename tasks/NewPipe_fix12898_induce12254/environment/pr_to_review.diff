@@ -1,0 +1,192 @@
+commit 150649aea9f2cf55b7b006d5538aaecd2ec57f42
+Author: Profpatsch <mail@profpatsch.de>
+Date:   Mon May 5 17:59:34 2025 +0200
+
+    Player/handleIntent: Don’t delete queue when clicking on timestamp
+    
+    Fixes https://github.com/TeamNewPipe/NewPipe/issues/11013
+    
+    We finally are at the point where we can have good logic around
+    clicking on timestamps.
+    
+    This is pretty straightforward:
+    
+    1) if we are already playing the stream (usual case), we skip to the
+       correct second directly
+    2) If we don’t have a queue yet, create a trivial one with the stream
+    3) If we have a queue, we insert the video as next item and start
+      playing it.
+    
+    The skipping logic in 1) is similar to the one further down in the old
+    optimization block, but will always correctly fire for timestamps now.
+    I copied it because it’s not quite the same code, and moving into a
+    separate method at this stage would complicate the code too much.
+
+diff --git a/app/src/main/java/org/schabi/newpipe/player/Player.java b/app/src/main/java/org/schabi/newpipe/player/Player.java
+index 3021aae61..ee4081068 100644
+--- a/app/src/main/java/org/schabi/newpipe/player/Player.java
++++ b/app/src/main/java/org/schabi/newpipe/player/Player.java
+@@ -403,9 +403,8 @@ public final class Player implements PlaybackListener, Listener {
+                     if (newQueue == null) {
+                         return;
+                     }
+-                    final int currentIndex = playQueue.getIndex();
+-                    playQueue.append(newQueue.getStreams());
+-                    playQueue.move(playQueue.size() - 1, currentIndex + 1);
++                    final PlayQueueItem newItem = newQueue.getStreams().get(0);
++                    newQueue.enqueueNext(newItem, false);
+                 }
+                 return;
+             }
+@@ -417,9 +416,43 @@ public final class Player implements PlaybackListener, Listener {
+                 streamItemDisposable.add(single.subscribeOn(Schedulers.io())
+                         .observeOn(AndroidSchedulers.mainThread())
+                         .subscribe(info -> {
+-                            final PlayQueue newPlayQueue = new SinglePlayQueue(info,
+-                                    dat.getSeconds() * 1000L);
+-                            NavigationHelper.playOnPopupPlayer(context, playQueue, false);
++                            final @Nullable PlayQueue oldPlayQueue = playQueue;
++                            info.setStartPosition(dat.getSeconds());
++                            final PlayQueueItem playQueueItem = new PlayQueueItem(info);
++
++                            // If the stream is already playing,
++                            // we can just seek to the appropriate timestamp
++                            if (oldPlayQueue != null
++                                    && playQueueItem.isSameItem(oldPlayQueue.getItem())) {
++                                // Player can have state = IDLE when playback is stopped or failed
++                                // and we should retry in this case
++                                if (simpleExoPlayer.getPlaybackState()
++                                        == com.google.android.exoplayer2.Player.STATE_IDLE) {
++                                    simpleExoPlayer.prepare();
++                                }
++                                simpleExoPlayer.seekTo(oldPlayQueue.getIndex(),
++                                        dat.getSeconds() * 1000L);
++                                simpleExoPlayer.setPlayWhenReady(playWhenReady);
++
++                            } else {
++                                final PlayQueue newPlayQueue;
++
++                                // If there is no queue yet, just add our item
++                                if (oldPlayQueue == null) {
++                                    newPlayQueue = new SinglePlayQueue(playQueueItem);
++
++                                // else we add the timestamped stream behind the current video
++                                // and start playing it.
++                                } else {
++                                    oldPlayQueue.enqueueNext(playQueueItem, true);
++                                    oldPlayQueue.offsetIndex(1);
++                                    newPlayQueue = oldPlayQueue;
++                                }
++                                initPlayback(newPlayQueue, playWhenReady);
++                            }
++
++                            handleIntentPost(oldPlayerType);
++
+                         }, throwable -> {
+                             // This will only show a snackbar if the passed context has a root view:
+                             // otherwise it will resort to showing a notification, so we are safe
+@@ -456,7 +489,7 @@ public final class Player implements PlaybackListener, Listener {
+         if (!exoPlayerIsNull()
+                 && newQueue.size() == 1 && newQueue.getItem() != null
+                 && playQueue != null && playQueue.size() == 1 && playQueue.getItem() != null
+-                && newQueue.getItem().getUrl().equals(playQueue.getItem().getUrl())
++                && newQueue.getItem().isSameItem(playQueue.getItem())
+                 && newQueue.getItem().getRecoveryPosition() != PlayQueueItem.RECOVERY_UNSET) {
+             // Player can have state = IDLE when playback is stopped or failed
+             // and we should retry in this case
+@@ -522,6 +555,7 @@ public final class Player implements PlaybackListener, Listener {
+         handleIntentPost(oldPlayerType);
+     }
+ 
++
+     private void handleIntentPost(final PlayerType oldPlayerType) {
+         if (oldPlayerType != playerType && playQueue != null) {
+             // If playerType changes from one to another we should reload the player
+diff --git a/app/src/main/java/org/schabi/newpipe/player/playqueue/PlayQueue.java b/app/src/main/java/org/schabi/newpipe/player/playqueue/PlayQueue.java
+index cfa2ab316..97196805d 100644
+--- a/app/src/main/java/org/schabi/newpipe/player/playqueue/PlayQueue.java
++++ b/app/src/main/java/org/schabi/newpipe/player/playqueue/PlayQueue.java
+@@ -291,6 +291,22 @@ public abstract class PlayQueue implements Serializable {
+         broadcast(new AppendEvent(itemList.size()));
+     }
+ 
++    /**
++     * Add the given item after the current stream.
++     *
++     * @param item item to add.
++     * @param skipIfSame if set, skip adding if the next stream is the same stream.
++     */
++    public void enqueueNext(@NonNull final PlayQueueItem item, final boolean skipIfSame) {
++        final int currentIndex = getIndex();
++        // if the next item is the same item as the one we want to enqueue, skip if flag is true
++        if (skipIfSame && item.isSameItem(getItem(currentIndex + 1))) {
++            return;
++        }
++        append(List.of(item));
++        move(size() - 1, currentIndex + 1);
++    }
++
+     /**
+      * Removes the item at the given index from the play queue.
+      * <p>
+@@ -529,8 +545,7 @@ public abstract class PlayQueue implements Serializable {
+             final PlayQueueItem stream = streams.get(i);
+             final PlayQueueItem otherStream = other.streams.get(i);
+             // Check is based on serviceId and URL
+-            if (stream.getServiceId() != otherStream.getServiceId()
+-                    || !stream.getUrl().equals(otherStream.getUrl())) {
++            if (!stream.isSameItem(otherStream)) {
+                 return false;
+             }
+         }
+diff --git a/app/src/main/java/org/schabi/newpipe/player/playqueue/PlayQueueItem.java b/app/src/main/java/org/schabi/newpipe/player/playqueue/PlayQueueItem.java
+index 759c51267..d1d897c39 100644
+--- a/app/src/main/java/org/schabi/newpipe/player/playqueue/PlayQueueItem.java
++++ b/app/src/main/java/org/schabi/newpipe/player/playqueue/PlayQueueItem.java
+@@ -38,7 +38,7 @@ public class PlayQueueItem implements Serializable {
+     private long recoveryPosition;
+     private Throwable error;
+ 
+-    PlayQueueItem(@NonNull final StreamInfo info) {
++    public PlayQueueItem(@NonNull final StreamInfo info) {
+         this(info.getName(), info.getUrl(), info.getServiceId(), info.getDuration(),
+                 info.getThumbnails(), info.getUploaderName(),
+                 info.getUploaderUrl(), info.getStreamType());
+@@ -71,6 +71,22 @@ public class PlayQueueItem implements Serializable {
+         this.recoveryPosition = RECOVERY_UNSET;
+     }
+ 
++    /** Whether these two items should be treated as the same stream
++     * for the sake of keeping the same player running when e.g. jumping between timestamps.
++     *
++     * @param other the {@link PlayQueueItem} to compare against.
++     * @return whether the two items are the same so the stream can be re-used.
++     */
++    public boolean isSameItem(@Nullable final PlayQueueItem other) {
++        if (other == null) {
++            return false;
++        }
++        // We assume that the same service & URL uniquely determines
++        // that we can keep the same stream running.
++        return serviceId == other.serviceId
++                && url.equals(other.url);
++    }
++
+     @NonNull
+     public String getTitle() {
+         return title;
+diff --git a/app/src/main/java/org/schabi/newpipe/player/playqueue/SinglePlayQueue.java b/app/src/main/java/org/schabi/newpipe/player/playqueue/SinglePlayQueue.java
+index 0eb0f235a..f13d7924d 100644
+--- a/app/src/main/java/org/schabi/newpipe/player/playqueue/SinglePlayQueue.java
++++ b/app/src/main/java/org/schabi/newpipe/player/playqueue/SinglePlayQueue.java
+@@ -16,7 +16,9 @@ public final class SinglePlayQueue extends PlayQueue {
+     public SinglePlayQueue(final StreamInfo info) {
+         super(0, List.of(new PlayQueueItem(info)));
+     }
+-
++    public SinglePlayQueue(final PlayQueueItem item) {
++        super(0, List.of(item));
++    }
+     public SinglePlayQueue(final StreamInfo info, final long startPosition) {
+         super(0, List.of(new PlayQueueItem(info)));
+         getItem().setRecoveryPosition(startPosition);

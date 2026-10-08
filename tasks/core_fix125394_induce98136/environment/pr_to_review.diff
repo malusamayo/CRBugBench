@@ -1,0 +1,788 @@
+commit e3a73c12bc5919e87d0641465211787b7c81e624
+Author: Dave Leaver <danzel@localhost.geek.nz>
+Date:   Wed Jan 24 02:49:47 2024 +1300
+
+    Add airtouch5 (#98136)
+    
+    Co-authored-by: Robert Resch <robert@resch.dev>
+
+diff --git a/.coveragerc b/.coveragerc
+index d0ce82dd735..9da67cad748 100644
+--- a/.coveragerc
++++ b/.coveragerc
+@@ -46,6 +46,9 @@ omit =
+     homeassistant/components/airtouch4/__init__.py
+     homeassistant/components/airtouch4/climate.py
+     homeassistant/components/airtouch4/coordinator.py
++    homeassistant/components/airtouch5/__init__.py
++    homeassistant/components/airtouch5/climate.py
++    homeassistant/components/airtouch5/entity.py
+     homeassistant/components/airvisual/__init__.py
+     homeassistant/components/airvisual/sensor.py
+     homeassistant/components/airvisual_pro/__init__.py
+diff --git a/.strict-typing b/.strict-typing
+index 8ffb02024c9..be0089a4333 100644
+--- a/.strict-typing
++++ b/.strict-typing
+@@ -53,6 +53,7 @@ homeassistant.components.airnow.*
+ homeassistant.components.airq.*
+ homeassistant.components.airthings.*
+ homeassistant.components.airthings_ble.*
++homeassistant.components.airtouch5.*
+ homeassistant.components.airvisual.*
+ homeassistant.components.airvisual_pro.*
+ homeassistant.components.airzone.*
+diff --git a/CODEOWNERS b/CODEOWNERS
+index 8ad0c7e5273..1378e0f776a 100644
+--- a/CODEOWNERS
++++ b/CODEOWNERS
+@@ -51,6 +51,8 @@ build.json @home-assistant/supervisor
+ /tests/components/airthings_ble/ @vincegio @LaStrada
+ /homeassistant/components/airtouch4/ @samsinnamon
+ /tests/components/airtouch4/ @samsinnamon
++/homeassistant/components/airtouch5/ @danzel
++/tests/components/airtouch5/ @danzel
+ /homeassistant/components/airvisual/ @bachya
+ /tests/components/airvisual/ @bachya
+ /homeassistant/components/airvisual_pro/ @bachya
+diff --git a/homeassistant/components/airtouch5/__init__.py b/homeassistant/components/airtouch5/__init__.py
+new file mode 100644
+index 00000000000..6ec32eaa021
+--- /dev/null
++++ b/homeassistant/components/airtouch5/__init__.py
+@@ -0,0 +1,50 @@
++"""The Airtouch 5 integration."""
++from __future__ import annotations
++
++from airtouch5py.airtouch5_simple_client import Airtouch5SimpleClient
++
++from homeassistant.config_entries import ConfigEntry
++from homeassistant.const import CONF_HOST, Platform
++from homeassistant.core import HomeAssistant
++from homeassistant.exceptions import ConfigEntryNotReady
++
++from .const import DOMAIN
++
++PLATFORMS: list[Platform] = [Platform.CLIMATE]
++
++
++async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
++    """Set up Airtouch 5 from a config entry."""
++
++    hass.data.setdefault(DOMAIN, {})
++
++    # Create API instance
++    host = entry.data[CONF_HOST]
++    client = Airtouch5SimpleClient(host)
++
++    # Connect to the API
++    try:
++        await client.connect_and_stay_connected()
++    except TimeoutError as t:
++        raise ConfigEntryNotReady() from t
++
++    # Store an API object for your platforms to access
++    hass.data[DOMAIN][entry.entry_id] = client
++
++    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
++
++    return True
++
++
++async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
++    """Unload a config entry."""
++    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
++        client: Airtouch5SimpleClient = hass.data[DOMAIN][entry.entry_id]
++        await client.disconnect()
++        client.ac_status_callbacks.clear()
++        client.connection_state_callbacks.clear()
++        client.data_packet_callbacks.clear()
++        client.zone_status_callbacks.clear()
++        hass.data[DOMAIN].pop(entry.entry_id)
++
++    return unload_ok
+diff --git a/homeassistant/components/airtouch5/climate.py b/homeassistant/components/airtouch5/climate.py
+new file mode 100644
+index 00000000000..829915ce6d1
+--- /dev/null
++++ b/homeassistant/components/airtouch5/climate.py
+@@ -0,0 +1,371 @@
++"""AirTouch 5 component to control AirTouch 5 Climate Devices."""
++import logging
++from typing import Any
++
++from airtouch5py.airtouch5_simple_client import Airtouch5SimpleClient
++from airtouch5py.packets.ac_ability import AcAbility
++from airtouch5py.packets.ac_control import (
++    AcControl,
++    SetAcFanSpeed,
++    SetAcMode,
++    SetpointControl,
++    SetPowerSetting,
++)
++from airtouch5py.packets.ac_status import AcFanSpeed, AcMode, AcPowerState, AcStatus
++from airtouch5py.packets.zone_control import (
++    ZoneControlZone,
++    ZoneSettingPower,
++    ZoneSettingValue,
++)
++from airtouch5py.packets.zone_name import ZoneName
++from airtouch5py.packets.zone_status import ZonePowerState, ZoneStatusZone
++
++from homeassistant.components.climate import (
++    FAN_AUTO,
++    FAN_DIFFUSE,
++    FAN_FOCUS,
++    FAN_HIGH,
++    FAN_LOW,
++    FAN_MEDIUM,
++    PRESET_BOOST,
++    PRESET_NONE,
++    ClimateEntity,
++    ClimateEntityFeature,
++    HVACMode,
++)
++from homeassistant.config_entries import ConfigEntry
++from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
++from homeassistant.core import HomeAssistant, callback
++from homeassistant.helpers.device_registry import DeviceInfo
++from homeassistant.helpers.entity_platform import AddEntitiesCallback
++
++from .const import DOMAIN, FAN_INTELLIGENT_AUTO, FAN_TURBO
++from .entity import Airtouch5Entity
++
++_LOGGER = logging.getLogger(__name__)
++
++AC_MODE_TO_HVAC_MODE = {
++    AcMode.AUTO: HVACMode.AUTO,
++    AcMode.AUTO_COOL: HVACMode.AUTO,
++    AcMode.AUTO_HEAT: HVACMode.AUTO,
++    AcMode.COOL: HVACMode.COOL,
++    AcMode.DRY: HVACMode.DRY,
++    AcMode.FAN: HVACMode.FAN_ONLY,
++    AcMode.HEAT: HVACMode.HEAT,
++}
++HVAC_MODE_TO_SET_AC_MODE = {
++    HVACMode.AUTO: SetAcMode.SET_TO_AUTO,
++    HVACMode.COOL: SetAcMode.SET_TO_COOL,
++    HVACMode.DRY: SetAcMode.SET_TO_DRY,
++    HVACMode.FAN_ONLY: SetAcMode.SET_TO_FAN,
++    HVACMode.HEAT: SetAcMode.SET_TO_HEAT,
++}
++
++
++AC_FAN_SPEED_TO_FAN_SPEED = {
++    AcFanSpeed.AUTO: FAN_AUTO,
++    AcFanSpeed.QUIET: FAN_DIFFUSE,
++    AcFanSpeed.LOW: FAN_LOW,
++    AcFanSpeed.MEDIUM: FAN_MEDIUM,
++    AcFanSpeed.HIGH: FAN_HIGH,
++    AcFanSpeed.POWERFUL: FAN_FOCUS,
++    AcFanSpeed.TURBO: FAN_TURBO,
++    AcFanSpeed.INTELLIGENT_AUTO_1: FAN_INTELLIGENT_AUTO,
++    AcFanSpeed.INTELLIGENT_AUTO_2: FAN_INTELLIGENT_AUTO,
++    AcFanSpeed.INTELLIGENT_AUTO_3: FAN_INTELLIGENT_AUTO,
++    AcFanSpeed.INTELLIGENT_AUTO_4: FAN_INTELLIGENT_AUTO,
++    AcFanSpeed.INTELLIGENT_AUTO_5: FAN_INTELLIGENT_AUTO,
++    AcFanSpeed.INTELLIGENT_AUTO_6: FAN_INTELLIGENT_AUTO,
++}
++FAN_MODE_TO_SET_AC_FAN_SPEED = {
++    FAN_AUTO: SetAcFanSpeed.SET_TO_AUTO,
++    FAN_DIFFUSE: SetAcFanSpeed.SET_TO_QUIET,
++    FAN_LOW: SetAcFanSpeed.SET_TO_LOW,
++    FAN_MEDIUM: SetAcFanSpeed.SET_TO_MEDIUM,
++    FAN_HIGH: SetAcFanSpeed.SET_TO_HIGH,
++    FAN_FOCUS: SetAcFanSpeed.SET_TO_POWERFUL,
++    FAN_TURBO: SetAcFanSpeed.SET_TO_TURBO,
++    FAN_INTELLIGENT_AUTO: SetAcFanSpeed.SET_TO_INTELLIGENT_AUTO,
++}
++
++
++async def async_setup_entry(
++    hass: HomeAssistant,
++    config_entry: ConfigEntry,
++    async_add_entities: AddEntitiesCallback,
++) -> None:
++    """Set up the Airtouch 5 Climate entities."""
++    client: Airtouch5SimpleClient = hass.data[DOMAIN][config_entry.entry_id]
++
++    entities: list[ClimateEntity] = []
++
++    # Add each AC (and remember what zones they apply to).
++    # Each zone is controlled by a single AC
++    zone_to_ac: dict[int, AcAbility] = {}
++    for ac in client.ac:
++        for i in range(ac.start_zone_number, ac.start_zone_number + ac.zone_count):
++            zone_to_ac[i] = ac
++        entities.append(Airtouch5AC(client, ac))
++
++    # Add each zone
++    for zone in client.zones:
++        entities.append(Airtouch5Zone(client, zone, zone_to_ac[zone.zone_number]))
++
++    async_add_entities(entities)
++
++
++class Airtouch5ClimateEntity(ClimateEntity, Airtouch5Entity):
++    """Base class for Airtouch5 Climate Entities."""
++
++    _attr_temperature_unit = UnitOfTemperature.CELSIUS
++    _attr_target_temperature_step = 1
++    _attr_name = None
++
++
++class Airtouch5AC(Airtouch5ClimateEntity):
++    """Representation of the AC unit. Used to control the overall HVAC Mode."""
++
++    _attr_supported_features = (
++        ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.FAN_MODE
++    )
++
++    def __init__(self, client: Airtouch5SimpleClient, ability: AcAbility) -> None:
++        """Initialise the Climate Entity."""
++        super().__init__(client)
++        self._ability = ability
++        self._attr_unique_id = f"ac_{ability.ac_number}"
++        self._attr_device_info = DeviceInfo(
++            identifiers={(DOMAIN, f"ac_{ability.ac_number}")},
++            name=f"AC {ability.ac_number}",
++            manufacturer="Polyaire",
++            model="AirTouch 5",
++        )
++        self._attr_hvac_modes = [HVACMode.OFF]
++        if ability.supports_mode_auto:
++            self._attr_hvac_modes.append(HVACMode.AUTO)
++        if ability.supports_mode_cool:
++            self._attr_hvac_modes.append(HVACMode.COOL)
++        if ability.supports_mode_dry:
++            self._attr_hvac_modes.append(HVACMode.DRY)
++        if ability.supports_mode_fan:
++            self._attr_hvac_modes.append(HVACMode.FAN_ONLY)
++        if ability.supports_mode_heat:
++            self._attr_hvac_modes.append(HVACMode.HEAT)
++
++        self._attr_fan_modes = []
++        if ability.supports_fan_speed_quiet:
++            self._attr_fan_modes.append(FAN_DIFFUSE)
++        if ability.supports_fan_speed_low:
++            self._attr_fan_modes.append(FAN_LOW)
++        if ability.supports_fan_speed_medium:
++            self._attr_fan_modes.append(FAN_MEDIUM)
++        if ability.supports_fan_speed_high:
++            self._attr_fan_modes.append(FAN_HIGH)
++        if ability.supports_fan_speed_powerful:
++            self._attr_fan_modes.append(FAN_FOCUS)
++        if ability.supports_fan_speed_turbo:
++            self._attr_fan_modes.append(FAN_TURBO)
++        if ability.supports_fan_speed_auto:
++            self._attr_fan_modes.append(FAN_AUTO)
++        if ability.supports_fan_speed_intelligent_auto:
++            self._attr_fan_modes.append(FAN_INTELLIGENT_AUTO)
++
++        # We can have different setpoints for heat cool, we expose the lowest low and highest high
++        self._attr_min_temp = min(
++            ability.min_cool_set_point, ability.min_heat_set_point
++        )
++        self._attr_max_temp = max(
++            ability.max_cool_set_point, ability.max_heat_set_point
++        )
++
++    @callback
++    def _async_update_attrs(self, data: dict[int, AcStatus]) -> None:
++        if self._ability.ac_number not in data:
++            return
++        status = data[self._ability.ac_number]
++
++        self._attr_current_temperature = status.temperature
++        self._attr_target_temperature = status.ac_setpoint
++        if status.ac_power_state in [AcPowerState.OFF, AcPowerState.AWAY_OFF]:
++            self._attr_hvac_mode = HVACMode.OFF
++        else:
++            self._attr_hvac_mode = AC_MODE_TO_HVAC_MODE[status.ac_mode]
++        self._attr_fan_mode = AC_FAN_SPEED_TO_FAN_SPEED[status.ac_fan_speed]
++        self.async_write_ha_state()
++
++    async def async_added_to_hass(self) -> None:
++        """Add data updated listener after this object has been initialized."""
++        await super().async_added_to_hass()
++        self._client.ac_status_callbacks.append(self._async_update_attrs)
++        self._async_update_attrs(self._client.latest_ac_status)
++
++    async def async_will_remove_from_hass(self) -> None:
++        """Remove data updated listener after this object has been initialized."""
++        await super().async_will_remove_from_hass()
++        self._client.ac_status_callbacks.remove(self._async_update_attrs)
++
++    async def _control(
++        self,
++        *,
++        power: SetPowerSetting = SetPowerSetting.KEEP_POWER_SETTING,
++        ac_mode: SetAcMode = SetAcMode.KEEP_AC_MODE,
++        fan: SetAcFanSpeed = SetAcFanSpeed.KEEP_AC_FAN_SPEED,
++        setpoint: SetpointControl = SetpointControl.KEEP_SETPOINT_VALUE,
++        temp: int = 0,
++    ) -> None:
++        control = AcControl(
++            power,
++            self._ability.ac_number,
++            ac_mode,
++            fan,
++            setpoint,
++            temp,
++        )
++        packet = self._client.data_packet_factory.ac_control([control])
++        await self._client.send_packet(packet)
++
++    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
++        """Set new operation mode."""
++        set_power_setting: SetPowerSetting
++        set_ac_mode: SetAcMode
++
++        if hvac_mode == HVACMode.OFF:
++            set_power_setting = SetPowerSetting.SET_TO_OFF
++            set_ac_mode = SetAcMode.KEEP_AC_MODE
++        else:
++            set_power_setting = SetPowerSetting.SET_TO_ON
++            if hvac_mode not in HVAC_MODE_TO_SET_AC_MODE:
++                raise ValueError(f"Unsupported hvac mode: {hvac_mode}")
++            set_ac_mode = HVAC_MODE_TO_SET_AC_MODE[hvac_mode]
++
++        await self._control(power=set_power_setting, ac_mode=set_ac_mode)
++
++    async def async_set_fan_mode(self, fan_mode: str) -> None:
++        """Set new fan mode."""
++        if fan_mode not in FAN_MODE_TO_SET_AC_FAN_SPEED:
++            raise ValueError(f"Unsupported fan mode: {fan_mode}")
++        fan_speed = FAN_MODE_TO_SET_AC_FAN_SPEED[fan_mode]
++        await self._control(fan=fan_speed)
++
++    async def async_set_temperature(self, **kwargs: Any) -> None:
++        """Set new target temperatures."""
++        if (temp := kwargs.get(ATTR_TEMPERATURE)) is None:
++            _LOGGER.debug("Argument `temperature` is missing in set_temperature")
++            return
++
++        await self._control(temp=temp)
++
++
++class Airtouch5Zone(Airtouch5ClimateEntity):
++    """Representation of a Zone. Used to control the AC effect in the zone."""
++
++    _attr_hvac_modes = [HVACMode.OFF, HVACMode.FAN_ONLY]
++    _attr_preset_modes = [PRESET_NONE, PRESET_BOOST]
++    _attr_supported_features = (
++        ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE
++    )
++
++    def __init__(
++        self, client: Airtouch5SimpleClient, name: ZoneName, ac: AcAbility
++    ) -> None:
++        """Initialise the Climate Entity."""
++        super().__init__(client)
++        self._name = name
++
++        self._attr_unique_id = f"zone_{name.zone_number}"
++        self._attr_device_info = DeviceInfo(
++            identifiers={(DOMAIN, f"zone_{name.zone_number}")},
++            name=name.zone_name,
++            manufacturer="Polyaire",
++            model="AirTouch 5",
++        )
++        # We can have different setpoints for heat and cool, we expose the lowest low and highest high
++        self._attr_min_temp = min(ac.min_cool_set_point, ac.min_heat_set_point)
++        self._attr_max_temp = max(ac.max_cool_set_point, ac.max_heat_set_point)
++
++    @callback
++    def _async_update_attrs(self, data: dict[int, ZoneStatusZone]) -> None:
++        if self._name.zone_number not in data:
++            return
++        status = data[self._name.zone_number]
++        self._attr_current_temperature = status.temperature
++        self._attr_target_temperature = status.set_point
++
++        if status.zone_power_state == ZonePowerState.OFF:
++            self._attr_hvac_mode = HVACMode.OFF
++            self._attr_preset_mode = PRESET_NONE
++        elif status.zone_power_state == ZonePowerState.ON:
++            self._attr_hvac_mode = HVACMode.FAN_ONLY
++            self._attr_preset_mode = PRESET_NONE
++        elif status.zone_power_state == ZonePowerState.TURBO:
++            self._attr_hvac_mode = HVACMode.FAN_ONLY
++            self._attr_preset_mode = PRESET_BOOST
++        else:
++            self._attr_hvac_mode = None
++
++        self.async_write_ha_state()
++
++    async def async_added_to_hass(self) -> None:
++        """Add data updated listener after this object has been initialized."""
++        await super().async_added_to_hass()
++        self._client.zone_status_callbacks.append(self._async_update_attrs)
++        self._async_update_attrs(self._client.latest_zone_status)
++
++    async def async_will_remove_from_hass(self) -> None:
++        """Remove data updated listener after this object has been initialized."""
++        await super().async_will_remove_from_hass()
++        self._client.zone_status_callbacks.remove(self._async_update_attrs)
++
++    async def _control(
++        self,
++        *,
++        zsv: ZoneSettingValue = ZoneSettingValue.KEEP_SETTING_VALUE,
++        power: ZoneSettingPower = ZoneSettingPower.KEEP_POWER_STATE,
++        value: float = 0,
++    ) -> None:
++        control = ZoneControlZone(self._name.zone_number, zsv, power, value)
++        packet = self._client.data_packet_factory.zone_control([control])
++        await self._client.send_packet(packet)
++
++    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
++        """Set new operation mode."""
++        power: ZoneSettingPower
++
++        if hvac_mode is HVACMode.OFF:
++            power = ZoneSettingPower.SET_TO_OFF
++        elif self._attr_preset_mode is PRESET_BOOST:
++            power = ZoneSettingPower.SET_TO_TURBO
++        else:
++            power = ZoneSettingPower.SET_TO_ON
++
++        await self._control(power=power)
++
++    async def async_set_preset_mode(self, preset_mode: str) -> None:
++        """Enable or disable Turbo. Done this way as we can't have a turbo HVACMode."""
++        power: ZoneSettingPower
++        if preset_mode == PRESET_BOOST:
++            power = ZoneSettingPower.SET_TO_TURBO
++        else:
++            power = ZoneSettingPower.SET_TO_ON
++
++        await self._control(power=power)
++
++    async def async_set_temperature(self, **kwargs: Any) -> None:
++        """Set new target temperatures."""
++
++        if (temp := kwargs.get(ATTR_TEMPERATURE)) is None:
++            _LOGGER.debug("Argument `temperature` is missing in set_temperature")
++            return
++
++        await self._control(
++            zsv=ZoneSettingValue.SET_TARGET_SETPOINT,
++            value=float(temp),
++        )
++
++    async def async_turn_on(self) -> None:
++        """Turn the zone on."""
++        await self.async_set_hvac_mode(HVACMode.FAN_ONLY)
++
++    async def async_turn_off(self) -> None:
++        """Turn the zone off."""
++        await self.async_set_hvac_mode(HVACMode.OFF)
+diff --git a/homeassistant/components/airtouch5/config_flow.py b/homeassistant/components/airtouch5/config_flow.py
+new file mode 100644
+index 00000000000..e5df2844653
+--- /dev/null
++++ b/homeassistant/components/airtouch5/config_flow.py
+@@ -0,0 +1,46 @@
++"""Config flow for Airtouch 5 integration."""
++from __future__ import annotations
++
++import logging
++from typing import Any
++
++from airtouch5py.airtouch5_simple_client import Airtouch5SimpleClient
++import voluptuous as vol
++
++from homeassistant import config_entries
++from homeassistant.const import CONF_HOST
++from homeassistant.data_entry_flow import FlowResult
++
++from .const import DOMAIN
++
++_LOGGER = logging.getLogger(__name__)
++
++STEP_USER_DATA_SCHEMA = vol.Schema({vol.Required(CONF_HOST): str})
++
++
++class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
++    """Handle a config flow for Airtouch 5."""
++
++    VERSION = 1
++
++    async def async_step_user(
++        self, user_input: dict[str, Any] | None = None
++    ) -> FlowResult:
++        """Handle the initial step."""
++        errors: dict[str, str] | None = None
++        if user_input is not None:
++            client = Airtouch5SimpleClient(user_input[CONF_HOST])
++            try:
++                await client.test_connection()
++            except Exception:  # pylint: disable=broad-exception-caught
++                errors = {"base": "cannot_connect"}
++            else:
++                await self.async_set_unique_id(user_input[CONF_HOST])
++                self._abort_if_unique_id_configured()
++                return self.async_create_entry(
++                    title=user_input[CONF_HOST], data=user_input
++                )
++
++        return self.async_show_form(
++            step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
++        )
+diff --git a/homeassistant/components/airtouch5/const.py b/homeassistant/components/airtouch5/const.py
+new file mode 100644
+index 00000000000..e98db04aaa3
+--- /dev/null
++++ b/homeassistant/components/airtouch5/const.py
+@@ -0,0 +1,6 @@
++"""Constants for the Airtouch 5 integration."""
++
++DOMAIN = "airtouch5"
++
++FAN_TURBO = "turbo"
++FAN_INTELLIGENT_AUTO = "intelligent_auto"
+diff --git a/homeassistant/components/airtouch5/entity.py b/homeassistant/components/airtouch5/entity.py
+new file mode 100644
+index 00000000000..a6ac76b5187
+--- /dev/null
++++ b/homeassistant/components/airtouch5/entity.py
+@@ -0,0 +1,40 @@
++"""Base class for Airtouch5 entities."""
++from airtouch5py.airtouch5_client import Airtouch5ConnectionStateChange
++from airtouch5py.airtouch5_simple_client import Airtouch5SimpleClient
++
++from homeassistant.core import callback
++from homeassistant.helpers.entity import Entity
++
++from .const import DOMAIN
++
++
++class Airtouch5Entity(Entity):
++    """Base class for Airtouch5 entities."""
++
++    _attr_should_poll = False
++    _attr_has_entity_name = True
++    _attr_translation_key = DOMAIN
++
++    def __init__(self, client: Airtouch5SimpleClient) -> None:
++        """Initialise the Entity."""
++        self._client = client
++        self._attr_available = True
++
++    @callback
++    def _receive_connection_callback(
++        self, state: Airtouch5ConnectionStateChange
++    ) -> None:
++        self._attr_available = state is Airtouch5ConnectionStateChange.CONNECTED
++        self.async_write_ha_state()
++
++    async def async_added_to_hass(self) -> None:
++        """Add data updated listener after this object has been initialized."""
++        self._client.connection_state_callbacks.append(
++            self._receive_connection_callback
++        )
++
++    async def async_will_remove_from_hass(self) -> None:
++        """Remove data updated listener when entity is removed from homeassistant."""
++        self._client.connection_state_callbacks.remove(
++            self._receive_connection_callback
++        )
+diff --git a/homeassistant/components/airtouch5/manifest.json b/homeassistant/components/airtouch5/manifest.json
+new file mode 100644
+index 00000000000..0d4cbc32761
+--- /dev/null
++++ b/homeassistant/components/airtouch5/manifest.json
+@@ -0,0 +1,10 @@
++{
++  "domain": "airtouch5",
++  "name": "AirTouch 5",
++  "codeowners": ["@danzel"],
++  "config_flow": true,
++  "documentation": "https://www.home-assistant.io/integrations/airtouch5",
++  "iot_class": "local_push",
++  "loggers": ["airtouch5py"],
++  "requirements": ["airtouch5py==0.2.8"]
++}
+diff --git a/homeassistant/components/airtouch5/strings.json b/homeassistant/components/airtouch5/strings.json
+new file mode 100644
+index 00000000000..6a91fa85fa5
+--- /dev/null
++++ b/homeassistant/components/airtouch5/strings.json
+@@ -0,0 +1,32 @@
++{
++  "config": {
++    "step": {
++      "user": {
++        "data": {
++          "host": "[%key:common::config_flow::data::host%]"
++        }
++      }
++    },
++    "error": {
++      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
++      "unknown": "[%key:common::config_flow::error::unknown%]"
++    },
++    "abort": {
++      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]"
++    }
++  },
++  "entity": {
++    "climate": {
++      "airtouch5": {
++        "state_attributes": {
++          "fan_mode": {
++            "state": {
++              "turbo": "Turbo",
++              "intelligent_auto": "Intelligent Auto"
++            }
++          }
++        }
++      }
++    }
++  }
++}
+diff --git a/mypy.ini b/mypy.ini
+index 68e40b51c50..6136a7b0d6f 100644
+--- a/mypy.ini
++++ b/mypy.ini
+@@ -290,6 +290,16 @@ disallow_untyped_defs = true
+ warn_return_any = true
+ warn_unreachable = true
+ 
++[mypy-homeassistant.components.airtouch5.*]
++check_untyped_defs = true
++disallow_incomplete_defs = true
++disallow_subclassing_any = true
++disallow_untyped_calls = true
++disallow_untyped_decorators = true
++disallow_untyped_defs = true
++warn_return_any = true
++warn_unreachable = true
++
+ [mypy-homeassistant.components.airvisual.*]
+ check_untyped_defs = true
+ disallow_incomplete_defs = true
+diff --git a/requirements_all.txt b/requirements_all.txt
+index b734ac8b853..2628afba075 100644
+--- a/requirements_all.txt
++++ b/requirements_all.txt
+@@ -415,6 +415,9 @@ airthings-cloud==0.2.0
+ # homeassistant.components.airtouch4
+ airtouch4pyapi==1.0.5
+ 
++# homeassistant.components.airtouch5
++airtouch5py==0.2.8
++
+ # homeassistant.components.alpha_vantage
+ alpha-vantage==2.3.1
+ 
+diff --git a/requirements_test_all.txt b/requirements_test_all.txt
+index 111a4a7d8ab..109c9c758ba 100644
+--- a/requirements_test_all.txt
++++ b/requirements_test_all.txt
+@@ -388,6 +388,9 @@ airthings-cloud==0.2.0
+ # homeassistant.components.airtouch4
+ airtouch4pyapi==1.0.5
+ 
++# homeassistant.components.airtouch5
++airtouch5py==0.2.8
++
+ # homeassistant.components.amberelectric
+ amberelectric==1.0.4
+ 
+diff --git a/tests/components/airtouch5/__init__.py b/tests/components/airtouch5/__init__.py
+new file mode 100644
+index 00000000000..2b76786e7e5
+--- /dev/null
++++ b/tests/components/airtouch5/__init__.py
+@@ -0,0 +1 @@
++"""Tests for the Airtouch 5 integration."""
+diff --git a/tests/components/airtouch5/conftest.py b/tests/components/airtouch5/conftest.py
+new file mode 100644
+index 00000000000..836ce81301a
+--- /dev/null
++++ b/tests/components/airtouch5/conftest.py
+@@ -0,0 +1,14 @@
++"""Common fixtures for the Airtouch 5 tests."""
++from collections.abc import Generator
++from unittest.mock import AsyncMock, patch
++
++import pytest
++
++
++@pytest.fixture
++def mock_setup_entry() -> Generator[AsyncMock, None, None]:
++    """Override async_setup_entry."""
++    with patch(
++        "homeassistant.components.airtouch5.async_setup_entry", return_value=True
++    ) as mock_setup_entry:
++        yield mock_setup_entry
+diff --git a/tests/components/airtouch5/test_config_flow.py b/tests/components/airtouch5/test_config_flow.py
+new file mode 100644
+index 00000000000..4f608fd4788
+--- /dev/null
++++ b/tests/components/airtouch5/test_config_flow.py
+@@ -0,0 +1,62 @@
++"""Test the Airtouch 5 config flow."""
++from unittest.mock import AsyncMock, patch
++
++import pytest
++
++from homeassistant import config_entries
++from homeassistant.components.airtouch5.const import DOMAIN
++from homeassistant.core import HomeAssistant
++from homeassistant.data_entry_flow import FlowResultType
++
++pytestmark = pytest.mark.usefixtures("mock_setup_entry")
++
++
++async def test_success(hass: HomeAssistant, mock_setup_entry: AsyncMock) -> None:
++    """Test we get the form."""
++    result = await hass.config_entries.flow.async_init(
++        DOMAIN, context={"source": config_entries.SOURCE_USER}
++    )
++    assert result["type"] == FlowResultType.FORM
++    assert result["errors"] is None
++
++    host = "1.1.1.1"
++
++    with patch(
++        "airtouch5py.airtouch5_simple_client.Airtouch5SimpleClient.test_connection",
++        return_value=None,
++    ):
++        result2 = await hass.config_entries.flow.async_configure(
++            result["flow_id"],
++            {
++                "host": host,
++            },
++        )
++        await hass.async_block_till_done()
++
++    assert result2["type"] == FlowResultType.CREATE_ENTRY
++    assert result2["title"] == host
++    assert result2["data"] == {
++        "host": host,
++    }
++    assert len(mock_setup_entry.mock_calls) == 1
++
++
++async def test_cannot_connect(hass: HomeAssistant) -> None:
++    """Test we handle cannot connect error."""
++    result = await hass.config_entries.flow.async_init(
++        DOMAIN, context={"source": config_entries.SOURCE_USER}
++    )
++
++    with patch(
++        "airtouch5py.airtouch5_simple_client.Airtouch5SimpleClient.test_connection",
++        side_effect=Exception,
++    ):
++        result2 = await hass.config_entries.flow.async_configure(
++            result["flow_id"],
++            {
++                "host": "1.1.1.1",
++            },
++        )
++
++    assert result2["type"] == FlowResultType.FORM
++    assert result2["errors"] == {"base": "cannot_connect"}

@@ -1,0 +1,2820 @@
+commit f77c0b6c92b586e60931da62406b4c88bccd94f6
+Author: Rikki Gibson <rigibson@microsoft.com>
+Date:   Wed Apr 12 14:46:34 2023 -0700
+
+    Interceptors (#67432)
+    
+    Co-authored-by: Charles Stoner <10732005+cston@users.noreply.github.com>
+    Co-authored-by: Julien Couvreur <jcouv@users.noreply.github.com>
+
+diff --git a/docs/features/interceptors.md b/docs/features/interceptors.md
+new file mode 100644
+index 00000000000..42557fe9e99
+--- /dev/null
++++ b/docs/features/interceptors.md
+@@ -0,0 +1,175 @@
++# Interceptors
++
++## Summary
++[summary]: #summary
++
++*Interceptors* are an experimental compiler feature planned to ship in .NET 8. The feature may be subject to breaking changes or removal in a future release.
++
++An *interceptor* is a method which can declaratively substitute a call to an *interceptable* method with a call to itself at compile time. This substitution occurs by having the interceptor declare the source locations of the calls that it intercepts. This provides a limited facility to change the semantics of existing code by adding new code to a compilation (e.g. in a source generator).
++
++```cs
++using System;
++using System.Runtime.CompilerServices;
++
++var c = new C();
++c.InterceptableMethod(1); // (L1,C1): prints "interceptor 1"
++c.InterceptableMethod(1); // (L2,C2): prints "other interceptor 1"
++c.InterceptableMethod(2); // (L3,C3): prints "other interceptor 2"
++c.InterceptableMethod(1); // prints "interceptable 1"
++
++class C
++{
++    [Interceptable]
++    public void InterceptableMethod(int param)
++    {
++        Console.WriteLine($"interceptable {param}");
++    }
++}
++
++// generated code
++static class D
++{
++    [InterceptsLocation("Program.cs", line: /*L1*/, character: /*C1*/)] // refers to the call at (L1, C1)
++    public static void InterceptorMethod(this C c, int param)
++    {
++        Console.WriteLine($"interceptor {param}");
++    }
++
++    [InterceptsLocation("Program.cs", line: /*L2*/, character: /*C2*/)] // refers to the call at (L2, C2)
++    [InterceptsLocation("Program.cs", line: /*L3*/, character: /*C3*/)] // refers to the call at (L3, C3)
++    public static void OtherInterceptorMethod(this C c, int param)
++    {
++        Console.WriteLine($"other interceptor {param}");
++    }
++}
++```
++
++## Detailed design
++[design]: #detailed-design
++
++### InterceptableAttribute
++
++A method can indicate that its calls can be *intercepted* by including `[Interceptable]` on its declaration.
++
++PROTOTYPE(ic): For now, if a call is intercepted to a method which lacks this attribute, a warning is reported, and interception still occurs. This may be changed to an error in the future.
++
++```cs
++namespace System.Runtime.CompilerServices
++{
++    [AttributeUsage(AttributeTargets.Method)]
++    public sealed class InterceptableAttribute : Attribute { }
++}
++```
++
++### InterceptsLocationAttribute
++
++A method indicates that it is an *interceptor* by adding one or more `[InterceptsLocation]` attributes. These attributes refer to the source locations of the calls it intercepts.
++
++```cs
++namespace System.Runtime.CompilerServices
++{
++    [AttributeUsage(AttributeTargets.Method, AllowMultiple = true)]
++    public sealed class InterceptsLocationAttribute(string filePath, int line, int character) : Attribute
++    {
++    }
++}
++```
++
++`[InterceptsLocation]` attributes included in source are emitted to the resulting assembly, just like other custom attributes.
++
++PROTOTYPE(ic): We may want to recognize `file class InterceptsLocationAttribute` as a valid declaration of the attribute, to allow generators to bring the attribute in without conflicting with other generators which may also be bringing the attribute in. See open question in [User opt-in](#user-opt-in).
++
++#### File paths
++
++File paths used in `[InterceptsLocation]` must exactly match the paths on the syntax trees they refer to by ordinal comparison. `SyntaxTree.FilePath` has already applied `/pathmap` substitution, so the paths used in the attribute will be less environment-specific in many projects.
++
++The compiler does not map `#line` directives when determining if an `[InterceptsLocation]` attribute intercepts a particular call in syntax.
++
++PROTOTYPE(ic): editorconfig support matches paths in cross-platform fashion (e.g. normalizing slashes). We should revisit how that works and consider if the same matching strategy should be used instead of ordinal comparison.
++
++#### Position
++
++Line and column numbers in `[InterceptsLocation]` are 1-indexed to match existing places where source locations are displayed to the user. For example, in `Diagnostic.ToString`.
++
++The location of the call is the location of the simple name syntax which denotes the interceptable method. For example, in `app.MapGet(...)`, the name syntax for `MapGet` would be considered the location of the call. For a static method call like `System.Console.WriteLine(...)`, the name syntax for `WriteLine` is the location of the call. If we allow intercepting calls to property accessors in the future (e.g `obj.Property`), we would also be able to use the name syntax in this way.
++
++#### Attribute creation
++
++The goal of the above decisions is to make it so that when source generators are filling in `[InterceptsLocation(...)]`, they simply need to read `nameSyntax.SyntaxTree.FilePath` and `nameSyntax.GetLineSpan().Span.Start` for the exact file path and position information they need to use.
++
++We should provide samples of recommended coding patterns for generator authors to show correct usage of these, including the "translation" from 0-indexed to 1-indexed positions.
++
++### Non-invocation method usages
++
++Conversion to delegate type, address-of, etc. usages of methods cannot be intercepted.
++
++Interception can only occur for calls to ordinary member methods--not constructors, delegates, properties, local functions, operators, etc. Support for more member kinds may be added in the future.
++
++### Arity
++
++Interceptors cannot have type parameters or be declared in generic types at any level of nesting.
++
++### Signature matching
++
++PROTOTYPE(ic): It is suggested to permit nullability differences and other comparable differences. Perhaps we can revisit the matching requirements of "partial methods" and imitate them here.
++
++When a call is intercepted, the interceptor and interceptable methods must meet the signature matching requirements detailed below:
++- When an interceptable instance method is compared to a classic extension method, we use the extension method in reduced form for comparison. The extension method parameter with the `this` modifier is compared to the instance method `this` parameter.
++- The returns and parameters, including the `this` parameter, must have the same ref kinds and types, except that reference types with oblivious nullability can match either annotated or unannotated reference types.
++- Method names and parameter names are not required to match.
++- Parameter default values are not required to match. When intercepting, default values on the interceptor method are ignored.
++- `params` modifiers are not required to match.
++- `scoped` modifiers and `[UnscopedRef]` must be equivalent.
++- In general, attributes which normally affect the behavior of the call site, such as `[CallerLineNumber]` are ignored on the interceptor of an intercepted call.
++  - The only exception to this is when the attribute affects "capabilities" of the method in a way that affects safety, such as with `[UnscopedRef]`. In this case, attributes are required to match across interceptable and interceptor methods.
++
++Arity does not need to match between intercepted and interceptor methods. In other words, it is permitted to intercept a generic method with a non-generic interceptor.
++
++### Conflicting interceptors
++
++If more than one interceptor refers to the same location, it is a compile-time error.
++
++If an `[InterceptsLocation]` attribute is found in the compilation which does not refer to the location of an explicit method call, it is a compile-time error.
++
++### Interceptor accessibility
++
++An interceptor must be accessible at the location where interception is occurring. PROTOTYPE(ic): This enforcement is not yet implemented.
++
++An interceptor contained in a file-local type is permitted to intercept a call in another file, even though the interceptor is not normally *visible* at the call site.
++
++This allows generator authors to avoid *polluting lookup* with interceptors, helps avoid name conflicts, and prevents use of interceptors in *unintended positions* from the interceptor author's point-of-view.
++
++We may also want to consider adjusting behavior of `[EditorBrowsable]` to work in the same compilation.
++
++### Editor experience
++
++Interceptors are treated like a post-compilation step in this design. Diagnostics are given for misuse of interceptors, but some diagnostics are only given in the command-line build and not in the IDE. There is limited traceability in the editor for which calls in a compilation are actually being intercepted. If this feature is brought forward past the experimental stage, this limitation will need to be re-examined.
++
++### User opt-in
++
++Although interceptors are an experimental feature, there will be no explicit opt-in step needed to use them. We won't publicize the feature (e.g. in blog posts) as something generator authors should onboard to in .NET 8.
++
++PROTOTYPE(ic): The BCL might not ship the attributes required by this feature, instead requiring them to be declared in some library brought in by a package reference, or in the user's project. But we haven't confirmed this.
++
++### Implementation strategy
++
++During the binding phase, `InterceptsLocationAttribute` usages are decoded and the related data for each usage are collected in a `ConcurrentSet` on the compilation:
++- intercepted file-path and location
++- attribute location
++- attributed method symbol
++PROTOTYPE(ic): the exact collection used to collect the attribute usages, and the exact way it is used, are not finalized. The main concern is to ensure we can scale to large numbers of interceptors without issue, and that we can report diagnostics for duplicate interception of the same location in a deterministic way.
++
++At this time, diagnostics are reported for the following conditions:
++- problems specific to the attributed interceptor method itself, for example, that it is not an ordinary method.
++- syntactic problems specific to the referenced location, for example, that it does not refer to an applicable simple name as defined in [Position](#position) subsection.
++
++During the lowering phase, when a given `BoundCall` is lowered:
++- we check if its syntax contains an applicable simple name
++- if so, we lookup whether it is being intercepted, based on data about `InterceptsLocationAttribute` collected during the binding phase.
++- if it is being intercepted, we perform an additional step after lowering of the receiver and arguments is completed:
++  - substitute the interceptable method with the interceptor method on the `BoundCall`.
++  - if the interceptor is a classic extension method, and the interceptable method is an instance method, we adjust the `BoundCall` to use the receiver as the first argument of the call, "pushing" the other arguments forward, similar to the way it would have bound if the original call were to an extension method in reduced form.
++
++At this time, diagnostics are reported for the following conditions:
++- incompatibility between the interceptor and interceptable methods, for example, in their signatures.
++- *duplicate* `[InterceptsLocation]`, that is, multiple interceptors which intercept the same call. PROTOTYPE(ic): not yet implemented.
+diff --git a/src/Compilers/CSharp/Portable/BoundTree/BoundExpression.cs b/src/Compilers/CSharp/Portable/BoundTree/BoundExpression.cs
+index 320953b548a..54a3d553ba5 100644
+--- a/src/Compilers/CSharp/Portable/BoundTree/BoundExpression.cs
++++ b/src/Compilers/CSharp/Portable/BoundTree/BoundExpression.cs
+@@ -5,6 +5,7 @@
+ using System.Collections.Immutable;
+ using System.Diagnostics;
+ using Microsoft.CodeAnalysis.CSharp.Symbols;
++using Microsoft.CodeAnalysis.CSharp.Syntax;
+ using Roslyn.Utilities;
+ using System;
+ 
+@@ -238,6 +239,29 @@ namespace Microsoft.CodeAnalysis.CSharp
+                 return this.Method;
+             }
+         }
++
++        public Location? InterceptableLocation
++        {
++            get
++            {
++                if (this.WasCompilerGenerated || this.Syntax is not InvocationExpressionSyntax syntax)
++                {
++                    return null;
++                }
++
++                // If a qualified name is used as a valid receiver of an invocation syntax at some point,
++                // we probably want to treat it similarly to a MemberAccessExpression.
++                // However, we don't expect to encounter it.
++                Debug.Assert(syntax.Expression is not QualifiedNameSyntax);
++
++                return syntax.Expression switch
++                {
++                    MemberAccessExpressionSyntax memberAccess => memberAccess.Name.Location,
++                    SimpleNameSyntax name => name.Location,
++                    _ => null
++                };
++            }
++        }
+     }
+ 
+     internal partial class BoundTypeExpression
+diff --git a/src/Compilers/CSharp/Portable/CSharpResources.resx b/src/Compilers/CSharp/Portable/CSharpResources.resx
+index 17f53721302..3a755724710 100644
+--- a/src/Compilers/CSharp/Portable/CSharpResources.resx
++++ b/src/Compilers/CSharp/Portable/CSharpResources.resx
+@@ -7505,4 +7505,55 @@ To remove the warning, you can use /reference instead (set the Embed Interop Typ
+   <data name="ERR_BadCaseInSwitchArm" xml:space="preserve">
+     <value>A switch expression arm does not begin with a 'case' keyword.</value>
+   </data>
++  <data name="WRN_CallNotInterceptable" xml:space="preserve">
++    <value>Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</value>
++  </data>
++  <data name="WRN_CallNotInterceptable_Title" xml:space="preserve">
++    <value>Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</value>
++  </data>
++  <data name="ERR_InterceptorCannotBeGeneric" xml:space="preserve">
++    <value>Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</value>
++  </data>
++  <data name="ERR_InterceptorPathNotInCompilation" xml:space="preserve">
++    <value>Cannot intercept: compilation does not contain a file with path '{0}'.</value>
++  </data>
++  <data name="ERR_InterceptorPathNotInCompilationWithCandidate" xml:space="preserve">
++    <value>Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</value>
++  </data>
++  <data name="ERR_InterceptorLineOutOfRange" xml:space="preserve">
++    <value>The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</value>
++  </data>
++  <data name="ERR_InterceptorCharacterOutOfRange" xml:space="preserve">
++    <value>The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</value>
++  </data>
++  <data name="ERR_InterceptorPositionBadToken" xml:space="preserve">
++    <value>The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</value>
++  </data>
++  <data name="ERR_InterceptorMustReferToStartOfTokenPosition" xml:space="preserve">
++    <value>The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</value>
++  </data>
++  <data name="ERR_InterceptorSignatureMismatch" xml:space="preserve">
++    <value>Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</value>
++  </data>
++  <data name="ERR_InterceptableMethodMustBeOrdinary" xml:space="preserve">
++    <value>An interceptable method must be an ordinary member method.</value>
++  </data>
++  <data name="ERR_InterceptorMethodMustBeOrdinary" xml:space="preserve">
++    <value>An interceptor method must be an ordinary member method.</value>
++  </data>
++  <data name="ERR_InterceptorMustHaveMatchingThisParameter" xml:space="preserve">
++    <value>Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</value>
++  </data>
++  <data name="ERR_InterceptorMustNotHaveThisParameter" xml:space="preserve">
++    <value>Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</value>
++  </data>
++  <data name="ERR_InterceptorFilePathCannotBeNull" xml:space="preserve">
++    <value>Interceptor cannot have a 'null' file path.</value>
++  </data>
++  <data name="ERR_InterceptorNameNotInvoked" xml:space="preserve">
++    <value>Possible method name '{0}' cannot be intercepted because it is not being invoked.</value>
++  </data>
++  <data name="ERR_InterceptorNonUniquePath" xml:space="preserve">
++    <value>Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</value>
++  </data>
+ </root>
+\ No newline at end of file
+diff --git a/src/Compilers/CSharp/Portable/Compilation/CSharpCompilation.cs b/src/Compilers/CSharp/Portable/Compilation/CSharpCompilation.cs
+index 739cf2884f8..1e6ecbbc628 100644
+--- a/src/Compilers/CSharp/Portable/Compilation/CSharpCompilation.cs
++++ b/src/Compilers/CSharp/Portable/Compilation/CSharpCompilation.cs
+@@ -2247,6 +2247,44 @@ namespace Microsoft.CodeAnalysis.CSharp
+             LazyInitializer.EnsureInitialized(ref _moduleInitializerMethods).Add(method);
+         }
+ 
++        private ConcurrentSet<(InterceptsLocationAttributeData, MethodSymbol)>? _interceptions;
++
++        internal void AddInterception(InterceptsLocationAttributeData location, MethodSymbol interceptor)
++        {
++            Debug.Assert(!_declarationDiagnosticsFrozen);
++            LazyInitializer.EnsureInitialized(ref _interceptions).Add((location, interceptor));
++        }
++
++        internal (InterceptsLocationAttributeData data, MethodSymbol interceptor)? GetInterceptor(Location? callLocation)
++        {
++            if (_interceptions is null || callLocation is null)
++            {
++                return null;
++            }
++
++            var sourceTree = callLocation.SourceTree;
++            Debug.Assert(sourceTree is not null);
++            var callLineColumn = callLocation.GetLineSpan().Span.Start;
++            foreach (var (interceptsLocation, interceptor) in _interceptions)
++            {
++                if (interceptsLocation.FilePath == sourceTree.FilePath
++                    && interceptsLocation.Line == callLineColumn.Line
++                    && interceptsLocation.Character == callLineColumn.Character)
++                {
++                    return (interceptsLocation, interceptor);
++                }
++            }
++
++            return null;
++        }
++
++        private void BuildInterceptionsMap()
++        {
++            // PROTOTYPE(ic): build a map where we can quickly lookup with a location and get a symbol.
++            // At this time, should report any duplicate interception diagnostics.
++            // NB: the attribute which appears lexically first wins a tie. Subsequent attributes referring to same location result in errors.
++        }
++
+         #endregion
+ 
+         #region Binding
+@@ -3237,6 +3275,8 @@ namespace Microsoft.CodeAnalysis.CSharp
+                     return false;
+                 }
+ 
++                BuildInterceptionsMap();
++
+                 // Perform initial bind of method bodies in spite of earlier errors. This is the same
+                 // behavior as when calling GetDiagnostics()
+ 
+diff --git a/src/Compilers/CSharp/Portable/Errors/ErrorCode.cs b/src/Compilers/CSharp/Portable/Errors/ErrorCode.cs
+index 0873da3121c..a60815d88e5 100644
+--- a/src/Compilers/CSharp/Portable/Errors/ErrorCode.cs
++++ b/src/Compilers/CSharp/Portable/Errors/ErrorCode.cs
+@@ -2189,6 +2189,24 @@ namespace Microsoft.CodeAnalysis.CSharp
+         ERR_BadStaticAfterUnsafe = 9133,
+ 
+         ERR_BadCaseInSwitchArm = 9134,
++
++        // PROTOTYPE(ic): pack errors
++        WRN_CallNotInterceptable = 27000,
++        ERR_InterceptorCannotBeGeneric = 27001,
++        ERR_InterceptorPathNotInCompilation = 27002,
++        ERR_InterceptorPathNotInCompilationWithCandidate = 27003,
++        ERR_InterceptorPositionBadToken = 27004,
++        ERR_InterceptorLineOutOfRange = 27005,
++        ERR_InterceptorCharacterOutOfRange = 27006,
++        ERR_InterceptorSignatureMismatch = 27007,
++        ERR_InterceptableMethodMustBeOrdinary = 27008,
++        ERR_InterceptorMethodMustBeOrdinary = 27009,
++        ERR_InterceptorMustReferToStartOfTokenPosition = 27010,
++        ERR_InterceptorMustHaveMatchingThisParameter = 27011,
++        ERR_InterceptorMustNotHaveThisParameter = 27012,
++        ERR_InterceptorFilePathCannotBeNull = 27013,
++        ERR_InterceptorNameNotInvoked = 27014,
++        ERR_InterceptorNonUniquePath = 27015,
+         #endregion
+ 
+         // Note: you will need to do the following after adding warnings:
+diff --git a/src/Compilers/CSharp/Portable/Errors/ErrorFacts.cs b/src/Compilers/CSharp/Portable/Errors/ErrorFacts.cs
+index d322bbe83d2..b8e3a06dd5a 100644
+--- a/src/Compilers/CSharp/Portable/Errors/ErrorFacts.cs
++++ b/src/Compilers/CSharp/Portable/Errors/ErrorFacts.cs
+@@ -530,6 +530,7 @@ namespace Microsoft.CodeAnalysis.CSharp
+                 case ErrorCode.WRN_ParamsArrayInLambdaOnly:
+                 case ErrorCode.WRN_CapturedPrimaryConstructorParameterPassedToBase:
+                 case ErrorCode.WRN_UnreadPrimaryConstructorParameter:
++                case ErrorCode.WRN_CallNotInterceptable:
+                     return 1;
+                 default:
+                     return 0;
+@@ -579,6 +580,10 @@ namespace Microsoft.CodeAnalysis.CSharp
+                 case ErrorCode.ERR_EncUpdateFailedDelegateTypeChanged:
+                 case ErrorCode.ERR_CannotBeConvertedToUtf8:
+                 case ErrorCode.ERR_FileTypeNonUniquePath:
++                case ErrorCode.WRN_CallNotInterceptable:
++                case ErrorCode.ERR_InterceptorSignatureMismatch:
++                case ErrorCode.ERR_InterceptorMustHaveMatchingThisParameter:
++                case ErrorCode.ERR_InterceptorMustNotHaveThisParameter:
+                     // Update src\EditorFeatures\CSharp\LanguageServer\CSharpLspBuildOnlyDiagnostics.cs
+                     // whenever new values are added here.
+                     return true;
+@@ -2309,6 +2314,18 @@ namespace Microsoft.CodeAnalysis.CSharp
+                 case ErrorCode.ERR_BadNullableReferenceTypeInUsingAlias:
+                 case ErrorCode.ERR_BadStaticAfterUnsafe:
+                 case ErrorCode.ERR_BadCaseInSwitchArm:
++                case ErrorCode.ERR_InterceptorCannotBeGeneric:
++                case ErrorCode.ERR_InterceptorPathNotInCompilation:
++                case ErrorCode.ERR_InterceptorPathNotInCompilationWithCandidate:
++                case ErrorCode.ERR_InterceptorPositionBadToken:
++                case ErrorCode.ERR_InterceptorLineOutOfRange:
++                case ErrorCode.ERR_InterceptorCharacterOutOfRange:
++                case ErrorCode.ERR_InterceptableMethodMustBeOrdinary:
++                case ErrorCode.ERR_InterceptorMethodMustBeOrdinary:
++                case ErrorCode.ERR_InterceptorMustReferToStartOfTokenPosition:
++                case ErrorCode.ERR_InterceptorFilePathCannotBeNull:
++                case ErrorCode.ERR_InterceptorNameNotInvoked:
++                case ErrorCode.ERR_InterceptorNonUniquePath:
+                     return false;
+                 default:
+                     // NOTE: All error codes must be explicitly handled in this switch statement
+diff --git a/src/Compilers/CSharp/Portable/Lowering/LocalRewriter/LocalRewriter_Call.cs b/src/Compilers/CSharp/Portable/Lowering/LocalRewriter/LocalRewriter_Call.cs
+index 0e683f5ac78..092b989bdbf 100644
+--- a/src/Compilers/CSharp/Portable/Lowering/LocalRewriter/LocalRewriter_Call.cs
++++ b/src/Compilers/CSharp/Portable/Lowering/LocalRewriter/LocalRewriter_Call.cs
+@@ -133,38 +133,131 @@ namespace Microsoft.CodeAnalysis.CSharp
+             }
+         }
+ 
++        private void InterceptCallAndAdjustArguments(
++            ref MethodSymbol method,
++            ref BoundExpression? receiverOpt,
++            ref ImmutableArray<BoundExpression> arguments,
++            ref ImmutableArray<RefKind> argumentRefKindsOpt,
++            ref bool invokedAsExtensionMethod,
++            Location? interceptableLocation)
++        {
++            // PROTOTYPE(ic):
++            // Add assertions for the possible shapes of calls which could come through this method.
++            // When the BoundCall shape changes in the future, force developer to decide what to do here.
++
++            // PROTOTYPE: perhaps a 'TryGet' pattern is more suitable here.
++            if (this._compilation.GetInterceptor(interceptableLocation) is not var (interceptsLocationAttributeData, interceptor))
++            {
++                // The call was not intercepted.
++                return;
++            }
++
++            Debug.Assert(interceptableLocation != null);
++            if (!method.IsInterceptable)
++            {
++                // PROTOTYPE(ic): it was speculated that we could avoid work if we know the current method is not interceptable.
++                // i.e. use this as an early out before even calling Compilation.GetInterceptor.
++                // But by calling 'GetInterceptor' before this, we don't really avoid that work. Is that fine?
++                // PROTOTYPE(ic): eventually we probably want this to be an error but for now it's convenient to just warn
++                // so we can experiment with intercepting APIs that haven't yet been marked.
++                this._diagnostics.Add(ErrorCode.WRN_CallNotInterceptable, interceptsLocationAttributeData.AttributeLocation, method);
++            }
++
++            Debug.Assert(interceptor.Arity == 0);
++
++            // When the original call is to an instance method, and the interceptor is an extension method,
++            // we need to take special care to intercept with the extension method as though it is being called in reduced form.
++            Debug.Assert(receiverOpt is not BoundTypeExpression || method.IsStatic);
++            var needToReduce = receiverOpt is not (null or BoundTypeExpression) && interceptor.IsExtensionMethod;
++            var symbolForCompare = needToReduce ? ReducedExtensionMethodSymbol.Create(interceptor, receiverOpt!.Type, _compilation) : interceptor;
++            if (!MemberSignatureComparer.InterceptorsComparer.Equals(method, symbolForCompare)) // PROTOTYPE(ic): also checked for 'scoped'/'[UnscopedRef]' differences
++            {
++                this._diagnostics.Add(ErrorCode.ERR_InterceptorSignatureMismatch, interceptableLocation, method, interceptor);
++                return;
++            }
++
++            // PROTOTYPE(ic): should we also reduce both methods if 'method' is being called as an extension method?
++
++            method.TryGetThisParameter(out var methodThisParameter);
++            symbolForCompare.TryGetThisParameter(out var interceptorThisParameterForCompare);
++            switch (methodThisParameter, interceptorThisParameterForCompare)
++            {
++                case (not null, null):
++                case (not null, not null) when !methodThisParameter.Type.Equals(interceptorThisParameterForCompare.Type, TypeCompareKind.ObliviousNullableModifierMatchesAny)
++                        || methodThisParameter.RefKind != interceptorThisParameterForCompare.RefKind: // PROTOTYPE(ic): and ref custom modifiers are equal?
++                    this._diagnostics.Add(ErrorCode.ERR_InterceptorMustHaveMatchingThisParameter, interceptsLocationAttributeData.AttributeLocation, methodThisParameter, method);
++                    break;
++                case (null, not null):
++                    this._diagnostics.Add(ErrorCode.ERR_InterceptorMustNotHaveThisParameter, interceptsLocationAttributeData.AttributeLocation, method);
++                    break;
++                default:
++                    break;
++            }
++
++            if (needToReduce)
++            {
++                Debug.Assert(methodThisParameter is not null);
++                arguments = arguments.Insert(0, receiverOpt!);
++                receiverOpt = null;
++
++                // CodeGenerator.EmitArguments requires that we have a fully-filled-out argumentRefKindsOpt for any ref/in/out arguments.
++                var thisRefKind = methodThisParameter.RefKind;
++                if (argumentRefKindsOpt.IsDefault && thisRefKind != RefKind.None)
++                {
++                    argumentRefKindsOpt = method.Parameters.SelectAsArray(static param => param.RefKind);
++                }
++
++                if (!argumentRefKindsOpt.IsDefault)
++                {
++                    argumentRefKindsOpt = argumentRefKindsOpt.Insert(0, thisRefKind);
++                }
++
++                // PROTOTYPE(ic): search for a scenario where propagating this value matters
++                invokedAsExtensionMethod = true;
++            }
++
++            method = interceptor;
++
++            return;
++        }
++
+         public override BoundNode VisitCall(BoundCall node)
+         {
+             Debug.Assert(node != null);
+ 
++            MethodSymbol method = node.Method;
++            ImmutableArray<int> argsToParamsOpt = node.ArgsToParamsOpt;
++            ImmutableArray<RefKind> argRefKindsOpt = node.ArgumentRefKindsOpt;
++            bool invokedAsExtensionMethod = node.InvokedAsExtensionMethod;
++
+             // Rewrite the receiver
+             BoundExpression? rewrittenReceiver = VisitExpression(node.ReceiverOpt);
+-            var argRefKindsOpt = node.ArgumentRefKindsOpt;
+ 
+             ArrayBuilder<LocalSymbol>? temps = null;
+             var rewrittenArguments = VisitArgumentsAndCaptureReceiverIfNeeded(
+                 ref rewrittenReceiver,
+                 captureReceiverMode: ReceiverCaptureMode.Default,
+                 node.Arguments,
+-                node.Method,
+-                node.ArgsToParamsOpt,
++                method,
++                argsToParamsOpt,
+                 argRefKindsOpt,
+                 storesOpt: null,
+                 ref temps);
+ 
+-            var rewrittenCall = MakeArgumentsAndCall(
+-                syntax: node.Syntax,
+-                rewrittenReceiver: rewrittenReceiver,
+-                method: node.Method,
+-                arguments: rewrittenArguments,
+-                argumentRefKindsOpt: argRefKindsOpt,
+-                expanded: node.Expanded,
+-                invokedAsExtensionMethod: node.InvokedAsExtensionMethod,
+-                argsToParamsOpt: node.ArgsToParamsOpt,
+-                resultKind: node.ResultKind,
+-                type: node.Type,
+-                temps,
+-                nodeOpt: node);
++            rewrittenArguments = MakeArguments(
++                node.Syntax,
++                rewrittenArguments,
++                method,
++                node.Expanded, // PROTOTYPE(ic): params differences shouldn't matter--maybe even make it an error--but we need to test
++                argsToParamsOpt,
++                ref argRefKindsOpt,
++                ref temps,
++                invokedAsExtensionMethod);
++
++            InterceptCallAndAdjustArguments(ref method, ref rewrittenReceiver, ref rewrittenArguments, ref argRefKindsOpt, ref invokedAsExtensionMethod, node.InterceptableLocation);
++
++            // PROTOTYPE(ic): intercept with object.ReferenceEquals?
++            var rewrittenCall = MakeCall(node, node.Syntax, rewrittenReceiver, method, rewrittenArguments, argRefKindsOpt, invokedAsExtensionMethod, node.ResultKind, node.Type, temps.ToImmutableAndFree());
+ 
+             if (Instrument)
+             {
+diff --git a/src/Compilers/CSharp/Portable/Symbols/Attributes/InterceptsLocationAttributeData.cs b/src/Compilers/CSharp/Portable/Symbols/Attributes/InterceptsLocationAttributeData.cs
+new file mode 100644
+index 00000000000..746dbdea4d7
+--- /dev/null
++++ b/src/Compilers/CSharp/Portable/Symbols/Attributes/InterceptsLocationAttributeData.cs
+@@ -0,0 +1,14 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++// See the LICENSE file in the project root for more information.
++
++namespace Microsoft.CodeAnalysis.CSharp
++{
++    /// <summary>
++    /// Information decoded from InterceptsLocationAttribute.
++    /// </summary>
++    /// <param name="Line">The 0-indexed line number.</param>
++    /// <param name="Character">The 0-indexed character number.</param>
++    // PROTOTYPE(ic): move away from records
++    internal sealed record InterceptsLocationAttributeData(string FilePath, int Line, int Character, Location AttributeLocation);
++}
+diff --git a/src/Compilers/CSharp/Portable/Symbols/Attributes/WellKnownAttributeData/MethodWellKnownAttributeData.cs b/src/Compilers/CSharp/Portable/Symbols/Attributes/WellKnownAttributeData/MethodWellKnownAttributeData.cs
+index e95f295b21e..f2a1894a2df 100644
+--- a/src/Compilers/CSharp/Portable/Symbols/Attributes/WellKnownAttributeData/MethodWellKnownAttributeData.cs
++++ b/src/Compilers/CSharp/Portable/Symbols/Attributes/WellKnownAttributeData/MethodWellKnownAttributeData.cs
+@@ -149,5 +149,21 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+                 SetDataStored();
+             }
+         }
++
++        private bool _hasInterceptableAttribute;
++        public bool HasInterceptableAttribute
++        {
++            get
++            {
++                VerifySealed(expected: true);
++                return _hasInterceptableAttribute;
++            }
++            set
++            {
++                VerifySealed(expected: false);
++                _hasInterceptableAttribute = value;
++                SetDataStored();
++            }
++        }
+     }
+ }
+diff --git a/src/Compilers/CSharp/Portable/Symbols/ErrorMethodSymbol.cs b/src/Compilers/CSharp/Portable/Symbols/ErrorMethodSymbol.cs
+index 595fbd42117..ef7005725a1 100644
+--- a/src/Compilers/CSharp/Portable/Symbols/ErrorMethodSymbol.cs
++++ b/src/Compilers/CSharp/Portable/Symbols/ErrorMethodSymbol.cs
+@@ -276,6 +276,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+ 
+         internal sealed override bool IsNullableAnalysisEnabled() => false;
+ 
++        internal override bool IsInterceptable => false;
++
+         protected override bool HasSetsRequiredMembersImpl
+         {
+             get
+diff --git a/src/Compilers/CSharp/Portable/Symbols/FunctionPointers/FunctionPointerMethodSymbol.cs b/src/Compilers/CSharp/Portable/Symbols/FunctionPointers/FunctionPointerMethodSymbol.cs
+index 71dffbb25d3..6b455b053ec 100644
+--- a/src/Compilers/CSharp/Portable/Symbols/FunctionPointers/FunctionPointerMethodSymbol.cs
++++ b/src/Compilers/CSharp/Portable/Symbols/FunctionPointers/FunctionPointerMethodSymbol.cs
+@@ -831,6 +831,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+         public override FlowAnalysisAnnotations FlowAnalysisAnnotations => FlowAnalysisAnnotations.None;
+         internal override bool IsMetadataNewSlot(bool ignoreInterfaceImplementationChanges = false) => false;
+         internal override bool IsMetadataVirtual(bool ignoreInterfaceImplementationChanges = false) => false;
++        internal sealed override bool IsInterceptable => false;
+         internal sealed override UnmanagedCallersOnlyAttributeData? GetUnmanagedCallersOnlyAttributeData(bool forceComplete) => null;
+ 
+         internal override bool GenerateDebugInfo => throw ExceptionUtilities.Unreachable();
+diff --git a/src/Compilers/CSharp/Portable/Symbols/MemberSignatureComparer.cs b/src/Compilers/CSharp/Portable/Symbols/MemberSignatureComparer.cs
+index 7868ec31152..ece99c14d63 100644
+--- a/src/Compilers/CSharp/Portable/Symbols/MemberSignatureComparer.cs
++++ b/src/Compilers/CSharp/Portable/Symbols/MemberSignatureComparer.cs
+@@ -128,6 +128,20 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+             considerRefKindDifferences: true,
+             typeComparison: TypeCompareKind.AllIgnoreOptions);
+ 
++        /// <summary>
++        /// This instance is used to determine if an interceptor can be applied to an interceptable method.
++        /// NB: when a classic extension method is intercepting an instance method call, a normalization to 'ReducedExtensionMethodSymbol' must be performed first.
++        /// </summary>
++        public static readonly MemberSignatureComparer InterceptorsComparer = new MemberSignatureComparer(
++            considerName: false,
++            considerExplicitlyImplementedInterfaces: false,
++            considerReturnType: true,
++            considerTypeConstraints: false,
++            considerCallingConvention: false,
++            considerRefKindDifferences: true,
++            considerArity: false,
++            typeComparison: TypeCompareKind.ObliviousNullableModifierMatchesAny);
++
+         /// <summary>
+         /// This instance is used to determine if a partial method implementation matches the definition,
+         /// including differences ignored by the runtime.
+@@ -336,6 +350,9 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+         // Compare the type constraints
+         private readonly bool _considerTypeConstraints;
+ 
++        // Compare the arity (type parameter count)
++        private readonly bool _considerArity;
++
+         // Compare the full calling conventions.  Still compares varargs if false.
+         private readonly bool _considerCallingConvention;
+ 
+@@ -352,9 +369,11 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+             bool considerTypeConstraints,
+             bool considerCallingConvention,
+             bool considerRefKindDifferences,
++            bool considerArity = true, // PROTOTYPE(ic): remove default value?
+             TypeCompareKind typeComparison = TypeCompareKind.IgnoreDynamic | TypeCompareKind.IgnoreNativeIntegers)
+         {
+             Debug.Assert(!considerExplicitlyImplementedInterfaces || considerName, "Doesn't make sense to consider interfaces separately from name.");
++            Debug.Assert(!considerTypeConstraints || considerArity, "If you consider type constraints, you must also consider arity");
+ 
+             _considerName = considerName;
+             _considerExplicitlyImplementedInterfaces = considerExplicitlyImplementedInterfaces;
+@@ -362,6 +381,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+             _considerTypeConstraints = considerTypeConstraints;
+             _considerCallingConvention = considerCallingConvention;
+             _considerRefKindDifferences = considerRefKindDifferences;
++            _considerArity = considerArity;
+             _typeComparison = typeComparison;
+             Debug.Assert((_typeComparison & TypeCompareKind.FunctionPointerRefMatchesOutInRefReadonly) == 0,
+                          $"Rely on the {nameof(considerRefKindDifferences)} flag to set this to ensure all cases are handled.");
+@@ -404,9 +424,12 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+ 
+             // NB: up to, and including, this check, we have not actually forced the (type) parameters
+             // to be expanded - we're only using the counts.
+-            int arity = member1.GetMemberArity();
+-            if ((arity != member2.GetMemberArity()) ||
+-                (member1.GetParameterCount() != member2.GetParameterCount()))
++            if (_considerArity && (member1.GetMemberArity() != member2.GetMemberArity()))
++            {
++                return false;
++            }
++
++            if (member1.GetParameterCount() != member2.GetParameterCount())
+             {
+                 return false;
+             }
+diff --git a/src/Compilers/CSharp/Portable/Symbols/Metadata/PE/PEMethodSymbol.cs b/src/Compilers/CSharp/Portable/Symbols/Metadata/PE/PEMethodSymbol.cs
+index 6bd5fe8a05b..67a870903fa 100644
+--- a/src/Compilers/CSharp/Portable/Symbols/Metadata/PE/PEMethodSymbol.cs
++++ b/src/Compilers/CSharp/Portable/Symbols/Metadata/PE/PEMethodSymbol.cs
+@@ -45,10 +45,12 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols.Metadata.PE
+         // This type is used to compact many different bits of information efficiently.
+         private struct PackedFlags
+         {
+-            // We currently pack everything into a 32-bit int with the following layout:
++            // We currently pack everything into a 64-bit long with the following layout:
+             //
+-            // |y|x|w|v|u|t|s|r|q|p|ooo|n|m|l|k|j|i|h|g|f|e|d|c|b|aaaaa|
++            // |________|________|________|_______|A|z|y|x|w|v|u|t|s|r|q|p|ooo|n|m|l|k|j|i|h|g|f|e|d|c|b|aaaaa|
+             // 
++            // _ = unused
++            //
+             // a = method kind. 5 bits.
+             // b = method kind populated. 1 bit.
+             //
+@@ -76,38 +78,49 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols.Metadata.PE
+             // w = IsSetsRequiredMembersPopulated. 1 bit.
+             // x = IsUnscopedRef. 1 bit.
+             // y = IsUnscopedRefPopulated. 1 bit.
+-            // 2 bits remain for future purposes.
++            // z = IsInterceptable. 1 bit.
++            // A = IsInterceptablePopulated. 1 bit.
++            // 31 bits remain for future purposes.
++
++            // PROTOTYPE(ic): consider reverting back to 'int' for these flags.
++            // - There may not be a need to cache 'IsInterceptable' on the symbol. We could just look it up from attributes each time.
++            //   Since the number of calls which are intercepted is relatively small, this may be a negligible additional cost.
++            // - Otherwise, there may be more space efficient method of storing the flags which we should be using instead.
++            //   For example, writing a byte is atomic, so if multiple *bits of information* aren't being stored independently in it,
++            //   we could store 'IsInterceptable' in a 'ThreeState' field, for example.
+ 
+             private const int MethodKindOffset = 0;
+-            private const int MethodKindMask = 0x1F;
+-
+-            private const int MethodKindIsPopulatedBit = 0x1 << 5;
+-            private const int IsExtensionMethodBit = 0x1 << 6;
+-            private const int IsExtensionMethodIsPopulatedBit = 0x1 << 7;
+-            private const int IsExplicitFinalizerOverrideBit = 0x1 << 8;
+-            private const int IsExplicitClassOverrideBit = 0x1 << 9;
+-            private const int IsExplicitOverrideIsPopulatedBit = 0x1 << 10;
+-            private const int IsObsoleteAttributePopulatedBit = 0x1 << 11;
+-            private const int IsCustomAttributesPopulatedBit = 0x1 << 12;
+-            private const int IsUseSiteDiagnosticPopulatedBit = 0x1 << 13;
+-            private const int IsConditionalPopulatedBit = 0x1 << 14;
+-            private const int IsOverriddenOrHiddenMembersPopulatedBit = 0x1 << 15;
+-            private const int IsReadOnlyBit = 0x1 << 16;
+-            private const int IsReadOnlyPopulatedBit = 0x1 << 17;
++            private const long MethodKindMask = 0x1F;
++
++            private const long MethodKindIsPopulatedBit = 0x1L << 5;
++            private const long IsExtensionMethodBit = 0x1L << 6;
++            private const long IsExtensionMethodIsPopulatedBit = 0x1L << 7;
++            private const long IsExplicitFinalizerOverrideBit = 0x1L << 8;
++            private const long IsExplicitClassOverrideBit = 0x1L << 9;
++            private const long IsExplicitOverrideIsPopulatedBit = 0x1L << 10;
++            private const long IsObsoleteAttributePopulatedBit = 0x1L << 11;
++            private const long IsCustomAttributesPopulatedBit = 0x1L << 12;
++            private const long IsUseSiteDiagnosticPopulatedBit = 0x1L << 13;
++            private const long IsConditionalPopulatedBit = 0x1L << 14;
++            private const long IsOverriddenOrHiddenMembersPopulatedBit = 0x1L << 15;
++            private const long IsReadOnlyBit = 0x1L << 16;
++            private const long IsReadOnlyPopulatedBit = 0x1L << 17;
+             private const int NullableContextOffset = 18;
+-            private const int NullableContextMask = 0x7;
+-            private const int DoesNotReturnBit = 0x1 << 21;
+-            private const int IsDoesNotReturnPopulatedBit = 0x1 << 22;
+-            private const int IsMemberNotNullPopulatedBit = 0x1 << 23;
+-            private const int IsInitOnlyBit = 0x1 << 24;
+-            private const int IsInitOnlyPopulatedBit = 0x1 << 25;
+-            private const int IsUnmanagedCallersOnlyAttributePopulatedBit = 0x1 << 26;
+-            private const int HasSetsRequiredMembersBit = 0x1 << 27;
+-            private const int HasSetsRequiredMembersPopulatedBit = 0x1 << 28;
+-            private const int IsUnscopedRefBit = 0x1 << 29;
+-            private const int IsUnscopedRefPopulatedBit = 0x1 << 30;
+-
+-            private int _bits;
++            private const long NullableContextMask = 0x7;
++            private const long DoesNotReturnBit = 0x1L << 21;
++            private const long IsDoesNotReturnPopulatedBit = 0x1L << 22;
++            private const long IsMemberNotNullPopulatedBit = 0x1L << 23;
++            private const long IsInitOnlyBit = 0x1L << 24;
++            private const long IsInitOnlyPopulatedBit = 0x1L << 25;
++            private const long IsUnmanagedCallersOnlyAttributePopulatedBit = 0x1L << 26;
++            private const long HasSetsRequiredMembersBit = 0x1L << 27;
++            private const long HasSetsRequiredMembersPopulatedBit = 0x1L << 28;
++            private const long IsUnscopedRefBit = 0x1L << 29;
++            private const long IsUnscopedRefPopulatedBit = 0x1L << 30;
++            private const long IsInterceptableBit = 0x1L << 31;
++            private const long IsInterceptablePopulatedBit = 0x1L << 32;
++
++            private long _bits;
+ 
+             public MethodKind MethodKind
+             {
+@@ -118,8 +131,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols.Metadata.PE
+ 
+                 set
+                 {
+-                    Debug.Assert((int)value == ((int)value & MethodKindMask));
+-                    _bits = (_bits & ~(MethodKindMask << MethodKindOffset)) | (((int)value & MethodKindMask) << MethodKindOffset) | MethodKindIsPopulatedBit;
++                    Debug.Assert((long)value == ((long)value & MethodKindMask));
++                    _bits = (_bits & ~(MethodKindMask << MethodKindOffset)) | (((long)value & MethodKindMask) << MethodKindOffset) | MethodKindIsPopulatedBit;
+                 }
+             }
+ 
+@@ -146,6 +159,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols.Metadata.PE
+             public bool HasSetsRequiredMembersPopulated => (_bits & HasSetsRequiredMembersPopulatedBit) != 0;
+             public bool IsUnscopedRef => (_bits & IsUnscopedRefBit) != 0;
+             public bool IsUnscopedRefPopulated => (_bits & IsUnscopedRefPopulatedBit) != 0;
++            public bool IsInterceptable => (_bits & IsInterceptableBit) != 0;
++            public bool IsInterceptablePopulated => (_bits & IsInterceptablePopulatedBit) != 0;
+ 
+ #if DEBUG
+             static PackedFlags()
+@@ -156,36 +171,36 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols.Metadata.PE
+             }
+ #endif
+ 
+-            private static bool BitsAreUnsetOrSame(int bits, int mask)
++            private static bool BitsAreUnsetOrSame(long bits, long mask)
+             {
+                 return (bits & mask) == 0 || (bits & mask) == mask;
+             }
+ 
+             public void InitializeIsExtensionMethod(bool isExtensionMethod)
+             {
+-                int bitsToSet = (isExtensionMethod ? IsExtensionMethodBit : 0) | IsExtensionMethodIsPopulatedBit;
++                var bitsToSet = (isExtensionMethod ? IsExtensionMethodBit : 0) | IsExtensionMethodIsPopulatedBit;
+                 Debug.Assert(BitsAreUnsetOrSame(_bits, bitsToSet));
+                 ThreadSafeFlagOperations.Set(ref _bits, bitsToSet);
+             }
+ 
+             public void InitializeIsReadOnly(bool isReadOnly)
+             {
+-                int bitsToSet = (isReadOnly ? IsReadOnlyBit : 0) | IsReadOnlyPopulatedBit;
++                var bitsToSet = (isReadOnly ? IsReadOnlyBit : 0) | IsReadOnlyPopulatedBit;
+                 Debug.Assert(BitsAreUnsetOrSame(_bits, bitsToSet));
+                 ThreadSafeFlagOperations.Set(ref _bits, bitsToSet);
+             }
+ 
+             public void InitializeMethodKind(MethodKind methodKind)
+             {
+-                Debug.Assert((int)methodKind == ((int)methodKind & MethodKindMask));
+-                int bitsToSet = (((int)methodKind & MethodKindMask) << MethodKindOffset) | MethodKindIsPopulatedBit;
++                Debug.Assert((long)methodKind == ((long)methodKind & MethodKindMask));
++                var bitsToSet = (((long)methodKind & MethodKindMask) << MethodKindOffset) | MethodKindIsPopulatedBit;
+                 Debug.Assert(BitsAreUnsetOrSame(_bits, bitsToSet));
+                 ThreadSafeFlagOperations.Set(ref _bits, bitsToSet);
+             }
+ 
+             public void InitializeIsExplicitOverride(bool isExplicitFinalizerOverride, bool isExplicitClassOverride)
+             {
+-                int bitsToSet =
++                var bitsToSet =
+                     (isExplicitFinalizerOverride ? IsExplicitFinalizerOverrideBit : 0) |
+                     (isExplicitClassOverride ? IsExplicitClassOverrideBit : 0) |
+                     IsExplicitOverrideIsPopulatedBit;
+@@ -225,12 +240,12 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols.Metadata.PE
+ 
+             public bool SetNullableContext(byte? value)
+             {
+-                return ThreadSafeFlagOperations.Set(ref _bits, (((int)value.ToNullableContextFlags() & NullableContextMask) << NullableContextOffset));
++                return ThreadSafeFlagOperations.Set(ref _bits, (((long)value.ToNullableContextFlags() & NullableContextMask) << NullableContextOffset));
+             }
+ 
+             public bool InitializeDoesNotReturn(bool value)
+             {
+-                int bitsToSet = IsDoesNotReturnPopulatedBit;
++                var bitsToSet = IsDoesNotReturnPopulatedBit;
+                 if (value) bitsToSet |= DoesNotReturnBit;
+ 
+                 return ThreadSafeFlagOperations.Set(ref _bits, bitsToSet);
+@@ -243,7 +258,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols.Metadata.PE
+ 
+             public void InitializeIsInitOnly(bool isInitOnly)
+             {
+-                int bitsToSet = (isInitOnly ? IsInitOnlyBit : 0) | IsInitOnlyPopulatedBit;
++                var bitsToSet = (isInitOnly ? IsInitOnlyBit : 0) | IsInitOnlyPopulatedBit;
+                 Debug.Assert(BitsAreUnsetOrSame(_bits, bitsToSet));
+                 ThreadSafeFlagOperations.Set(ref _bits, bitsToSet);
+             }
+@@ -255,7 +270,7 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols.Metadata.PE
+ 
+             public bool InitializeSetsRequiredMembersBit(bool value)
+             {
+-                int bitsToSet = HasSetsRequiredMembersPopulatedBit;
++                var bitsToSet = HasSetsRequiredMembersPopulatedBit;
+                 if (value) bitsToSet |= HasSetsRequiredMembersBit;
+ 
+                 return ThreadSafeFlagOperations.Set(ref _bits, bitsToSet);
+@@ -263,11 +278,19 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols.Metadata.PE
+ 
+             public bool InitializeIsUnscopedRef(bool value)
+             {
+-                int bitsToSet = IsUnscopedRefPopulatedBit;
++                var bitsToSet = IsUnscopedRefPopulatedBit;
+                 if (value) bitsToSet |= IsUnscopedRefBit;
+ 
+                 return ThreadSafeFlagOperations.Set(ref _bits, bitsToSet);
+             }
++
++            public bool InitializeInterceptable(bool value)
++            {
++                var bitsToSet = IsInterceptablePopulatedBit;
++                if (value) bitsToSet |= IsInterceptableBit;
++
++                return ThreadSafeFlagOperations.Set(ref _bits, bitsToSet);
++            }
+         }
+ 
+         /// <summary>
+@@ -1649,6 +1672,21 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols.Metadata.PE
+             }
+         }
+ 
++        internal sealed override bool IsInterceptable
++        {
++            get
++            {
++                if (!_packedFlags.IsInterceptablePopulated)
++                {
++                    var moduleSymbol = _containingType.ContainingPEModule;
++                    bool interceptable = moduleSymbol.Module.HasInterceptableAttribute(_handle);
++                    _packedFlags.InitializeInterceptable(interceptable);
++                }
++
++                return _packedFlags.IsInterceptable;
++            }
++        }
++
+         internal sealed override bool UseUpdatedEscapeRules => ContainingModule.UseUpdatedEscapeRules;
+     }
+ }
+diff --git a/src/Compilers/CSharp/Portable/Symbols/MethodSymbol.cs b/src/Compilers/CSharp/Portable/Symbols/MethodSymbol.cs
+index e359a98d68f..d8fd84a9cc3 100644
+--- a/src/Compilers/CSharp/Portable/Symbols/MethodSymbol.cs
++++ b/src/Compilers/CSharp/Portable/Symbols/MethodSymbol.cs
+@@ -94,6 +94,11 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+         /// </summary>
+         internal virtual bool IsDirectlyExcludedFromCodeCoverage { get => false; }
+ 
++        /// <summary>
++        /// True if the method is annotated with the `[Interceptable]` attribute.
++        /// </summary>
++        internal abstract bool IsInterceptable { get; }
++
+         /// <summary>
+         /// If a method is annotated with `[MemberNotNull(...)]` attributes, returns the list of members
+         /// listed in those attributes.
+diff --git a/src/Compilers/CSharp/Portable/Symbols/NativeIntegerTypeSymbol.cs b/src/Compilers/CSharp/Portable/Symbols/NativeIntegerTypeSymbol.cs
+index 7a296e86a17..5b93f8268ed 100644
+--- a/src/Compilers/CSharp/Portable/Symbols/NativeIntegerTypeSymbol.cs
++++ b/src/Compilers/CSharp/Portable/Symbols/NativeIntegerTypeSymbol.cs
+@@ -349,6 +349,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+ 
+         internal override UnmanagedCallersOnlyAttributeData? GetUnmanagedCallersOnlyAttributeData(bool forceComplete) => UnderlyingMethod.GetUnmanagedCallersOnlyAttributeData(forceComplete);
+ 
++        internal override bool IsInterceptable => UnderlyingMethod.IsInterceptable;
++
+         public override Symbol? AssociatedSymbol => _associatedSymbol;
+ 
+         internal override int CalculateLocalSyntaxOffset(int localPosition, SyntaxTree localTree)
+diff --git a/src/Compilers/CSharp/Portable/Symbols/ReducedExtensionMethodSymbol.cs b/src/Compilers/CSharp/Portable/Symbols/ReducedExtensionMethodSymbol.cs
+index c59e90fd576..76cda79d142 100644
+--- a/src/Compilers/CSharp/Portable/Symbols/ReducedExtensionMethodSymbol.cs
++++ b/src/Compilers/CSharp/Portable/Symbols/ReducedExtensionMethodSymbol.cs
+@@ -530,6 +530,12 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+ 
+         internal override bool IsEffectivelyReadOnly => _reducedFrom.Parameters[0].RefKind == RefKind.In;
+ 
++        internal override bool TryGetThisParameter(out ParameterSymbol thisParameter)
++        {
++            thisParameter = _reducedFrom.Parameters[0];
++            return true;
++        }
++
+         public override ImmutableArray<MethodSymbol> ExplicitInterfaceImplementations
+         {
+             get { return ImmutableArray<MethodSymbol>.Empty; }
+@@ -574,6 +580,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+ 
+         internal override bool IsNullableAnalysisEnabled() => throw ExceptionUtilities.Unreachable();
+ 
++        internal override bool IsInterceptable => throw ExceptionUtilities.Unreachable();
++
+         public override bool Equals(Symbol obj, TypeCompareKind compareKind)
+         {
+             if ((object)this == obj) return true;
+diff --git a/src/Compilers/CSharp/Portable/Symbols/Retargeting/RetargetingMethodSymbol.cs b/src/Compilers/CSharp/Portable/Symbols/Retargeting/RetargetingMethodSymbol.cs
+index 78140610913..30d17e493ca 100644
+--- a/src/Compilers/CSharp/Portable/Symbols/Retargeting/RetargetingMethodSymbol.cs
++++ b/src/Compilers/CSharp/Portable/Symbols/Retargeting/RetargetingMethodSymbol.cs
+@@ -256,6 +256,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols.Retargeting
+             return _lazyUnmanagedAttributeData;
+         }
+ 
++        internal override bool IsInterceptable => UnderlyingMethod.IsInterceptable;
++
+         internal override bool TryGetThisParameter(out ParameterSymbol? thisParameter)
+         {
+             if (!_underlyingMethod.TryGetThisParameter(out var underlyingParameter))
+diff --git a/src/Compilers/CSharp/Portable/Symbols/SignatureOnlyMethodSymbol.cs b/src/Compilers/CSharp/Portable/Symbols/SignatureOnlyMethodSymbol.cs
+index 279464bc50d..ebd1f6e3a72 100644
+--- a/src/Compilers/CSharp/Portable/Symbols/SignatureOnlyMethodSymbol.cs
++++ b/src/Compilers/CSharp/Portable/Symbols/SignatureOnlyMethodSymbol.cs
+@@ -96,6 +96,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+ 
+         internal sealed override bool IsNullableAnalysisEnabled() => throw ExceptionUtilities.Unreachable();
+ 
++        internal sealed override bool IsInterceptable => throw ExceptionUtilities.Unreachable();
++
+         #region Not used by MethodSignatureComparer
+ 
+         internal override bool GenerateDebugInfo { get { throw ExceptionUtilities.Unreachable(); } }
+diff --git a/src/Compilers/CSharp/Portable/Symbols/Source/SourceMethodSymbolWithAttributes.cs b/src/Compilers/CSharp/Portable/Symbols/Source/SourceMethodSymbolWithAttributes.cs
+index 01864120d85..1c9b963f7ed 100644
+--- a/src/Compilers/CSharp/Portable/Symbols/Source/SourceMethodSymbolWithAttributes.cs
++++ b/src/Compilers/CSharp/Portable/Symbols/Source/SourceMethodSymbolWithAttributes.cs
+@@ -591,6 +591,19 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+                     diagnostics.Add(ErrorCode.ERR_UnscopedRefAttributeUnsupportedMemberTarget, arguments.AttributeSyntaxOpt.Location);
+                 }
+             }
++            else if (attribute.IsTargetAttribute(this, AttributeDescription.InterceptableAttribute))
++            {
++                if (MethodKind != MethodKind.Ordinary)
++                {
++                    // PROTOTYPE(ic): consider relaxing this in future.
++                    diagnostics.Add(ErrorCode.ERR_InterceptableMethodMustBeOrdinary, arguments.AttributeSyntaxOpt.Location);
++                }
++                arguments.GetOrCreateData<MethodWellKnownAttributeData>().HasInterceptableAttribute = true;
++            }
++            else if (attribute.IsTargetAttribute(this, AttributeDescription.InterceptsLocationAttribute))
++            {
++                DecodeInterceptsLocationAttribute(arguments);
++            }
+             else
+             {
+                 var compilation = this.DeclaringCompilation;
+@@ -929,6 +942,125 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+             }
+         }
+ 
++        private void DecodeInterceptsLocationAttribute(DecodeWellKnownAttributeArguments<AttributeSyntax, CSharpAttributeData, AttributeLocation> arguments)
++        {
++            Debug.Assert(arguments.AttributeSyntaxOpt is object);
++            Debug.Assert(!arguments.Attribute.HasErrors);
++            var attributeArguments = arguments.Attribute.CommonConstructorArguments;
++            if (attributeArguments is not [
++                { Type.SpecialType: SpecialType.System_String },
++                { Kind: not TypedConstantKind.Array, Value: int lineNumberOneBased },
++                { Kind: not TypedConstantKind.Array, Value: int characterNumberOneBased }])
++            {
++                // Since the attribute does not have errors (asserted above), it should be guaranteed that we have the above arguments.
++                throw ExceptionUtilities.Unreachable();
++            }
++
++            var diagnostics = (BindingDiagnosticBag)arguments.Diagnostics;
++            var attributeLocation = arguments.AttributeSyntaxOpt.Location;
++
++            var filePath = (string?)attributeArguments[0].Value;
++            if (filePath is null)
++            {
++                diagnostics.Add(ErrorCode.ERR_InterceptorFilePathCannotBeNull, attributeLocation);
++                return;
++            }
++
++            if (Arity != 0 || ContainingType.IsGenericType)
++            {
++                // PROTOTYPE(ic): for now, let's disallow type arguments on the method or containing types.
++                // eventually, we could consider doing a type argument inference, seeing if the interceptor's type constraints are met, etc...
++                // but let's not bother unless somebody actually needs it.
++                diagnostics.Add(ErrorCode.ERR_InterceptorCannotBeGeneric, attributeLocation, this);
++                return;
++            }
++
++            if (MethodKind != MethodKind.Ordinary)
++            {
++                // PROTOTYPE(ic): consider relaxing this in future.
++                diagnostics.Add(ErrorCode.ERR_InterceptorMethodMustBeOrdinary, attributeLocation);
++                return;
++            }
++
++            var syntaxTrees = DeclaringCompilation.SyntaxTrees;
++            var matchingTrees = syntaxTrees.WhereAsArray(static (tree, filePath) => tree.FilePath == filePath, filePath);
++            if (matchingTrees is [])
++            {
++                var suffixMatch = syntaxTrees.FirstOrDefault(static (tree, filePath) => tree.FilePath.EndsWith(filePath), filePath);
++                if (suffixMatch != null)
++                {
++                    diagnostics.Add(ErrorCode.ERR_InterceptorPathNotInCompilationWithCandidate, attributeLocation, filePath, suffixMatch.FilePath);
++                }
++                else
++                {
++                    diagnostics.Add(ErrorCode.ERR_InterceptorPathNotInCompilation, attributeLocation, filePath);
++                }
++
++                return;
++            }
++
++            if (matchingTrees is not [var matchingTree])
++            {
++                diagnostics.Add(ErrorCode.ERR_InterceptorNonUniquePath, attributeLocation, filePath);
++                return;
++            }
++
++            // Internally, line and character numbers are 0-indexed, but when they appear in code or diagnostic messages, they are 1-indexed.
++            // PROTOTYPE(ic): test with zero or negative display line/character numbers.
++            int lineNumberZeroBased = lineNumberOneBased - 1;
++            int characterNumberZeroBased = characterNumberOneBased - 1;
++
++            var referencedLines = matchingTree.GetText().Lines;
++            var referencedLineCount = referencedLines.Count;
++            if (lineNumberZeroBased >= referencedLineCount)
++            {
++                diagnostics.Add(ErrorCode.ERR_InterceptorLineOutOfRange, attributeLocation, referencedLineCount, lineNumberOneBased);
++                return;
++            }
++
++            var line = referencedLines[lineNumberZeroBased];
++            var lineLength = line.End - line.Start;
++            if (characterNumberZeroBased >= lineLength)
++            {
++                diagnostics.Add(ErrorCode.ERR_InterceptorCharacterOutOfRange, attributeLocation, lineLength, characterNumberOneBased);
++                return;
++            }
++
++            var referencedPosition = line.Start + characterNumberZeroBased;
++            var root = matchingTree.GetRoot();
++            var referencedToken = root.FindToken(referencedPosition);
++            switch (referencedToken)
++            {
++                case { Parent: SimpleNameSyntax { Parent: MemberAccessExpressionSyntax { Parent: InvocationExpressionSyntax } memberAccess } rhs } when memberAccess.Name == rhs:
++                case { Parent: SimpleNameSyntax { Parent: InvocationExpressionSyntax invocation } simpleName } when invocation.Expression == simpleName:
++                    // happy case
++                    break;
++                case { Parent: SimpleNameSyntax { Parent: not MemberAccessExpressionSyntax } }:
++                case { Parent: SimpleNameSyntax { Parent: MemberAccessExpressionSyntax memberAccess } rhs } when memberAccess.Name == rhs:
++                    // NB: there are all sorts of places "simple names" can appear in syntax. With these checks we are trying to
++                    // minimize confusion about why the name being used is not *interceptable*, but it's done on a best-effort basis.
++                    diagnostics.Add(ErrorCode.ERR_InterceptorNameNotInvoked, attributeLocation, referencedToken.Text);
++                    return;
++                default:
++                    diagnostics.Add(ErrorCode.ERR_InterceptorPositionBadToken, attributeLocation, referencedToken.Text);
++                    return;
++            }
++
++            // Did they actually refer to the start of the token, not the middle, or in leading trivia?
++            var tokenPositionDifference = referencedPosition - referencedToken.Span.Start;
++            if (tokenPositionDifference != 0)
++            {
++                // PROTOTYPE(ic): when a token's leading trivia spans multiple lines, this doesn't suggest a valid position.
++                diagnostics.Add(ErrorCode.ERR_InterceptorMustReferToStartOfTokenPosition, attributeLocation, referencedToken.Text, characterNumberOneBased - tokenPositionDifference);
++                return;
++            }
++
++            // PROTOTYPE(ic): The attribute should probably be expected to contain "display locations" (1-indexed) a la Diagnostic.ToString().
++            // But to do this, we would want to expose helper API for source generators, to produce "display locations" to put in the attribute.
++            // We would normalize to 0-indexed in this step. all our location-oriented complaints are made here, so we shouldn't need to convert back to "display location" after that point.
++            DeclaringCompilation.AddInterception(new InterceptsLocationAttributeData(filePath, lineNumberZeroBased, characterNumberZeroBased, attributeLocation), this);
++        }
++
+         private void DecodeUnmanagedCallersOnlyAttribute(ref DecodeWellKnownAttributeArguments<AttributeSyntax, CSharpAttributeData, AttributeLocation> arguments)
+         {
+             Debug.Assert(arguments.AttributeSyntaxOpt != null);
+@@ -1239,6 +1371,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+         internal sealed override bool IsDirectlyExcludedFromCodeCoverage =>
+             GetDecodedWellKnownAttributeData()?.HasExcludeFromCodeCoverageAttribute == true;
+ 
++        internal sealed override bool IsInterceptable => GetDecodedWellKnownAttributeData()?.HasInterceptableAttribute == true;
++
+         internal override bool RequiresSecurityObject
+         {
+             get
+diff --git a/src/Compilers/CSharp/Portable/Symbols/SubstitutedMethodSymbol.cs b/src/Compilers/CSharp/Portable/Symbols/SubstitutedMethodSymbol.cs
+index 4e21bb16912..81740b40b5c 100644
+--- a/src/Compilers/CSharp/Portable/Symbols/SubstitutedMethodSymbol.cs
++++ b/src/Compilers/CSharp/Portable/Symbols/SubstitutedMethodSymbol.cs
+@@ -215,6 +215,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+         internal sealed override UnmanagedCallersOnlyAttributeData GetUnmanagedCallersOnlyAttributeData(bool forceComplete)
+             => this.OriginalDefinition.GetUnmanagedCallersOnlyAttributeData(forceComplete);
+ 
++        internal sealed override bool IsInterceptable => UnderlyingMethod.IsInterceptable;
++
+         public sealed override Symbol AssociatedSymbol
+         {
+             get
+diff --git a/src/Compilers/CSharp/Portable/Symbols/Synthesized/SynthesizedEntryPointSymbol.cs b/src/Compilers/CSharp/Portable/Symbols/Synthesized/SynthesizedEntryPointSymbol.cs
+index e69f0c4e5eb..d0c10c5b667 100644
+--- a/src/Compilers/CSharp/Portable/Symbols/Synthesized/SynthesizedEntryPointSymbol.cs
++++ b/src/Compilers/CSharp/Portable/Symbols/Synthesized/SynthesizedEntryPointSymbol.cs
+@@ -198,6 +198,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+             get { return false; }
+         }
+ 
++        internal override bool IsInterceptable => false;
++
+         internal sealed override ObsoleteAttributeData ObsoleteAttributeData
+         {
+             get { return null; }
+diff --git a/src/Compilers/CSharp/Portable/Symbols/Synthesized/SynthesizedGlobalMethodSymbol.cs b/src/Compilers/CSharp/Portable/Symbols/Synthesized/SynthesizedGlobalMethodSymbol.cs
+index 873180ce436..d528f319c2a 100644
+--- a/src/Compilers/CSharp/Portable/Symbols/Synthesized/SynthesizedGlobalMethodSymbol.cs
++++ b/src/Compilers/CSharp/Portable/Symbols/Synthesized/SynthesizedGlobalMethodSymbol.cs
+@@ -336,6 +336,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+ 
+         internal sealed override bool IsNullableAnalysisEnabled() => false;
+ 
++        internal sealed override bool IsInterceptable => false;
++
+         protected sealed override bool HasSetsRequiredMembersImpl => throw ExceptionUtilities.Unreachable();
+ 
+         internal sealed override bool HasUnscopedRefAttribute => false;
+diff --git a/src/Compilers/CSharp/Portable/Symbols/Synthesized/SynthesizedInstanceMethodSymbol.cs b/src/Compilers/CSharp/Portable/Symbols/Synthesized/SynthesizedInstanceMethodSymbol.cs
+index 28ed8edcf2b..0af1191744f 100644
+--- a/src/Compilers/CSharp/Portable/Symbols/Synthesized/SynthesizedInstanceMethodSymbol.cs
++++ b/src/Compilers/CSharp/Portable/Symbols/Synthesized/SynthesizedInstanceMethodSymbol.cs
+@@ -42,6 +42,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+             }
+         }
+ 
++        internal sealed override bool IsInterceptable => false;
++
+         internal override bool TryGetThisParameter(out ParameterSymbol thisParameter)
+         {
+             Debug.Assert(!IsStatic);
+diff --git a/src/Compilers/CSharp/Portable/Symbols/Synthesized/SynthesizedIntrinsicOperatorSymbol.cs b/src/Compilers/CSharp/Portable/Symbols/Synthesized/SynthesizedIntrinsicOperatorSymbol.cs
+index a95e0fcb295..4d428a9bdcc 100644
+--- a/src/Compilers/CSharp/Portable/Symbols/Synthesized/SynthesizedIntrinsicOperatorSymbol.cs
++++ b/src/Compilers/CSharp/Portable/Symbols/Synthesized/SynthesizedIntrinsicOperatorSymbol.cs
+@@ -78,6 +78,13 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+                 return true;
+             }
+         }
++        internal sealed override bool IsInterceptable
++        {
++            get
++            {
++                return false;
++            }
++        }
+ 
+         internal override CSharpCompilation DeclaringCompilation
+         {
+diff --git a/src/Compilers/CSharp/Portable/Symbols/Synthesized/SynthesizedStaticConstructor.cs b/src/Compilers/CSharp/Portable/Symbols/Synthesized/SynthesizedStaticConstructor.cs
+index 4cfb133a4d3..2251657cfef 100644
+--- a/src/Compilers/CSharp/Portable/Symbols/Synthesized/SynthesizedStaticConstructor.cs
++++ b/src/Compilers/CSharp/Portable/Symbols/Synthesized/SynthesizedStaticConstructor.cs
+@@ -292,6 +292,8 @@ namespace Microsoft.CodeAnalysis.CSharp.Symbols
+ 
+         internal override bool IsInitOnly => false;
+ 
++        internal sealed override bool IsInterceptable => false;
++
+         public sealed override bool IsImplicitlyDeclared
+         {
+             get
+diff --git a/src/Compilers/CSharp/Portable/xlf/CSharpResources.cs.xlf b/src/Compilers/CSharp/Portable/xlf/CSharpResources.cs.xlf
+index 5d0c7b8d38c..c4fbff9f19d 100644
+--- a/src/Compilers/CSharp/Portable/xlf/CSharpResources.cs.xlf
++++ b/src/Compilers/CSharp/Portable/xlf/CSharpResources.cs.xlf
+@@ -837,6 +837,81 @@
+         <target state="translated">Vlastnosti instance v rozhraních nemůžou mít inicializátory.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ERR_InterceptableMethodMustBeOrdinary">
++        <source>An interceptable method must be an ordinary member method.</source>
++        <target state="new">An interceptable method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCannotBeGeneric">
++        <source>Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</source>
++        <target state="new">Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCharacterOutOfRange">
++        <source>The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</source>
++        <target state="new">The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorFilePathCannotBeNull">
++        <source>Interceptor cannot have a 'null' file path.</source>
++        <target state="new">Interceptor cannot have a 'null' file path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorLineOutOfRange">
++        <source>The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</source>
++        <target state="new">The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMethodMustBeOrdinary">
++        <source>An interceptor method must be an ordinary member method.</source>
++        <target state="new">An interceptor method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustHaveMatchingThisParameter">
++        <source>Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</source>
++        <target state="new">Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustNotHaveThisParameter">
++        <source>Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</source>
++        <target state="new">Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustReferToStartOfTokenPosition">
++        <source>The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</source>
++        <target state="new">The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNameNotInvoked">
++        <source>Possible method name '{0}' cannot be intercepted because it is not being invoked.</source>
++        <target state="new">Possible method name '{0}' cannot be intercepted because it is not being invoked.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNonUniquePath">
++        <source>Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</source>
++        <target state="new">Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilation">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'.</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilationWithCandidate">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPositionBadToken">
++        <source>The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</source>
++        <target state="new">The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorSignatureMismatch">
++        <source>Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</source>
++        <target state="new">Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ERR_InterfaceImplementedByUnmanagedCallersOnlyMethod">
+         <source>'UnmanagedCallersOnly' method '{0}' cannot implement interface member '{1}' in type '{2}'</source>
+         <target state="translated">Metoda UnmanagedCallersOnly {0} nemůže implementovat člena rozhraní {1} v typu {2}.</target>
+@@ -2072,6 +2147,16 @@
+         <target state="translated">Tato kombinace argumentů parametru může vystavit proměnné, na které odkazuje parametr, mimo obor jejich deklarace</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable">
++        <source>Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable_Title">
++        <source>Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="WRN_CallerArgumentExpressionAttributeHasInvalidParameterName">
+         <source>The CallerArgumentExpressionAttribute applied to parameter '{0}' will have no effect. It is applied with an invalid parameter name.</source>
+         <target state="translated">Atribut CallerArgumentExpressionAttribute použitý u parametru {0} nebude mít žádný účinek. Argument je použitý s neplatným názvem parametru.</target>
+diff --git a/src/Compilers/CSharp/Portable/xlf/CSharpResources.de.xlf b/src/Compilers/CSharp/Portable/xlf/CSharpResources.de.xlf
+index cbaf0e3d645..f37e7913a93 100644
+--- a/src/Compilers/CSharp/Portable/xlf/CSharpResources.de.xlf
++++ b/src/Compilers/CSharp/Portable/xlf/CSharpResources.de.xlf
+@@ -837,6 +837,81 @@
+         <target state="translated">Instanzeigenschaften in Schnittstellen können keine Initialisierer aufweisen.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ERR_InterceptableMethodMustBeOrdinary">
++        <source>An interceptable method must be an ordinary member method.</source>
++        <target state="new">An interceptable method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCannotBeGeneric">
++        <source>Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</source>
++        <target state="new">Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCharacterOutOfRange">
++        <source>The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</source>
++        <target state="new">The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorFilePathCannotBeNull">
++        <source>Interceptor cannot have a 'null' file path.</source>
++        <target state="new">Interceptor cannot have a 'null' file path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorLineOutOfRange">
++        <source>The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</source>
++        <target state="new">The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMethodMustBeOrdinary">
++        <source>An interceptor method must be an ordinary member method.</source>
++        <target state="new">An interceptor method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustHaveMatchingThisParameter">
++        <source>Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</source>
++        <target state="new">Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustNotHaveThisParameter">
++        <source>Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</source>
++        <target state="new">Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustReferToStartOfTokenPosition">
++        <source>The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</source>
++        <target state="new">The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNameNotInvoked">
++        <source>Possible method name '{0}' cannot be intercepted because it is not being invoked.</source>
++        <target state="new">Possible method name '{0}' cannot be intercepted because it is not being invoked.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNonUniquePath">
++        <source>Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</source>
++        <target state="new">Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilation">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'.</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilationWithCandidate">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPositionBadToken">
++        <source>The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</source>
++        <target state="new">The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorSignatureMismatch">
++        <source>Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</source>
++        <target state="new">Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ERR_InterfaceImplementedByUnmanagedCallersOnlyMethod">
+         <source>'UnmanagedCallersOnly' method '{0}' cannot implement interface member '{1}' in type '{2}'</source>
+         <target state="translated">Die Methode „UnmanagedCallersOnly“ „{0}“ kann das Schnittstellenelement „{1}“ im Typ „{2}“ nicht implementieren.</target>
+@@ -2072,6 +2147,16 @@
+         <target state="translated">Diese Kombination aus Argumenten führt möglicherweise dazu, dass vom Parameter referenzierte Variablen außerhalb ihres Deklarationsbereichs verfügbar gemacht werden.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable">
++        <source>Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable_Title">
++        <source>Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="WRN_CallerArgumentExpressionAttributeHasInvalidParameterName">
+         <source>The CallerArgumentExpressionAttribute applied to parameter '{0}' will have no effect. It is applied with an invalid parameter name.</source>
+         <target state="translated">Das CallerArgumentExpressionAttribute, das auf den Parameter „{0}“ angewendet wird, hat keine Auswirkungen. Es wird mit einem ungültigen Parameternamen angewendet.</target>
+diff --git a/src/Compilers/CSharp/Portable/xlf/CSharpResources.es.xlf b/src/Compilers/CSharp/Portable/xlf/CSharpResources.es.xlf
+index 1ca73009449..a84cdfdd073 100644
+--- a/src/Compilers/CSharp/Portable/xlf/CSharpResources.es.xlf
++++ b/src/Compilers/CSharp/Portable/xlf/CSharpResources.es.xlf
+@@ -837,6 +837,81 @@
+         <target state="translated">Las propiedades de la instancia en las interfaces no pueden tener inicializadores.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ERR_InterceptableMethodMustBeOrdinary">
++        <source>An interceptable method must be an ordinary member method.</source>
++        <target state="new">An interceptable method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCannotBeGeneric">
++        <source>Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</source>
++        <target state="new">Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCharacterOutOfRange">
++        <source>The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</source>
++        <target state="new">The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorFilePathCannotBeNull">
++        <source>Interceptor cannot have a 'null' file path.</source>
++        <target state="new">Interceptor cannot have a 'null' file path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorLineOutOfRange">
++        <source>The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</source>
++        <target state="new">The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMethodMustBeOrdinary">
++        <source>An interceptor method must be an ordinary member method.</source>
++        <target state="new">An interceptor method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustHaveMatchingThisParameter">
++        <source>Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</source>
++        <target state="new">Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustNotHaveThisParameter">
++        <source>Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</source>
++        <target state="new">Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustReferToStartOfTokenPosition">
++        <source>The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</source>
++        <target state="new">The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNameNotInvoked">
++        <source>Possible method name '{0}' cannot be intercepted because it is not being invoked.</source>
++        <target state="new">Possible method name '{0}' cannot be intercepted because it is not being invoked.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNonUniquePath">
++        <source>Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</source>
++        <target state="new">Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilation">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'.</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilationWithCandidate">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPositionBadToken">
++        <source>The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</source>
++        <target state="new">The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorSignatureMismatch">
++        <source>Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</source>
++        <target state="new">Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ERR_InterfaceImplementedByUnmanagedCallersOnlyMethod">
+         <source>'UnmanagedCallersOnly' method '{0}' cannot implement interface member '{1}' in type '{2}'</source>
+         <target state="translated">El método "UnmanagedCallersOnly" "{0}" no puede implementar el miembro de interfaz "{1}" en el tipo "{2}"</target>
+@@ -2072,6 +2147,16 @@
+         <target state="translated">Esta combinación de argumentos puede exponer variables a las que el parámetro hace referencia fuera de su ámbito de declaración</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable">
++        <source>Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable_Title">
++        <source>Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="WRN_CallerArgumentExpressionAttributeHasInvalidParameterName">
+         <source>The CallerArgumentExpressionAttribute applied to parameter '{0}' will have no effect. It is applied with an invalid parameter name.</source>
+         <target state="translated">El atributo CallerArgumentExpressionAttribute aplicado al parámetro "{0}" no tendrá ningún efecto. Se ha aplicado con un nombre de parámetro no válido.</target>
+diff --git a/src/Compilers/CSharp/Portable/xlf/CSharpResources.fr.xlf b/src/Compilers/CSharp/Portable/xlf/CSharpResources.fr.xlf
+index adc89cef5c5..0c5a4ff6cd7 100644
+--- a/src/Compilers/CSharp/Portable/xlf/CSharpResources.fr.xlf
++++ b/src/Compilers/CSharp/Portable/xlf/CSharpResources.fr.xlf
+@@ -837,6 +837,81 @@
+         <target state="translated">Les propriétés d'instance dans les interfaces ne peuvent pas avoir d'initialiseurs.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ERR_InterceptableMethodMustBeOrdinary">
++        <source>An interceptable method must be an ordinary member method.</source>
++        <target state="new">An interceptable method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCannotBeGeneric">
++        <source>Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</source>
++        <target state="new">Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCharacterOutOfRange">
++        <source>The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</source>
++        <target state="new">The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorFilePathCannotBeNull">
++        <source>Interceptor cannot have a 'null' file path.</source>
++        <target state="new">Interceptor cannot have a 'null' file path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorLineOutOfRange">
++        <source>The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</source>
++        <target state="new">The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMethodMustBeOrdinary">
++        <source>An interceptor method must be an ordinary member method.</source>
++        <target state="new">An interceptor method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustHaveMatchingThisParameter">
++        <source>Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</source>
++        <target state="new">Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustNotHaveThisParameter">
++        <source>Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</source>
++        <target state="new">Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustReferToStartOfTokenPosition">
++        <source>The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</source>
++        <target state="new">The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNameNotInvoked">
++        <source>Possible method name '{0}' cannot be intercepted because it is not being invoked.</source>
++        <target state="new">Possible method name '{0}' cannot be intercepted because it is not being invoked.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNonUniquePath">
++        <source>Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</source>
++        <target state="new">Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilation">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'.</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilationWithCandidate">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPositionBadToken">
++        <source>The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</source>
++        <target state="new">The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorSignatureMismatch">
++        <source>Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</source>
++        <target state="new">Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ERR_InterfaceImplementedByUnmanagedCallersOnlyMethod">
+         <source>'UnmanagedCallersOnly' method '{0}' cannot implement interface member '{1}' in type '{2}'</source>
+         <target state="translated">La méthode UnmanagedCallersOnly '{0}' ne peut pas implémenter le membre d'interface '{1}' dans le type '{2}'</target>
+@@ -2072,6 +2147,16 @@
+         <target state="translated">Cette combinaison d'arguments pour peut exposer les variables référencées par le paramètre en dehors de la portée de leur déclaration</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable">
++        <source>Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable_Title">
++        <source>Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="WRN_CallerArgumentExpressionAttributeHasInvalidParameterName">
+         <source>The CallerArgumentExpressionAttribute applied to parameter '{0}' will have no effect. It is applied with an invalid parameter name.</source>
+         <target state="translated">Le CallerArgumentExpressionAttribute appliqué au paramètre « {0} » n’aura aucun effet. Il est appliqué avec un nom de paramètre non valide.</target>
+diff --git a/src/Compilers/CSharp/Portable/xlf/CSharpResources.it.xlf b/src/Compilers/CSharp/Portable/xlf/CSharpResources.it.xlf
+index 55e65685f45..c2184963212 100644
+--- a/src/Compilers/CSharp/Portable/xlf/CSharpResources.it.xlf
++++ b/src/Compilers/CSharp/Portable/xlf/CSharpResources.it.xlf
+@@ -837,6 +837,81 @@
+         <target state="translated">Le proprietà di istanza nelle interfacce non possono avere inizializzatori.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ERR_InterceptableMethodMustBeOrdinary">
++        <source>An interceptable method must be an ordinary member method.</source>
++        <target state="new">An interceptable method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCannotBeGeneric">
++        <source>Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</source>
++        <target state="new">Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCharacterOutOfRange">
++        <source>The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</source>
++        <target state="new">The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorFilePathCannotBeNull">
++        <source>Interceptor cannot have a 'null' file path.</source>
++        <target state="new">Interceptor cannot have a 'null' file path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorLineOutOfRange">
++        <source>The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</source>
++        <target state="new">The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMethodMustBeOrdinary">
++        <source>An interceptor method must be an ordinary member method.</source>
++        <target state="new">An interceptor method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustHaveMatchingThisParameter">
++        <source>Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</source>
++        <target state="new">Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustNotHaveThisParameter">
++        <source>Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</source>
++        <target state="new">Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustReferToStartOfTokenPosition">
++        <source>The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</source>
++        <target state="new">The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNameNotInvoked">
++        <source>Possible method name '{0}' cannot be intercepted because it is not being invoked.</source>
++        <target state="new">Possible method name '{0}' cannot be intercepted because it is not being invoked.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNonUniquePath">
++        <source>Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</source>
++        <target state="new">Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilation">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'.</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilationWithCandidate">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPositionBadToken">
++        <source>The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</source>
++        <target state="new">The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorSignatureMismatch">
++        <source>Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</source>
++        <target state="new">Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ERR_InterfaceImplementedByUnmanagedCallersOnlyMethod">
+         <source>'UnmanagedCallersOnly' method '{0}' cannot implement interface member '{1}' in type '{2}'</source>
+         <target state="translated">Il metodo '{0}' di 'UnmanagedCallersOnly' non può implementare il membro di interfaccia '{1}' nel tipo '{2}'</target>
+@@ -2072,6 +2147,16 @@
+         <target state="translated">Questa combinazione di argomenti potrebbe esporre variabili a cui fa riferimento il parametro al di fuori del relativo ambito di dichiarazione</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable">
++        <source>Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable_Title">
++        <source>Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="WRN_CallerArgumentExpressionAttributeHasInvalidParameterName">
+         <source>The CallerArgumentExpressionAttribute applied to parameter '{0}' will have no effect. It is applied with an invalid parameter name.</source>
+         <target state="translated">CallerArgumentExpressionAttribute applicato al parametro '{0}' non avrà alcun effetto. È applicato con un nome di parametro non valido.</target>
+diff --git a/src/Compilers/CSharp/Portable/xlf/CSharpResources.ja.xlf b/src/Compilers/CSharp/Portable/xlf/CSharpResources.ja.xlf
+index 28a6f3390d9..7c173929e51 100644
+--- a/src/Compilers/CSharp/Portable/xlf/CSharpResources.ja.xlf
++++ b/src/Compilers/CSharp/Portable/xlf/CSharpResources.ja.xlf
+@@ -837,6 +837,81 @@
+         <target state="translated">インターフェイス内のインスタンス プロパティは初期化子を持つことができません。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ERR_InterceptableMethodMustBeOrdinary">
++        <source>An interceptable method must be an ordinary member method.</source>
++        <target state="new">An interceptable method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCannotBeGeneric">
++        <source>Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</source>
++        <target state="new">Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCharacterOutOfRange">
++        <source>The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</source>
++        <target state="new">The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorFilePathCannotBeNull">
++        <source>Interceptor cannot have a 'null' file path.</source>
++        <target state="new">Interceptor cannot have a 'null' file path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorLineOutOfRange">
++        <source>The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</source>
++        <target state="new">The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMethodMustBeOrdinary">
++        <source>An interceptor method must be an ordinary member method.</source>
++        <target state="new">An interceptor method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustHaveMatchingThisParameter">
++        <source>Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</source>
++        <target state="new">Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustNotHaveThisParameter">
++        <source>Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</source>
++        <target state="new">Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustReferToStartOfTokenPosition">
++        <source>The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</source>
++        <target state="new">The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNameNotInvoked">
++        <source>Possible method name '{0}' cannot be intercepted because it is not being invoked.</source>
++        <target state="new">Possible method name '{0}' cannot be intercepted because it is not being invoked.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNonUniquePath">
++        <source>Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</source>
++        <target state="new">Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilation">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'.</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilationWithCandidate">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPositionBadToken">
++        <source>The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</source>
++        <target state="new">The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorSignatureMismatch">
++        <source>Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</source>
++        <target state="new">Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ERR_InterfaceImplementedByUnmanagedCallersOnlyMethod">
+         <source>'UnmanagedCallersOnly' method '{0}' cannot implement interface member '{1}' in type '{2}'</source>
+         <target state="translated">'UnmanagedCallersOnly' メソッド '{0}' は、インターフェイス メンバー '{1}' を型 '{2}' で実装できません</target>
+@@ -2072,6 +2147,16 @@
+         <target state="translated">この引数の組み合わせは、パラメーターによって参照される変数が宣言のスコープ外に公開される可能性があります</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable">
++        <source>Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable_Title">
++        <source>Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="WRN_CallerArgumentExpressionAttributeHasInvalidParameterName">
+         <source>The CallerArgumentExpressionAttribute applied to parameter '{0}' will have no effect. It is applied with an invalid parameter name.</source>
+         <target state="translated">パラメーター '{0}' に適用された CallerArgumentExpressionAttribute は、無効なパラメーター名で適用されているため無効となります</target>
+diff --git a/src/Compilers/CSharp/Portable/xlf/CSharpResources.ko.xlf b/src/Compilers/CSharp/Portable/xlf/CSharpResources.ko.xlf
+index f20f98eeecb..381ee286369 100644
+--- a/src/Compilers/CSharp/Portable/xlf/CSharpResources.ko.xlf
++++ b/src/Compilers/CSharp/Portable/xlf/CSharpResources.ko.xlf
+@@ -837,6 +837,81 @@
+         <target state="translated">인터페이스의 인스턴스 속성은 이니셜라이저를 사용할 수 없습니다.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ERR_InterceptableMethodMustBeOrdinary">
++        <source>An interceptable method must be an ordinary member method.</source>
++        <target state="new">An interceptable method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCannotBeGeneric">
++        <source>Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</source>
++        <target state="new">Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCharacterOutOfRange">
++        <source>The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</source>
++        <target state="new">The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorFilePathCannotBeNull">
++        <source>Interceptor cannot have a 'null' file path.</source>
++        <target state="new">Interceptor cannot have a 'null' file path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorLineOutOfRange">
++        <source>The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</source>
++        <target state="new">The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMethodMustBeOrdinary">
++        <source>An interceptor method must be an ordinary member method.</source>
++        <target state="new">An interceptor method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustHaveMatchingThisParameter">
++        <source>Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</source>
++        <target state="new">Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustNotHaveThisParameter">
++        <source>Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</source>
++        <target state="new">Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustReferToStartOfTokenPosition">
++        <source>The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</source>
++        <target state="new">The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNameNotInvoked">
++        <source>Possible method name '{0}' cannot be intercepted because it is not being invoked.</source>
++        <target state="new">Possible method name '{0}' cannot be intercepted because it is not being invoked.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNonUniquePath">
++        <source>Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</source>
++        <target state="new">Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilation">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'.</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilationWithCandidate">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPositionBadToken">
++        <source>The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</source>
++        <target state="new">The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorSignatureMismatch">
++        <source>Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</source>
++        <target state="new">Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ERR_InterfaceImplementedByUnmanagedCallersOnlyMethod">
+         <source>'UnmanagedCallersOnly' method '{0}' cannot implement interface member '{1}' in type '{2}'</source>
+         <target state="translated">'UnmanagedCallersOnly' 메서드 '{0}'은(는) '{2}' 유형의 인터페이스 멤버 '{1}'을(를) 구현할 수 없습니다.</target>
+@@ -2072,6 +2147,16 @@
+         <target state="translated">이 인수 조합은 선언 범위 외부의 매개 변수에서 참조하는 변수를 노출할 수 있습니다.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable">
++        <source>Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable_Title">
++        <source>Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="WRN_CallerArgumentExpressionAttributeHasInvalidParameterName">
+         <source>The CallerArgumentExpressionAttribute applied to parameter '{0}' will have no effect. It is applied with an invalid parameter name.</source>
+         <target state="translated">매개 변수 '{0}'에 적용된 CallerArgumentExpressionAttribute는 효과가 없습니다. 잘못된 매개 변수 이름으로 적용되었습니다.</target>
+diff --git a/src/Compilers/CSharp/Portable/xlf/CSharpResources.pl.xlf b/src/Compilers/CSharp/Portable/xlf/CSharpResources.pl.xlf
+index a1abd909de8..9f1b32cdeb8 100644
+--- a/src/Compilers/CSharp/Portable/xlf/CSharpResources.pl.xlf
++++ b/src/Compilers/CSharp/Portable/xlf/CSharpResources.pl.xlf
+@@ -837,6 +837,81 @@
+         <target state="translated">Właściwości wystąpienia w interfejsach nie mogą mieć inicjatorów.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ERR_InterceptableMethodMustBeOrdinary">
++        <source>An interceptable method must be an ordinary member method.</source>
++        <target state="new">An interceptable method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCannotBeGeneric">
++        <source>Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</source>
++        <target state="new">Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCharacterOutOfRange">
++        <source>The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</source>
++        <target state="new">The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorFilePathCannotBeNull">
++        <source>Interceptor cannot have a 'null' file path.</source>
++        <target state="new">Interceptor cannot have a 'null' file path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorLineOutOfRange">
++        <source>The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</source>
++        <target state="new">The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMethodMustBeOrdinary">
++        <source>An interceptor method must be an ordinary member method.</source>
++        <target state="new">An interceptor method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustHaveMatchingThisParameter">
++        <source>Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</source>
++        <target state="new">Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustNotHaveThisParameter">
++        <source>Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</source>
++        <target state="new">Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustReferToStartOfTokenPosition">
++        <source>The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</source>
++        <target state="new">The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNameNotInvoked">
++        <source>Possible method name '{0}' cannot be intercepted because it is not being invoked.</source>
++        <target state="new">Possible method name '{0}' cannot be intercepted because it is not being invoked.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNonUniquePath">
++        <source>Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</source>
++        <target state="new">Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilation">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'.</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilationWithCandidate">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPositionBadToken">
++        <source>The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</source>
++        <target state="new">The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorSignatureMismatch">
++        <source>Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</source>
++        <target state="new">Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ERR_InterfaceImplementedByUnmanagedCallersOnlyMethod">
+         <source>'UnmanagedCallersOnly' method '{0}' cannot implement interface member '{1}' in type '{2}'</source>
+         <target state="translated">Metoda "UnmanagedCallersOnly" "{0}" nie może implementować składowej interfejsu "{1}" w typie "{2}"</target>
+@@ -2072,6 +2147,16 @@
+         <target state="translated">Ta kombinacja argumentów może uwidaczniać zmienne przywoływane przez parametr poza zakresem deklaracji</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable">
++        <source>Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable_Title">
++        <source>Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="WRN_CallerArgumentExpressionAttributeHasInvalidParameterName">
+         <source>The CallerArgumentExpressionAttribute applied to parameter '{0}' will have no effect. It is applied with an invalid parameter name.</source>
+         <target state="translated">Atrybut CallerArgumentExpressionAttribute zastosowany do parametru "{0}" nie odniesie żadnego skutku. Zastosowano go z nieprawidłową nazwą parametru.</target>
+diff --git a/src/Compilers/CSharp/Portable/xlf/CSharpResources.pt-BR.xlf b/src/Compilers/CSharp/Portable/xlf/CSharpResources.pt-BR.xlf
+index 8a6c9a7435d..c2f8a46f01a 100644
+--- a/src/Compilers/CSharp/Portable/xlf/CSharpResources.pt-BR.xlf
++++ b/src/Compilers/CSharp/Portable/xlf/CSharpResources.pt-BR.xlf
+@@ -837,6 +837,81 @@
+         <target state="translated">As propriedades da instância nas interfaces não podem ter inicializadores.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ERR_InterceptableMethodMustBeOrdinary">
++        <source>An interceptable method must be an ordinary member method.</source>
++        <target state="new">An interceptable method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCannotBeGeneric">
++        <source>Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</source>
++        <target state="new">Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCharacterOutOfRange">
++        <source>The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</source>
++        <target state="new">The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorFilePathCannotBeNull">
++        <source>Interceptor cannot have a 'null' file path.</source>
++        <target state="new">Interceptor cannot have a 'null' file path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorLineOutOfRange">
++        <source>The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</source>
++        <target state="new">The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMethodMustBeOrdinary">
++        <source>An interceptor method must be an ordinary member method.</source>
++        <target state="new">An interceptor method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustHaveMatchingThisParameter">
++        <source>Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</source>
++        <target state="new">Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustNotHaveThisParameter">
++        <source>Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</source>
++        <target state="new">Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustReferToStartOfTokenPosition">
++        <source>The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</source>
++        <target state="new">The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNameNotInvoked">
++        <source>Possible method name '{0}' cannot be intercepted because it is not being invoked.</source>
++        <target state="new">Possible method name '{0}' cannot be intercepted because it is not being invoked.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNonUniquePath">
++        <source>Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</source>
++        <target state="new">Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilation">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'.</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilationWithCandidate">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPositionBadToken">
++        <source>The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</source>
++        <target state="new">The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorSignatureMismatch">
++        <source>Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</source>
++        <target state="new">Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ERR_InterfaceImplementedByUnmanagedCallersOnlyMethod">
+         <source>'UnmanagedCallersOnly' method '{0}' cannot implement interface member '{1}' in type '{2}'</source>
+         <target state="translated">O método 'UnmanagedCallersOnly' '{0}' não pode implementar o membro de interface '{1}' no tipo '{2}'</target>
+@@ -2072,6 +2147,16 @@
+         <target state="translated">Essa combinação de argumentos pode expor variáveis referenciadas por parâmetro fora de seu escopo de declaração</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable">
++        <source>Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable_Title">
++        <source>Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="WRN_CallerArgumentExpressionAttributeHasInvalidParameterName">
+         <source>The CallerArgumentExpressionAttribute applied to parameter '{0}' will have no effect. It is applied with an invalid parameter name.</source>
+         <target state="translated">O CallerArgumentExpressionAttribute aplicado ao parâmetro '{0}' não terá efeito. Ele é aplicado com um nome de parâmetro inválido.</target>
+diff --git a/src/Compilers/CSharp/Portable/xlf/CSharpResources.ru.xlf b/src/Compilers/CSharp/Portable/xlf/CSharpResources.ru.xlf
+index 31219991d28..e6572a2510f 100644
+--- a/src/Compilers/CSharp/Portable/xlf/CSharpResources.ru.xlf
++++ b/src/Compilers/CSharp/Portable/xlf/CSharpResources.ru.xlf
+@@ -837,6 +837,81 @@
+         <target state="translated">Свойства экземпляра в интерфейсах не могут иметь инициализаторы.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ERR_InterceptableMethodMustBeOrdinary">
++        <source>An interceptable method must be an ordinary member method.</source>
++        <target state="new">An interceptable method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCannotBeGeneric">
++        <source>Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</source>
++        <target state="new">Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCharacterOutOfRange">
++        <source>The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</source>
++        <target state="new">The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorFilePathCannotBeNull">
++        <source>Interceptor cannot have a 'null' file path.</source>
++        <target state="new">Interceptor cannot have a 'null' file path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorLineOutOfRange">
++        <source>The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</source>
++        <target state="new">The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMethodMustBeOrdinary">
++        <source>An interceptor method must be an ordinary member method.</source>
++        <target state="new">An interceptor method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustHaveMatchingThisParameter">
++        <source>Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</source>
++        <target state="new">Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustNotHaveThisParameter">
++        <source>Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</source>
++        <target state="new">Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustReferToStartOfTokenPosition">
++        <source>The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</source>
++        <target state="new">The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNameNotInvoked">
++        <source>Possible method name '{0}' cannot be intercepted because it is not being invoked.</source>
++        <target state="new">Possible method name '{0}' cannot be intercepted because it is not being invoked.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNonUniquePath">
++        <source>Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</source>
++        <target state="new">Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilation">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'.</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilationWithCandidate">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPositionBadToken">
++        <source>The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</source>
++        <target state="new">The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorSignatureMismatch">
++        <source>Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</source>
++        <target state="new">Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ERR_InterfaceImplementedByUnmanagedCallersOnlyMethod">
+         <source>'UnmanagedCallersOnly' method '{0}' cannot implement interface member '{1}' in type '{2}'</source>
+         <target state="translated">Метод UnmanagedCallersOnly "{0}" не может реализовать элемент интерфейса "{1}" в типе "{2}"</target>
+@@ -2072,6 +2147,16 @@
+         <target state="translated">Эта комбинация аргументов может представить переменные, на которые ссылается параметр, за пределами области их объявления.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable">
++        <source>Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable_Title">
++        <source>Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="WRN_CallerArgumentExpressionAttributeHasInvalidParameterName">
+         <source>The CallerArgumentExpressionAttribute applied to parameter '{0}' will have no effect. It is applied with an invalid parameter name.</source>
+         <target state="translated">Применение класса CallerArgumentExpressionAttribute к параметру "{0}" не подействует, поскольку он применен с недопустимым именем параметра.</target>
+diff --git a/src/Compilers/CSharp/Portable/xlf/CSharpResources.tr.xlf b/src/Compilers/CSharp/Portable/xlf/CSharpResources.tr.xlf
+index 3da8f1d3986..dce2f22aa7b 100644
+--- a/src/Compilers/CSharp/Portable/xlf/CSharpResources.tr.xlf
++++ b/src/Compilers/CSharp/Portable/xlf/CSharpResources.tr.xlf
+@@ -837,6 +837,81 @@
+         <target state="translated">Arabirimlerdeki örnek özelliklerinin başlatıcıları olamaz.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ERR_InterceptableMethodMustBeOrdinary">
++        <source>An interceptable method must be an ordinary member method.</source>
++        <target state="new">An interceptable method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCannotBeGeneric">
++        <source>Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</source>
++        <target state="new">Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCharacterOutOfRange">
++        <source>The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</source>
++        <target state="new">The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorFilePathCannotBeNull">
++        <source>Interceptor cannot have a 'null' file path.</source>
++        <target state="new">Interceptor cannot have a 'null' file path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorLineOutOfRange">
++        <source>The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</source>
++        <target state="new">The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMethodMustBeOrdinary">
++        <source>An interceptor method must be an ordinary member method.</source>
++        <target state="new">An interceptor method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustHaveMatchingThisParameter">
++        <source>Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</source>
++        <target state="new">Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustNotHaveThisParameter">
++        <source>Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</source>
++        <target state="new">Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustReferToStartOfTokenPosition">
++        <source>The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</source>
++        <target state="new">The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNameNotInvoked">
++        <source>Possible method name '{0}' cannot be intercepted because it is not being invoked.</source>
++        <target state="new">Possible method name '{0}' cannot be intercepted because it is not being invoked.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNonUniquePath">
++        <source>Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</source>
++        <target state="new">Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilation">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'.</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilationWithCandidate">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPositionBadToken">
++        <source>The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</source>
++        <target state="new">The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorSignatureMismatch">
++        <source>Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</source>
++        <target state="new">Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ERR_InterfaceImplementedByUnmanagedCallersOnlyMethod">
+         <source>'UnmanagedCallersOnly' method '{0}' cannot implement interface member '{1}' in type '{2}'</source>
+         <target state="translated">'{0}' 'UnmanagedCallersOnly' yöntemi, '{1}' arabirim üyesini '{2}' türünde uygulayamaz</target>
+@@ -2072,6 +2147,16 @@
+         <target state="translated">Bu argüman kombinasyonu, parametre tarafından başvurulan değişkenleri bildirim kapsamı dışında gösterebilir.</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable">
++        <source>Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable_Title">
++        <source>Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="WRN_CallerArgumentExpressionAttributeHasInvalidParameterName">
+         <source>The CallerArgumentExpressionAttribute applied to parameter '{0}' will have no effect. It is applied with an invalid parameter name.</source>
+         <target state="translated">'{0}' parametresine uygulanan CallerArgumentExpressionAttribute hiçbir etkiye sahip olmaz. Geçersiz bir parametre adıyla uygulanır.</target>
+diff --git a/src/Compilers/CSharp/Portable/xlf/CSharpResources.zh-Hans.xlf b/src/Compilers/CSharp/Portable/xlf/CSharpResources.zh-Hans.xlf
+index e81aad7713c..83178c6eaa8 100644
+--- a/src/Compilers/CSharp/Portable/xlf/CSharpResources.zh-Hans.xlf
++++ b/src/Compilers/CSharp/Portable/xlf/CSharpResources.zh-Hans.xlf
+@@ -837,6 +837,81 @@
+         <target state="translated">接口中的实例属性不能具有初始值设定项。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ERR_InterceptableMethodMustBeOrdinary">
++        <source>An interceptable method must be an ordinary member method.</source>
++        <target state="new">An interceptable method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCannotBeGeneric">
++        <source>Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</source>
++        <target state="new">Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCharacterOutOfRange">
++        <source>The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</source>
++        <target state="new">The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorFilePathCannotBeNull">
++        <source>Interceptor cannot have a 'null' file path.</source>
++        <target state="new">Interceptor cannot have a 'null' file path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorLineOutOfRange">
++        <source>The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</source>
++        <target state="new">The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMethodMustBeOrdinary">
++        <source>An interceptor method must be an ordinary member method.</source>
++        <target state="new">An interceptor method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustHaveMatchingThisParameter">
++        <source>Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</source>
++        <target state="new">Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustNotHaveThisParameter">
++        <source>Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</source>
++        <target state="new">Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustReferToStartOfTokenPosition">
++        <source>The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</source>
++        <target state="new">The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNameNotInvoked">
++        <source>Possible method name '{0}' cannot be intercepted because it is not being invoked.</source>
++        <target state="new">Possible method name '{0}' cannot be intercepted because it is not being invoked.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNonUniquePath">
++        <source>Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</source>
++        <target state="new">Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilation">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'.</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilationWithCandidate">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPositionBadToken">
++        <source>The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</source>
++        <target state="new">The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorSignatureMismatch">
++        <source>Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</source>
++        <target state="new">Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ERR_InterfaceImplementedByUnmanagedCallersOnlyMethod">
+         <source>'UnmanagedCallersOnly' method '{0}' cannot implement interface member '{1}' in type '{2}'</source>
+         <target state="translated">“UnmanagedCallersOnly”方法“{0}”无法实现类型“{2}”中的接口成员“{1}”</target>
+@@ -2072,6 +2147,16 @@
+         <target state="translated">这种参数组合可能会在变量声明范围之外公开由参数引用的变量</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable">
++        <source>Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable_Title">
++        <source>Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="WRN_CallerArgumentExpressionAttributeHasInvalidParameterName">
+         <source>The CallerArgumentExpressionAttribute applied to parameter '{0}' will have no effect. It is applied with an invalid parameter name.</source>
+         <target state="translated">应用于参数“{0}”的 CallerArgumentExpressionAttribute 将不起任何作用。它采用了无效的参数名。</target>
+diff --git a/src/Compilers/CSharp/Portable/xlf/CSharpResources.zh-Hant.xlf b/src/Compilers/CSharp/Portable/xlf/CSharpResources.zh-Hant.xlf
+index f7c55165dee..a2ee19f7133 100644
+--- a/src/Compilers/CSharp/Portable/xlf/CSharpResources.zh-Hant.xlf
++++ b/src/Compilers/CSharp/Portable/xlf/CSharpResources.zh-Hant.xlf
+@@ -837,6 +837,81 @@
+         <target state="translated">介面中的執行個體屬性不可有初始設定式。</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="ERR_InterceptableMethodMustBeOrdinary">
++        <source>An interceptable method must be an ordinary member method.</source>
++        <target state="new">An interceptable method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCannotBeGeneric">
++        <source>Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</source>
++        <target state="new">Method '{0}' cannot be used as an interceptor because it or its containing type has type parameters.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorCharacterOutOfRange">
++        <source>The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</source>
++        <target state="new">The given line is '{0}' characters long, which is fewer than the provided character number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorFilePathCannotBeNull">
++        <source>Interceptor cannot have a 'null' file path.</source>
++        <target state="new">Interceptor cannot have a 'null' file path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorLineOutOfRange">
++        <source>The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</source>
++        <target state="new">The given file has '{0}' lines, which is fewer than the provided line number '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMethodMustBeOrdinary">
++        <source>An interceptor method must be an ordinary member method.</source>
++        <target state="new">An interceptor method must be an ordinary member method.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustHaveMatchingThisParameter">
++        <source>Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</source>
++        <target state="new">Interceptor must have a 'this' parameter matching parameter '{0}' on '{1}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustNotHaveThisParameter">
++        <source>Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</source>
++        <target state="new">Interceptor must not have a 'this' parameter because '{0}' does not have a 'this' parameter.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorMustReferToStartOfTokenPosition">
++        <source>The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</source>
++        <target state="new">The provided character number does not refer to the start of method name token '{0}'. Consider using character number '{1}' instead.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNameNotInvoked">
++        <source>Possible method name '{0}' cannot be intercepted because it is not being invoked.</source>
++        <target state="new">Possible method name '{0}' cannot be intercepted because it is not being invoked.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorNonUniquePath">
++        <source>Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</source>
++        <target state="new">Cannot intercept a call in file with path '{0}' because multiple files in the compilation have this path.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilation">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'.</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPathNotInCompilationWithCandidate">
++        <source>Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</source>
++        <target state="new">Cannot intercept: compilation does not contain a file with path '{0}'. Did you mean to use path '{1}'?</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorPositionBadToken">
++        <source>The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</source>
++        <target state="new">The provided line and character number does not refer to an interceptable method name, but rather to token '{0}'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="ERR_InterceptorSignatureMismatch">
++        <source>Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</source>
++        <target state="new">Cannot intercept method '{0}' with interceptor '{1}' because the signatures do not match.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="ERR_InterfaceImplementedByUnmanagedCallersOnlyMethod">
+         <source>'UnmanagedCallersOnly' method '{0}' cannot implement interface member '{1}' in type '{2}'</source>
+         <target state="translated">'UnmanagedCallersOnly' 方法 '{0}' 無法在類型 '{2}' 中實作介面成員 '{1}'</target>
+@@ -2072,6 +2147,16 @@
+         <target state="translated">此引數組合會在其宣告範圍外公開參數所參考的變數</target>
+         <note />
+       </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable">
++        <source>Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to '{0}' is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
++      <trans-unit id="WRN_CallNotInterceptable_Title">
++        <source>Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</source>
++        <target state="new">Call to a method is intercepted, but the method is not marked with 'System.Runtime.CompilerServices.InterceptableAttribute'.</target>
++        <note />
++      </trans-unit>
+       <trans-unit id="WRN_CallerArgumentExpressionAttributeHasInvalidParameterName">
+         <source>The CallerArgumentExpressionAttribute applied to parameter '{0}' will have no effect. It is applied with an invalid parameter name.</source>
+         <target state="translated">套用到參數 '{0}' 的 CallerArgumentExpressionAttribute 將沒有效果。它套用了不正確的參數名稱。</target>
+diff --git a/src/Compilers/CSharp/Test/Symbol/Symbols/ExtensionMethodTests.cs b/src/Compilers/CSharp/Test/Symbol/Symbols/ExtensionMethodTests.cs
+index 2b5e6d04c03..e25babdc31e 100644
+--- a/src/Compilers/CSharp/Test/Symbol/Symbols/ExtensionMethodTests.cs
++++ b/src/Compilers/CSharp/Test/Symbol/Symbols/ExtensionMethodTests.cs
+@@ -2745,8 +2745,9 @@ class Program
+             methodSymbol = (MethodSymbol)symbolInfo.Symbol.GetSymbol<MethodSymbol>();
+             Assert.False(methodSymbol.IsFromCompilation(compilation));
+ 
+-            // 9341 is resolved as Won't Fix since ThisParameter property is internal.
+-            Assert.Throws<InvalidOperationException>(() => methodSymbol.ThisParameter);
++            parameter = methodSymbol.ThisParameter;
++            Assert.Equal(-1, parameter.Ordinal);
++            Assert.Equal(parameter.ContainingSymbol, methodSymbol);
+         }
+ 
+         private CompilationVerifier CompileAndVerify(string source, string expectedOutput = null, Action<ModuleSymbol> validator = null,
+diff --git a/src/Compilers/CSharp/Test/Syntax/Diagnostics/DiagnosticTest.cs b/src/Compilers/CSharp/Test/Syntax/Diagnostics/DiagnosticTest.cs
+index 3eddc361b39..dba8f95929a 100644
+--- a/src/Compilers/CSharp/Test/Syntax/Diagnostics/DiagnosticTest.cs
++++ b/src/Compilers/CSharp/Test/Syntax/Diagnostics/DiagnosticTest.cs
+@@ -304,6 +304,7 @@ class X
+                         case ErrorCode.WRN_ParamsArrayInLambdaOnly:
+                         case ErrorCode.WRN_CapturedPrimaryConstructorParameterPassedToBase:
+                         case ErrorCode.WRN_UnreadPrimaryConstructorParameter:
++                        case ErrorCode.WRN_CallNotInterceptable:
+                             Assert.Equal(1, ErrorFacts.GetWarningLevel(errorCode));
+                             break;
+                         case ErrorCode.WRN_MainIgnored:
+@@ -2937,6 +2938,10 @@ class Program
+                     case ErrorCode.ERR_EncUpdateFailedDelegateTypeChanged:
+                     case ErrorCode.ERR_CannotBeConvertedToUtf8:
+                     case ErrorCode.ERR_FileTypeNonUniquePath:
++                    case ErrorCode.WRN_CallNotInterceptable:
++                    case ErrorCode.ERR_InterceptorSignatureMismatch:
++                    case ErrorCode.ERR_InterceptorMustHaveMatchingThisParameter:
++                    case ErrorCode.ERR_InterceptorMustNotHaveThisParameter:
+                         Assert.True(isBuildOnly, $"Check failed for ErrorCode.{errorCode}");
+                         break;
+ 
+diff --git a/src/Compilers/Core/Portable/InternalUtilities/EnumUtilties.cs b/src/Compilers/Core/Portable/InternalUtilities/EnumUtilties.cs
+index 8e0d40e161b..75a0010c538 100644
+--- a/src/Compilers/Core/Portable/InternalUtilities/EnumUtilties.cs
++++ b/src/Compilers/Core/Portable/InternalUtilities/EnumUtilties.cs
+@@ -69,6 +69,19 @@ namespace Roslyn.Utilities
+             return true;
+         }
+ 
++        internal static bool ContainsAllValues<T>(long mask) where T : struct, Enum, IConvertible
++        {
++            foreach (T value in GetValues<T>())
++            {
++                long val = value.ToInt64(null);
++                if ((val & mask) != val)
++                {
++                    return false;
++                }
++            }
++            return true;
++        }
++
+         internal static bool ContainsValue<T>(T value) where T : struct, Enum
+         {
+             return Array.IndexOf(GetValues<T>(), value) >= 0;
+diff --git a/src/Compilers/Core/Portable/InternalUtilities/ThreadSafeFlagOperations.cs b/src/Compilers/Core/Portable/InternalUtilities/ThreadSafeFlagOperations.cs
+index 536e48c2cab..af304f9e051 100644
+--- a/src/Compilers/Core/Portable/InternalUtilities/ThreadSafeFlagOperations.cs
++++ b/src/Compilers/Core/Portable/InternalUtilities/ThreadSafeFlagOperations.cs
+@@ -24,6 +24,22 @@ namespace Roslyn.Utilities
+             return true;
+         }
+ 
++        public static bool Set(ref long flags, long toSet)
++        {
++            long oldState, newState;
++            do
++            {
++                oldState = flags;
++                newState = oldState | toSet;
++                if (newState == oldState)
++                {
++                    return false;
++                }
++            }
++            while (Interlocked.CompareExchange(ref flags, newState, oldState) != oldState);
++            return true;
++        }
++
+         public static bool Clear(ref int flags, int toClear)
+         {
+             int oldState, newState;
+diff --git a/src/Compilers/Core/Portable/MetadataReader/PEModule.cs b/src/Compilers/Core/Portable/MetadataReader/PEModule.cs
+index 478a6c3f809..0e8c83d76fd 100644
+--- a/src/Compilers/Core/Portable/MetadataReader/PEModule.cs
++++ b/src/Compilers/Core/Portable/MetadataReader/PEModule.cs
+@@ -1025,6 +1025,11 @@ namespace Microsoft.CodeAnalysis
+             return HasStringAndIntValuedAttribute(token, AttributeDescription.FixedBufferAttribute, out elementTypeName, out bufferSize);
+         }
+ 
++        internal bool HasInterceptableAttribute(EntityHandle token)
++        {
++            return FindTargetAttribute(token, AttributeDescription.InterceptableAttribute).HasValue;
++        }
++
+         internal bool HasAccessedThroughPropertyAttribute(EntityHandle token, out string propertyName)
+         {
+             return HasStringValuedAttribute(token, AttributeDescription.AccessedThroughPropertyAttribute, out propertyName);
+diff --git a/src/Compilers/Core/Portable/Symbols/Attributes/AttributeDescription.cs b/src/Compilers/Core/Portable/Symbols/Attributes/AttributeDescription.cs
+index 59fe257f622..b154a4e01d5 100644
+--- a/src/Compilers/Core/Portable/Symbols/Attributes/AttributeDescription.cs
++++ b/src/Compilers/Core/Portable/Symbols/Attributes/AttributeDescription.cs
+@@ -179,6 +179,8 @@ namespace Microsoft.CodeAnalysis
+         private static readonly byte[] s_signature_HasThis_Void_Type_Type_Type_Type = new byte[] { (byte)SignatureAttributes.Instance, 4, Void, TypeHandle, (byte)TypeHandleTarget.SystemType, TypeHandle, (byte)TypeHandleTarget.SystemType, TypeHandle, (byte)TypeHandleTarget.SystemType, TypeHandle, (byte)TypeHandleTarget.SystemType };
+         private static readonly byte[] s_signature_HasThis_Void_Type_Int32 = new byte[] { (byte)SignatureAttributes.Instance, 2, Void, TypeHandle, (byte)TypeHandleTarget.SystemType, Int32 };
+ 
++        private static readonly byte[] s_signature_HasThis_Void_String_Int32_Int32 = new byte[] { (byte)SignatureAttributes.Instance, 3, Void, String, Int32, Int32 };
++
+         private static readonly byte[] s_signature_HasThis_Void_SzArray_Boolean = new byte[] { (byte)SignatureAttributes.Instance, 1, Void, SzArray, Boolean };
+         private static readonly byte[] s_signature_HasThis_Void_SzArray_Byte = new byte[] { (byte)SignatureAttributes.Instance, 1, Void, SzArray, Byte };
+         private static readonly byte[] s_signature_HasThis_Void_SzArray_String = new byte[] { (byte)SignatureAttributes.Instance, 1, Void, SzArray, String };
+@@ -222,6 +224,7 @@ namespace Microsoft.CodeAnalysis
+         private static readonly byte[][] s_signaturesOfMemberNotNullAttribute = { s_signature_HasThis_Void_String, s_signature_HasThis_Void_SzArray_String };
+         private static readonly byte[][] s_signaturesOfMemberNotNullWhenAttribute = { s_signature_HasThis_Void_Boolean_String, s_signature_HasThis_Void_Boolean_SzArray_String };
+         private static readonly byte[][] s_signaturesOfFixedBufferAttribute = { s_signature_HasThis_Void_Type_Int32 };
++        private static readonly byte[][] s_signaturesOfInterceptsLocationAttribute = { s_signature_HasThis_Void_String_Int32_Int32 };
+         private static readonly byte[][] s_signaturesOfPrincipalPermissionAttribute = { s_signature_HasThis_Void_SecurityAction };
+         private static readonly byte[][] s_signaturesOfPermissionSetAttribute = { s_signature_HasThis_Void_SecurityAction };
+ 
+@@ -384,6 +387,8 @@ namespace Microsoft.CodeAnalysis
+         internal static readonly AttributeDescription StructLayoutAttribute = new AttributeDescription("System.Runtime.InteropServices", "StructLayoutAttribute", s_signaturesOfStructLayoutAttribute);
+         internal static readonly AttributeDescription FieldOffsetAttribute = new AttributeDescription("System.Runtime.InteropServices", "FieldOffsetAttribute", s_signaturesOfFieldOffsetAttribute);
+         internal static readonly AttributeDescription FixedBufferAttribute = new AttributeDescription("System.Runtime.CompilerServices", "FixedBufferAttribute", s_signaturesOfFixedBufferAttribute);
++        internal static readonly AttributeDescription InterceptableAttribute = new AttributeDescription("System.Runtime.CompilerServices", "InterceptableAttribute", s_signatures_HasThis_Void_Only);
++        internal static readonly AttributeDescription InterceptsLocationAttribute = new AttributeDescription("System.Runtime.CompilerServices", "InterceptsLocationAttribute", s_signaturesOfInterceptsLocationAttribute);
+         internal static readonly AttributeDescription AllowNullAttribute = new AttributeDescription("System.Diagnostics.CodeAnalysis", "AllowNullAttribute", s_signatures_HasThis_Void_Only);
+         internal static readonly AttributeDescription DisallowNullAttribute = new AttributeDescription("System.Diagnostics.CodeAnalysis", "DisallowNullAttribute", s_signatures_HasThis_Void_Only);
+         internal static readonly AttributeDescription MaybeNullAttribute = new AttributeDescription("System.Diagnostics.CodeAnalysis", "MaybeNullAttribute", s_signatures_HasThis_Void_Only);
+diff --git a/src/EditorFeatures/CSharp/LanguageServer/CSharpLspBuildOnlyDiagnostics.cs b/src/EditorFeatures/CSharp/LanguageServer/CSharpLspBuildOnlyDiagnostics.cs
+index a2cea39d046..30dcbe4de81 100644
+--- a/src/EditorFeatures/CSharp/LanguageServer/CSharpLspBuildOnlyDiagnostics.cs
++++ b/src/EditorFeatures/CSharp/LanguageServer/CSharpLspBuildOnlyDiagnostics.cs
+@@ -43,7 +43,11 @@ namespace Microsoft.CodeAnalysis.CSharp.LanguageServer
+         "CS1969", // ErrorCode.ERR_DynamicRequiredTypesMissing:
+         "CS8984", // ErrorCode.ERR_EncUpdateFailedDelegateTypeChanged:
+         "CS9026", // ErrorCode.ERR_CannotBeConvertedToUtf8:
+-        "CS9068" // ErrorCode.ERR_FileTypeNonUniquePath:
++        "CS9068", // ErrorCode.ERR_FileTypeNonUniquePath:
++        "CS27000", // ErrorCode.WRN_CallNotInterceptable:
++        "CS27007", // ErrorCode.ERR_InterceptorSignatureMismatch
++        "CS27011", // ErrorCode.ERR_InterceptorMustHaveMatchingThisParameter
++        "CS27012" // ErrorCode.ERR_InterceptorMustNotHaveThisParameter
+         )]
+     internal sealed class CSharpLspBuildOnlyDiagnostics : ILspBuildOnlyDiagnostics
+     {
+diff --git a/src/EditorFeatures/CSharpTest/Diagnostics/Suppression/RemoveUnnecessaryPragmaSuppressionsTests.cs b/src/EditorFeatures/CSharpTest/Diagnostics/Suppression/RemoveUnnecessaryPragmaSuppressionsTests.cs
+index 1b784415bda..99b817ce89f 100644
+--- a/src/EditorFeatures/CSharpTest/Diagnostics/Suppression/RemoveUnnecessaryPragmaSuppressionsTests.cs
++++ b/src/EditorFeatures/CSharpTest/Diagnostics/Suppression/RemoveUnnecessaryPragmaSuppressionsTests.cs
+@@ -295,7 +295,7 @@ class Class
+                 PragmasAndSuppressMessageAttributes
+             }
+ 
+-            [Theory, CombinatorialData]
++            [Theory(Skip = "PROTOTYPE(ic): should be able to re-enable after packing error codes"), CombinatorialData]
+             [WorkItem("https://github.com/dotnet/roslyn/issues/46047")]
+             public async Task TestDoNotRemoveUnsupportedDiagnosticSuppression(bool disable, TestKind testKind)
+             {
+diff --git a/src/ExpressionEvaluator/CSharp/Source/ExpressionCompiler/Symbols/EECompilationContextMethod.cs b/src/ExpressionEvaluator/CSharp/Source/ExpressionCompiler/Symbols/EECompilationContextMethod.cs
+index 248c0d64c06..adf9b95a8d5 100644
+--- a/src/ExpressionEvaluator/CSharp/Source/ExpressionCompiler/Symbols/EECompilationContextMethod.cs
++++ b/src/ExpressionEvaluator/CSharp/Source/ExpressionCompiler/Symbols/EECompilationContextMethod.cs
+@@ -78,6 +78,8 @@ namespace Microsoft.CodeAnalysis.CSharp.ExpressionEvaluator
+             return _underlyingMethod.GetUnmanagedCallersOnlyAttributeData(forceComplete);
+         }
+ 
++        internal override bool IsInterceptable => false;
++
+         internal override bool IsNullableAnalysisEnabled()
+         {
+             return _underlyingMethod.IsNullableAnalysisEnabled();
+diff --git a/src/ExpressionEvaluator/CSharp/Source/ExpressionCompiler/Symbols/EEMethodSymbol.cs b/src/ExpressionEvaluator/CSharp/Source/ExpressionCompiler/Symbols/EEMethodSymbol.cs
+index b2ad97f1b54..f5425d2141a 100644
+--- a/src/ExpressionEvaluator/CSharp/Source/ExpressionCompiler/Symbols/EEMethodSymbol.cs
++++ b/src/ExpressionEvaluator/CSharp/Source/ExpressionCompiler/Symbols/EEMethodSymbol.cs
+@@ -451,6 +451,8 @@ namespace Microsoft.CodeAnalysis.CSharp.ExpressionEvaluator
+ 
+         internal override bool IsInitOnly => false;
+ 
++        internal override bool IsInterceptable => false;
++
+         internal override ObsoleteAttributeData ObsoleteAttributeData
+         {
+             get { throw ExceptionUtilities.Unreachable(); }
+diff --git a/src/ExpressionEvaluator/CSharp/Source/ExpressionCompiler/Symbols/PlaceholderMethodSymbol.cs b/src/ExpressionEvaluator/CSharp/Source/ExpressionCompiler/Symbols/PlaceholderMethodSymbol.cs
+index 20372abe82b..c3bc327c971 100644
+--- a/src/ExpressionEvaluator/CSharp/Source/ExpressionCompiler/Symbols/PlaceholderMethodSymbol.cs
++++ b/src/ExpressionEvaluator/CSharp/Source/ExpressionCompiler/Symbols/PlaceholderMethodSymbol.cs
+@@ -277,6 +277,8 @@ namespace Microsoft.CodeAnalysis.CSharp.ExpressionEvaluator
+ 
+         internal override bool IsNullableAnalysisEnabled() => false;
+ 
++        internal override bool IsInterceptable => false;
++
+         protected override bool HasSetsRequiredMembersImpl => throw ExceptionUtilities.Unreachable();
+ 
+ #if DEBUG

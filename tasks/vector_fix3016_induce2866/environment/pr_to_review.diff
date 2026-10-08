@@ -1,0 +1,5035 @@
+commit d2fe5279087ceb3dddd561c3b3d01959fad59006
+Author: Bruce Guenter <bruce@untroubled.org>
+Date:   Mon Jun 29 12:08:28 2020 -0600
+
+    enhancement(sinks): Batch buffer rework (#2866)
+    
+    * Add new VecBuffer wrapper around Vec
+    
+    This new buffer type keeps track of its maximum size, and pre-allocates
+    the buffer.
+    
+    * Add BatchSettings parameter to all buffers
+    
+    * Move detection of batch "fullness" to trait Batch
+    
+    This also drops fn len, as it is no longer necessary.
+    
+    * Make the Batch::push trait method failable
+    
+    This requires reworking the logic in BatchSink::start_send, and so
+    demands some close scrutiny.
+    
+    * Introduce StatefulBuffer wrapper and clean up BatchSink
+    
+    * Drop superfluous Batch::is_full trait method
+    
+    * Merge BatchBytesConfig and BatchEventsConfig and adjust sinks
+    
+    * Account for the separating "," in JsonArrayBuffer
+    
+    * Use a simplified fake-ish builder pattern to build BatchSettings
+    
+    * Split up batch size and timeout settings
+    
+    * Manually track number of bytes written in Buffer
+    
+    * Handle individual items that are too large to buffer
+    
+    If the first event to be added to a buffer is too large, this could
+    cause a sink pipeline to permanently block. Instead, drop the output
+    event with an error message but return as if it was added.
+    
+    * Drop test batch_sink_allows_the_final_item_to_exceed_the_buffer_size
+    
+    We explicitly do not want batches to exceed the buffer size.
+    
+    Signed-off-by: Bruce Guenter <bruce@timber.io>
+
+diff --git a/.meta/_partials/fields/_batch_options.toml.erb b/.meta/_partials/fields/_batch_options.toml.erb
+index 3db58f9d86..579dd7c836 100644
+--- a/.meta/_partials/fields/_batch_options.toml.erb
++++ b/.meta/_partials/fields/_batch_options.toml.erb
+@@ -6,25 +6,27 @@ common = <%= common.to_toml %>
+ groups = <%= groups.to_toml %>
+ description = "Configures the sink batching behavior."
+ 
+-<%- if max_events -%>
+-[<%= namespace %>.batch.children.max_events]
++<%- if max_bytes -%>
++[<%= namespace %>.batch.children.max_bytes]
+ type = "uint"
+ common = true
+-default = <%= max_events.to_toml %>
++default = <%= max_bytes.to_toml %>
+ groups = <%= groups.to_toml %>
+-unit = "events"
+-description = "The maximum size of a batch, in events, before it is flushed."
++unit = "bytes"
++description = "The maximum size of a batch, in bytes, before it is flushed."
+ <%- end -%>
+ 
+-<%- if max_size -%>
+-[<%= namespace %>.batch.children.max_size]
++[<%= namespace %>.batch.children.max_events]
+ type = "uint"
+ common = true
+-default = <%= max_size.to_toml %>
+-groups = <%= groups.to_toml %>
+-unit = "bytes"
+-description = "The maximum size of a batch, in bytes, before it is flushed."
++<%- if max_events -%>
++default = <%= max_events.to_toml %>
++<%- else -%>
++examples = [ 1000 ]
+ <%- end -%>
++groups = <%= groups.to_toml %>
++unit = "events"
++description = "The maximum size of a batch, in events, before it is flushed."
+ 
+ [<%= namespace %>.batch.children.timeout_secs]
+ type = "uint"
+diff --git a/.meta/sinks/aws_cloudwatch_logs.toml.erb b/.meta/sinks/aws_cloudwatch_logs.toml.erb
+index f3cc5e374f..11cc9e3ce0 100644
+--- a/.meta/sinks/aws_cloudwatch_logs.toml.erb
++++ b/.meta/sinks/aws_cloudwatch_logs.toml.erb
+@@ -28,7 +28,7 @@ write_to_description = "[Amazon Web Service's CloudWatch Logs service][urls.aws_
+ 
+ <%= render("_partials/fields/_component_options.toml", type: "sink", name: "aws_cloudwatch_logs") %>
+ 
+-<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.aws_cloudwatch_logs.options", common: false, max_events: 1000, max_size: nil, timeout_secs: 1) %>
++<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.aws_cloudwatch_logs.options", common: false, max_bytes: nil, max_events: 1000, timeout_secs: 1) %>
+ 
+ <%= render(
+   "_partials/fields/_buffer_options.toml",
+diff --git a/.meta/sinks/aws_cloudwatch_metrics.toml.erb b/.meta/sinks/aws_cloudwatch_metrics.toml.erb
+index d3378c104a..ac942a5b1e 100644
+--- a/.meta/sinks/aws_cloudwatch_metrics.toml.erb
++++ b/.meta/sinks/aws_cloudwatch_metrics.toml.erb
+@@ -24,7 +24,7 @@ write_to_description = "[Amazon Web Service's CloudWatch Metrics service][urls.a
+ 
+ <%= render("_partials/fields/_aws_options.toml", namespace: "sinks.aws_cloudwatch_metrics.options") %>
+ 
+-<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.aws_cloudwatch_metrics.options", common: false, max_events: 20, max_size: nil, timeout_secs: 1) %>
++<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.aws_cloudwatch_metrics.options", common: false, max_bytes: nil, max_events: 20, timeout_secs: 1) %>
+ 
+ <%= render("_partials/fields/_component_options.toml", type: "sink", name: "aws_cloudwatch_metrics") %>
+ 
+diff --git a/.meta/sinks/aws_kinesis_firehose.toml.erb b/.meta/sinks/aws_kinesis_firehose.toml.erb
+index 8bd5fa16ae..6134b2756b 100644
+--- a/.meta/sinks/aws_kinesis_firehose.toml.erb
++++ b/.meta/sinks/aws_kinesis_firehose.toml.erb
+@@ -31,7 +31,7 @@ write_to_description = "[Amazon Web Service's Kinesis Data Firehose][urls.aws_ki
+ 
+ <%= render("_partials/fields/_component_options.toml", type: "sink", name: "aws_kinesis_firehose") %>
+ 
+-<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.aws_kinesis_firehose.options", common: false, max_events: 500, max_size: nil, timeout_secs: 1) %>
++<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.aws_kinesis_firehose.options", common: false, max_bytes: nil, max_events: 500, timeout_secs: 1) %>
+ 
+ <%= render(
+   "_partials/fields/_buffer_options.toml",
+diff --git a/.meta/sinks/aws_kinesis_streams.toml.erb b/.meta/sinks/aws_kinesis_streams.toml.erb
+index 8abb057696..76c3d82c6d 100644
+--- a/.meta/sinks/aws_kinesis_streams.toml.erb
++++ b/.meta/sinks/aws_kinesis_streams.toml.erb
+@@ -31,7 +31,7 @@ write_to_description = "[Amazon Web Service's Kinesis Data Stream service][urls.
+ 
+ <%= render("_partials/fields/_component_options.toml", type: "sinks", name: "aws_kinesis_streams") %>
+ 
+-<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.aws_kinesis_streams.options", common: false, max_events: 500, max_size: nil, timeout_secs: 1) %>
++<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.aws_kinesis_streams.options", common: false, max_bytes: nil, max_events: 500, timeout_secs: 1) %>
+ 
+ <%= render(
+   "_partials/fields/_buffer_options.toml",
+diff --git a/.meta/sinks/aws_s3.toml.erb b/.meta/sinks/aws_s3.toml.erb
+index 2f80c17d9a..9a4763c214 100644
+--- a/.meta/sinks/aws_s3.toml.erb
++++ b/.meta/sinks/aws_s3.toml.erb
+@@ -37,8 +37,8 @@ write_to_description = "[Amazon Web Service's S3 service][urls.aws_s3] via the [
+   "_partials/fields/_batch_options.toml",
+   namespace: "sinks.aws_s3.options",
+   common: true,
++  max_bytes: 10000000,
+   max_events: nil,
+-  max_size: 10490000,
+   timeout_secs: 300
+ ) %>
+ 
+diff --git a/.meta/sinks/clickhouse.toml.erb b/.meta/sinks/clickhouse.toml.erb
+index 2f34a38602..526a638c7a 100644
+--- a/.meta/sinks/clickhouse.toml.erb
++++ b/.meta/sinks/clickhouse.toml.erb
+@@ -29,7 +29,7 @@ write_to_description = "[Clickhouse][urls.clickhouse] via the [`HTTP` Interface]
+ 
+ <%= render("_partials/fields/_component_options.toml", type: "sink", name: "clickhouse") %>
+ 
+-<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.clickhouse.options", common: false, max_events: nil, max_size: 1049000, timeout_secs: 1) %>
++<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.clickhouse.options", common: false, max_bytes: 1049000, max_events: nil, timeout_secs: 1) %>
+ 
+ <%= render(
+   "_partials/fields/_buffer_options.toml",
+diff --git a/.meta/sinks/datadog_metrics.toml.erb b/.meta/sinks/datadog_metrics.toml.erb
+index d84db4fae8..38e33591b2 100644
+--- a/.meta/sinks/datadog_metrics.toml.erb
++++ b/.meta/sinks/datadog_metrics.toml.erb
+@@ -21,7 +21,7 @@ write_to_description = "[Datadog's][urls.datadog] metrics service using [HTTP AP
+ 
+ <%= render("_partials/fields/_component_options.toml", type: "sink", name: "datadog_metrics") %>
+ 
+-<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.datadog_metrics.options", common: false, max_events: 20, max_size: nil, timeout_secs: 1) %>
++<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.datadog_metrics.options", common: false, max_bytes: nil, max_events: 20, timeout_secs: 1) %>
+ 
+ <%= render(
+   "_partials/fields/_request_options.toml",
+diff --git a/.meta/sinks/elasticsearch.toml.erb b/.meta/sinks/elasticsearch.toml.erb
+index f124300210..0f78726be4 100644
+--- a/.meta/sinks/elasticsearch.toml.erb
++++ b/.meta/sinks/elasticsearch.toml.erb
+@@ -45,8 +45,8 @@ endpoint][urls.elasticsearch_bulk]\
+   "_partials/fields/_batch_options.toml",
+   namespace: "sinks.elasticsearch.options",
+   common: false,
++  max_bytes: 10490000,
+   max_events: nil,
+-  max_size: 10490000,
+   timeout_secs: 1
+ ) %>
+ 
+diff --git a/.meta/sinks/gcp_cloud_storage.toml.erb b/.meta/sinks/gcp_cloud_storage.toml.erb
+index 47dff09bc3..d3be12b71d 100644
+--- a/.meta/sinks/gcp_cloud_storage.toml.erb
++++ b/.meta/sinks/gcp_cloud_storage.toml.erb
+@@ -32,7 +32,7 @@ write_to_description = "[Google Cloud Platform's Cloud Storage service](https://
+ 
+ <%= render("_partials/fields/_component_options.toml", type: "sink", name: "gcp_cloud_storage") %>
+ 
+-<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.gcp_cloud_storage.options", common: false, max_events: nil, max_size: 10485760, timeout_secs: 300) %>
++<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.gcp_cloud_storage.options", common: false, max_bytes: 10485760, max_events: nil, timeout_secs: 300) %>
+ 
+ <%= render(
+   "_partials/fields/_buffer_options.toml",
+diff --git a/.meta/sinks/gcp_pubsub.toml.erb b/.meta/sinks/gcp_pubsub.toml.erb
+index 67fe2d6c3a..0c336ed094 100644
+--- a/.meta/sinks/gcp_pubsub.toml.erb
++++ b/.meta/sinks/gcp_pubsub.toml.erb
+@@ -26,7 +26,7 @@ write_to_description = "[Google Cloud Platform's Pubsub service][urls.gcp_pubsub
+ 
+ <%= render("_partials/fields/_component_options.toml", type: "sink", name: "gcp_pubsub") %>
+ 
+-<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.gcp_pubsub.options", common: false, max_events: nil, max_size: 10485760, timeout_secs: 1) %>
++<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.gcp_pubsub.options", common: false, max_bytes: 10485760, max_events: 1000, timeout_secs: 1) %>
+ 
+ <%= render(
+   "_partials/fields/_buffer_options.toml",
+diff --git a/.meta/sinks/gcp_stackdriver_logs.toml.erb b/.meta/sinks/gcp_stackdriver_logs.toml.erb
+index e762e89124..233871e730 100644
+--- a/.meta/sinks/gcp_stackdriver_logs.toml.erb
++++ b/.meta/sinks/gcp_stackdriver_logs.toml.erb
+@@ -27,8 +27,8 @@ write_to_description = "[Google Cloud Platform's Stackdriver Logging service][ur
+ <%= render("_partials/fields/_batch_options.toml",
+   namespace: "sinks.gcp_stackdriver_logs.options",
+   common: false,
++  max_bytes: 5242880,
+   max_events: nil,
+-  max_size: 5242880,
+   timeout_secs: 1) %>
+ 
+ <%= render(
+diff --git a/.meta/sinks/honeycomb.toml.erb b/.meta/sinks/honeycomb.toml.erb
+index 286a816353..e25d057180 100644
+--- a/.meta/sinks/honeycomb.toml.erb
++++ b/.meta/sinks/honeycomb.toml.erb
+@@ -25,7 +25,7 @@ write_to_description = "[Honeycomb][urls.honeycomb] via the [batch events API][u
+ 
+ <%= render("_partials/fields/_component_options.toml", type: "sink", name: "honeycomb") %>
+ 
+-<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.honeycomb.options", common: false, max_events: nil, max_size: 5242880, timeout_secs: 1) %>
++<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.honeycomb.options", common: false, max_bytes: 5242880, max_events: nil, timeout_secs: 1) %>
+ 
+ <%= render("_partials/fields/_buffer_options.toml", namespace: "sinks.honeycomb.options") %>
+ 
+diff --git a/.meta/sinks/http.toml.erb b/.meta/sinks/http.toml.erb
+index 0306b0c66a..b943022f10 100644
+--- a/.meta/sinks/http.toml.erb
++++ b/.meta/sinks/http.toml.erb
+@@ -20,7 +20,7 @@ write_to_description = "a generic [HTTP][urls.http] endpoint"
+ 
+ <%= render("_partials/fields/_component_options.toml", type: "sink", name: "http") %>
+ 
+-<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.http.options", common: true, max_events: nil, max_size: 1049000, timeout_secs: 1) %>
++<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.http.options", common: true, max_bytes: 1049000, max_events: nil, timeout_secs: 1) %>
+ 
+ <%= render(
+   "_partials/fields/_buffer_options.toml",
+diff --git a/.meta/sinks/humio_logs.toml.erb b/.meta/sinks/humio_logs.toml.erb
+index 7cf66076c4..e1f4096912 100644
+--- a/.meta/sinks/humio_logs.toml.erb
++++ b/.meta/sinks/humio_logs.toml.erb
+@@ -27,7 +27,7 @@ write_to_description = "[Humio][urls.humio] via the [HEC API][urls.humio_hec]"
+ 
+ <%= render("_partials/fields/_component_options.toml", type: "sink", name: "humio_logs") %>
+ 
+-<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.humio_logs.options", common: false, max_events: nil, max_size: 1049000, timeout_secs: 1) %>
++<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.humio_logs.options", common: false, max_bytes: 1049000, max_events: nil, timeout_secs: 1) %>
+ 
+ <%= render(
+   "_partials/fields/_buffer_options.toml",
+diff --git a/.meta/sinks/influxdb_logs.toml b/.meta/sinks/influxdb_logs.toml
+index 53c8e4bbb7..1f0f78070f 100644
+--- a/.meta/sinks/influxdb_logs.toml
++++ b/.meta/sinks/influxdb_logs.toml
+@@ -36,8 +36,8 @@ write_to_description = "[InfluxDB][urls.influxdb] using [v1][urls.influxdb_http_
+   "_partials/fields/_batch_options.toml",
+   common: false,
+   groups: ["v1", "v2"],
++  max_bytes: 1049000,
+   max_events: nil,
+-  max_size: 10490000,
+   namespace: "sinks.influxdb_logs.options",
+   timeout_secs: 1
+ ) %>
+diff --git a/.meta/sinks/influxdb_metrics.toml.erb b/.meta/sinks/influxdb_metrics.toml.erb
+index d10e5063d6..87770cb733 100644
+--- a/.meta/sinks/influxdb_metrics.toml.erb
++++ b/.meta/sinks/influxdb_metrics.toml.erb
+@@ -36,8 +36,8 @@ write_to_description = "[InfluxDB][urls.influxdb] using [v1][urls.influxdb_http_
+   "_partials/fields/_batch_options.toml",
+   common: false,
+   groups: ["v1", "v2"],
++  max_bytes: nil,
+   max_events: 20,
+-  max_size: nil,
+   namespace: "sinks.influxdb_metrics.options",
+   timeout_secs: 1
+ ) %>
+diff --git a/.meta/sinks/logdna.toml.erb b/.meta/sinks/logdna.toml.erb
+index 27f5596fe9..f7760f47a2 100644
+--- a/.meta/sinks/logdna.toml.erb
++++ b/.meta/sinks/logdna.toml.erb
+@@ -26,7 +26,7 @@ write_to_description = "[LogDna][urls.logdna]'s HTTP Ingestion API"
+ 
+ <%= render("_partials/fields/_component_options.toml", type: "sink", name: "logdna") %>
+ 
+-<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.logdna.options", common: false, max_events: nil, max_size: 10490000, timeout_secs: 1) %>
++<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.logdna.options", common: false, max_bytes: 10490000, max_events: nil, timeout_secs: 1) %>
+ 
+ <%= render(
+   "_partials/fields/_buffer_options.toml",
+diff --git a/.meta/sinks/loki.toml.erb b/.meta/sinks/loki.toml.erb
+index 46347510dc..fa73b26e8e 100644
+--- a/.meta/sinks/loki.toml.erb
++++ b/.meta/sinks/loki.toml.erb
+@@ -27,7 +27,7 @@ write_to_description = "[Loki][urls.loki]"
+ 
+ <%= render("_partials/fields/_component_options.toml", type: "sink", name: "loki") %>
+ 
+-<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.loki.options", common: false, max_events: nil, max_size: 10490000, timeout_secs: 1) %>
++<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.loki.options", common: false, max_bytes: 10490000, max_events: nil, timeout_secs: 1) %>
+ 
+ <%= render(
+   "_partials/fields/_buffer_options.toml",
+diff --git a/.meta/sinks/new_relic_logs.toml.erb b/.meta/sinks/new_relic_logs.toml.erb
+index 776031e774..f36c84dbf0 100644
+--- a/.meta/sinks/new_relic_logs.toml.erb
++++ b/.meta/sinks/new_relic_logs.toml.erb
+@@ -25,7 +25,7 @@ write_to_description = "[New Relic's log service][urls.new_relic] via their [log
+ 
+ <%= render("_partials/fields/_component_options.toml", type: "sink", name: "new_relic_logs") %>
+ 
+-<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.new_relic_logs.options", common: false, max_events: nil, max_size: 524000, timeout_secs: 1) %>
++<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.new_relic_logs.options", common: false, max_bytes: 5240000, max_events: nil, timeout_secs: 1) %>
+ 
+ <%= render(
+   "_partials/fields/_buffer_options.toml",
+diff --git a/.meta/sinks/sematext_logs.toml.erb b/.meta/sinks/sematext_logs.toml.erb
+index b9b9681645..130448bbb0 100644
+--- a/.meta/sinks/sematext_logs.toml.erb
++++ b/.meta/sinks/sematext_logs.toml.erb
+@@ -25,7 +25,7 @@ write_to_description = "[Sematext][urls.sematext] via the [Elasticsearch API][ur
+ 
+ <%= render("_partials/fields/_component_options.toml", type: "sink", name: "sematext_logs") %>
+ 
+-<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.sematext_logs.options", common: false, max_events: nil, max_size: 10490000, timeout_secs: 1) %>
++<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.sematext_logs.options", common: false, max_bytes: 10490000, max_events: nil, timeout_secs: 1) %>
+ 
+ <%= render(
+   "_partials/fields/_buffer_options.toml",
+diff --git a/.meta/sinks/splunk_hec.toml.erb b/.meta/sinks/splunk_hec.toml.erb
+index 67216ff6ba..8a049ae5bf 100644
+--- a/.meta/sinks/splunk_hec.toml.erb
++++ b/.meta/sinks/splunk_hec.toml.erb
+@@ -22,7 +22,7 @@ write_to_description = "a [Splunk's HTTP Event Collector][urls.splunk_hec]"
+ 
+ <%= render("_partials/fields/_component_options.toml", type: "sink", name: "splunk_hec") %>
+ 
+-<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.splunk_hec.options", common: false, max_events: nil, max_size: 1049000, timeout_secs: 1) %>
++<%= render("_partials/fields/_batch_options.toml", namespace: "sinks.splunk_hec.options", common: false, max_bytes: 1049000, max_events: nil, timeout_secs: 1) %>
+ 
+ <%= render(
+   "_partials/fields/_buffer_options.toml",
+diff --git a/benches/batch.rs b/benches/batch.rs
+index a4b6e91992..803e32a519 100644
+--- a/benches/batch.rs
++++ b/benches/batch.rs
+@@ -5,14 +5,14 @@ use std::convert::Infallible;
+ use std::time::Duration;
+ use vector::buffers::Acker;
+ use vector::sinks::util::{
+-    Batch, BatchSettings, BatchSink, Buffer, Compression, Partition, PartitionBatchSink,
++    Batch, BatchSink, BatchSize, Buffer, Compression, Partition, PartitionBatchSink, PushResult,
+ };
+ use vector::test_util::random_lines;
+ 
+ fn batching(
+     bench_name: &'static str,
+     compression: Compression,
+-    max_size: usize,
++    max_bytes: usize,
+     num_events: usize,
+     event_len: usize,
+ ) -> Benchmark {
+@@ -28,13 +28,14 @@ fn batching(
+             |input| {
+                 let mut rt = vector::test_util::runtime();
+                 let (acker, _) = Acker::new_for_testing();
++                let batch = BatchSize {
++                    bytes: max_bytes,
++                    events: num_events,
++                };
+                 let batch_sink = BatchSink::new(
+                     tower::service_fn(|_| future::ok::<_, Infallible>(())),
+-                    Buffer::new(compression),
+-                    BatchSettings {
+-                        size: max_size,
+-                        timeout: Duration::from_secs(1),
+-                    },
++                    Buffer::new(batch, compression),
++                    Duration::from_secs(1),
+                     acker,
+                 )
+                 .sink_map_err(|e| panic!(e));
+@@ -51,7 +52,7 @@ fn batching(
+ fn partitioned_batching(
+     bench_name: &'static str,
+     compression: Compression,
+-    max_size: usize,
++    max_bytes: usize,
+     num_events: usize,
+     event_len: usize,
+ ) -> Benchmark {
+@@ -72,13 +73,14 @@ fn partitioned_batching(
+             |input| {
+                 let mut rt = vector::test_util::runtime();
+                 let (acker, _) = Acker::new_for_testing();
++                let batch = BatchSize {
++                    bytes: max_bytes,
++                    events: num_events,
++                };
+                 let batch_sink = PartitionBatchSink::new(
+                     tower::service_fn(|_| future::ok::<_, Infallible>(())),
+-                    PartitionedBuffer::new(compression),
+-                    BatchSettings {
+-                        size: max_size,
+-                        timeout: Duration::from_secs(1),
+-                    },
++                    PartitionedBuffer::new(batch, compression),
++                    Duration::from_secs(1),
+                     acker,
+                 )
+                 .sink_map_err(|e| panic!(e));
+@@ -166,9 +168,9 @@ impl Partition<Bytes> for InnerBuffer {
+ }
+ 
+ impl PartitionedBuffer {
+-    pub fn new(compression: Compression) -> Self {
++    pub fn new(batch: BatchSize, compression: Compression) -> Self {
+         Self {
+-            inner: Buffer::new(compression),
++            inner: Buffer::new(batch, compression),
+             key: None,
+         }
+     }
+@@ -178,14 +180,15 @@ impl Batch for PartitionedBuffer {
+     type Input = InnerBuffer;
+     type Output = InnerBuffer;
+ 
+-    fn len(&self) -> usize {
+-        self.inner.len()
+-    }
+-
+-    fn push(&mut self, item: Self::Input) {
+-        let partition = item.partition();
+-        self.key = Some(partition);
+-        self.inner.push(&item.inner[..])
++    fn push(&mut self, item: Self::Input) -> PushResult<Self::Input> {
++        let key = item.key;
++        match Batch::push(&mut self.inner, item.inner) {
++            PushResult::Ok(full) => {
++                self.key = Some(key);
++                PushResult::Ok(full)
++            }
++            PushResult::Overflow(inner) => PushResult::Overflow(InnerBuffer { inner, key }),
++        }
+     }
+ 
+     fn is_empty(&self) -> bool {
+diff --git a/config/vector.spec.toml b/config/vector.spec.toml
+index bfd60d07a2..0c63cde08e 100644
+--- a/config/vector.spec.toml
++++ b/config/vector.spec.toml
+@@ -3738,10 +3738,18 @@ require('custom_module')
+     # The maximum size of a batch, in bytes, before it is flushed.
+     #
+     # * optional
+-    # * default: 10490000
++    # * default: 10000000
+     # * type: uint
+     # * unit: bytes
+-    max_size = 10490000
++    max_bytes = 10000000
++
++    # The maximum size of a batch, in events, before it is flushed.
++    #
++    # * optional
++    # * no default
++    # * type: uint
++    # * unit: events
++    max_events = 1000
+ 
+     # The maximum age of a batch before it is flushed.
+     #
+@@ -4082,7 +4090,15 @@ require('custom_module')
+     # * default: 1049000
+     # * type: uint
+     # * unit: bytes
+-    max_size = 1049000
++    max_bytes = 1049000
++
++    # The maximum size of a batch, in events, before it is flushed.
++    #
++    # * optional
++    # * no default
++    # * type: uint
++    # * unit: events
++    max_events = 1000
+ 
+     # The maximum age of a batch before it is flushed.
+     #
+@@ -4797,7 +4813,15 @@ require('custom_module')
+     # * default: 10490000
+     # * type: uint
+     # * unit: bytes
+-    max_size = 10490000
++    max_bytes = 10490000
++
++    # The maximum size of a batch, in events, before it is flushed.
++    #
++    # * optional
++    # * no default
++    # * type: uint
++    # * unit: events
++    max_events = 1000
+ 
+     # The maximum age of a batch before it is flushed.
+     #
+@@ -5232,7 +5256,15 @@ require('custom_module')
+     # * default: 10485760
+     # * type: uint
+     # * unit: bytes
+-    max_size = 10485760
++    max_bytes = 10485760
++
++    # The maximum size of a batch, in events, before it is flushed.
++    #
++    # * optional
++    # * no default
++    # * type: uint
++    # * unit: events
++    max_events = 1000
+ 
+     # The maximum age of a batch before it is flushed.
+     #
+@@ -5612,7 +5644,15 @@ require('custom_module')
+     # * default: 10485760
+     # * type: uint
+     # * unit: bytes
+-    max_size = 10485760
++    max_bytes = 10485760
++
++    # The maximum size of a batch, in events, before it is flushed.
++    #
++    # * optional
++    # * default: 1000
++    # * type: uint
++    # * unit: events
++    max_events = 1000
+ 
+     # The maximum age of a batch before it is flushed.
+     #
+@@ -5828,7 +5868,15 @@ require('custom_module')
+     # * default: 5242880
+     # * type: uint
+     # * unit: bytes
+-    max_size = 5242880
++    max_bytes = 5242880
++
++    # The maximum size of a batch, in events, before it is flushed.
++    #
++    # * optional
++    # * no default
++    # * type: uint
++    # * unit: events
++    max_events = 1000
+ 
+     # The maximum age of a batch before it is flushed.
+     #
+@@ -6218,7 +6266,15 @@ require('custom_module')
+     # * default: 5242880
+     # * type: uint
+     # * unit: bytes
+-    max_size = 5242880
++    max_bytes = 5242880
++
++    # The maximum size of a batch, in events, before it is flushed.
++    #
++    # * optional
++    # * no default
++    # * type: uint
++    # * unit: events
++    max_events = 1000
+ 
+     # The maximum age of a batch before it is flushed.
+     #
+@@ -6384,7 +6440,15 @@ require('custom_module')
+     # * default: 1049000
+     # * type: uint
+     # * unit: bytes
+-    max_size = 1049000
++    max_bytes = 1049000
++
++    # The maximum size of a batch, in events, before it is flushed.
++    #
++    # * optional
++    # * no default
++    # * type: uint
++    # * unit: events
++    max_events = 1000
+ 
+     # The maximum age of a batch before it is flushed.
+     #
+@@ -6671,7 +6735,15 @@ require('custom_module')
+     # * default: 1049000
+     # * type: uint
+     # * unit: bytes
+-    max_size = 1049000
++    max_bytes = 1049000
++
++    # The maximum size of a batch, in events, before it is flushed.
++    #
++    # * optional
++    # * no default
++    # * type: uint
++    # * unit: events
++    max_events = 1000
+ 
+     # The maximum age of a batch before it is flushed.
+     #
+@@ -6888,10 +6960,18 @@ require('custom_module')
+     # The maximum size of a batch, in bytes, before it is flushed.
+     #
+     # * optional
+-    # * default: 10490000
++    # * default: 1049000
+     # * type: uint
+     # * unit: bytes
+-    max_size = 10490000
++    max_bytes = 1049000
++
++    # The maximum size of a batch, in events, before it is flushed.
++    #
++    # * optional
++    # * no default
++    # * type: uint
++    # * unit: events
++    max_events = 1000
+ 
+     # The maximum age of a batch before it is flushed.
+     #
+@@ -7701,7 +7781,15 @@ require('custom_module')
+     # * default: 10490000
+     # * type: uint
+     # * unit: bytes
+-    max_size = 10490000
++    max_bytes = 10490000
++
++    # The maximum size of a batch, in events, before it is flushed.
++    #
++    # * optional
++    # * no default
++    # * type: uint
++    # * unit: events
++    max_events = 1000
+ 
+     # The maximum age of a batch before it is flushed.
+     #
+@@ -7897,7 +7985,15 @@ require('custom_module')
+     # * default: 10490000
+     # * type: uint
+     # * unit: bytes
+-    max_size = 10490000
++    max_bytes = 10490000
++
++    # The maximum size of a batch, in events, before it is flushed.
++    #
++    # * optional
++    # * no default
++    # * type: uint
++    # * unit: events
++    max_events = 1000
+ 
+     # The maximum age of a batch before it is flushed.
+     #
+@@ -8193,10 +8289,18 @@ require('custom_module')
+     # The maximum size of a batch, in bytes, before it is flushed.
+     #
+     # * optional
+-    # * default: 524000
++    # * default: 5240000
+     # * type: uint
+     # * unit: bytes
+-    max_size = 524000
++    max_bytes = 5240000
++
++    # The maximum size of a batch, in events, before it is flushed.
++    #
++    # * optional
++    # * no default
++    # * type: uint
++    # * unit: events
++    max_events = 1000
+ 
+     # The maximum age of a batch before it is flushed.
+     #
+@@ -8678,7 +8782,15 @@ require('custom_module')
+     # * default: 10490000
+     # * type: uint
+     # * unit: bytes
+-    max_size = 10490000
++    max_bytes = 10490000
++
++    # The maximum size of a batch, in events, before it is flushed.
++    #
++    # * optional
++    # * no default
++    # * type: uint
++    # * unit: events
++    max_events = 1000
+ 
+     # The maximum age of a batch before it is flushed.
+     #
+@@ -9080,7 +9192,15 @@ require('custom_module')
+     # * default: 1049000
+     # * type: uint
+     # * unit: bytes
+-    max_size = 1049000
++    max_bytes = 1049000
++
++    # The maximum size of a batch, in events, before it is flushed.
++    #
++    # * optional
++    # * no default
++    # * type: uint
++    # * unit: events
++    max_events = 1000
+ 
+     # The maximum age of a batch before it is flushed.
+     #
+diff --git a/rfcs/2020-06-12-2768-batch-and-buffer-rework.md b/rfcs/2020-06-12-2768-batch-and-buffer-rework.md
+index 38fc674f5a..bf2713aea1 100644
+--- a/rfcs/2020-06-12-2768-batch-and-buffer-rework.md
++++ b/rfcs/2020-06-12-2768-batch-and-buffer-rework.md
+@@ -88,7 +88,7 @@ the buffer over its size limits.
+ #[must_use]
+ enum PushResult<E> {
+     Ok,
+-    Full(E),
++    Overflow(E),
+ }
+ 
+ trait Batch {
+diff --git a/src/sinks/aws_cloudwatch_logs/mod.rs b/src/sinks/aws_cloudwatch_logs/mod.rs
+index 7fb2467838..5bec100103 100644
+--- a/src/sinks/aws_cloudwatch_logs/mod.rs
++++ b/src/sinks/aws_cloudwatch_logs/mod.rs
+@@ -7,8 +7,8 @@ use crate::{
+     sinks::util::{
+         encoding::{EncodingConfig, EncodingConfiguration},
+         retries::{FixedRetryPolicy, RetryLogic},
+-        rusoto, BatchEventsConfig, PartitionBatchSink, PartitionBuffer, PartitionInnerBuffer,
+-        TowerRequestConfig, TowerRequestSettings,
++        rusoto, BatchConfig, BatchSettings, PartitionBatchSink, PartitionBuffer,
++        PartitionInnerBuffer, TowerRequestConfig, TowerRequestSettings, VecBuffer,
+     },
+     template::Template,
+     topology::config::{DataType, SinkConfig, SinkContext},
+@@ -67,7 +67,7 @@ pub struct CloudwatchLogsSinkConfig {
+     pub create_missing_group: Option<bool>,
+     pub create_missing_stream: Option<bool>,
+     #[serde(default)]
+-    pub batch: BatchEventsConfig,
++    pub batch: BatchConfig,
+     #[serde(default)]
+     pub request: TowerRequestConfig,
+     pub assume_role: Option<String>,
+@@ -145,7 +145,10 @@ pub enum CloudwatchError {
+ #[typetag::serde(name = "aws_cloudwatch_logs")]
+ impl SinkConfig for CloudwatchLogsSinkConfig {
+     fn build(&self, cx: SinkContext) -> crate::Result<(super::RouterSink, super::Healthcheck)> {
+-        let batch = self.batch.unwrap_or(1000, 1);
++        let batch = self
++            .batch
++            .use_size_as_events()?
++            .get_settings_or_default(BatchSettings::default().events(1000).timeout(1));
+         let request = self.request.unwrap_with(&REQUEST_DEFAULTS);
+ 
+         let log_group = self.group_name.clone();
+@@ -159,8 +162,8 @@ impl SinkConfig for CloudwatchLogsSinkConfig {
+             )?);
+ 
+         let sink = {
+-            let buffer = PartitionBuffer::new(Vec::new());
+-            let svc_sink = PartitionBatchSink::new(svc, buffer, batch, cx.acker())
++            let buffer = PartitionBuffer::new(VecBuffer::new(batch.size));
++            let svc_sink = PartitionBatchSink::new(svc, buffer, batch.timeout, cx.acker())
+                 .sink_map_err(|e| error!("Fatal cloudwatchlogs sink error: {}", e))
+                 .with_flat_map(move |event| iter_ok(partition(event, &log_group, &log_stream)));
+             Box::new(svc_sink)
+@@ -1129,9 +1132,9 @@ mod integration_tests {
+             encoding: Encoding::Text.into(),
+             create_missing_group: None,
+             create_missing_stream: None,
+-            batch: BatchEventsConfig {
+-                timeout_secs: None,
++            batch: BatchConfig {
+                 max_events: Some(2),
++                ..Default::default()
+             },
+             request: Default::default(),
+             assume_role: None,
+diff --git a/src/sinks/aws_cloudwatch_metrics.rs b/src/sinks/aws_cloudwatch_metrics.rs
+index cf45696042..336184d380 100644
+--- a/src/sinks/aws_cloudwatch_metrics.rs
++++ b/src/sinks/aws_cloudwatch_metrics.rs
+@@ -3,7 +3,8 @@ use crate::{
+     event::metric::{Metric, MetricKind, MetricValue},
+     region::RegionOrEndpoint,
+     sinks::util::{
+-        retries2::RetryLogic, rusoto, service2::TowerRequestConfig, BatchEventsConfig, MetricBuffer,
++        retries2::RetryLogic, rusoto, service2::TowerRequestConfig, BatchConfig, BatchSettings,
++        MetricBuffer,
+     },
+     topology::config::{DataType, SinkConfig, SinkContext, SinkDescription},
+ };
+@@ -34,7 +35,7 @@ pub struct CloudWatchMetricsSinkConfig {
+     #[serde(flatten)]
+     pub region: RegionOrEndpoint,
+     #[serde(default)]
+-    pub batch: BatchEventsConfig,
++    pub batch: BatchConfig,
+     #[serde(default)]
+     pub request: TowerRequestConfig,
+     pub assume_role: Option<String>,
+@@ -82,7 +83,10 @@ impl CloudWatchMetricsSvc {
+             cx.resolver(),
+         )?;
+ 
+-        let batch = config.batch.unwrap_or(20, 1);
++        let batch = config
++            .batch
++            .use_size_as_events()?
++            .get_settings_or_default(BatchSettings::default().events(20).timeout(1));
+         let request = config.request.unwrap_with(&REQUEST_DEFAULTS);
+ 
+         let cloudwatch_metrics = CloudWatchMetricsSvc { client, config };
+@@ -91,8 +95,8 @@ impl CloudWatchMetricsSvc {
+             .batch_sink(
+                 CloudWatchMetricsRetryLogic,
+                 cloudwatch_metrics,
+-                MetricBuffer::new(),
+-                batch,
++                MetricBuffer::new(batch.size),
++                batch.timeout,
+                 cx.acker(),
+             )
+             .sink_map_err(|e| error!("CloudwatchMetrics sink error: {}", e));
+diff --git a/src/sinks/aws_kinesis_firehose.rs b/src/sinks/aws_kinesis_firehose.rs
+index 5516137649..fc18212be3 100644
+--- a/src/sinks/aws_kinesis_firehose.rs
++++ b/src/sinks/aws_kinesis_firehose.rs
+@@ -8,7 +8,7 @@ use crate::{
+         rusoto,
+         service2::TowerRequestConfig,
+         sink::Response,
+-        BatchEventsConfig,
++        BatchConfig, BatchSettings, VecBuffer,
+     },
+     topology::config::{DataType, SinkConfig, SinkContext, SinkDescription},
+ };
+@@ -45,7 +45,7 @@ pub struct KinesisFirehoseSinkConfig {
+     pub region: RegionOrEndpoint,
+     pub encoding: EncodingConfig<Encoding>,
+     #[serde(default)]
+-    pub batch: BatchEventsConfig,
++    pub batch: BatchConfig,
+     #[serde(default)]
+     pub request: TowerRequestConfig,
+     pub assume_role: Option<String>,
+@@ -97,7 +97,10 @@ impl KinesisFirehoseService {
+             cx.resolver(),
+         )?;
+ 
+-        let batch = config.batch.unwrap_or(500, 1);
++        let batch = config
++            .batch
++            .use_size_as_events()?
++            .get_settings_or_default(BatchSettings::default().events(500).timeout(1));
+         let request = config.request.unwrap_with(&REQUEST_DEFAULTS);
+         let encoding = config.encoding.clone();
+ 
+@@ -107,8 +110,8 @@ impl KinesisFirehoseService {
+             .batch_sink(
+                 KinesisFirehoseRetryLogic,
+                 kinesis,
+-                Vec::new(),
+-                batch,
++                VecBuffer::new(batch.size),
++                batch.timeout,
+                 cx.acker(),
+             )
+             .sink_map_err(|e| error!("Fatal kinesis firehose sink error: {}", e))
+@@ -269,7 +272,7 @@ mod integration_tests {
+         region::RegionOrEndpoint,
+         sinks::{
+             elasticsearch::{ElasticSearchAuth, ElasticSearchCommon, ElasticSearchConfig},
+-            util::BatchEventsConfig,
++            util::BatchConfig,
+         },
+         test_util::{random_events_with_stream, random_string, runtime},
+         topology::config::SinkContext,
+@@ -299,9 +302,9 @@ mod integration_tests {
+             stream_name: stream.clone(),
+             region: RegionOrEndpoint::with_endpoint("http://localhost:4573".into()),
+             encoding: EncodingConfig::from(Encoding::Json), // required for ES destination w/ localstack
+-            batch: BatchEventsConfig {
++            batch: BatchConfig {
+                 max_events: Some(2),
+-                timeout_secs: None,
++                ..Default::default()
+             },
+             request: TowerRequestConfig {
+                 timeout_secs: Some(10),
+diff --git a/src/sinks/aws_kinesis_streams.rs b/src/sinks/aws_kinesis_streams.rs
+index f8c43433ff..3458df1fb9 100644
+--- a/src/sinks/aws_kinesis_streams.rs
++++ b/src/sinks/aws_kinesis_streams.rs
+@@ -9,7 +9,7 @@ use crate::{
+         rusoto,
+         service2::TowerRequestConfig,
+         sink::Response,
+-        BatchEventsConfig,
++        BatchConfig, BatchSettings, VecBuffer,
+     },
+     topology::config::{DataType, SinkConfig, SinkContext, SinkDescription},
+ };
+@@ -50,7 +50,7 @@ pub struct KinesisSinkConfig {
+     pub region: RegionOrEndpoint,
+     pub encoding: EncodingConfig<Encoding>,
+     #[serde(default)]
+-    pub batch: BatchEventsConfig,
++    pub batch: BatchConfig,
+     #[serde(default)]
+     pub request: TowerRequestConfig,
+     pub assume_role: Option<String>,
+@@ -102,7 +102,10 @@ impl KinesisService {
+             cx.resolver(),
+         )?);
+ 
+-        let batch = config.batch.unwrap_or(500, 1);
++        let batch = config
++            .batch
++            .use_size_as_events()?
++            .get_settings_or_default(BatchSettings::default().events(500).timeout(1));
+         let request = config.request.unwrap_with(&REQUEST_DEFAULTS);
+         let encoding = config.encoding.clone();
+         let partition_key_field = config.partition_key_field.clone();
+@@ -110,7 +113,13 @@ impl KinesisService {
+         let kinesis = KinesisService { client, config };
+ 
+         let sink = request
+-            .batch_sink(KinesisRetryLogic, kinesis, Vec::new(), batch, cx.acker())
++            .batch_sink(
++                KinesisRetryLogic,
++                kinesis,
++                VecBuffer::new(batch.size),
++                batch.timeout,
++                cx.acker(),
++            )
+             .sink_map_err(|e| error!("Fatal kinesis streams sink error: {}", e))
+             .with_flat_map(move |e| iter_ok(encode_event(e, &partition_key_field, &encoding)));
+ 
+@@ -362,9 +371,9 @@ mod integration_tests {
+             partition_key_field: None,
+             region: RegionOrEndpoint::with_endpoint("http://localhost:4568".into()),
+             encoding: Encoding::Text.into(),
+-            batch: BatchEventsConfig {
++            batch: BatchConfig {
+                 max_events: Some(2),
+-                timeout_secs: None,
++                ..Default::default()
+             },
+             request: Default::default(),
+             assume_role: None,
+diff --git a/src/sinks/aws_s3.rs b/src/sinks/aws_s3.rs
+index 9c4d9c0968..78664375dc 100644
+--- a/src/sinks/aws_s3.rs
++++ b/src/sinks/aws_s3.rs
+@@ -9,7 +9,7 @@ use crate::{
+         rusoto,
+         service2::{ServiceBuilderExt, TowerCompat, TowerRequestConfig},
+         sink::Response,
+-        BatchBytesConfig, Buffer, Compression, PartitionBatchSink, PartitionBuffer,
++        BatchConfig, BatchSettings, Buffer, Compression, PartitionBatchSink, PartitionBuffer,
+         PartitionInnerBuffer,
+     },
+     template::Template,
+@@ -61,7 +61,7 @@ pub struct S3SinkConfig {
+     #[serde(default = "Compression::default_gzip")]
+     pub compression: Compression,
+     #[serde(default)]
+-    pub batch: BatchBytesConfig,
++    pub batch: BatchConfig,
+     #[serde(default)]
+     pub request: TowerRequestConfig,
+     pub assume_role: Option<String>,
+@@ -175,7 +175,10 @@ impl S3Sink {
+         let compression = config.compression;
+         let filename_time_format = config.filename_time_format.clone().unwrap_or("%s".into());
+         let filename_append_uuid = config.filename_append_uuid.unwrap_or(true);
+-        let batch = config.batch.unwrap_or(bytesize::mib(10u64), 300);
++        let batch = config
++            .batch
++            .use_size_as_bytes()?
++            .get_settings_or_default(BatchSettings::default().bytes(10_000_000).timeout(300));
+ 
+         let key_prefix = config
+             .key_prefix
+@@ -209,11 +212,12 @@ impl S3Sink {
+             .settings(request, S3RetryLogic)
+             .service(s3);
+ 
+-        let buffer = PartitionBuffer::new(Buffer::new(config.compression));
++        let buffer = PartitionBuffer::new(Buffer::new(batch.size, config.compression));
+ 
+-        let sink = PartitionBatchSink::new(TowerCompat::new(svc), buffer, batch, cx.acker())
+-            .with_flat_map(move |e| iter_ok(encode_event(e, &key_prefix, &encoding)))
+-            .sink_map_err(|error| error!("Sink failed to flush: {}", error));
++        let sink =
++            PartitionBatchSink::new(TowerCompat::new(svc), buffer, batch.timeout, cx.acker())
++                .with_flat_map(move |e| iter_ok(encode_event(e, &key_prefix, &encoding)))
++                .sink_map_err(|error| error!("Sink failed to flush: {}", error));
+ 
+         Ok(Box::new(sink))
+     }
+@@ -599,7 +603,7 @@ mod integration_tests {
+                 key_prefix: Some(format!("{}/{}", random_string(10), "{{i}}")),
+                 filename_time_format: Some("waitsforfullbatch".into()),
+                 filename_append_uuid: Some(false),
+-                ..config(1000).await
++                ..config(1010).await
+             };
+             let prefix = config.key_prefix.clone();
+             let sink = S3Sink::new(&config, cx).unwrap();
+@@ -651,7 +655,7 @@ mod integration_tests {
+                 key_prefix: Some(format!("{}/{}", random_string(10), "{{i}}")),
+                 filename_time_format: Some("waitsforfullbatch".into()),
+                 filename_append_uuid: Some(false),
+-                ..config(1000).await
++                ..config(1010).await
+             }
+         });
+ 
+@@ -719,7 +723,7 @@ mod integration_tests {
+             let config = S3SinkConfig {
+                 compression: Compression::Gzip,
+                 filename_time_format: Some("%S%f".into()),
+-                ..config(1000).await
++                ..config(10000).await
+             };
+ 
+             let prefix = config.key_prefix.clone();
+@@ -730,7 +734,7 @@ mod integration_tests {
+             let _ = sink.send_all(events).compat().await.unwrap();
+ 
+             let keys = get_keys(prefix.unwrap()).await;
+-            assert_eq!(keys.len(), 2);
++            assert_eq!(keys.len(), 6);
+ 
+             let response_lines = stream::iter(keys).fold(Vec::new(), |mut acc, key| async {
+                 assert!(key.ends_with(".log.gz"));
+@@ -797,9 +801,10 @@ mod integration_tests {
+             key_prefix: Some(random_string(10) + "/date=%F/"),
+             bucket: BUCKET.to_string(),
+             compression: Compression::None,
+-            batch: BatchBytesConfig {
+-                max_size: Some(batch_size),
++            batch: BatchConfig {
++                max_bytes: Some(batch_size),
+                 timeout_secs: Some(5),
++                ..Default::default()
+             },
+             region: RegionOrEndpoint::with_endpoint("http://localhost:9000".to_owned()),
+             ..Default::default()
+diff --git a/src/sinks/clickhouse.rs b/src/sinks/clickhouse.rs
+index 40e080492d..1ecd4b6afc 100644
+--- a/src/sinks/clickhouse.rs
++++ b/src/sinks/clickhouse.rs
+@@ -6,7 +6,7 @@ use crate::{
+         http::{Auth, BatchedHttpSink, HttpClient, HttpRetryLogic, HttpSink},
+         retries2::{RetryAction, RetryLogic},
+         service2::TowerRequestConfig,
+-        BatchBytesConfig, Buffer, Compression,
++        BatchConfig, BatchSettings, Buffer, Compression,
+     },
+     tls::{TlsOptions, TlsSettings},
+     topology::config::{DataType, SinkConfig, SinkContext, SinkDescription},
+@@ -33,7 +33,7 @@ pub struct ClickhouseConfig {
+     )]
+     pub encoding: EncodingConfigWithDefault<Encoding>,
+     #[serde(default)]
+-    pub batch: BatchBytesConfig,
++    pub batch: BatchConfig,
+     pub auth: Option<Auth>,
+     #[serde(default)]
+     pub request: TowerRequestConfig,
+@@ -61,15 +61,19 @@ pub enum Encoding {
+ #[typetag::serde(name = "clickhouse")]
+ impl SinkConfig for ClickhouseConfig {
+     fn build(&self, cx: SinkContext) -> crate::Result<(super::RouterSink, super::Healthcheck)> {
+-        let batch = self.batch.unwrap_or(bytesize::mib(10u64), 1);
++        let batch = self.batch.use_size_as_bytes()?.get_settings_or_default(
++            BatchSettings::default()
++                .bytes(bytesize::mib(10u64))
++                .timeout(1),
++        );
+         let request = self.request.unwrap_with(&REQUEST_DEFAULTS);
+         let tls_settings = TlsSettings::from_options(&self.tls)?;
+ 
+         let sink = BatchedHttpSink::new(
+             self.clone(),
+-            Buffer::new(self.compression),
++            Buffer::new(batch.size, self.compression),
+             request,
+-            batch,
++            batch.timeout,
+             tls_settings,
+             &cx,
+         )
+@@ -255,9 +259,9 @@ mod integration_tests {
+             host: host.clone(),
+             table: table.clone(),
+             compression: Compression::None,
+-            batch: BatchBytesConfig {
+-                max_size: Some(1),
+-                timeout_secs: None,
++            batch: BatchConfig {
++                max_events: Some(1),
++                ..Default::default()
+             },
+             request: TowerRequestConfig {
+                 retry_attempts: Some(1),
+@@ -299,9 +303,9 @@ mod integration_tests {
+             table: table.clone(),
+             compression: Compression::None,
+             encoding,
+-            batch: BatchBytesConfig {
+-                max_size: Some(1),
+-                timeout_secs: None,
++            batch: BatchConfig {
++                max_events: Some(1),
++                ..Default::default()
+             },
+             request: TowerRequestConfig {
+                 retry_attempts: Some(1),
+@@ -361,7 +365,7 @@ compression = "none"
+ [request]
+   retry_attempts = 1
+ [batch]
+-  max_size = 1
++  max_events = 1
+ [encoding]
+   timestamp_format = "unix""#,
+             host, table
+@@ -415,9 +419,9 @@ compression = "none"
+             host: host.clone(),
+             table: table.clone(),
+             compression: Compression::None,
+-            batch: BatchBytesConfig {
+-                max_size: Some(1),
+-                timeout_secs: None,
++            batch: BatchConfig {
++                max_events: Some(1),
++                ..Default::default()
+             },
+             ..Default::default()
+         };
+diff --git a/src/sinks/datadog/metrics.rs b/src/sinks/datadog/metrics.rs
+index ce41cb6b49..7d09b78272 100644
+--- a/src/sinks/datadog/metrics.rs
++++ b/src/sinks/datadog/metrics.rs
+@@ -7,7 +7,7 @@ use crate::{
+     sinks::util::{
+         http::{BatchedHttpSink, HttpClient, HttpSink},
+         service2::TowerRequestConfig,
+-        BatchEventsConfig, MetricBuffer,
++        BatchConfig, BatchSettings, MetricBuffer,
+     },
+     topology::config::{DataType, SinkConfig, SinkContext, SinkDescription},
+ };
+@@ -41,7 +41,7 @@ pub struct DatadogConfig {
+     pub host: String,
+     pub api_key: String,
+     #[serde(default)]
+-    pub batch: BatchEventsConfig,
++    pub batch: BatchConfig,
+     #[serde(default)]
+     pub request: TowerRequestConfig,
+ }
+@@ -109,7 +109,10 @@ impl SinkConfig for DatadogConfig {
+     fn build(&self, cx: SinkContext) -> crate::Result<(super::RouterSink, super::Healthcheck)> {
+         let healthcheck = healthcheck(self.clone(), cx.resolver()).boxed().compat();
+ 
+-        let batch = self.batch.unwrap_or(20, 1);
++        let batch = self
++            .batch
++            .use_size_as_events()?
++            .get_settings_or_default(BatchSettings::default().events(20).timeout(1));
+         let request = self.request.unwrap_with(&REQUEST_DEFAULTS);
+ 
+         let uri = build_uri(&self.host)?;
+@@ -121,8 +124,15 @@ impl SinkConfig for DatadogConfig {
+             last_sent_timestamp: AtomicI64::new(timestamp),
+         };
+ 
+-        let sink = BatchedHttpSink::new(sink, MetricBuffer::new(), request, batch, None, &cx)
+-            .sink_map_err(|e| error!("Fatal datadog error: {}", e));
++        let sink = BatchedHttpSink::new(
++            sink,
++            MetricBuffer::new(batch.size),
++            request,
++            batch.timeout,
++            None,
++            &cx,
++        )
++        .sink_map_err(|e| error!("Fatal datadog error: {}", e));
+ 
+         Ok((Box::new(sink), Box::new(healthcheck)))
+     }
+diff --git a/src/sinks/elasticsearch.rs b/src/sinks/elasticsearch.rs
+index 44d80af8f3..0c62e57b77 100644
+--- a/src/sinks/elasticsearch.rs
++++ b/src/sinks/elasticsearch.rs
+@@ -10,7 +10,7 @@ use crate::{
+         retries2::{RetryAction, RetryLogic},
+         rusoto,
+         service2::TowerRequestConfig,
+-        BatchBytesConfig, Buffer, Compression,
++        BatchConfig, BatchSettings, Buffer, Compression,
+     },
+     template::{Template, TemplateError},
+     tls::{TlsOptions, TlsSettings},
+@@ -52,7 +52,7 @@ pub struct ElasticSearchConfig {
+     )]
+     pub encoding: EncodingConfigWithDefault<Encoding>,
+     #[serde(default)]
+-    pub batch: BatchBytesConfig,
++    pub batch: BatchConfig,
+     #[serde(default)]
+     pub request: TowerRequestConfig,
+     pub auth: Option<ElasticSearchAuth>,
+@@ -107,16 +107,24 @@ impl SinkConfig for ElasticSearchConfig {
+ 
+         let common = ElasticSearchCommon::parse_config(&self)?;
+         let compression = common.compression;
+-        let batch = self.batch.unwrap_or(bytesize::mib(10u64), 1);
++        let batch = self
++            .batch
++            .clone()
++            .use_size_as_bytes()?
++            .get_settings_or_default(
++                BatchSettings::default()
++                    .bytes(bytesize::mib(10u64))
++                    .timeout(1),
++            );
+         let request = self.request.unwrap_with(&REQUEST_DEFAULTS);
+         let tls_settings = common.tls_settings.clone();
+ 
+         let sink = BatchedHttpSink::with_retry_logic(
+             common,
+-            Buffer::new(compression),
++            Buffer::new(batch.size, compression),
+             ElasticSearchRetryLogic,
+             request,
+-            batch,
++            batch.timeout,
+             tls_settings,
+             &cx,
+         )
+@@ -811,9 +819,9 @@ mod integration_tests {
+ 
+     fn config() -> ElasticSearchConfig {
+         ElasticSearchConfig {
+-            batch: BatchBytesConfig {
+-                max_size: Some(1),
+-                timeout_secs: None,
++            batch: BatchConfig {
++                max_events: Some(1),
++                ..Default::default()
+             },
+             ..Default::default()
+         }
+diff --git a/src/sinks/gcp/cloud_storage.rs b/src/sinks/gcp/cloud_storage.rs
+index 587f8d97dc..f3e4585bfc 100644
+--- a/src/sinks/gcp/cloud_storage.rs
++++ b/src/sinks/gcp/cloud_storage.rs
+@@ -8,7 +8,7 @@ use crate::{
+             http::{HttpClient, HttpClientFuture},
+             retries2::{RetryAction, RetryLogic},
+             service2::{ServiceBuilderExt, TowerCompat, TowerRequestConfig},
+-            BatchBytesConfig, Buffer, Compression, PartitionBatchSink, PartitionBuffer,
++            BatchConfig, BatchSettings, Buffer, Compression, PartitionBatchSink, PartitionBuffer,
+             PartitionInnerBuffer,
+         },
+         Healthcheck, RouterSink,
+@@ -69,7 +69,7 @@ pub struct GcsSinkConfig {
+     #[serde(default)]
+     compression: Compression,
+     #[serde(default)]
+-    batch: BatchBytesConfig,
++    batch: BatchConfig,
+     #[serde(default)]
+     request: TowerRequestConfig,
+     #[serde(flatten)]
+@@ -199,7 +199,11 @@ impl GcsSink {
+         let request = config.request.unwrap_with(&REQUEST_DEFAULTS);
+         let encoding = config.encoding.clone();
+ 
+-        let batch = config.batch.unwrap_or(bytesize::mib(10u64), 300);
++        let batch = config.batch.use_size_as_bytes()?.get_settings_or_default(
++            BatchSettings::default()
++                .bytes(bytesize::mib(10u64))
++                .timeout(300),
++        );
+ 
+         let key_prefix = config
+             .key_prefix
+@@ -215,11 +219,12 @@ impl GcsSink {
+             .settings(request, GcsRetryLogic)
+             .service(self);
+ 
+-        let buffer = PartitionBuffer::new(Buffer::new(config.compression));
++        let buffer = PartitionBuffer::new(Buffer::new(batch.size, config.compression));
+ 
+-        let sink = PartitionBatchSink::new(TowerCompat::new(svc), buffer, batch, cx.acker())
+-            .sink_map_err(|e| error!("Fatal gcs sink error: {}", e))
+-            .with_flat_map(move |e| iter_ok(encode_event(e, &key_prefix, &encoding)));
++        let sink =
++            PartitionBatchSink::new(TowerCompat::new(svc), buffer, batch.timeout, cx.acker())
++                .sink_map_err(|e| error!("Fatal gcs sink error: {}", e))
++                .with_flat_map(move |e| iter_ok(encode_event(e, &key_prefix, &encoding)));
+ 
+         Ok(Box::new(sink))
+     }
+diff --git a/src/sinks/gcp/pubsub.rs b/src/sinks/gcp/pubsub.rs
+index be199f0324..6c39d71962 100644
+--- a/src/sinks/gcp/pubsub.rs
++++ b/src/sinks/gcp/pubsub.rs
+@@ -6,7 +6,7 @@ use crate::{
+             encoding::{EncodingConfigWithDefault, EncodingConfiguration},
+             http::{BatchedHttpSink, HttpClient, HttpSink},
+             service2::TowerRequestConfig,
+-            BatchBytesConfig, BoxedRawValue, JsonArrayBuffer,
++            BatchConfig, BatchSettings, BoxedRawValue, JsonArrayBuffer,
+         },
+         Healthcheck, RouterSink, UriParseError,
+     },
+@@ -37,7 +37,7 @@ pub struct PubsubConfig {
+     pub auth: GcpAuthConfig,
+ 
+     #[serde(default)]
+-    pub batch: BatchBytesConfig,
++    pub batch: BatchConfig,
+     #[serde(default)]
+     pub request: TowerRequestConfig,
+     #[serde(
+@@ -65,7 +65,12 @@ inventory::submit! {
+ impl SinkConfig for PubsubConfig {
+     fn build(&self, cx: SinkContext) -> crate::Result<(RouterSink, Healthcheck)> {
+         let sink = PubsubSink::from_config(self)?;
+-        let batch_settings = self.batch.unwrap_or(bytesize::mib(10u64), 1);
++        let batch_settings = self.batch.use_size_as_bytes()?.get_settings_or_default(
++            BatchSettings::default()
++                .bytes(bytesize::mib(10u64))
++                .events(1000)
++                .timeout(1),
++        );
+         let request_settings = self.request.unwrap_with(&Default::default());
+         let tls_settings = TlsSettings::from_options(&self.tls)?;
+ 
+@@ -80,9 +85,9 @@ impl SinkConfig for PubsubConfig {
+ 
+         let sink = BatchedHttpSink::new(
+             sink,
+-            JsonArrayBuffer::default(),
++            JsonArrayBuffer::new(batch_settings.size),
+             request_settings,
+-            batch_settings,
++            batch_settings.timeout,
+             Some(tls_settings),
+             &cx,
+         )
+diff --git a/src/sinks/gcp/stackdriver_logs.rs b/src/sinks/gcp/stackdriver_logs.rs
+index 62ba51e29d..51cae4ca2e 100644
+--- a/src/sinks/gcp/stackdriver_logs.rs
++++ b/src/sinks/gcp/stackdriver_logs.rs
+@@ -6,7 +6,7 @@ use crate::{
+             encoding::{EncodingConfigWithDefault, EncodingConfiguration},
+             http::{BatchedHttpSink, HttpClient, HttpSink},
+             service2::TowerRequestConfig,
+-            BatchBytesConfig, BoxedRawValue, JsonArrayBuffer,
++            BatchConfig, BatchSettings, BoxedRawValue, JsonArrayBuffer,
+         },
+         Healthcheck, RouterSink,
+     },
+@@ -48,7 +48,7 @@ pub struct StackdriverConfig {
+     pub encoding: EncodingConfigWithDefault<Encoding>,
+ 
+     #[serde(default)]
+-    pub batch: BatchBytesConfig,
++    pub batch: BatchConfig,
+     #[serde(default)]
+     pub request: TowerRequestConfig,
+ 
+@@ -112,7 +112,11 @@ impl SinkConfig for StackdriverConfig {
+     fn build(&self, cx: SinkContext) -> crate::Result<(RouterSink, Healthcheck)> {
+         let creds = self.auth.make_credentials(Scope::LoggingWrite)?;
+ 
+-        let batch = self.batch.unwrap_or(bytesize::kib(5000u64), 1);
++        let batch = self.batch.use_size_as_bytes()?.get_settings_or_default(
++            BatchSettings::default()
++                .bytes(bytesize::kib(5000u64))
++                .timeout(1),
++        );
+         let request = self.request.unwrap_with(&REQUEST_DEFAULTS);
+         let tls_settings = TlsSettings::from_options(&self.tls)?;
+ 
+@@ -135,9 +139,9 @@ impl SinkConfig for StackdriverConfig {
+ 
+         let sink = BatchedHttpSink::new(
+             sink,
+-            JsonArrayBuffer::default(),
++            JsonArrayBuffer::new(batch.size),
+             request,
+-            batch,
++            batch.timeout,
+             tls_settings,
+             &cx,
+         )
+diff --git a/src/sinks/honeycomb.rs b/src/sinks/honeycomb.rs
+index b82db60702..cdbdeda104 100644
+--- a/src/sinks/honeycomb.rs
++++ b/src/sinks/honeycomb.rs
+@@ -4,7 +4,7 @@ use crate::{
+     sinks::util::{
+         http::{BatchedHttpSink, HttpClient, HttpSink},
+         service2::TowerRequestConfig,
+-        BatchBytesConfig, BoxedRawValue, JsonArrayBuffer, UriSerde,
++        BatchConfig, BatchSettings, BoxedRawValue, JsonArrayBuffer, UriSerde,
+     },
+     tls::TlsSettings,
+     topology::config::{DataType, SinkConfig, SinkContext, SinkDescription},
+@@ -28,7 +28,7 @@ pub struct HoneycombConfig {
+     dataset: String,
+ 
+     #[serde(default)]
+-    batch: BatchBytesConfig,
++    batch: BatchConfig,
+ 
+     #[serde(default)]
+     request: TowerRequestConfig,
+@@ -42,13 +42,17 @@ inventory::submit! {
+ impl SinkConfig for HoneycombConfig {
+     fn build(&self, cx: SinkContext) -> crate::Result<(super::RouterSink, super::Healthcheck)> {
+         let request_settings = self.request.unwrap_with(&TowerRequestConfig::default());
+-        let batch_settings = self.batch.unwrap_or(bytesize::mib(5u64), 1);
++        let batch_settings = self.batch.use_size_as_bytes()?.get_settings_or_default(
++            BatchSettings::default()
++                .bytes(bytesize::kib(100u64))
++                .timeout(1),
++        );
+ 
+         let sink = BatchedHttpSink::new(
+             self.clone(),
+-            JsonArrayBuffer::default(),
++            JsonArrayBuffer::new(batch_settings.size),
+             request_settings,
+-            batch_settings,
++            batch_settings.timeout,
+             None,
+             &cx,
+         )
+diff --git a/src/sinks/http.rs b/src/sinks/http.rs
+index d2ad5478da..688eb5c538 100644
+--- a/src/sinks/http.rs
++++ b/src/sinks/http.rs
+@@ -5,7 +5,7 @@ use crate::{
+         encoding::{EncodingConfig, EncodingConfiguration},
+         http::{Auth, BatchedHttpSink, HttpClient, HttpSink},
+         service2::TowerRequestConfig,
+-        BatchBytesConfig, Buffer, Compression, UriSerde,
++        BatchConfig, BatchSettings, Buffer, Compression, UriSerde,
+     },
+     tls::{TlsOptions, TlsSettings},
+     topology::config::{DataType, SinkConfig, SinkContext, SinkDescription},
+@@ -48,7 +48,7 @@ pub struct HttpSinkConfig {
+     pub compression: Compression,
+     pub encoding: EncodingConfig<Encoding>,
+     #[serde(default)]
+-    pub batch: BatchBytesConfig,
++    pub batch: BatchConfig,
+     #[serde(default)]
+     pub request: TowerRequestConfig,
+     pub tls: Option<TlsOptions>,
+@@ -110,14 +110,18 @@ impl SinkConfig for HttpSinkConfig {
+         config.uri = build_uri(config.uri.clone()).into();
+ 
+         let compression = config.compression;
+-        let batch = config.batch.unwrap_or(bytesize::mib(10u64), 1);
++        let batch = config.batch.use_size_as_bytes()?.get_settings_or_default(
++            BatchSettings::default()
++                .bytes(bytesize::mib(10u64))
++                .timeout(1),
++        );
+         let request = config.request.unwrap_with(&REQUEST_DEFAULTS);
+ 
+         let sink = BatchedHttpSink::new(
+             config,
+-            Buffer::new(compression),
++            Buffer::new(batch.size, compression),
+             request,
+-            batch,
++            batch.timeout,
+             Some(tls.clone()),
+             &cx,
+         )
+diff --git a/src/sinks/humio_logs.rs b/src/sinks/humio_logs.rs
+index 1e8f88ff8d..d9f370df1b 100644
+--- a/src/sinks/humio_logs.rs
++++ b/src/sinks/humio_logs.rs
+@@ -1,8 +1,7 @@
+ use crate::{
+     sinks::splunk_hec::{self, HecSinkConfig},
+     sinks::util::{
+-        encoding::EncodingConfigWithDefault, service2::TowerRequestConfig, BatchBytesConfig,
+-        Compression,
++        encoding::EncodingConfigWithDefault, service2::TowerRequestConfig, BatchConfig, Compression,
+     },
+     topology::config::{DataType, SinkConfig, SinkContext, SinkDescription},
+ };
+@@ -26,7 +25,7 @@ pub struct HumioLogsConfig {
+     request: TowerRequestConfig,
+ 
+     #[serde(default)]
+-    batch: BatchBytesConfig,
++    batch: BatchConfig,
+ }
+ 
+ inventory::submit! {
+diff --git a/src/sinks/influxdb/logs.rs b/src/sinks/influxdb/logs.rs
+index 421c10452e..5601830bed 100644
+--- a/src/sinks/influxdb/logs.rs
++++ b/src/sinks/influxdb/logs.rs
+@@ -6,7 +6,9 @@ use crate::sinks::influxdb::{
+ };
+ use crate::sinks::util::encoding::EncodingConfigWithDefault;
+ use crate::sinks::util::http::{BatchedHttpSink, HttpSink};
+-use crate::sinks::util::{service2::TowerRequestConfig, BatchBytesConfig, Buffer, Compression};
++use crate::sinks::util::{
++    service2::TowerRequestConfig, BatchConfig, BatchSettings, Buffer, Compression,
++};
+ use crate::sinks::Healthcheck;
+ use crate::{
+     event::{log_schema, Event},
+@@ -35,7 +37,7 @@ pub struct InfluxDBLogsConfig {
+     )]
+     pub encoding: EncodingConfigWithDefault<Encoding>,
+     #[serde(default)]
+-    pub batch: BatchBytesConfig,
++    pub batch: BatchConfig,
+     #[serde(default)]
+     pub request: TowerRequestConfig,
+ }
+@@ -78,7 +80,11 @@ impl SinkConfig for InfluxDBLogsConfig {
+ 
+         let healthcheck = self.healthcheck(cx.resolver())?;
+ 
+-        let batch = self.batch.unwrap_or(bytesize::mib(1u64), 1);
++        let batch = self.batch.use_size_as_bytes()?.get_settings_or_default(
++            BatchSettings::default()
++                .bytes(bytesize::mib(1u64))
++                .timeout(1),
++        );
+         let request = self.request.unwrap_with(&REQUEST_DEFAULTS);
+ 
+         let settings = influxdb_settings(
+@@ -104,9 +110,9 @@ impl SinkConfig for InfluxDBLogsConfig {
+ 
+         let sink = BatchedHttpSink::new(
+             sink,
+-            Buffer::new(Compression::None),
++            Buffer::new(batch.size, Compression::None),
+             request,
+-            batch,
++            batch.timeout,
+             None,
+             &cx,
+         )
+diff --git a/src/sinks/influxdb/metrics.rs b/src/sinks/influxdb/metrics.rs
+index ebd55a84d0..7dfff0c94e 100644
+--- a/src/sinks/influxdb/metrics.rs
++++ b/src/sinks/influxdb/metrics.rs
+@@ -7,7 +7,7 @@ use crate::{
+     sinks::util::{
+         http::{HttpBatchService, HttpRetryLogic},
+         service2::TowerRequestConfig,
+-        BatchEventsConfig, MetricBuffer,
++        BatchConfig, BatchSettings, MetricBuffer,
+     },
+     topology::config::{DataType, SinkConfig, SinkContext, SinkDescription},
+ };
+@@ -37,7 +37,7 @@ pub struct InfluxDBConfig {
+     #[serde(flatten)]
+     pub influxdb2_settings: Option<InfluxDB2Settings>,
+     #[serde(default)]
+-    pub batch: BatchEventsConfig,
++    pub batch: BatchConfig,
+     #[serde(default)]
+     pub request: TowerRequestConfig,
+ }
+@@ -92,7 +92,10 @@ impl InfluxDBSvc {
+         let token = settings.token();
+         let protocol_version = settings.protocol_version();
+ 
+-        let batch = config.batch.unwrap_or(20, 1);
++        let batch = config
++            .batch
++            .use_size_as_events()?
++            .get_settings_or_default(BatchSettings::default().events(20).timeout(1));
+         let request = config.request.unwrap_with(&REQUEST_DEFAULTS);
+ 
+         let uri = settings.write_uri(endpoint)?;
+@@ -110,8 +113,8 @@ impl InfluxDBSvc {
+             .batch_sink(
+                 HttpRetryLogic,
+                 influxdb_http_service,
+-                MetricBuffer::new(),
+-                batch,
++                MetricBuffer::new(batch.size),
++                batch.timeout,
+                 cx.acker(),
+             )
+             .sink_map_err(|e| error!("Fatal influxdb sink error: {}", e));
+diff --git a/src/sinks/logdna.rs b/src/sinks/logdna.rs
+index c298da842e..8af9c28166 100644
+--- a/src/sinks/logdna.rs
++++ b/src/sinks/logdna.rs
+@@ -5,7 +5,7 @@ use crate::{
+         encoding::EncodingConfigWithDefault,
+         http::{Auth, BatchedHttpSink, HttpClient, HttpSink},
+         service2::TowerRequestConfig,
+-        BatchBytesConfig, BoxedRawValue, JsonArrayBuffer, UriSerde,
++        BatchConfig, BatchSettings, BoxedRawValue, JsonArrayBuffer, UriSerde,
+     },
+     tls::TlsSettings,
+     topology::config::{DataType, SinkConfig, SinkContext, SinkDescription},
+@@ -42,7 +42,7 @@ pub struct LogdnaConfig {
+     default_app: Option<String>,
+ 
+     #[serde(default)]
+-    batch: BatchBytesConfig,
++    batch: BatchConfig,
+ 
+     #[serde(default)]
+     request: TowerRequestConfig,
+@@ -64,13 +64,17 @@ pub enum Encoding {
+ impl SinkConfig for LogdnaConfig {
+     fn build(&self, cx: SinkContext) -> crate::Result<(super::RouterSink, super::Healthcheck)> {
+         let request_settings = self.request.unwrap_with(&TowerRequestConfig::default());
+-        let batch_settings = self.batch.unwrap_or(bytesize::mib(10u64), 1);
++        let batch_settings = self.batch.use_size_as_bytes()?.get_settings_or_default(
++            BatchSettings::default()
++                .bytes(bytesize::mib(10u64))
++                .timeout(1),
++        );
+ 
+         let sink = BatchedHttpSink::new(
+             self.clone(),
+-            JsonArrayBuffer::default(),
++            JsonArrayBuffer::new(batch_settings.size),
+             request_settings,
+-            batch_settings,
++            batch_settings.timeout,
+             None,
+             &cx,
+         )
+diff --git a/src/sinks/loki.rs b/src/sinks/loki.rs
+index 6c4dbab43a..9d4366cc08 100644
+--- a/src/sinks/loki.rs
++++ b/src/sinks/loki.rs
+@@ -20,7 +20,7 @@ use crate::{
+         encoding::{EncodingConfigWithDefault, EncodingConfiguration},
+         http::{Auth, BatchedHttpSink, HttpClient, HttpSink},
+         service2::TowerRequestConfig,
+-        BatchBytesConfig, UriSerde,
++        BatchConfig, BatchSettings, UriSerde, VecBuffer,
+     },
+     template::Template,
+     tls::{TlsOptions, TlsSettings},
+@@ -55,7 +55,7 @@ pub struct LokiConfig {
+     request: TowerRequestConfig,
+ 
+     #[serde(default)]
+-    batch: BatchBytesConfig,
++    batch: BatchConfig,
+ 
+     tls: Option<TlsOptions>,
+ }
+@@ -81,14 +81,18 @@ impl SinkConfig for LokiConfig {
+         }
+ 
+         let request_settings = self.request.unwrap_with(&TowerRequestConfig::default());
+-        let batch_settings = self.batch.unwrap_or(bytesize::mib(10u64), 1);
++        let batch_settings = self.batch.use_size_as_bytes()?.get_settings_or_default(
++            BatchSettings::default()
++                .bytes(bytesize::mib(10u64))
++                .timeout(1),
++        );
+         let tls = TlsSettings::from_options(&self.tls)?;
+ 
+         let sink = BatchedHttpSink::new(
+             self.clone(),
+-            Vec::new(),
++            VecBuffer::new(batch_settings.size),
+             request_settings,
+-            batch_settings,
++            batch_settings.timeout,
+             Some(tls),
+             &cx,
+         )
+diff --git a/src/sinks/new_relic_logs.rs b/src/sinks/new_relic_logs.rs
+index e8f0eea3a4..62ee961e9b 100644
+--- a/src/sinks/new_relic_logs.rs
++++ b/src/sinks/new_relic_logs.rs
+@@ -3,7 +3,7 @@ use crate::{
+     sinks::util::{
+         encoding::{EncodingConfigWithDefault, EncodingConfiguration},
+         service2::TowerRequestConfig,
+-        BatchBytesConfig, Compression,
++        BatchConfig, Compression,
+     },
+     topology::config::{DataType, SinkConfig, SinkContext, SinkDescription},
+ };
+@@ -40,7 +40,7 @@ pub struct NewRelicLogsConfig {
+     #[serde(default)]
+     pub compression: Compression,
+     #[serde(default)]
+-    pub batch: BatchBytesConfig,
++    pub batch: BatchConfig,
+ 
+     #[serde(default)]
+     pub request: TowerRequestConfig,
+@@ -106,11 +106,13 @@ impl NewRelicLogsConfig {
+             NewRelicLogsRegion::Eu => Uri::from_static("https://log-api.eu.newrelic.com/log/v1"),
+         };
+ 
+-        let batch = BatchBytesConfig {
++        let batch = self.batch.use_size_as_bytes()?;
++        let batch = BatchConfig {
+             // The max request size is 10MiB, so in order to be comfortably
+             // within this we batch up to 5MiB.
+-            max_size: Some(self.batch.max_size.unwrap_or(bytesize::mib(5u64) as usize)),
+-            ..self.batch
++            max_bytes: Some(batch.max_bytes.unwrap_or(bytesize::mib(5u64) as usize)),
++            max_events: None,
++            ..batch
+         };
+ 
+         let request = TowerRequestConfig {
+@@ -177,7 +179,7 @@ mod tests {
+         assert_eq!(http_config.method, Some(HttpMethod::Post));
+         assert_eq!(http_config.encoding.codec(), &Encoding::Json.into());
+         assert_eq!(
+-            http_config.batch.max_size,
++            http_config.batch.max_bytes,
+             Some(bytesize::mib(5u64) as usize)
+         );
+         assert_eq!(http_config.request.in_flight_limit, Some(100));
+@@ -208,7 +210,7 @@ mod tests {
+         assert_eq!(http_config.method, Some(HttpMethod::Post));
+         assert_eq!(http_config.encoding.codec(), &Encoding::Json.into());
+         assert_eq!(
+-            http_config.batch.max_size,
++            http_config.batch.max_bytes,
+             Some(bytesize::mib(8u64) as usize)
+         );
+         assert_eq!(http_config.request.in_flight_limit, Some(12));
+@@ -245,7 +247,7 @@ mod tests {
+         assert_eq!(http_config.method, Some(HttpMethod::Post));
+         assert_eq!(http_config.encoding.codec(), &Encoding::Json.into());
+         assert_eq!(
+-            http_config.batch.max_size,
++            http_config.batch.max_bytes,
+             Some(bytesize::mib(8u64) as usize)
+         );
+         assert_eq!(http_config.request.in_flight_limit, Some(12));
+diff --git a/src/sinks/sematext_logs.rs b/src/sinks/sematext_logs.rs
+index 4e384c61c7..3abc178ec2 100644
+--- a/src/sinks/sematext_logs.rs
++++ b/src/sinks/sematext_logs.rs
+@@ -1,8 +1,7 @@
+ use crate::{
+     sinks::elasticsearch::{ElasticSearchConfig, Encoding},
+     sinks::util::{
+-        encoding::EncodingConfigWithDefault, service2::TowerRequestConfig, BatchBytesConfig,
+-        Compression,
++        encoding::EncodingConfigWithDefault, service2::TowerRequestConfig, BatchConfig, Compression,
+     },
+     topology::config::{DataType, SinkConfig, SinkContext, SinkDescription},
+     Event,
+@@ -27,7 +26,7 @@ pub struct SematextLogsConfig {
+     request: TowerRequestConfig,
+ 
+     #[serde(default)]
+-    batch: BatchBytesConfig,
++    batch: BatchConfig,
+ }
+ 
+ inventory::submit! {
+diff --git a/src/sinks/splunk_hec.rs b/src/sinks/splunk_hec.rs
+index ee4dd43ff4..9543a7beb9 100644
+--- a/src/sinks/splunk_hec.rs
++++ b/src/sinks/splunk_hec.rs
+@@ -6,7 +6,7 @@ use crate::{
+         encoding::{EncodingConfigWithDefault, EncodingConfiguration},
+         http::{BatchedHttpSink, HttpClient, HttpSink},
+         service2::TowerRequestConfig,
+-        BatchBytesConfig, Buffer, Compression,
++        BatchConfig, BatchSettings, Buffer, Compression,
+     },
+     tls::{TlsOptions, TlsSettings},
+     topology::config::{DataType, SinkConfig, SinkContext, SinkDescription},
+@@ -46,7 +46,7 @@ pub struct HecSinkConfig {
+     #[serde(default)]
+     pub compression: Compression,
+     #[serde(default)]
+-    pub batch: BatchBytesConfig,
++    pub batch: BatchConfig,
+     #[serde(default)]
+     pub request: TowerRequestConfig,
+     pub tls: Option<TlsOptions>,
+@@ -82,15 +82,19 @@ impl SinkConfig for HecSinkConfig {
+     fn build(&self, cx: SinkContext) -> crate::Result<(super::RouterSink, super::Healthcheck)> {
+         validate_host(&self.host)?;
+ 
+-        let batch = self.batch.unwrap_or(bytesize::mib(1u64), 1);
++        let batch = self.batch.use_size_as_bytes()?.get_settings_or_default(
++            BatchSettings::default()
++                .bytes(bytesize::mib(1u64))
++                .timeout(1),
++        );
+         let request = self.request.unwrap_with(&REQUEST_DEFAULTS);
+         let tls_settings = TlsSettings::from_options(&self.tls)?;
+ 
+         let sink = BatchedHttpSink::new(
+             self.clone(),
+-            Buffer::new(self.compression),
++            Buffer::new(batch.size, self.compression),
+             request,
+-            batch,
++            batch.timeout,
+             tls_settings,
+             &cx,
+         )
+@@ -726,9 +730,9 @@ mod integration_tests {
+             host_key: "host".into(),
+             compression: Compression::None,
+             encoding: encoding.into(),
+-            batch: BatchBytesConfig {
+-                max_size: Some(1),
+-                timeout_secs: None,
++            batch: BatchConfig {
++                max_events: Some(1),
++                ..Default::default()
+             },
+             indexed_fields,
+             ..Default::default()
+diff --git a/src/sinks/statsd.rs b/src/sinks/statsd.rs
+index 7d0917e75a..170511b6f1 100644
+--- a/src/sinks/statsd.rs
++++ b/src/sinks/statsd.rs
+@@ -2,7 +2,9 @@ use crate::{
+     buffers::Acker,
+     event::metric::{MetricKind, MetricValue},
+     event::Event,
+-    sinks::util::{service2::TowerCompat, BatchBytesConfig, BatchSink, Buffer, Compression},
++    sinks::util::{
++        service2::TowerCompat, BatchConfig, BatchSettings, BatchSink, Buffer, Compression,
++    },
+     topology::config::{DataType, SinkConfig, SinkContext, SinkDescription},
+ };
+ use futures::{future, FutureExt, TryFutureExt};
+@@ -51,7 +53,7 @@ pub struct StatsdSinkConfig {
+     #[serde(default = "default_address")]
+     pub address: SocketAddr,
+     #[serde(default)]
+-    pub batch: BatchBytesConfig,
++    pub batch: BatchConfig,
+ }
+ 
+ pub fn default_address() -> SocketAddr {
+@@ -86,7 +88,10 @@ impl StatsdSvc {
+         // However we need to leave some space for +1 extra trailing event in the buffer.
+         // Also one might keep an eye on server side limitations, like
+         // mentioned here https://github.com/DataDog/dd-agent/issues/2638
+-        let batch = config.batch.unwrap_or(1300, 1);
++        let batch = config
++            .batch
++            .use_size_as_bytes()?
++            .get_settings_or_default(BatchSettings::default().bytes(1300).events(1000).timeout(1));
+         let namespace = config.namespace.clone();
+ 
+         let client = Client::new(config.address)?;
+@@ -96,8 +101,8 @@ impl StatsdSvc {
+ 
+         let sink = BatchSink::new(
+             TowerCompat::new(svc),
+-            Buffer::new(Compression::None),
+-            batch,
++            Buffer::new(batch.size, Compression::None),
++            batch.timeout,
+             acker,
+         )
+         .sink_map_err(|e| error!("Fatal statsd sink error: {}", e))
+@@ -330,9 +335,10 @@ mod test {
+         let config = StatsdSinkConfig {
+             namespace: "vector".into(),
+             address: default_address(),
+-            batch: BatchBytesConfig {
+-                max_size: Some(512),
++            batch: BatchConfig {
++                max_bytes: Some(512),
+                 timeout_secs: Some(1),
++                ..Default::default()
+             },
+         };
+ 
+diff --git a/src/sinks/util/batch.rs b/src/sinks/util/batch.rs
+index 961a954ae6..3227bca2dd 100644
+--- a/src/sinks/util/batch.rs
++++ b/src/sinks/util/batch.rs
+@@ -1,47 +1,142 @@
++use derivative::Derivative;
+ use serde::{Deserialize, Serialize};
++use snafu::Snafu;
+ use std::time::Duration;
+ 
+-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+-pub struct BatchBytesConfig {
++#[derive(Debug, Snafu)]
++pub enum BatchError {
++    #[snafu(display("Cannot configure both `max_bytes` and `max_size`"))]
++    BytesAndSize,
++    #[snafu(display("Cannot configure both `max_events` and `max_size`"))]
++    EventsAndSize,
++    #[snafu(display("This sink does not allow setting `max_bytes`"))]
++    BytesNotAllowed,
++}
++
++#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
++pub struct BatchConfig {
++    pub max_bytes: Option<usize>,
++    pub max_events: Option<usize>,
++    /// Deprecated. Left in for backwards compatibility, use `max_bytes`
++    /// or `max_events` instead.
+     pub max_size: Option<usize>,
+     pub timeout_secs: Option<u64>,
+ }
+ 
+-impl BatchBytesConfig {
+-    pub fn unwrap_or(&self, size: u64, timeout: u64) -> BatchSettings {
++impl BatchConfig {
++    pub fn use_size_as_bytes(&self) -> Result<Self, BatchError> {
++        let max_bytes = match (self.max_bytes, self.max_size) {
++            (Some(_), Some(_)) => return Err(BatchError::BytesAndSize),
++            (Some(bytes), None) => Some(bytes),
++            (None, Some(size)) => Some(size),
++            (None, None) => None,
++        };
++        Ok(Self {
++            max_bytes,
++            max_size: None,
++            ..*self
++        })
++    }
++
++    pub fn use_size_as_events(&self) -> Result<Self, BatchError> {
++        let max_events = match (self.max_events, self.max_size) {
++            (Some(_), Some(_)) => return Err(BatchError::EventsAndSize),
++            (Some(events), None) => Some(events),
++            (None, Some(size)) => Some(size),
++            (None, None) => None,
++        };
++        // Sinks that used `max_size` for an event count cannot count
++        // bytes, so err if `max_bytes` is set.
++        if self.max_bytes.is_some() {
++            return Err(BatchError::BytesNotAllowed);
++        }
++        Ok(Self {
++            max_events: max_events,
++            max_size: None,
++            ..*self
++        })
++    }
++
++    pub fn get_settings_or_default(&self, defaults: BatchSettings) -> BatchSettings {
+         BatchSettings {
+-            size: self.max_size.unwrap_or(size as usize),
+-            timeout: Duration::from_secs(self.timeout_secs.unwrap_or(timeout)),
++            size: BatchSize {
++                bytes: self.max_bytes.unwrap_or(defaults.size.bytes),
++                events: self.max_events.unwrap_or(defaults.size.events),
++            },
++            timeout: self
++                .timeout_secs
++                .map(Duration::from_secs)
++                .unwrap_or(defaults.timeout),
+         }
+     }
+ }
+ 
+-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+-pub struct BatchEventsConfig {
+-    pub max_events: Option<usize>,
+-    pub timeout_secs: Option<u64>,
++#[derive(Clone, Copy, Debug, Derivative)]
++#[derivative(Default)]
++pub struct BatchSize {
++    #[derivative(Default(value = "usize::max_value()"))]
++    pub bytes: usize,
++    #[derivative(Default(value = "usize::max_value()"))]
++    pub events: usize,
+ }
+ 
+-impl BatchEventsConfig {
+-    pub fn unwrap_or(&self, size: u64, timeout: u64) -> BatchSettings {
+-        BatchSettings {
+-            size: self.max_events.unwrap_or(size as usize),
+-            timeout: Duration::from_secs(self.timeout_secs.unwrap_or(timeout)),
++#[derive(Clone, Copy, Debug, Default)]
++pub struct BatchSettings {
++    pub size: BatchSize,
++    pub timeout: Duration,
++}
++
++impl BatchSettings {
++    // Fake the builder pattern
++    pub const fn bytes(self, bytes: u64) -> Self {
++        Self {
++            size: BatchSize {
++                bytes: bytes as usize,
++                ..self.size
++            },
++            ..self
++        }
++    }
++    pub const fn events(self, events: usize) -> Self {
++        Self {
++            size: BatchSize {
++                events,
++                ..self.size
++            },
++            ..self
++        }
++    }
++    pub const fn timeout(self, secs: u64) -> Self {
++        Self {
++            timeout: Duration::from_secs(secs),
++            ..self
+         }
+     }
+ }
+ 
+-#[derive(Clone, Debug)]
+-pub struct BatchSettings {
+-    pub size: usize,
+-    pub timeout: Duration,
++pub(super) fn err_event_too_large<T>(length: usize) -> PushResult<T> {
++    error!(message = "Event larger than batch size, dropping", %length, rate_limit_secs = 1);
++    PushResult::Ok(false)
++}
++
++/// This enum provides the result of a push operation, indicating if the
++/// event was added and the fullness state of the buffer.
++#[must_use]
++#[derive(Debug, Eq, PartialEq)]
++pub enum PushResult<T> {
++    /// Event was added, with an indicator if the buffer is now full
++    Ok(bool),
++    /// Event could not be added because it would overflow the
++    /// buffer. Since push takes ownership of the event, it must be
++    /// returned here.
++    Overflow(T),
+ }
+ 
+ pub trait Batch {
+     type Input;
+     type Output;
+-    fn len(&self) -> usize;
+-    fn push(&mut self, item: Self::Input);
++
++    fn push(&mut self, item: Self::Input) -> PushResult<Self::Input>;
+     fn is_empty(&self) -> bool;
+     fn fresh(&self) -> Self;
+     fn finish(self) -> Self::Output;
+@@ -57,31 +152,65 @@ pub trait Batch {
+     }
+ }
+ 
+-impl<T> Batch for Vec<T> {
+-    type Input = T;
+-    type Output = Self;
++#[derive(Clone, Debug)]
++pub struct StatefulBatch<B> {
++    inner: B,
++    was_full: bool,
++}
++
++impl<B> From<B> for StatefulBatch<B> {
++    fn from(inner: B) -> Self {
++        Self {
++            inner,
++            was_full: false,
++        }
++    }
++}
++
++impl<B> StatefulBatch<B> {
++    pub fn was_full(&self) -> bool {
++        self.was_full
++    }
+ 
+-    fn len(&self) -> usize {
+-        self.len()
++    pub fn into_inner(self) -> B {
++        self.inner
+     }
++}
++
++impl<B> Batch for StatefulBatch<B>
++where
++    B: Batch,
++{
++    type Input = B::Input;
++    type Output = B::Output;
+ 
+-    fn push(&mut self, item: Self::Input) {
+-        self.push(item)
++    fn push(&mut self, item: Self::Input) -> PushResult<Self::Input> {
++        if self.was_full {
++            PushResult::Overflow(item)
++        } else {
++            let result = self.inner.push(item);
++            self.was_full =
++                matches!(result, PushResult::Overflow(_)) || matches!(result, PushResult::Ok(true));
++            result
++        }
+     }
+ 
+     fn is_empty(&self) -> bool {
+-        self.is_empty()
++        !self.was_full && self.inner.is_empty()
+     }
+ 
+     fn fresh(&self) -> Self {
+-        Self::new()
++        Self {
++            inner: self.inner.fresh(),
++            was_full: false,
++        }
+     }
+ 
+     fn finish(self) -> Self::Output {
+-        self
++        self.inner.finish()
+     }
+ 
+     fn num_items(&self) -> usize {
+-        self.len()
++        self.inner.num_items()
+     }
+ }
+diff --git a/src/sinks/util/buffer/json.rs b/src/sinks/util/buffer/json.rs
+index 08e5d20b24..fc84d511a6 100644
+--- a/src/sinks/util/buffer/json.rs
++++ b/src/sinks/util/buffer/json.rs
+@@ -1,28 +1,45 @@
+-use crate::sinks::util::Batch;
++use crate::sinks::util::{batch::err_event_too_large, Batch, BatchSize, PushResult};
+ use serde_json::value::{to_raw_value, RawValue, Value};
+ 
+ pub type BoxedRawValue = Box<RawValue>;
+ 
+ /// A `batch` implementation for storing an array of json
+ /// values.
+-#[derive(Default, Debug)]
++#[derive(Debug)]
+ pub struct JsonArrayBuffer {
+     buffer: Vec<BoxedRawValue>,
+     total_bytes: usize,
++    settings: BatchSize,
++}
++
++impl JsonArrayBuffer {
++    pub fn new(settings: BatchSize) -> Self {
++        Self {
++            buffer: Vec::new(),
++            total_bytes: 0,
++            settings,
++        }
++    }
+ }
+ 
+ impl Batch for JsonArrayBuffer {
+     type Input = Value;
+     type Output = Vec<BoxedRawValue>;
+ 
+-    fn len(&self) -> usize {
+-        self.total_bytes
+-    }
+-
+-    fn push(&mut self, item: Self::Input) {
+-        let item = to_raw_value(&item).expect("Value should be valid json");
+-        self.total_bytes += item.get().len();
+-        self.buffer.push(item);
++    fn push(&mut self, item: Self::Input) -> PushResult<Self::Input> {
++        let raw_item = to_raw_value(&item).expect("Value should be valid json");
++        let new_len = self.total_bytes + raw_item.get().len() + 1;
++        if self.is_empty() && new_len >= self.settings.bytes {
++            err_event_too_large(raw_item.get().len())
++        } else if self.buffer.len() >= self.settings.events || new_len > self.settings.bytes {
++            PushResult::Overflow(item)
++        } else {
++            self.total_bytes = new_len;
++            self.buffer.push(raw_item);
++            PushResult::Ok(
++                self.buffer.len() >= self.settings.events || new_len >= self.settings.bytes,
++            )
++        }
+     }
+ 
+     fn is_empty(&self) -> bool {
+@@ -30,7 +47,7 @@ impl Batch for JsonArrayBuffer {
+     }
+ 
+     fn fresh(&self) -> Self {
+-        JsonArrayBuffer::default()
++        Self::new(self.settings)
+     }
+ 
+     fn finish(self) -> Self::Output {
+@@ -44,23 +61,36 @@ impl Batch for JsonArrayBuffer {
+ 
+ #[cfg(test)]
+ mod tests {
++    use super::super::PushResult;
+     use super::*;
+     use serde_json::json;
+ 
+     #[test]
+     fn multi_object_array() {
+-        let mut buffer = JsonArrayBuffer::default();
+-
+-        buffer.push(json!({
+-            "key1": "value1"
+-        }));
+-
+-        buffer.push(json!({
+-            "key2": "value2"
+-        }));
++        let batch = BatchSize {
++            bytes: 9999,
++            events: 2,
++        };
++        let mut buffer = JsonArrayBuffer::new(batch);
++
++        assert_eq!(
++            buffer.push(json!({
++                "key1": "value1"
++            })),
++            PushResult::Ok(false)
++        );
++
++        assert_eq!(
++            buffer.push(json!({
++                "key2": "value2"
++            })),
++            PushResult::Ok(true)
++        );
++
++        assert!(matches!(buffer.push(json!({})), PushResult::Overflow(_)));
+ 
+         assert_eq!(buffer.num_items(), 2);
+-        assert_eq!(buffer.len(), 34);
++        assert_eq!(buffer.total_bytes, 36);
+ 
+         let json = buffer.finish();
+ 
+diff --git a/src/sinks/util/buffer/metrics.rs b/src/sinks/util/buffer/metrics.rs
+index 9cd6bf03ed..5d7efca0d2 100644
+--- a/src/sinks/util/buffer/metrics.rs
++++ b/src/sinks/util/buffer/metrics.rs
+@@ -1,6 +1,6 @@
+ use crate::event::metric::{Metric, MetricKind, MetricValue};
+ use crate::event::Event;
+-use crate::sinks::util::Batch;
++use crate::sinks::util::{Batch, BatchSize, PushResult};
+ use std::cmp::Ordering;
+ use std::collections::{hash_map::DefaultHasher, HashSet};
+ use std::hash::{Hash, Hasher};
+@@ -59,6 +59,7 @@ impl PartialEq for MetricEntry {
+ pub struct MetricBuffer {
+     state: HashSet<MetricEntry>,
+     metrics: HashSet<MetricEntry>,
++    max_events: usize,
+ }
+ 
+ impl MetricBuffer {
+@@ -96,10 +97,15 @@ impl MetricBuffer {
+     //   Absolute AggregatedHistogram => Absolute AggregatedHistogram
+     //   Absolute AggregatedSummary   => Absolute AggregatedSummary
+     //
+-    pub fn new() -> Self {
++    pub fn new(settings: BatchSize) -> Self {
++        Self::new_with_state(settings.events, HashSet::new())
++    }
++
++    fn new_with_state(max_events: usize, state: HashSet<MetricEntry>) -> Self {
+         Self {
+-            state: HashSet::new(),
+-            metrics: HashSet::new(),
++            state,
++            metrics: HashSet::with_capacity(max_events),
++            max_events,
+         }
+     }
+ }
+@@ -108,83 +114,84 @@ impl Batch for MetricBuffer {
+     type Input = Event;
+     type Output = Vec<Metric>;
+ 
+-    fn len(&self) -> usize {
+-        self.num_items()
+-    }
+-
+-    fn push(&mut self, item: Self::Input) {
+-        let item = item.into_metric();
+-
+-        match &item.value {
+-            MetricValue::Counter { value } if item.kind.is_absolute() => {
+-                let new = MetricEntry(item.clone());
+-                if let Some(MetricEntry(Metric {
+-                    value: MetricValue::Counter { value: value0, .. },
+-                    ..
+-                })) = self.state.get(&new)
+-                {
+-                    // Counters are disaggregated. We take the previoud value from the state
+-                    // and emit the difference between previous and current as a Counter
+-                    let delta = MetricEntry(Metric {
+-                        name: item.name.to_string(),
+-                        timestamp: item.timestamp,
+-                        tags: item.tags.clone(),
+-                        kind: MetricKind::Incremental,
+-                        value: MetricValue::Counter {
+-                            value: value - value0,
+-                        },
+-                    });
+-
+-                    // The resulting Counters could be added up normally
+-                    if let Some(MetricEntry(mut existing)) = self.metrics.take(&delta) {
++    fn push(&mut self, item: Self::Input) -> PushResult<Self::Input> {
++        if self.num_items() >= self.max_events {
++            PushResult::Overflow(item)
++        } else {
++            let item = item.into_metric();
++
++            match &item.value {
++                MetricValue::Counter { value } if item.kind.is_absolute() => {
++                    let new = MetricEntry(item.clone());
++                    if let Some(MetricEntry(Metric {
++                        value: MetricValue::Counter { value: value0, .. },
++                        ..
++                    })) = self.state.get(&new)
++                    {
++                        // Counters are disaggregated. We take the previoud value from the state
++                        // and emit the difference between previous and current as a Counter
++                        let delta = MetricEntry(Metric {
++                            name: item.name.to_string(),
++                            timestamp: item.timestamp,
++                            tags: item.tags.clone(),
++                            kind: MetricKind::Incremental,
++                            value: MetricValue::Counter {
++                                value: value - value0,
++                            },
++                        });
++
++                        // The resulting Counters could be added up normally
++                        if let Some(MetricEntry(mut existing)) = self.metrics.take(&delta) {
++                            existing.add(&item);
++                            self.metrics.insert(MetricEntry(existing));
++                        } else {
++                            self.metrics.insert(delta);
++                        }
++                        self.state.replace(new);
++                    } else {
++                        self.state.insert(new);
++                    }
++                }
++                MetricValue::Gauge { .. } if item.kind.is_incremental() => {
++                    let new = MetricEntry(item.clone().into_absolute());
++                    if let Some(MetricEntry(mut existing)) = self.metrics.take(&new) {
+                         existing.add(&item);
+                         self.metrics.insert(MetricEntry(existing));
+                     } else {
+-                        self.metrics.insert(delta);
++                        // If the metric is not present in active batch,
++                        // then we look it up in permanent state, where we keep track
++                        // of its values throughout the entire application uptime
++                        let mut initial = if let Some(default) = self.state.get(&new) {
++                            default.0.clone()
++                        } else {
++                            // Otherwise we start from zero value
++                            Metric {
++                                name: item.name.to_string(),
++                                timestamp: item.timestamp,
++                                tags: item.tags.clone(),
++                                kind: MetricKind::Absolute,
++                                value: MetricValue::Gauge { value: 0.0 },
++                            }
++                        };
++                        initial.add(&item);
++                        self.metrics.insert(MetricEntry(initial));
+                     }
+-                    self.state.replace(new);
+-                } else {
+-                    self.state.insert(new);
+                 }
+-            }
+-            MetricValue::Gauge { .. } if item.kind.is_incremental() => {
+-                let new = MetricEntry(item.clone().into_absolute());
+-                if let Some(MetricEntry(mut existing)) = self.metrics.take(&new) {
+-                    existing.add(&item);
+-                    self.metrics.insert(MetricEntry(existing));
+-                } else {
+-                    // If the metric is not present in active batch,
+-                    // then we look it up in permanent state, where we keep track
+-                    // of its values throughout the entire application uptime
+-                    let mut initial = if let Some(default) = self.state.get(&new) {
+-                        default.0.clone()
+-                    } else {
+-                        // Otherwise we start from zero value
+-                        Metric {
+-                            name: item.name.to_string(),
+-                            timestamp: item.timestamp,
+-                            tags: item.tags.clone(),
+-                            kind: MetricKind::Absolute,
+-                            value: MetricValue::Gauge { value: 0.0 },
+-                        }
+-                    };
+-                    initial.add(&item);
+-                    self.metrics.insert(MetricEntry(initial));
++                _metric if item.kind.is_absolute() => {
++                    let new = MetricEntry(item);
++                    self.metrics.replace(new);
+                 }
+-            }
+-            _metric if item.kind.is_absolute() => {
+-                let new = MetricEntry(item);
+-                self.metrics.replace(new);
+-            }
+-            _ => {
+-                let new = MetricEntry(item.clone());
+-                if let Some(MetricEntry(mut existing)) = self.metrics.take(&new) {
+-                    existing.add(&item);
+-                    self.metrics.insert(MetricEntry(existing));
+-                } else {
+-                    self.metrics.insert(new);
++                _ => {
++                    let new = MetricEntry(item.clone());
++                    if let Some(MetricEntry(mut existing)) = self.metrics.take(&new) {
++                        existing.add(&item);
++                        self.metrics.insert(MetricEntry(existing));
++                    } else {
++                        self.metrics.insert(new);
++                    }
+                 }
+             }
++            PushResult::Ok(self.num_items() >= self.max_events)
+         }
+     }
+ 
+@@ -202,10 +209,7 @@ impl Batch for MetricBuffer {
+             }
+         }
+ 
+-        Self {
+-            state,
+-            metrics: HashSet::new(),
+-        }
++        Self::new_with_state(self.max_events, state)
+     }
+ 
+     fn finish(self) -> Self::Output {
+@@ -266,7 +270,7 @@ fn compress_distribution(values: Vec<f64>, sample_rates: Vec<u32>) -> (Vec<f64>,
+ #[cfg(test)]
+ mod test {
+     use super::*;
+-    use crate::sinks::util::{BatchSettings, BatchSink};
++    use crate::sinks::util::{BatchSink, BatchSize};
+     use crate::{
+         buffers::Acker,
+         event::metric::{Metric, MetricValue},
+@@ -313,13 +317,14 @@ mod test {
+ 
+             future::ok::<_, std::io::Error>(())
+         });
++        let batch_size = BatchSize {
++            bytes: 9999,
++            events: 6,
++        };
+         let buffered = BatchSink::with_executor(
+             svc,
+-            MetricBuffer::new(),
+-            BatchSettings {
+-                timeout: Duration::from_secs(0),
+-                size: 6,
+-            },
++            MetricBuffer::new(batch_size),
++            Duration::from_secs(0),
+             acker,
+             rt.executor(),
+         );
+@@ -380,7 +385,7 @@ mod test {
+         assert_eq!(buffer[1].len(), 2);
+ 
+         assert_eq!(
+-            sorted(&buffer[0].clone().finish()),
++            sorted(&buffer[0].clone()),
+             [
+                 Metric {
+                     name: "counter-0".into(),
+@@ -428,7 +433,7 @@ mod test {
+         );
+ 
+         assert_eq!(
+-            sorted(&buffer[1].clone().finish()),
++            sorted(&buffer[1].clone()),
+             [
+                 Metric {
+                     name: "counter-2".into(),
+@@ -491,7 +496,7 @@ mod test {
+         assert_eq!(buffer[0].len(), 4);
+ 
+         assert_eq!(
+-            sorted(&buffer[0].clone().finish()),
++            sorted(&buffer[0].clone()),
+             [
+                 Metric {
+                     name: "counter-0".into(),
+@@ -566,7 +571,7 @@ mod test {
+         assert_eq!(buffer[0].len(), 4);
+ 
+         assert_eq!(
+-            sorted(&buffer[0].clone().finish()),
++            sorted(&buffer[0].clone()),
+             [
+                 Metric {
+                     name: "gauge-1".into(),
+@@ -656,7 +661,7 @@ mod test {
+         assert_eq!(buffer[0].len(), 5);
+ 
+         assert_eq!(
+-            sorted(&buffer[0].clone().finish()),
++            sorted(&buffer[0].clone()),
+             [
+                 Metric {
+                     name: "gauge-1".into(),
+@@ -741,7 +746,7 @@ mod test {
+         assert_eq!(buffer.len(), 1);
+ 
+         assert_eq!(
+-            sorted(&buffer[0].clone().finish()),
++            sorted(&buffer[0].clone()),
+             [Metric {
+                 name: "set-0".into(),
+                 timestamp: None,
+@@ -802,7 +807,7 @@ mod test {
+         assert_eq!(buffer.len(), 1);
+ 
+         assert_eq!(
+-            sorted(&buffer[0].clone().finish()),
++            sorted(&buffer[0].clone()),
+             [
+                 Metric {
+                     name: "dist-2".into(),
+@@ -909,7 +914,7 @@ mod test {
+         assert_eq!(buffer.len(), 1);
+ 
+         assert_eq!(
+-            sorted(&buffer[0].clone().finish()),
++            sorted(&buffer[0].clone()),
+             [
+                 Metric {
+                     name: "buckets-2".into(),
+@@ -1001,7 +1006,7 @@ mod test {
+         assert_eq!(buffer.len(), 1);
+ 
+         assert_eq!(
+-            sorted(&buffer[0].clone().finish()),
++            sorted(&buffer[0].clone()),
+             [
+                 Metric {
+                     name: "buckets-2".into(),
+@@ -1067,7 +1072,7 @@ mod test {
+         assert_eq!(buffer.len(), 1);
+ 
+         assert_eq!(
+-            sorted(&buffer[0].clone().finish()),
++            sorted(&buffer[0].clone()),
+             [
+                 Metric {
+                     name: "quantiles-2".into(),
+diff --git a/src/sinks/util/buffer/mod.rs b/src/sinks/util/buffer/mod.rs
+index dbb16854bf..7e374d9c8f 100644
+--- a/src/sinks/util/buffer/mod.rs
++++ b/src/sinks/util/buffer/mod.rs
+@@ -1,4 +1,4 @@
+-use super::batch::Batch;
++use super::batch::{err_event_too_large, Batch, BatchSize, PushResult};
+ use flate2::write::GzEncoder;
+ use serde::{Deserialize, Serialize};
+ use std::io::Write;
+@@ -6,6 +6,7 @@ use std::io::Write;
+ pub mod json;
+ pub mod metrics;
+ pub mod partition;
++pub mod vec;
+ 
+ pub use partition::{Partition, PartitionBuffer, PartitionInnerBuffer};
+ 
+@@ -42,6 +43,10 @@ impl Compression {
+ pub struct Buffer {
+     inner: InnerBuffer,
+     num_items: usize,
++    num_bytes: usize,
++    max_bytes: usize,
++    max_events: usize,
++    compression: Compression,
+ }
+ 
+ #[derive(Debug)]
+@@ -51,16 +56,25 @@ pub enum InnerBuffer {
+ }
+ 
+ impl Buffer {
+-    pub fn new(compression: Compression) -> Self {
++    pub fn new(settings: BatchSize, compression: Compression) -> Self {
++        Self::new_with_settings(settings.bytes, settings.events, compression)
++    }
++
++    fn new_with_settings(max_bytes: usize, max_events: usize, compression: Compression) -> Self {
++        let buffer = Vec::with_capacity(max_bytes);
+         let inner = match compression {
+-            Compression::None => InnerBuffer::Plain(Vec::new()),
++            Compression::None => InnerBuffer::Plain(buffer),
+             Compression::Gzip => {
+-                InnerBuffer::Gzip(GzEncoder::new(Vec::new(), flate2::Compression::fast()))
++                InnerBuffer::Gzip(GzEncoder::new(buffer, flate2::Compression::fast()))
+             }
+         };
+         Self {
+             inner,
+             num_items: 0,
++            num_bytes: 0,
++            max_bytes,
++            max_events,
++            compression,
+         }
+     }
+ 
+@@ -97,12 +111,20 @@ impl Batch for Buffer {
+     type Input = Vec<u8>;
+     type Output = Vec<u8>;
+ 
+-    fn len(&self) -> usize {
+-        self.size()
+-    }
+-
+-    fn push(&mut self, item: Self::Input) {
+-        self.push(&item)
++    fn push(&mut self, item: Self::Input) -> PushResult<Self::Input> {
++        // The compressed encoders don't flush bytes immediately, so we
++        // can't track compressed sizes. Keep a running count of the
++        // number of bytes written instead.
++        let new_bytes = self.num_bytes + item.len();
++        if self.is_empty() && item.len() > self.max_bytes {
++            err_event_too_large(item.len())
++        } else if self.num_items >= self.max_events || new_bytes > self.max_bytes {
++            PushResult::Overflow(item)
++        } else {
++            self.push(&item);
++            self.num_bytes = new_bytes;
++            PushResult::Ok(self.num_items >= self.max_events || new_bytes >= self.max_bytes)
++        }
+     }
+ 
+     fn is_empty(&self) -> bool {
+@@ -110,16 +132,7 @@ impl Batch for Buffer {
+     }
+ 
+     fn fresh(&self) -> Self {
+-        let inner = match &self.inner {
+-            InnerBuffer::Plain(_) => InnerBuffer::Plain(Vec::new()),
+-            InnerBuffer::Gzip(_) => {
+-                InnerBuffer::Gzip(GzEncoder::new(Vec::new(), flate2::Compression::default()))
+-            }
+-        };
+-        Self {
+-            inner,
+-            num_items: 0,
+-        }
++        Self::new_with_settings(self.max_bytes, self.max_events, self.compression)
+     }
+ 
+     fn finish(self) -> Self::Output {
+@@ -140,7 +153,7 @@ impl Batch for Buffer {
+ mod test {
+     use super::{Buffer, Compression};
+     use crate::buffers::Acker;
+-    use crate::sinks::util::{BatchSettings, BatchSink};
++    use crate::sinks::util::{BatchSink, BatchSize};
+     use crate::test_util::runtime;
+     use futures01::{future, Future, Sink};
+     use std::io::Read;
+@@ -165,13 +178,16 @@ mod test {
+ 
+             future::ok::<_, std::io::Error>(())
+         });
++        let batch_size = BatchSize {
++            bytes: 100_000,
++            events: 1_000,
++        };
++        let timeout = Duration::from_secs(0);
++
+         let buffered = BatchSink::with_executor(
+             svc,
+-            Buffer::new(Compression::Gzip),
+-            BatchSettings {
+-                timeout: Duration::from_secs(0),
+-                size: 1000,
+-            },
++            Buffer::new(batch_size, Compression::Gzip),
++            timeout,
+             acker,
+             rt.executor(),
+         );
+@@ -199,7 +215,7 @@ mod test {
+         let output = output.into_iter().collect::<Vec<Vec<u8>>>();
+ 
+         assert!(output.len() > 1);
+-        assert!(dbg!(output.iter().map(|o| o.len()).sum::<usize>()) < 51_000);
++        assert!(dbg!(output.iter().map(|o| o.len()).sum::<usize>()) < 80_000);
+ 
+         let decompressed = output.into_iter().flat_map(|batch| {
+             let mut decompressed = vec![];
+diff --git a/src/sinks/util/buffer/partition.rs b/src/sinks/util/buffer/partition.rs
+index 30c96cd60c..2ca7c8ddf9 100644
+--- a/src/sinks/util/buffer/partition.rs
++++ b/src/sinks/util/buffer/partition.rs
+@@ -1,4 +1,4 @@
+-use crate::sinks::util::Batch;
++use crate::sinks::util::{Batch, PushResult};
+ 
+ pub trait Partition<K> {
+     fn partition(&self) -> K;
+@@ -29,14 +29,15 @@ where
+     type Input = PartitionInnerBuffer<T::Input, K>;
+     type Output = PartitionInnerBuffer<T::Output, K>;
+ 
+-    fn len(&self) -> usize {
+-        self.inner.len()
+-    }
+-
+-    fn push(&mut self, item: Self::Input) {
+-        let partition = item.partition();
+-        self.key = Some(partition);
+-        self.inner.push(item.inner)
++    fn push(&mut self, item: Self::Input) -> PushResult<Self::Input> {
++        let key = item.key;
++        match self.inner.push(item.inner) {
++            PushResult::Ok(full) => {
++                self.key = Some(key);
++                PushResult::Ok(full)
++            }
++            PushResult::Overflow(inner) => PushResult::Overflow(Self::Input { inner, key }),
++        }
+     }
+ 
+     fn is_empty(&self) -> bool {
+@@ -44,10 +45,7 @@ where
+     }
+ 
+     fn fresh(&self) -> Self {
+-        Self {
+-            inner: self.inner.fresh(),
+-            key: None,
+-        }
++        Self::new(self.inner.fresh())
+     }
+ 
+     fn finish(mut self) -> Self::Output {
+diff --git a/src/sinks/util/buffer/vec.rs b/src/sinks/util/buffer/vec.rs
+new file mode 100644
+index 0000000000..f63789f8dc
+--- /dev/null
++++ b/src/sinks/util/buffer/vec.rs
+@@ -0,0 +1,48 @@
++use super::super::{Batch, BatchSize, PushResult};
++
++#[derive(Clone)]
++pub struct VecBuffer<T> {
++    batch: Vec<T>,
++    max_events: usize,
++}
++
++impl<T> VecBuffer<T> {
++    pub fn new(settings: BatchSize) -> Self {
++        Self::new_with_max(settings.events)
++    }
++
++    fn new_with_max(max_events: usize) -> Self {
++        let batch = Vec::with_capacity(max_events);
++        Self { batch, max_events }
++    }
++}
++
++impl<T> Batch for VecBuffer<T> {
++    type Input = T;
++    type Output = Vec<T>;
++
++    fn push(&mut self, item: Self::Input) -> PushResult<Self::Input> {
++        if self.batch.len() >= self.max_events {
++            PushResult::Overflow(item)
++        } else {
++            self.batch.push(item);
++            PushResult::Ok(self.batch.len() >= self.max_events)
++        }
++    }
++
++    fn is_empty(&self) -> bool {
++        self.batch.is_empty()
++    }
++
++    fn fresh(&self) -> Self {
++        Self::new_with_max(self.max_events)
++    }
++
++    fn finish(self) -> Self::Output {
++        self.batch
++    }
++
++    fn num_items(&self) -> usize {
++        self.batch.len()
++    }
++}
+diff --git a/src/sinks/util/http.rs b/src/sinks/util/http.rs
+index dc1240429c..54a6154b53 100644
+--- a/src/sinks/util/http.rs
++++ b/src/sinks/util/http.rs
+@@ -1,7 +1,7 @@
+ use super::{
+     retries2::{RetryAction, RetryLogic},
+     service2::{TowerBatchedSink, TowerRequestSettings},
+-    sink, Batch, BatchSettings,
++    sink, Batch,
+ };
+ use crate::{
+     dns::Resolver,
+@@ -24,6 +24,7 @@ use std::{
+     future::Future,
+     sync::Arc,
+     task::{Context, Poll},
++    time::Duration,
+ };
+ use tower03::Service;
+ use tracing::Span;
+@@ -82,7 +83,7 @@ where
+         sink: T,
+         batch: B,
+         request_settings: TowerRequestSettings,
+-        batch_settings: BatchSettings,
++        batch_timeout: Duration,
+         tls_settings: impl Into<MaybeTlsSettings>,
+         cx: &SinkContext,
+     ) -> Self {
+@@ -91,7 +92,7 @@ where
+             batch,
+             HttpRetryLogic,
+             request_settings,
+-            batch_settings,
++            batch_timeout,
+             tls_settings,
+             cx,
+         )
+@@ -110,7 +111,7 @@ where
+         batch: B,
+         logic: L,
+         request_settings: TowerRequestSettings,
+-        batch_settings: BatchSettings,
++        batch_timeout: Duration,
+         tls_settings: impl Into<MaybeTlsSettings>,
+         cx: &SinkContext,
+     ) -> Self {
+@@ -124,7 +125,7 @@ where
+             };
+ 
+         let svc = HttpBatchService::new(cx.resolver(), tls_settings, request_builder);
+-        let inner = request_settings.batch_sink(logic, svc, batch, batch_settings, cx.acker());
++        let inner = request_settings.batch_sink(logic, svc, batch, batch_timeout, cx.acker());
+ 
+         Self {
+             sink,
+diff --git a/src/sinks/util/mod.rs b/src/sinks/util/mod.rs
+index 8ce3e44ff5..f26edfc6cf 100644
+--- a/src/sinks/util/mod.rs
++++ b/src/sinks/util/mod.rs
+@@ -23,10 +23,11 @@ use encoding::{EncodingConfig, EncodingConfiguration};
+ use serde::{Deserialize, Serialize};
+ use snafu::Snafu;
+ 
+-pub use batch::{Batch, BatchBytesConfig, BatchEventsConfig, BatchSettings};
++pub use batch::{Batch, BatchConfig, BatchSettings, BatchSize, PushResult};
+ pub use buffer::json::{BoxedRawValue, JsonArrayBuffer};
+ pub use buffer::metrics::{MetricBuffer, MetricEntry};
+ pub use buffer::partition::Partition;
++pub use buffer::vec::VecBuffer;
+ pub use buffer::{Buffer, Compression, PartitionBuffer, PartitionInnerBuffer};
+ pub use service::{ServiceBuilderExt, TowerRequestConfig, TowerRequestLayer, TowerRequestSettings};
+ pub use sink::{BatchSink, PartitionBatchSink, StreamSink};
+diff --git a/src/sinks/util/service.rs b/src/sinks/util/service.rs
+index 76ede0b4ae..27fb70b268 100644
+--- a/src/sinks/util/service.rs
++++ b/src/sinks/util/service.rs
+@@ -1,7 +1,7 @@
+ use super::{
+     retries::{FixedRetryPolicy, RetryLogic},
+     sink::Response,
+-    Batch, BatchSettings, BatchSink,
++    Batch, BatchSink,
+ };
+ use crate::buffers::Acker;
+ use futures01::{Async, Future, Poll};
+@@ -124,7 +124,7 @@ impl TowerRequestSettings {
+         retry_logic: L,
+         service: S,
+         batch: B,
+-        batch_settings: BatchSettings,
++        batch_timeout: Duration,
+         acker: Acker,
+     ) -> TowerBatchedSink<S, B, L, Request>
+     // Would like to return `impl Sink + SinkExt<T>` here, but that
+@@ -150,7 +150,7 @@ impl TowerRequestSettings {
+             })
+             .service(service);
+ 
+-        BatchSink::new(service, batch, batch_settings, acker)
++        BatchSink::new(service, batch, batch_timeout, acker)
+     }
+ }
+ 
+diff --git a/src/sinks/util/service2.rs b/src/sinks/util/service2.rs
+index 971f5c381f..f30be538b2 100644
+--- a/src/sinks/util/service2.rs
++++ b/src/sinks/util/service2.rs
+@@ -1,6 +1,6 @@
+ use super::retries2::{FixedRetryPolicy, RetryLogic};
+ use super::sink::Response;
+-use super::{Batch, BatchSettings, BatchSink};
++use super::{Batch, BatchSink};
+ use crate::buffers::Acker;
+ use futures::TryFutureExt;
+ use serde::{Deserialize, Serialize};
+@@ -124,7 +124,7 @@ impl TowerRequestSettings {
+         retry_logic: L,
+         service: S,
+         batch: B,
+-        batch_settings: BatchSettings,
++        batch_timeout: Duration,
+         acker: Acker,
+     ) -> TowerBatchedSink<S, B, L, Request>
+     // Would like to return `impl Sink + SinkExt<T>` here, but that
+@@ -149,7 +149,7 @@ impl TowerRequestSettings {
+             .service(service);
+ 
+         let service = TowerCompat::new(service);
+-        BatchSink::new(service, batch, batch_settings, acker)
++        BatchSink::new(service, batch, batch_timeout, acker)
+     }
+ }
+ 
+diff --git a/src/sinks/util/sink.rs b/src/sinks/util/sink.rs
+index a15f5d5750..8bbf1ac253 100644
+--- a/src/sinks/util/sink.rs
++++ b/src/sinks/util/sink.rs
+@@ -32,7 +32,7 @@
+ //! driven independently from the sink. A oneshot channel is used to tie them back into
+ //! the sink to allow it to notify the consumer that the request has succeeded.
+ 
+-use super::batch::{Batch, BatchSettings};
++use super::batch::{Batch, PushResult, StatefulBatch};
+ use super::buffer::partition::Partition;
+ use crate::buffers::Acker;
+ use futures01::{
+@@ -46,7 +46,7 @@ use std::{
+     fmt,
+     hash::Hash,
+     marker::PhantomData,
+-    time::Instant,
++    time::{Duration, Instant},
+ };
+ use tokio01::{
+     executor::{DefaultExecutor, Executor},
+@@ -136,8 +136,8 @@ impl<T: Sink> Sink for StreamSink<T> {
+ /// in all requests will not be acked until r1 has completed.
+ pub struct BatchSink<S, B, Request, E = DefaultExecutor> {
+     service: ServiceSink<S, Request>,
+-    batch: B,
+-    settings: BatchSettings,
++    batch: StatefulBatch<B>,
++    timeout: Duration,
+     linger: Option<Delay>,
+     closing: bool,
+     exec: E,
+@@ -152,8 +152,8 @@ where
+     S::Response: Response,
+     B: Batch<Output = Request>,
+ {
+-    pub fn new(service: S, batch: B, settings: BatchSettings, acker: Acker) -> Self {
+-        BatchSink::with_executor(service, batch, settings, acker, DefaultExecutor::current())
++    pub fn new(service: S, batch: B, timeout: Duration, acker: Acker) -> Self {
++        BatchSink::with_executor(service, batch, timeout, acker, DefaultExecutor::current())
+     }
+ }
+ 
+@@ -166,19 +166,13 @@ where
+     B: Batch<Output = Request>,
+     E: Executor,
+ {
+-    pub fn with_executor(
+-        service: S,
+-        batch: B,
+-        settings: BatchSettings,
+-        acker: Acker,
+-        exec: E,
+-    ) -> Self {
++    pub fn with_executor(service: S, batch: B, timeout: Duration, acker: Acker, exec: E) -> Self {
+         let service = ServiceSink::new(service, acker);
+ 
+         Self {
+             service,
+-            batch,
+-            settings,
++            batch: batch.into(),
++            timeout,
+             linger: None,
+             closing: false,
+             exec,
+@@ -187,14 +181,13 @@ where
+     }
+ 
+     fn should_send(&mut self) -> bool {
+-        self.closing || self.batch.len() >= self.settings.size || self.linger_elapsed()
++        self.closing || self.batch.was_full() || self.linger_elapsed()
+     }
+ 
+     fn linger_elapsed(&mut self) -> bool {
+-        if let Some(delay) = &mut self.linger {
+-            delay.poll().expect("timer error").is_ready()
+-        } else {
+-            false
++        match &mut self.linger {
++            Some(delay) => delay.poll().expect("timer error").is_ready(),
++            None => false,
+         }
+     }
+ }
+@@ -212,27 +205,35 @@ where
+     type SinkError = crate::Error;
+ 
+     fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
+-        if self.batch.len() >= self.settings.size {
++        if self.batch.was_full() {
+             trace!("batch full.");
+             self.poll_complete()?;
+ 
+-            if self.batch.len() > self.settings.size {
+-                debug!(message = "Batch full; applying back pressure.", size = %self.settings.size, rate_limit_secs = 10);
++            if !self.batch.is_empty() {
++                debug!(
++                    message = "Batch buffer full; applying back pressure.",
++                    rate_limit_secs = 10
++                );
+                 return Ok(AsyncSink::NotReady(item));
+             }
+         }
+ 
+-        if self.batch.len() == 0 {
+-            trace!("Creating new batch.");
++        if self.linger.is_none() {
++            trace!("Starting new batch timer.");
+             // We just inserted the first item of a new batch, so set our delay to the longest time
+             // we want to allow that item to linger in the batch before being flushed.
+-            let deadline = Instant::now() + self.settings.timeout;
++            let deadline = Instant::now() + self.timeout;
+             self.linger = Some(Delay::new(deadline));
+         }
+ 
+-        self.batch.push(item);
+-
+-        Ok(AsyncSink::Ready)
++        match self.batch.push(item) {
++            PushResult::Ok(false) => Ok(AsyncSink::Ready),
++            PushResult::Ok(true) => {
++                self.poll_complete()?;
++                Ok(AsyncSink::Ready)
++            }
++            PushResult::Overflow(item) => self.start_send(item),
++        }
+     }
+ 
+     fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
+@@ -293,7 +294,7 @@ where
+         f.debug_struct("BatchSink")
+             .field("service", &self.service)
+             .field("batch", &self.batch)
+-            .field("settings", &self.settings)
++            .field("timeout", &self.timeout)
+             .finish()
+     }
+ }
+@@ -317,11 +318,11 @@ type LingerDelay<K> = Box<dyn Future<Item = LingerState<K>, Error = ()> + Send +
+ /// and r3 are dispatched and r2 and r3 complete, all events contained
+ /// in all requests will not be acked until r1 has completed.
+ pub struct PartitionBatchSink<B, S, K, Request, E = DefaultExecutor> {
+-    batch: B,
++    batch: StatefulBatch<B>,
+     service: ServiceSink<S, Request>,
+     exec: E,
+-    partitions: HashMap<K, B>,
+-    settings: BatchSettings,
++    partitions: HashMap<K, StatefulBatch<B>>,
++    timeout: Duration,
+     closing: bool,
+     sending: VecDeque<B>,
+     lingers: FuturesUnordered<LingerDelay<K>>,
+@@ -343,11 +344,11 @@ where
+     S::Error: Into<crate::Error> + Send + 'static,
+     S::Response: Response,
+ {
+-    pub fn new(service: S, batch: B, settings: BatchSettings, acker: Acker) -> Self {
++    pub fn new(service: S, batch: B, timeout: Duration, acker: Acker) -> Self {
+         PartitionBatchSink::with_executor(
+             service,
+             batch,
+-            settings,
++            timeout,
+             acker,
+             DefaultExecutor::current(),
+         )
+@@ -365,21 +366,15 @@ where
+     S::Response: Response,
+     E: Executor,
+ {
+-    pub fn with_executor(
+-        service: S,
+-        batch: B,
+-        settings: BatchSettings,
+-        acker: Acker,
+-        exec: E,
+-    ) -> Self {
++    pub fn with_executor(service: S, batch: B, timeout: Duration, acker: Acker, exec: E) -> Self {
+         let service = ServiceSink::new(service, acker);
+ 
+         Self {
+-            batch,
++            batch: batch.into(),
+             service,
+             exec,
+             partitions: HashMap::new(),
+-            settings,
++            timeout,
+             closing: false,
+             sending: VecDeque::new(),
+             lingers: FuturesUnordered::new(),
+@@ -391,7 +386,7 @@ where
+         let (tx, rx) = oneshot::channel();
+         let partition_clone = partition.clone();
+ 
+-        let deadline = Instant::now() + self.settings.timeout;
++        let deadline = Instant::now() + self.timeout;
+         let delay = Delay::new(deadline)
+             .map(move |_| LingerState::Elapsed(partition_clone))
+             .map_err(|_| ());
+@@ -424,6 +419,43 @@ where
+             self.service.poll_complete()
+         }
+     }
++
++    fn handle_full_batch(&mut self, item: B::Input, partition: &K) -> FullBatchResult<B::Input> {
++        trace!("Batch full; driving service to completion.");
++        if let Err(error) = self.poll_complete() {
++            return FullBatchResult::Result(Err(error));
++        }
++
++        match self.partitions.get_mut(partition) {
++            Some(batch) => {
++                if !batch.is_empty() {
++                    debug!(
++                        message = "Send buffer full; applying back pressure.",
++                        rate_limit_secs = 10
++                    );
++                    FullBatchResult::Result(Ok(AsyncSink::NotReady(item)))
++                } else {
++                    match batch.push(item) {
++                        PushResult::Ok(full) => {
++                            if full {
++                                if let Err(error) = self.poll_complete() {
++                                    return FullBatchResult::Result(Err(error));
++                                }
++                            }
++                            FullBatchResult::Result(Ok(AsyncSink::Ready))
++                        }
++                        PushResult::Overflow(_) => unreachable!("Empty buffer overflowed"),
++                    }
++                }
++            }
++            None => FullBatchResult::Continue(item),
++        }
++    }
++}
++
++enum FullBatchResult<T> {
++    Continue(T),
++    Result(StartSend<T, crate::Error>),
+ }
+ 
+ impl<B, S, K, Request, E> Sink for PartitionBatchSink<B, S, K, Request, E>
+@@ -463,42 +495,53 @@ where
+ 
+         let partition = item.partition();
+ 
+-        if let Some(batch) = self.partitions.get_mut(&partition) {
+-            if batch.len() >= self.settings.size {
+-                trace!("Batch full; driving service to completion.");
+-                self.poll_complete()?;
+-
+-                if let Some(batch) = self.partitions.get_mut(&partition) {
+-                    if batch.len() >= self.settings.size {
+-                        debug!(
+-                            message = "Buffer full; applying back pressure.",
+-                            max_size = %self.settings.size,
+-                            rate_limit_secs = 10
+-                        );
+-                        return Ok(AsyncSink::NotReady(item));
+-                    } else {
+-                        batch.push(item);
+-                        return Ok(AsyncSink::Ready);
++        let item = match self.partitions.get_mut(&partition) {
++            Some(batch) => {
++                if batch.was_full() {
++                    match self.handle_full_batch(item, &partition) {
++                        FullBatchResult::Result(result) => return result,
++                        FullBatchResult::Continue(item) => item,
++                    }
++                } else {
++                    trace!("adding event to batch.");
++                    match batch.push(item) {
++                        PushResult::Ok(full) => {
++                            if full {
++                                self.poll_complete()?;
++                            }
++                            return Ok(AsyncSink::Ready);
++                        }
++                        PushResult::Overflow(item) => {
++                            match self.handle_full_batch(item, &partition) {
++                                FullBatchResult::Result(result) => return result,
++                                FullBatchResult::Continue(item) => item,
++                            }
++                        }
+                     }
+                 }
+-            } else {
+-                trace!("adding event to batch.");
+-                batch.push(item);
+-                return Ok(AsyncSink::Ready);
+             }
+-        }
++            None => item,
++        };
+ 
+         trace!("replacing batch.");
+         // We fall through to this case, when there is no batch already
+         // or the batch got submitted by polling_complete above.
+         let mut batch = self.batch.fresh();
+ 
+-        batch.push(item);
+-        self.set_linger(partition.clone());
++        match batch.push(item) {
++            PushResult::Overflow(_) => unreachable!("Empty buffer overflowed"),
++            PushResult::Ok(full) => {
++                self.set_linger(partition.clone());
+ 
+-        self.partitions.insert(partition, batch);
++                self.partitions.insert(partition, batch);
+ 
+-        Ok(AsyncSink::Ready)
++                if full {
++                    self.poll_complete()?;
++                }
++
++                Ok(AsyncSink::Ready)
++            }
++        }
+     }
+ 
+     fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
+@@ -509,7 +552,6 @@ where
+         }
+ 
+         let closing = self.closing;
+-        let max_size = self.settings.size;
+ 
+         let mut partitions = Vec::new();
+ 
+@@ -528,7 +570,7 @@ where
+         let ready = self
+             .partitions
+             .iter()
+-            .filter(|(_, b)| closing || b.len() >= max_size)
++            .filter(|(_, b)| closing || b.was_full())
+             .map(|(p, _)| p.clone())
+             .collect::<Vec<_>>();
+ 
+@@ -546,7 +588,7 @@ where
+         }
+ 
+         for batch in ready_batches.into_iter().chain(partitions) {
+-            self.poll_send(batch)?;
++            self.poll_send(batch.into_inner())?;
+         }
+ 
+         // If we still have an inflight partition then
+@@ -580,7 +622,7 @@ where
+         f.debug_struct("PartitionedBatchSink")
+             .field("batch", &self.batch)
+             .field("service", &self.service)
+-            .field("settings", &self.settings)
++            .field("timeout", &self.timeout)
+             .finish()
+     }
+ }
+@@ -725,7 +767,7 @@ impl<'a> Response for &'a str {}
+ mod tests {
+     use super::*;
+     use crate::buffers::Acker;
+-    use crate::sinks::util::{buffer::partition::Partition, BatchSettings, Buffer, Compression};
++    use crate::sinks::util::{buffer::partition::Partition, BatchSize, VecBuffer};
+     use crate::test_util::runtime;
+     use bytes::Bytes;
+     use futures01::{future, Sink};
+@@ -735,10 +777,11 @@ mod tests {
+     };
+     use tokio01_test::clock::MockClock;
+ 
+-    const SETTINGS: BatchSettings = BatchSettings {
+-        size: 10,
+-        timeout: Duration::from_secs(10),
++    const BATCH_SIZE: BatchSize = BatchSize {
++        events: 10,
++        bytes: 9999,
+     };
++    const TIMEOUT: Duration = Duration::from_secs(10);
+ 
+     #[test]
+     fn batch_sink_acking_sequential() {
+@@ -749,7 +792,13 @@ mod tests {
+         let (acker, ack_counter) = Acker::new_for_testing();
+ 
+         let svc = tower::service_fn(|_| future::ok::<_, std::io::Error>(()));
+-        let buffered = BatchSink::with_executor(svc, Vec::new(), SETTINGS, acker, rt.executor());
++        let buffered = BatchSink::with_executor(
++            svc,
++            VecBuffer::new(BATCH_SIZE),
++            TIMEOUT,
++            acker,
++            rt.executor(),
++        );
+ 
+         let _ = clock.enter(|_| {
+             buffered
+@@ -793,12 +842,18 @@ mod tests {
+             Delay::new(deadline).map(drop)
+         });
+ 
+-        let settings = BatchSettings {
+-            size: 1,
+-            ..SETTINGS
++        let batch_size = BatchSize {
++            events: 1,
++            ..BATCH_SIZE
+         };
+ 
+-        let mut sink = BatchSink::with_executor(svc, Vec::new(), settings, acker, exec.clone());
++        let mut sink = BatchSink::with_executor(
++            svc,
++            VecBuffer::new(batch_size),
++            TIMEOUT,
++            acker,
++            exec.clone(),
++        );
+ 
+         let _ = clock.enter(|handle| {
+             assert!(sink.start_send(0).unwrap().is_ready());
+@@ -863,7 +918,13 @@ mod tests {
+ 
+             future::ok::<_, std::io::Error>(())
+         });
+-        let buffered = BatchSink::with_executor(svc, Vec::new(), SETTINGS, acker, rt.executor());
++        let buffered = BatchSink::with_executor(
++            svc,
++            VecBuffer::new(BATCH_SIZE),
++            TIMEOUT,
++            acker,
++            rt.executor(),
++        );
+ 
+         let _ = clock.enter(|_| {
+             buffered
+@@ -899,8 +960,13 @@ mod tests {
+ 
+             future::ok::<_, std::io::Error>(())
+         });
+-        let mut buffered =
+-            BatchSink::with_executor(svc, Vec::new(), SETTINGS, acker, rt.executor());
++        let mut buffered = BatchSink::with_executor(
++            svc,
++            VecBuffer::new(BATCH_SIZE),
++            TIMEOUT,
++            acker,
++            rt.executor(),
++        );
+ 
+         clock.enter(|_| {
+             assert!(buffered.start_send(0).unwrap().is_ready());
+@@ -928,15 +994,20 @@ mod tests {
+ 
+             future::ok::<_, std::io::Error>(())
+         });
+-        let mut buffered =
+-            BatchSink::with_executor(svc, Vec::new(), SETTINGS, acker, rt.executor());
++        let mut buffered = BatchSink::with_executor(
++            svc,
++            VecBuffer::new(BATCH_SIZE),
++            TIMEOUT,
++            acker,
++            rt.executor(),
++        );
+ 
+         clock.enter(|handle| {
+             assert!(buffered.start_send(0).unwrap().is_ready());
+             assert!(buffered.start_send(1).unwrap().is_ready());
+ 
+             // Move clock forward by linger timeout + 1 sec
+-            handle.advance(SETTINGS.timeout + Duration::from_secs(1));
++            handle.advance(TIMEOUT + Duration::from_secs(1));
+ 
+             future::poll_fn(|| buffered.poll_complete()).wait().unwrap();
+         });
+@@ -946,10 +1017,8 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn batch_sink_allows_the_final_item_to_exceed_the_buffer_size() {
++    fn partition_batch_sink_buffers_messages_until_limit() {
+         let rt = runtime();
+-        let mut clock = MockClock::new();
+-
+         let (acker, _) = Acker::new_for_testing();
+         let sent_requests = Arc::new(Mutex::new(Vec::new()));
+ 
+@@ -960,57 +1029,14 @@ mod tests {
+ 
+             future::ok::<_, std::io::Error>(())
+         });
+-        let buffered = BatchSink::with_executor(
++        let buffered = PartitionBatchSink::with_executor(
+             svc,
+-            Buffer::new(Compression::None),
+-            SETTINGS,
++            VecBuffer::new(BATCH_SIZE),
++            TIMEOUT,
+             acker,
+             rt.executor(),
+         );
+ 
+-        let input = vec![
+-            vec![0, 1, 2],
+-            vec![3, 4, 5],
+-            vec![6, 7, 8],
+-            vec![9, 10, 11],
+-            vec![12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23],
+-            vec![24],
+-        ];
+-        let _ = clock.enter(|_| {
+-            buffered
+-                .sink_map_err(drop)
+-                .send_all(futures01::stream::iter_ok(input))
+-                .wait()
+-                .unwrap()
+-        });
+-
+-        let output = sent_requests.lock().unwrap();
+-        assert_eq!(
+-            &*output,
+-            &vec![
+-                vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+-                vec![12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23],
+-                vec![24],
+-            ]
+-        );
+-    }
+-
+-    #[test]
+-    fn partition_batch_sink_buffers_messages_until_limit() {
+-        let rt = runtime();
+-        let (acker, _) = Acker::new_for_testing();
+-        let sent_requests = Arc::new(Mutex::new(Vec::new()));
+-
+-        let svc = tower::service_fn(|req| {
+-            let sent_requests = sent_requests.clone();
+-
+-            sent_requests.lock().unwrap().push(req);
+-
+-            future::ok::<_, std::io::Error>(())
+-        });
+-        let buffered =
+-            PartitionBatchSink::with_executor(svc, Vec::new(), SETTINGS, acker, rt.executor());
+-
+         let (_buffered, _) = buffered
+             .sink_map_err(drop)
+             .send_all(futures01::stream::iter_ok(0..22))
+@@ -1042,13 +1068,18 @@ mod tests {
+             future::ok::<_, std::io::Error>(())
+         });
+ 
+-        let settings = BatchSettings {
+-            size: 1,
+-            ..SETTINGS
++        let batch_size = BatchSize {
++            events: 1,
++            ..BATCH_SIZE
+         };
+ 
+-        let buffered =
+-            PartitionBatchSink::with_executor(svc, Vec::new(), settings, acker, rt.executor());
++        let buffered = PartitionBatchSink::with_executor(
++            svc,
++            VecBuffer::new(batch_size),
++            TIMEOUT,
++            acker,
++            rt.executor(),
++        );
+ 
+         let input = vec![Partitions::A, Partitions::B];
+ 
+@@ -1077,13 +1108,18 @@ mod tests {
+             future::ok::<_, std::io::Error>(())
+         });
+ 
+-        let settings = BatchSettings {
+-            size: 2,
+-            ..SETTINGS
++        let batch_size = BatchSize {
++            events: 2,
++            ..BATCH_SIZE
+         };
+ 
+-        let buffered =
+-            PartitionBatchSink::with_executor(svc, Vec::new(), settings, acker, rt.executor());
++        let buffered = PartitionBatchSink::with_executor(
++            svc,
++            VecBuffer::new(batch_size),
++            TIMEOUT,
++            acker,
++            rt.executor(),
++        );
+ 
+         let input = vec![Partitions::A, Partitions::B, Partitions::A, Partitions::B];
+ 
+@@ -1119,8 +1155,13 @@ mod tests {
+             future::ok::<_, std::io::Error>(())
+         });
+ 
+-        let mut buffered =
+-            PartitionBatchSink::with_executor(svc, Vec::new(), SETTINGS, acker, rt.executor());
++        let mut buffered = PartitionBatchSink::with_executor(
++            svc,
++            VecBuffer::new(BATCH_SIZE),
++            TIMEOUT,
++            acker,
++            rt.executor(),
++        );
+ 
+         clock.enter(|handle| {
+             buffered.start_send(1 as usize).unwrap();
+diff --git a/website/docs/reference/sinks/aws_s3.md b/website/docs/reference/sinks/aws_s3.md
+index 0432631872..1e0dfdae5b 100644
+--- a/website/docs/reference/sinks/aws_s3.md
++++ b/website/docs/reference/sinks/aws_s3.md
+@@ -1,5 +1,5 @@
+ ---
+-last_modified_on: "2020-06-18"
++last_modified_on: "2020-06-25"
+ delivery_guarantee: "at_least_once"
+ component_title: "AWS S3"
+ description: "The Vector `aws_s3` sink batches `log` events to Amazon Web Service's S3 service via the `PutObject` API endpoint."
+@@ -52,7 +52,8 @@ endpoint](https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectPUT.html).
+   region = "us-east-1" # required, required when endpoint = ""
+ 
+   # Batch
+-  batch.max_size = 10490000 # optional, default, bytes
++  batch.max_bytes = 10000000 # optional, default, bytes
++  batch.max_events = 1000 # optional, no default, events
+   batch.timeout_secs = 300 # optional, default, seconds
+ 
+   # Buffer
+@@ -89,7 +90,8 @@ endpoint](https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectPUT.html).
+   grant_write_acp = "79a59df900b949e55d96a1e698fbacedfd6e09d98eacf8f8d5218e7cd47ef2be" # optional, no default
+ 
+   # Batch
+-  batch.max_size = 10490000 # optional, default, bytes
++  batch.max_bytes = 10000000 # optional, default, bytes
++  batch.max_events = 1000 # optional, no default, events
+   batch.timeout_secs = 300 # optional, default, seconds
+ 
+   # Buffer
+@@ -209,11 +211,11 @@ Configures the sink batching behavior.
+ <Fields filters={false}>
+ <Field
+   common={true}
+-  defaultValue={10490000}
++  defaultValue={10000000}
+   enumValues={null}
+-  examples={[10490000]}
++  examples={[10000000]}
+   groups={[]}
+-  name={"max_size"}
++  name={"max_bytes"}
+   path={"batch"}
+   relevantWhen={null}
+   required={false}
+@@ -223,9 +225,32 @@ Configures the sink batching behavior.
+   warnings={[]}
+   >
+ 
+-#### max_size
++#### max_bytes
+ 
+ The maximum size of a batch, in bytes, before it is flushed.
++
++
++
++</Field>
++<Field
++  common={true}
++  defaultValue={null}
++  enumValues={null}
++  examples={[1000]}
++  groups={[]}
++  name={"max_events"}
++  path={"batch"}
++  relevantWhen={null}
++  required={false}
++  templateable={false}
++  type={"uint"}
++  unit={"events"}
++  warnings={[]}
++  >
++
++#### max_events
++
++The maximum size of a batch, in events, before it is flushed.
+  See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+@@ -320,7 +345,7 @@ Configures the sink specific buffer behavior.
+ #### max_events
+ 
+ The maximum number of [events][docs.data-model] allowed in the buffer.
+-
++ See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+ </Field>
+@@ -343,7 +368,7 @@ The maximum number of [events][docs.data-model] allowed in the buffer.
+ #### max_size
+ 
+ The maximum size of the buffer on the disk.
+- See [Buffers & Batches](#buffers--batches) for more info.
++
+ 
+ 
+ </Field>
+@@ -1259,7 +1284,7 @@ are contained and [delivery guarantees][docs.guarantees] are honored.
+ *Batches* are flushed when 1 of 2 conditions are met:
+ 
+ 1. The batch age meets or exceeds the configured [`timeout_secs`](#timeout_secs).
+-2. The batch size meets or exceeds the configured [`max_size`](#max_size).
++2. The batch size meets or exceeds the configured [`max_events`](#max_events).
+ 
+ *Buffers* are controlled via the [`buffer.*`](#buffer) options.
+ 
+diff --git a/website/docs/reference/sinks/clickhouse.md b/website/docs/reference/sinks/clickhouse.md
+index 5c7d209e26..596aaf1271 100644
+--- a/website/docs/reference/sinks/clickhouse.md
++++ b/website/docs/reference/sinks/clickhouse.md
+@@ -1,5 +1,5 @@
+ ---
+-last_modified_on: "2020-06-02"
++last_modified_on: "2020-06-25"
+ delivery_guarantee: "at_least_once"
+ component_title: "Clickhouse"
+ description: "The Vector `clickhouse` sink batches `log` events to Clickhouse via the `HTTP` Interface."
+@@ -83,7 +83,8 @@ The Vector `clickhouse` sink
+   auth.user = "${CLICKHOUSE_USERNAME}" # required, required when strategy = "basic"
+ 
+   # Batch
+-  batch.max_size = 1049000 # optional, default, bytes
++  batch.max_bytes = 1049000 # optional, default, bytes
++  batch.max_events = 1000 # optional, no default, events
+   batch.timeout_secs = 1 # optional, default, seconds
+ 
+   # Buffer
+@@ -267,7 +268,7 @@ Configures the sink batching behavior.
+   enumValues={null}
+   examples={[1049000]}
+   groups={[]}
+-  name={"max_size"}
++  name={"max_bytes"}
+   path={"batch"}
+   relevantWhen={null}
+   required={false}
+@@ -277,9 +278,32 @@ Configures the sink batching behavior.
+   warnings={[]}
+   >
+ 
+-#### max_size
++#### max_bytes
+ 
+ The maximum size of a batch, in bytes, before it is flushed.
++
++
++
++</Field>
++<Field
++  common={true}
++  defaultValue={null}
++  enumValues={null}
++  examples={[1000]}
++  groups={[]}
++  name={"max_events"}
++  path={"batch"}
++  relevantWhen={null}
++  required={false}
++  templateable={false}
++  type={"uint"}
++  unit={"events"}
++  warnings={[]}
++  >
++
++#### max_events
++
++The maximum size of a batch, in events, before it is flushed.
+  See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+@@ -351,7 +375,7 @@ Configures the sink specific buffer behavior.
+ #### max_events
+ 
+ The maximum number of [events][docs.data-model] allowed in the buffer.
+-
++ See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+ </Field>
+@@ -374,7 +398,7 @@ The maximum number of [events][docs.data-model] allowed in the buffer.
+ #### max_size
+ 
+ The maximum size of the buffer on the disk.
+- See [Buffers & Batches](#buffers--batches) for more info.
++
+ 
+ 
+ </Field>
+@@ -1020,7 +1044,7 @@ are contained and [delivery guarantees][docs.guarantees] are honored.
+ *Batches* are flushed when 1 of 2 conditions are met:
+ 
+ 1. The batch age meets or exceeds the configured [`timeout_secs`](#timeout_secs).
+-2. The batch size meets or exceeds the configured [`max_size`](#max_size).
++2. The batch size meets or exceeds the configured [`max_events`](#max_events).
+ 
+ *Buffers* are controlled via the [`buffer.*`](#buffer) options.
+ 
+diff --git a/website/docs/reference/sinks/elasticsearch.md b/website/docs/reference/sinks/elasticsearch.md
+index 41c2bd666d..4c6e03947b 100644
+--- a/website/docs/reference/sinks/elasticsearch.md
++++ b/website/docs/reference/sinks/elasticsearch.md
+@@ -1,5 +1,5 @@
+ ---
+-last_modified_on: "2020-06-24"
++last_modified_on: "2020-06-25"
+ delivery_guarantee: "at_least_once"
+ component_title: "Elasticsearch"
+ description: "The Vector `elasticsearch` sink batches `log` events to Elasticsearch via the `_bulk` API endpoint."
+@@ -87,7 +87,8 @@ endpoint][urls.elasticsearch_bulk].
+   aws.region = "us-east-1" # optional, no default, relevant when strategy = "aws"
+ 
+   # Batch
+-  batch.max_size = 10490000 # optional, default, bytes
++  batch.max_bytes = 10490000 # optional, default, bytes
++  batch.max_events = 1000 # optional, no default, events
+   batch.timeout_secs = 1 # optional, default, seconds
+ 
+   # Buffer
+@@ -326,7 +327,7 @@ Configures the sink batching behavior.
+   enumValues={null}
+   examples={[10490000]}
+   groups={[]}
+-  name={"max_size"}
++  name={"max_bytes"}
+   path={"batch"}
+   relevantWhen={null}
+   required={false}
+@@ -336,9 +337,32 @@ Configures the sink batching behavior.
+   warnings={[]}
+   >
+ 
+-#### max_size
++#### max_bytes
+ 
+ The maximum size of a batch, in bytes, before it is flushed.
++
++
++
++</Field>
++<Field
++  common={true}
++  defaultValue={null}
++  enumValues={null}
++  examples={[1000]}
++  groups={[]}
++  name={"max_events"}
++  path={"batch"}
++  relevantWhen={null}
++  required={false}
++  templateable={false}
++  type={"uint"}
++  unit={"events"}
++  warnings={[]}
++  >
++
++#### max_events
++
++The maximum size of a batch, in events, before it is flushed.
+  See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+@@ -410,7 +434,7 @@ Configures the sink specific buffer behavior.
+ #### max_events
+ 
+ The maximum number of [events][docs.data-model] allowed in the buffer.
+-
++ See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+ </Field>
+@@ -433,7 +457,7 @@ The maximum number of [events][docs.data-model] allowed in the buffer.
+ #### max_size
+ 
+ The maximum size of the buffer on the disk.
+- See [Buffers & Batches](#buffers--batches) for more info.
++
+ 
+ 
+ </Field>
+@@ -1316,7 +1340,7 @@ are contained and [delivery guarantees][docs.guarantees] are honored.
+ *Batches* are flushed when 1 of 2 conditions are met:
+ 
+ 1. The batch age meets or exceeds the configured [`timeout_secs`](#timeout_secs).
+-2. The batch size meets or exceeds the configured [`max_size`](#max_size).
++2. The batch size meets or exceeds the configured [`max_events`](#max_events).
+ 
+ *Buffers* are controlled via the [`buffer.*`](#buffer) options.
+ 
+diff --git a/website/docs/reference/sinks/gcp_cloud_storage.md b/website/docs/reference/sinks/gcp_cloud_storage.md
+index 401e1195a6..ecd4a3897b 100644
+--- a/website/docs/reference/sinks/gcp_cloud_storage.md
++++ b/website/docs/reference/sinks/gcp_cloud_storage.md
+@@ -1,5 +1,5 @@
+ ---
+-last_modified_on: "2020-06-02"
++last_modified_on: "2020-06-25"
+ delivery_guarantee: "at_least_once"
+ component_title: "GCP Cloud Storage (GCS)"
+ description: "The Vector `gcp_cloud_storage` sink batches `log` events to Google Cloud Platform's Cloud Storage service via the XML Interface."
+@@ -75,7 +75,8 @@ the [XML Interface](https://cloud.google.com/storage/docs/xml-api/overview).
+   healthcheck = true # optional, default
+ 
+   # Batch
+-  batch.max_size = 10485760 # optional, default, bytes
++  batch.max_bytes = 10485760 # optional, default, bytes
++  batch.max_events = 1000 # optional, no default, events
+   batch.timeout_secs = 300 # optional, default, seconds
+ 
+   # Buffer
+@@ -176,7 +177,7 @@ Configures the sink batching behavior.
+   enumValues={null}
+   examples={[10485760]}
+   groups={[]}
+-  name={"max_size"}
++  name={"max_bytes"}
+   path={"batch"}
+   relevantWhen={null}
+   required={false}
+@@ -186,9 +187,32 @@ Configures the sink batching behavior.
+   warnings={[]}
+   >
+ 
+-#### max_size
++#### max_bytes
+ 
+ The maximum size of a batch, in bytes, before it is flushed.
++
++
++
++</Field>
++<Field
++  common={true}
++  defaultValue={null}
++  enumValues={null}
++  examples={[1000]}
++  groups={[]}
++  name={"max_events"}
++  path={"batch"}
++  relevantWhen={null}
++  required={false}
++  templateable={false}
++  type={"uint"}
++  unit={"events"}
++  warnings={[]}
++  >
++
++#### max_events
++
++The maximum size of a batch, in events, before it is flushed.
+  See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+@@ -283,7 +307,7 @@ Configures the sink specific buffer behavior.
+ #### max_events
+ 
+ The maximum number of [events][docs.data-model] allowed in the buffer.
+-
++ See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+ </Field>
+@@ -306,7 +330,7 @@ The maximum number of [events][docs.data-model] allowed in the buffer.
+ #### max_size
+ 
+ The maximum size of the buffer on the disk.
+- See [Buffers & Batches](#buffers--batches) for more info.
++
+ 
+ 
+ </Field>
+@@ -1132,7 +1156,7 @@ are contained and [delivery guarantees][docs.guarantees] are honored.
+ *Batches* are flushed when 1 of 2 conditions are met:
+ 
+ 1. The batch age meets or exceeds the configured [`timeout_secs`](#timeout_secs).
+-2. The batch size meets or exceeds the configured [`max_size`](#max_size).
++2. The batch size meets or exceeds the configured [`max_events`](#max_events).
+ 
+ *Buffers* are controlled via the [`buffer.*`](#buffer) options.
+ 
+diff --git a/website/docs/reference/sinks/gcp_pubsub.md b/website/docs/reference/sinks/gcp_pubsub.md
+index 9ad48ef44a..326394a118 100644
+--- a/website/docs/reference/sinks/gcp_pubsub.md
++++ b/website/docs/reference/sinks/gcp_pubsub.md
+@@ -1,5 +1,5 @@
+ ---
+-last_modified_on: "2020-06-02"
++last_modified_on: "2020-06-23"
+ delivery_guarantee: "at_least_once"
+ component_title: "GCP PubSub"
+ description: "The Vector `gcp_pubsub` sink batches `log` events to Google Cloud Platform's Pubsub service via the REST Interface."
+@@ -64,7 +64,8 @@ Interface][urls.gcp_pubsub_rest].
+   topic = "this-is-a-topic" # required
+ 
+   # Batch
+-  batch.max_size = 10485760 # optional, default, bytes
++  batch.max_bytes = 10485760 # optional, default, bytes
++  batch.max_events = 1000 # optional, default, events
+   batch.timeout_secs = 1 # optional, default, seconds
+ 
+   # Buffer
+@@ -153,7 +154,7 @@ Configures the sink batching behavior.
+   enumValues={null}
+   examples={[10485760]}
+   groups={[]}
+-  name={"max_size"}
++  name={"max_bytes"}
+   path={"batch"}
+   relevantWhen={null}
+   required={false}
+@@ -163,9 +164,32 @@ Configures the sink batching behavior.
+   warnings={[]}
+   >
+ 
+-#### max_size
++#### max_bytes
+ 
+ The maximum size of a batch, in bytes, before it is flushed.
++
++
++
++</Field>
++<Field
++  common={true}
++  defaultValue={1000}
++  enumValues={null}
++  examples={[1000]}
++  groups={[]}
++  name={"max_events"}
++  path={"batch"}
++  relevantWhen={null}
++  required={false}
++  templateable={false}
++  type={"uint"}
++  unit={"events"}
++  warnings={[]}
++  >
++
++#### max_events
++
++The maximum size of a batch, in events, before it is flushed.
+  See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+@@ -237,7 +261,7 @@ Configures the sink specific buffer behavior.
+ #### max_events
+ 
+ The maximum number of [events][docs.data-model] allowed in the buffer.
+-
++ See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+ </Field>
+@@ -260,7 +284,7 @@ The maximum number of [events][docs.data-model] allowed in the buffer.
+ #### max_size
+ 
+ The maximum size of the buffer on the disk.
+- See [Buffers & Batches](#buffers--batches) for more info.
++
+ 
+ 
+ </Field>
+@@ -917,7 +941,7 @@ are contained and [delivery guarantees][docs.guarantees] are honored.
+ *Batches* are flushed when 1 of 2 conditions are met:
+ 
+ 1. The batch age meets or exceeds the configured [`timeout_secs`](#timeout_secs).
+-2. The batch size meets or exceeds the configured [`max_size`](#max_size).
++2. The batch size meets or exceeds the configured [`max_events`](#max_events).
+ 
+ *Buffers* are controlled via the [`buffer.*`](#buffer) options.
+ 
+diff --git a/website/docs/reference/sinks/gcp_stackdriver_logs.md b/website/docs/reference/sinks/gcp_stackdriver_logs.md
+index da0c7e43d5..50c1cbfd0d 100644
+--- a/website/docs/reference/sinks/gcp_stackdriver_logs.md
++++ b/website/docs/reference/sinks/gcp_stackdriver_logs.md
+@@ -1,5 +1,5 @@
+ ---
+-last_modified_on: "2020-06-15"
++last_modified_on: "2020-06-25"
+ delivery_guarantee: "at_least_once"
+ component_title: "GCP Stackdriver Logs"
+ description: "The Vector `gcp_stackdriver_logs` sink batches [`log`](#log) events to Google Cloud Platform's Stackdriver Logging service via the REST Interface."
+@@ -67,7 +67,8 @@ the [REST Interface][urls.gcp_stackdriver_logging_rest].
+   severity_key = "severity" # optional, no default
+ 
+   # Batch
+-  batch.max_size = 5242880 # optional, default, bytes
++  batch.max_bytes = 5242880 # optional, default, bytes
++  batch.max_events = 1000 # optional, no default, events
+   batch.timeout_secs = 1 # optional, default, seconds
+ 
+   # Buffer
+@@ -136,7 +137,7 @@ Configures the sink batching behavior.
+   enumValues={null}
+   examples={[5242880]}
+   groups={[]}
+-  name={"max_size"}
++  name={"max_bytes"}
+   path={"batch"}
+   relevantWhen={null}
+   required={false}
+@@ -146,9 +147,32 @@ Configures the sink batching behavior.
+   warnings={[]}
+   >
+ 
+-#### max_size
++#### max_bytes
+ 
+ The maximum size of a batch, in bytes, before it is flushed.
++
++
++
++</Field>
++<Field
++  common={true}
++  defaultValue={null}
++  enumValues={null}
++  examples={[1000]}
++  groups={[]}
++  name={"max_events"}
++  path={"batch"}
++  relevantWhen={null}
++  required={false}
++  templateable={false}
++  type={"uint"}
++  unit={"events"}
++  warnings={[]}
++  >
++
++#### max_events
++
++The maximum size of a batch, in events, before it is flushed.
+  See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+@@ -246,7 +270,7 @@ Configures the sink specific buffer behavior.
+ #### max_events
+ 
+ The maximum number of [events][docs.data-model] allowed in the buffer.
+-
++ See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+ </Field>
+@@ -269,7 +293,7 @@ The maximum number of [events][docs.data-model] allowed in the buffer.
+ #### max_size
+ 
+ The maximum size of the buffer on the disk.
+- See [Buffers & Batches](#buffers--batches) for more info.
++
+ 
+ 
+ </Field>
+@@ -1100,7 +1124,7 @@ are contained and [delivery guarantees][docs.guarantees] are honored.
+ *Batches* are flushed when 1 of 2 conditions are met:
+ 
+ 1. The batch age meets or exceeds the configured [`timeout_secs`](#timeout_secs).
+-2. The batch size meets or exceeds the configured [`max_size`](#max_size).
++2. The batch size meets or exceeds the configured [`max_events`](#max_events).
+ 
+ *Buffers* are controlled via the [`buffer.*`](#buffer) options.
+ 
+diff --git a/website/docs/reference/sinks/honeycomb.md b/website/docs/reference/sinks/honeycomb.md
+index 72b78c5168..54c73a159f 100644
+--- a/website/docs/reference/sinks/honeycomb.md
++++ b/website/docs/reference/sinks/honeycomb.md
+@@ -1,5 +1,5 @@
+ ---
+-last_modified_on: "2020-05-21"
++last_modified_on: "2020-06-25"
+ delivery_guarantee: "at_least_once"
+ component_title: "Honeycomb"
+ description: "The Vector `honeycomb` sink batches `log` events to Honeycomb via the batch events API."
+@@ -62,7 +62,8 @@ The Vector `honeycomb` sink
+   healthcheck = true # optional, default
+ 
+   # Batch
+-  batch.max_size = 5242880 # optional, default, bytes
++  batch.max_bytes = 5242880 # optional, default, bytes
++  batch.max_events = 1000 # optional, no default, events
+   batch.timeout_secs = 1 # optional, default, seconds
+ 
+   # Buffer
+@@ -136,7 +137,7 @@ Configures the sink batching behavior.
+   enumValues={null}
+   examples={[5242880]}
+   groups={[]}
+-  name={"max_size"}
++  name={"max_bytes"}
+   path={"batch"}
+   relevantWhen={null}
+   required={false}
+@@ -146,9 +147,32 @@ Configures the sink batching behavior.
+   warnings={[]}
+   >
+ 
+-#### max_size
++#### max_bytes
+ 
+ The maximum size of a batch, in bytes, before it is flushed.
++
++
++
++</Field>
++<Field
++  common={true}
++  defaultValue={null}
++  enumValues={null}
++  examples={[1000]}
++  groups={[]}
++  name={"max_events"}
++  path={"batch"}
++  relevantWhen={null}
++  required={false}
++  templateable={false}
++  type={"uint"}
++  unit={"events"}
++  warnings={[]}
++  >
++
++#### max_events
++
++The maximum size of a batch, in events, before it is flushed.
+  See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+@@ -220,7 +244,7 @@ Configures the sink specific buffer behavior.
+ #### max_events
+ 
+ The maximum number of [events][docs.data-model] allowed in the buffer.
+-
++ See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+ </Field>
+@@ -243,7 +267,7 @@ The maximum number of [events][docs.data-model] allowed in the buffer.
+ #### max_size
+ 
+ The maximum size of the buffer on the disk.
+- See [Buffers & Batches](#buffers--batches) for more info.
++
+ 
+ 
+ </Field>
+@@ -552,7 +576,7 @@ are contained and [delivery guarantees][docs.guarantees] are honored.
+ *Batches* are flushed when 1 of 2 conditions are met:
+ 
+ 1. The batch age meets or exceeds the configured [`timeout_secs`](#timeout_secs).
+-2. The batch size meets or exceeds the configured [`max_size`](#max_size).
++2. The batch size meets or exceeds the configured [`max_events`](#max_events).
+ 
+ *Buffers* are controlled via the [`buffer.*`](#buffer) options.
+ 
+diff --git a/website/docs/reference/sinks/http.md b/website/docs/reference/sinks/http.md
+index 1da4ce86d1..4a2b941cc9 100644
+--- a/website/docs/reference/sinks/http.md
++++ b/website/docs/reference/sinks/http.md
+@@ -1,5 +1,5 @@
+ ---
+-last_modified_on: "2020-06-02"
++last_modified_on: "2020-06-25"
+ delivery_guarantee: "at_least_once"
+ component_title: "HTTP"
+ description: "The Vector `http` sink batches `log` events to a generic HTTP endpoint."
+@@ -50,7 +50,8 @@ The Vector `http` sink
+   uri = "https://10.22.212.22:9000/endpoint" # required
+ 
+   # Batch
+-  batch.max_size = 1049000 # optional, default, bytes
++  batch.max_bytes = 1049000 # optional, default, bytes
++  batch.max_events = 1000 # optional, no default, events
+   batch.timeout_secs = 1 # optional, default, seconds
+ 
+   # Buffer
+@@ -87,7 +88,8 @@ The Vector `http` sink
+   auth.user = "${HTTP_USERNAME}" # required, required when strategy = "basic"
+ 
+   # Batch
+-  batch.max_size = 1049000 # optional, default, bytes
++  batch.max_bytes = 1049000 # optional, default, bytes
++  batch.max_events = 1000 # optional, no default, events
+   batch.timeout_secs = 1 # optional, default, seconds
+ 
+   # Buffer
+@@ -273,7 +275,7 @@ Configures the sink batching behavior.
+   enumValues={null}
+   examples={[1049000]}
+   groups={[]}
+-  name={"max_size"}
++  name={"max_bytes"}
+   path={"batch"}
+   relevantWhen={null}
+   required={false}
+@@ -283,9 +285,32 @@ Configures the sink batching behavior.
+   warnings={[]}
+   >
+ 
+-#### max_size
++#### max_bytes
+ 
+ The maximum size of a batch, in bytes, before it is flushed.
++
++
++
++</Field>
++<Field
++  common={true}
++  defaultValue={null}
++  enumValues={null}
++  examples={[1000]}
++  groups={[]}
++  name={"max_events"}
++  path={"batch"}
++  relevantWhen={null}
++  required={false}
++  templateable={false}
++  type={"uint"}
++  unit={"events"}
++  warnings={[]}
++  >
++
++#### max_events
++
++The maximum size of a batch, in events, before it is flushed.
+  See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+@@ -357,7 +382,7 @@ Configures the sink specific buffer behavior.
+ #### max_events
+ 
+ The maximum number of [events][docs.data-model] allowed in the buffer.
+-
++ See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+ </Field>
+@@ -380,7 +405,7 @@ The maximum number of [events][docs.data-model] allowed in the buffer.
+ #### max_size
+ 
+ The maximum size of the buffer on the disk.
+- See [Buffers & Batches](#buffers--batches) for more info.
++
+ 
+ 
+ </Field>
+@@ -1142,7 +1167,7 @@ are contained and [delivery guarantees][docs.guarantees] are honored.
+ *Batches* are flushed when 1 of 2 conditions are met:
+ 
+ 1. The batch age meets or exceeds the configured [`timeout_secs`](#timeout_secs).
+-2. The batch size meets or exceeds the configured [`max_size`](#max_size).
++2. The batch size meets or exceeds the configured [`max_events`](#max_events).
+ 
+ *Buffers* are controlled via the [`buffer.*`](#buffer) options.
+ 
+diff --git a/website/docs/reference/sinks/humio_logs.md b/website/docs/reference/sinks/humio_logs.md
+index f3a1ec65e0..6824a08bf7 100644
+--- a/website/docs/reference/sinks/humio_logs.md
++++ b/website/docs/reference/sinks/humio_logs.md
+@@ -1,5 +1,5 @@
+ ---
+-last_modified_on: "2020-05-25"
++last_modified_on: "2020-06-25"
+ delivery_guarantee: "at_least_once"
+ component_title: "Humio Logs"
+ description: "The Vector `humio_logs` sink batches `log` events to Humio via the HEC API."
+@@ -68,7 +68,8 @@ The Vector `humio_logs` sink
+   token = "${HUMIO_TOKEN}" # required
+ 
+   # Batch
+-  batch.max_size = 1049000 # optional, default, bytes
++  batch.max_bytes = 1049000 # optional, default, bytes
++  batch.max_events = 1000 # optional, no default, events
+   batch.timeout_secs = 1 # optional, default, seconds
+ 
+   # Buffer
+@@ -128,7 +129,7 @@ Configures the sink batching behavior.
+   enumValues={null}
+   examples={[1049000]}
+   groups={[]}
+-  name={"max_size"}
++  name={"max_bytes"}
+   path={"batch"}
+   relevantWhen={null}
+   required={false}
+@@ -138,9 +139,32 @@ Configures the sink batching behavior.
+   warnings={[]}
+   >
+ 
+-#### max_size
++#### max_bytes
+ 
+ The maximum size of a batch, in bytes, before it is flushed.
++
++
++
++</Field>
++<Field
++  common={true}
++  defaultValue={null}
++  enumValues={null}
++  examples={[1000]}
++  groups={[]}
++  name={"max_events"}
++  path={"batch"}
++  relevantWhen={null}
++  required={false}
++  templateable={false}
++  type={"uint"}
++  unit={"events"}
++  warnings={[]}
++  >
++
++#### max_events
++
++The maximum size of a batch, in events, before it is flushed.
+  See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+@@ -212,7 +236,7 @@ Configures the sink specific buffer behavior.
+ #### max_events
+ 
+ The maximum number of [events][docs.data-model] allowed in the buffer.
+-
++ See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+ </Field>
+@@ -235,7 +259,7 @@ The maximum number of [events][docs.data-model] allowed in the buffer.
+ #### max_size
+ 
+ The maximum size of the buffer on the disk.
+- See [Buffers & Batches](#buffers--batches) for more info.
++
+ 
+ 
+ </Field>
+@@ -708,7 +732,7 @@ are contained and [delivery guarantees][docs.guarantees] are honored.
+ *Batches* are flushed when 1 of 2 conditions are met:
+ 
+ 1. The batch age meets or exceeds the configured [`timeout_secs`](#timeout_secs).
+-2. The batch size meets or exceeds the configured [`max_size`](#max_size).
++2. The batch size meets or exceeds the configured [`max_events`](#max_events).
+ 
+ *Buffers* are controlled via the [`buffer.*`](#buffer) options.
+ 
+diff --git a/website/docs/reference/sinks/influxdb_logs.md b/website/docs/reference/sinks/influxdb_logs.md
+index 690d115129..5ba62a22e1 100644
+--- a/website/docs/reference/sinks/influxdb_logs.md
++++ b/website/docs/reference/sinks/influxdb_logs.md
+@@ -1,5 +1,5 @@
+ ---
+-last_modified_on: "2020-05-25"
++last_modified_on: "2020-06-25"
+ delivery_guarantee: "at_least_once"
+ component_title: "InfluxDB Logs"
+ description: "The Vector `influxdb_logs` sink batches `log` events to InfluxDB using v1 or v2 HTTP API."
+@@ -79,7 +79,8 @@ The Vector `influxdb_logs` sink
+   username = "todd" # optional, no default
+ 
+   # Batch
+-  batch.max_size = 10490000 # optional, default, bytes
++  batch.max_bytes = 1049000 # optional, default, bytes
++  batch.max_events = 1000 # optional, no default, events
+   batch.timeout_secs = 1 # optional, default, seconds
+ 
+   # Buffer
+@@ -144,7 +145,8 @@ The Vector `influxdb_logs` sink
+   token = "${INFLUXDB_TOKEN}" # required
+ 
+   # Batch
+-  batch.max_size = 10490000 # optional, default, bytes
++  batch.max_bytes = 1049000 # optional, default, bytes
++  batch.max_events = 1000 # optional, no default, events
+   batch.timeout_secs = 1 # optional, default, seconds
+ 
+   # Buffer
+@@ -196,11 +198,11 @@ Configures the sink batching behavior.
+ <Fields filters={false}>
+ <Field
+   common={true}
+-  defaultValue={10490000}
++  defaultValue={1049000}
+   enumValues={null}
+-  examples={[10490000]}
++  examples={[1049000]}
+   groups={["v1","v2"]}
+-  name={"max_size"}
++  name={"max_bytes"}
+   path={"batch"}
+   relevantWhen={null}
+   required={false}
+@@ -210,9 +212,32 @@ Configures the sink batching behavior.
+   warnings={[]}
+   >
+ 
+-#### max_size
++#### max_bytes
+ 
+ The maximum size of a batch, in bytes, before it is flushed.
++
++
++
++</Field>
++<Field
++  common={true}
++  defaultValue={null}
++  enumValues={null}
++  examples={[1000]}
++  groups={["v1","v2"]}
++  name={"max_events"}
++  path={"batch"}
++  relevantWhen={null}
++  required={false}
++  templateable={false}
++  type={"uint"}
++  unit={"events"}
++  warnings={[]}
++  >
++
++#### max_events
++
++The maximum size of a batch, in events, before it is flushed.
+  See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+@@ -307,7 +332,7 @@ Configures the sink specific buffer behavior.
+ #### max_events
+ 
+ The maximum number of [events][docs.data-model] allowed in the buffer.
+-
++ See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+ </Field>
+@@ -330,7 +355,7 @@ The maximum number of [events][docs.data-model] allowed in the buffer.
+ #### max_size
+ 
+ The maximum size of the buffer on the disk.
+- See [Buffers & Batches](#buffers--batches) for more info.
++
+ 
+ 
+ </Field>
+@@ -945,7 +970,7 @@ are contained and [delivery guarantees][docs.guarantees] are honored.
+ *Batches* are flushed when 1 of 2 conditions are met:
+ 
+ 1. The batch age meets or exceeds the configured [`timeout_secs`](#timeout_secs).
+-2. The batch size meets or exceeds the configured [`max_size`](#max_size).
++2. The batch size meets or exceeds the configured [`max_events`](#max_events).
+ 
+ *Buffers* are controlled via the [`buffer.*`](#buffer) options.
+ 
+diff --git a/website/docs/reference/sinks/logdna.md b/website/docs/reference/sinks/logdna.md
+index 393c40c583..9d0ec937f8 100644
+--- a/website/docs/reference/sinks/logdna.md
++++ b/website/docs/reference/sinks/logdna.md
+@@ -1,5 +1,5 @@
+ ---
+-last_modified_on: "2020-05-21"
++last_modified_on: "2020-06-25"
+ delivery_guarantee: "at_least_once"
+ component_title: "LogDNA"
+ description: "The Vector `logdna` sink batches `log` events to LogDna's HTTP Ingestion API."
+@@ -67,7 +67,8 @@ The Vector `logdna` sink
+   tags = ["tag1", "tag2"] # optional, no default
+ 
+   # Batch
+-  batch.max_size = 10490000 # optional, default, bytes
++  batch.max_bytes = 10490000 # optional, default, bytes
++  batch.max_events = 1000 # optional, no default, events
+   batch.timeout_secs = 1 # optional, default, seconds
+ 
+   # Buffer
+@@ -146,7 +147,7 @@ Configures the sink batching behavior.
+   enumValues={null}
+   examples={[10490000]}
+   groups={[]}
+-  name={"max_size"}
++  name={"max_bytes"}
+   path={"batch"}
+   relevantWhen={null}
+   required={false}
+@@ -156,9 +157,32 @@ Configures the sink batching behavior.
+   warnings={[]}
+   >
+ 
+-#### max_size
++#### max_bytes
+ 
+ The maximum size of a batch, in bytes, before it is flushed.
++
++
++
++</Field>
++<Field
++  common={true}
++  defaultValue={null}
++  enumValues={null}
++  examples={[1000]}
++  groups={[]}
++  name={"max_events"}
++  path={"batch"}
++  relevantWhen={null}
++  required={false}
++  templateable={false}
++  type={"uint"}
++  unit={"events"}
++  warnings={[]}
++  >
++
++#### max_events
++
++The maximum size of a batch, in events, before it is flushed.
+  See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+@@ -230,7 +254,7 @@ Configures the sink specific buffer behavior.
+ #### max_events
+ 
+ The maximum number of [events][docs.data-model] allowed in the buffer.
+-
++ See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+ </Field>
+@@ -253,7 +277,7 @@ The maximum number of [events][docs.data-model] allowed in the buffer.
+ #### max_size
+ 
+ The maximum size of the buffer on the disk.
+- See [Buffers & Batches](#buffers--batches) for more info.
++
+ 
+ 
+ </Field>
+@@ -772,7 +796,7 @@ are contained and [delivery guarantees][docs.guarantees] are honored.
+ *Batches* are flushed when 1 of 2 conditions are met:
+ 
+ 1. The batch age meets or exceeds the configured [`timeout_secs`](#timeout_secs).
+-2. The batch size meets or exceeds the configured [`max_size`](#max_size).
++2. The batch size meets or exceeds the configured [`max_events`](#max_events).
+ 
+ *Buffers* are controlled via the [`buffer.*`](#buffer) options.
+ 
+diff --git a/website/docs/reference/sinks/loki.md b/website/docs/reference/sinks/loki.md
+index fa5ee40593..ec7543d816 100644
+--- a/website/docs/reference/sinks/loki.md
++++ b/website/docs/reference/sinks/loki.md
+@@ -1,5 +1,5 @@
+ ---
+-last_modified_on: "2020-06-02"
++last_modified_on: "2020-06-25"
+ delivery_guarantee: "at_least_once"
+ component_title: "Loki"
+ description: "The Vector `loki` sink batches `log` events to Loki."
+@@ -77,7 +77,8 @@ The Vector `loki` sink
+   auth.user = "${LOKI_USERNAME}" # required, required when strategy = "basic"
+ 
+   # Batch
+-  batch.max_size = 10490000 # optional, default, bytes
++  batch.max_bytes = 10490000 # optional, default, bytes
++  batch.max_events = 1000 # optional, no default, events
+   batch.timeout_secs = 1 # optional, default, seconds
+ 
+   # Buffer
+@@ -265,7 +266,7 @@ Configures the sink batching behavior.
+   enumValues={null}
+   examples={[10490000]}
+   groups={[]}
+-  name={"max_size"}
++  name={"max_bytes"}
+   path={"batch"}
+   relevantWhen={null}
+   required={false}
+@@ -275,9 +276,32 @@ Configures the sink batching behavior.
+   warnings={[]}
+   >
+ 
+-#### max_size
++#### max_bytes
+ 
+ The maximum size of a batch, in bytes, before it is flushed.
++
++
++
++</Field>
++<Field
++  common={true}
++  defaultValue={null}
++  enumValues={null}
++  examples={[1000]}
++  groups={[]}
++  name={"max_events"}
++  path={"batch"}
++  relevantWhen={null}
++  required={false}
++  templateable={false}
++  type={"uint"}
++  unit={"events"}
++  warnings={[]}
++  >
++
++#### max_events
++
++The maximum size of a batch, in events, before it is flushed.
+  See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+@@ -349,7 +373,7 @@ Configures the sink specific buffer behavior.
+ #### max_events
+ 
+ The maximum number of [events][docs.data-model] allowed in the buffer.
+-
++ See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+ </Field>
+@@ -372,7 +396,7 @@ The maximum number of [events][docs.data-model] allowed in the buffer.
+ #### max_size
+ 
+ The maximum size of the buffer on the disk.
+- See [Buffers & Batches](#buffers--batches) for more info.
++
+ 
+ 
+ </Field>
+@@ -1097,7 +1121,7 @@ are contained and [delivery guarantees][docs.guarantees] are honored.
+ *Batches* are flushed when 1 of 2 conditions are met:
+ 
+ 1. The batch age meets or exceeds the configured [`timeout_secs`](#timeout_secs).
+-2. The batch size meets or exceeds the configured [`max_size`](#max_size).
++2. The batch size meets or exceeds the configured [`max_events`](#max_events).
+ 
+ *Buffers* are controlled via the [`buffer.*`](#buffer) options.
+ 
+diff --git a/website/docs/reference/sinks/new_relic_logs.md b/website/docs/reference/sinks/new_relic_logs.md
+index 910da40696..9d47324bb8 100644
+--- a/website/docs/reference/sinks/new_relic_logs.md
++++ b/website/docs/reference/sinks/new_relic_logs.md
+@@ -1,5 +1,5 @@
+ ---
+-last_modified_on: "2020-05-25"
++last_modified_on: "2020-06-25"
+ delivery_guarantee: "at_least_once"
+ component_title: "New Relic Logs"
+ description: "The Vector `new_relic_logs` sink batches `log` events to New Relic's log service via their log API."
+@@ -72,7 +72,8 @@ API][urls.new_relic_log_api].
+   region = "us" # optional, default
+ 
+   # Batch
+-  batch.max_size = 524000 # optional, default, bytes
++  batch.max_bytes = 5240000 # optional, default, bytes
++  batch.max_events = 1000 # optional, no default, events
+   batch.timeout_secs = 1 # optional, default, seconds
+ 
+   # Buffer
+@@ -128,11 +129,11 @@ Configures the sink batching behavior.
+ <Fields filters={false}>
+ <Field
+   common={true}
+-  defaultValue={524000}
++  defaultValue={5240000}
+   enumValues={null}
+-  examples={[524000]}
++  examples={[5240000]}
+   groups={[]}
+-  name={"max_size"}
++  name={"max_bytes"}
+   path={"batch"}
+   relevantWhen={null}
+   required={false}
+@@ -142,9 +143,32 @@ Configures the sink batching behavior.
+   warnings={[]}
+   >
+ 
+-#### max_size
++#### max_bytes
+ 
+ The maximum size of a batch, in bytes, before it is flushed.
++
++
++
++</Field>
++<Field
++  common={true}
++  defaultValue={null}
++  enumValues={null}
++  examples={[1000]}
++  groups={[]}
++  name={"max_events"}
++  path={"batch"}
++  relevantWhen={null}
++  required={false}
++  templateable={false}
++  type={"uint"}
++  unit={"events"}
++  warnings={[]}
++  >
++
++#### max_events
++
++The maximum size of a batch, in events, before it is flushed.
+  See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+@@ -216,7 +240,7 @@ Configures the sink specific buffer behavior.
+ #### max_events
+ 
+ The maximum number of [events][docs.data-model] allowed in the buffer.
+-
++ See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+ </Field>
+@@ -239,7 +263,7 @@ The maximum number of [events][docs.data-model] allowed in the buffer.
+ #### max_size
+ 
+ The maximum size of the buffer on the disk.
+- See [Buffers & Batches](#buffers--batches) for more info.
++
+ 
+ 
+ </Field>
+@@ -736,7 +760,7 @@ are contained and [delivery guarantees][docs.guarantees] are honored.
+ *Batches* are flushed when 1 of 2 conditions are met:
+ 
+ 1. The batch age meets or exceeds the configured [`timeout_secs`](#timeout_secs).
+-2. The batch size meets or exceeds the configured [`max_size`](#max_size).
++2. The batch size meets or exceeds the configured [`max_events`](#max_events).
+ 
+ *Buffers* are controlled via the [`buffer.*`](#buffer) options.
+ 
+diff --git a/website/docs/reference/sinks/sematext_logs.md b/website/docs/reference/sinks/sematext_logs.md
+index 6081ae6d05..2741a9388c 100644
+--- a/website/docs/reference/sinks/sematext_logs.md
++++ b/website/docs/reference/sinks/sematext_logs.md
+@@ -1,5 +1,5 @@
+ ---
+-last_modified_on: "2020-05-21"
++last_modified_on: "2020-06-25"
+ delivery_guarantee: "at_least_once"
+ component_title: "Sematext Logs"
+ description: "The Vector `sematext_logs` sink batches `log` events to Sematext via the Elasticsearch API."
+@@ -62,7 +62,8 @@ The Vector `sematext_logs` sink
+   token = "${SEMATEXT_TOKEN}" # required
+ 
+   # Batch
+-  batch.max_size = 10490000 # optional, default, bytes
++  batch.max_bytes = 10490000 # optional, default, bytes
++  batch.max_events = 1000 # optional, no default, events
+   batch.timeout_secs = 1 # optional, default, seconds
+ 
+   # Buffer
+@@ -118,7 +119,7 @@ Configures the sink batching behavior.
+   enumValues={null}
+   examples={[10490000]}
+   groups={[]}
+-  name={"max_size"}
++  name={"max_bytes"}
+   path={"batch"}
+   relevantWhen={null}
+   required={false}
+@@ -128,9 +129,32 @@ Configures the sink batching behavior.
+   warnings={[]}
+   >
+ 
+-#### max_size
++#### max_bytes
+ 
+ The maximum size of a batch, in bytes, before it is flushed.
++
++
++
++</Field>
++<Field
++  common={true}
++  defaultValue={null}
++  enumValues={null}
++  examples={[1000]}
++  groups={[]}
++  name={"max_events"}
++  path={"batch"}
++  relevantWhen={null}
++  required={false}
++  templateable={false}
++  type={"uint"}
++  unit={"events"}
++  warnings={[]}
++  >
++
++#### max_events
++
++The maximum size of a batch, in events, before it is flushed.
+  See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+@@ -202,7 +226,7 @@ Configures the sink specific buffer behavior.
+ #### max_events
+ 
+ The maximum number of [events][docs.data-model] allowed in the buffer.
+-
++ See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+ </Field>
+@@ -225,7 +249,7 @@ The maximum number of [events][docs.data-model] allowed in the buffer.
+ #### max_size
+ 
+ The maximum size of the buffer on the disk.
+- See [Buffers & Batches](#buffers--batches) for more info.
++
+ 
+ 
+ </Field>
+@@ -676,7 +700,7 @@ are contained and [delivery guarantees][docs.guarantees] are honored.
+ *Batches* are flushed when 1 of 2 conditions are met:
+ 
+ 1. The batch age meets or exceeds the configured [`timeout_secs`](#timeout_secs).
+-2. The batch size meets or exceeds the configured [`max_size`](#max_size).
++2. The batch size meets or exceeds the configured [`max_events`](#max_events).
+ 
+ *Buffers* are controlled via the [`buffer.*`](#buffer) options.
+ 
+diff --git a/website/docs/reference/sinks/splunk_hec.md b/website/docs/reference/sinks/splunk_hec.md
+index 5dd1518d0e..514fc65fc7 100644
+--- a/website/docs/reference/sinks/splunk_hec.md
++++ b/website/docs/reference/sinks/splunk_hec.md
+@@ -1,5 +1,5 @@
+ ---
+-last_modified_on: "2020-06-02"
++last_modified_on: "2020-06-25"
+ delivery_guarantee: "at_least_once"
+ component_title: "Splunk HEC"
+ description: "The Vector `splunk_hec` sink batches `log` events to a Splunk's HTTP Event Collector."
+@@ -74,7 +74,8 @@ HTTP Event Collector][urls.splunk_hec].
+   token = "${SPLUNK_HEC_TOKEN}" # required
+ 
+   # Batch
+-  batch.max_size = 1049000 # optional, default, bytes
++  batch.max_bytes = 1049000 # optional, default, bytes
++  batch.max_events = 1000 # optional, no default, events
+   batch.timeout_secs = 1 # optional, default, seconds
+ 
+   # Buffer
+@@ -142,7 +143,7 @@ Configures the sink batching behavior.
+   enumValues={null}
+   examples={[1049000]}
+   groups={[]}
+-  name={"max_size"}
++  name={"max_bytes"}
+   path={"batch"}
+   relevantWhen={null}
+   required={false}
+@@ -152,9 +153,32 @@ Configures the sink batching behavior.
+   warnings={[]}
+   >
+ 
+-#### max_size
++#### max_bytes
+ 
+ The maximum size of a batch, in bytes, before it is flushed.
++
++
++
++</Field>
++<Field
++  common={true}
++  defaultValue={null}
++  enumValues={null}
++  examples={[1000]}
++  groups={[]}
++  name={"max_events"}
++  path={"batch"}
++  relevantWhen={null}
++  required={false}
++  templateable={false}
++  type={"uint"}
++  unit={"events"}
++  warnings={[]}
++  >
++
++#### max_events
++
++The maximum size of a batch, in events, before it is flushed.
+  See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+@@ -226,7 +250,7 @@ Configures the sink specific buffer behavior.
+ #### max_events
+ 
+ The maximum number of [events][docs.data-model] allowed in the buffer.
+-
++ See [Buffers & Batches](#buffers--batches) for more info.
+ 
+ 
+ </Field>
+@@ -249,7 +273,7 @@ The maximum number of [events][docs.data-model] allowed in the buffer.
+ #### max_size
+ 
+ The maximum size of the buffer on the disk.
+- See [Buffers & Batches](#buffers--batches) for more info.
++
+ 
+ 
+ </Field>
+@@ -967,7 +991,7 @@ are contained and [delivery guarantees][docs.guarantees] are honored.
+ *Batches* are flushed when 1 of 2 conditions are met:
+ 
+ 1. The batch age meets or exceeds the configured [`timeout_secs`](#timeout_secs).
+-2. The batch size meets or exceeds the configured [`max_size`](#max_size).
++2. The batch size meets or exceeds the configured [`max_events`](#max_events).
+ 
+ *Buffers* are controlled via the [`buffer.*`](#buffer) options.
+ 

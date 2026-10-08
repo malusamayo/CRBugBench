@@ -1,0 +1,94 @@
+commit 45a931322feb7186598dca935aaf0e8d57cc4827
+Author: Lawrence Mitchell <lmitchell@nvidia.com>
+Date:   Mon Nov 4 12:33:00 2024 +0000
+
+    fix(rust): Run join type coercion with correct schemas active (#19625)
+
+diff --git a/crates/polars-plan/src/plans/conversion/join.rs b/crates/polars-plan/src/plans/conversion/join.rs
+index 5222ca73cd..8a10db7de1 100644
+--- a/crates/polars-plan/src/plans/conversion/join.rs
++++ b/crates/polars-plan/src/plans/conversion/join.rs
+@@ -109,9 +109,31 @@ pub fn resolve_join(
+ 
+     ctxt.conversion_optimizer
+         .fill_scratch(&left_on, ctxt.expr_arena);
++    ctxt.conversion_optimizer
++        .coerce_types(ctxt.expr_arena, ctxt.lp_arena, input_left)
++        .map_err(|e| e.context("'join' failed".into()))?;
+     ctxt.conversion_optimizer
+         .fill_scratch(&right_on, ctxt.expr_arena);
+-
++    ctxt.conversion_optimizer
++        .coerce_types(ctxt.expr_arena, ctxt.lp_arena, input_right)
++        .map_err(|e| e.context("'join' failed".into()))?;
++
++    let get_dtype = |expr: &ExprIR, schema: &SchemaRef| {
++        ctxt.expr_arena
++            .get(expr.node())
++            .get_type(schema, Context::Default, ctxt.expr_arena)
++            .ok()
++            .unwrap()
++    };
++    for (lnode, rnode) in left_on.iter().zip(right_on.iter()) {
++        let ltype = get_dtype(lnode, &schema_left);
++        let rtype = get_dtype(rnode, &schema_right);
++        polars_ensure!(
++            ltype == rtype,
++            SchemaMismatch: "datatypes of join keys don't match - `{}`: {} on left does not match `{}`: {} on right",
++            lnode.output_name(), ltype, rnode.output_name(), rtype
++        )
++    }
+     // Every expression must be elementwise so that we are
+     // guaranteed the keys for a join are all the same length.
+     let all_elementwise =
+@@ -128,7 +150,7 @@ pub fn resolve_join(
+         right_on,
+         options,
+     };
+-    run_conversion(lp, ctxt, "join")
++    Ok(ctxt.lp_arena.add(lp))
+ }
+ 
+ #[cfg(feature = "iejoin")]
+diff --git a/py-polars/tests/unit/operations/test_join.py b/py-polars/tests/unit/operations/test_join.py
+index 87ad4dfc5a..c65be5ad61 100644
+--- a/py-polars/tests/unit/operations/test_join.py
++++ b/py-polars/tests/unit/operations/test_join.py
+@@ -14,6 +14,7 @@ from polars.exceptions import (
+     ComputeError,
+     DuplicateError,
+     InvalidOperationError,
++    SchemaError,
+ )
+ from polars.testing import assert_frame_equal, assert_series_equal
+ 
+@@ -1099,3 +1100,16 @@ def test_left_join_slice_pushdown_19405(set_sorted: bool) -> None:
+ 
+     q = left.join(right, on="k", how="left").head(5)
+     assert_frame_equal(q.collect(), pl.DataFrame({"k": [1, 1, 1, 1, 2]}))
++
++
++def test_join_key_type_coercion_19597() -> None:
++    left = pl.LazyFrame({"a": pl.Series([1, 2, 3], dtype=pl.Float64)})
++    right = pl.LazyFrame({"a": pl.Series([1, 2, 3], dtype=pl.Int64)})
++
++    with pytest.raises(SchemaError, match="datatypes of join keys don't match"):
++        left.join(right, left_on=pl.col("a"), right_on=pl.col("a")).collect_schema()
++
++    with pytest.raises(SchemaError, match="datatypes of join keys don't match"):
++        left.join(
++            right, left_on=pl.col("a") * 2, right_on=pl.col("a") * 2
++        ).collect_schema()
+diff --git a/py-polars/tests/unit/operations/test_join_asof.py b/py-polars/tests/unit/operations/test_join_asof.py
+index 21b7db4ebb..4ab2a9fe89 100644
+--- a/py-polars/tests/unit/operations/test_join_asof.py
++++ b/py-polars/tests/unit/operations/test_join_asof.py
+@@ -141,7 +141,7 @@ def test_join_asof_mismatched_dtypes() -> None:
+     )
+ 
+     with pytest.raises(
+-        pl.exceptions.ComputeError, match="datatypes of join keys don't match"
++        pl.exceptions.SchemaError, match="datatypes of join keys don't match"
+     ):
+         df1.join_asof(df2, on="a", strategy="forward")
+ 

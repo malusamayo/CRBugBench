@@ -1,0 +1,4148 @@
+commit 75a4f1bc9f541de345143522ee49373160168db7
+Author: Mackinnon Buck <mackinnon.buck@gmail.com>
+Date:   Thu Jul 20 15:12:21 2023 -0700
+
+    [Blazor] Improvements to the interaction between SSR and interactive rendering (#49238)
+
+diff --git a/src/Components/Endpoints/src/DependencyInjection/ServerComponentSerializer.cs b/src/Components/Endpoints/src/DependencyInjection/ServerComponentSerializer.cs
+index 7fa6d460da..39b6e137a2 100644
+--- a/src/Components/Endpoints/src/DependencyInjection/ServerComponentSerializer.cs
++++ b/src/Components/Endpoints/src/DependencyInjection/ServerComponentSerializer.cs
+@@ -18,10 +18,10 @@ internal sealed class ServerComponentSerializer
+             .CreateProtector(ServerComponentSerializationSettings.DataProtectionProviderPurpose)
+             .ToTimeLimitedDataProtector();
+ 
+-    public ServerComponentMarker SerializeInvocation(ServerComponentInvocationSequence invocationId, Type type, ParameterView parameters, bool prerendered)
++    public ServerComponentMarker SerializeInvocation(ServerComponentInvocationSequence invocationId, Type type, ParameterView parameters, string key, bool prerendered)
+     {
+         var (sequence, serverComponent) = CreateSerializedServerComponent(invocationId, type, parameters);
+-        return prerendered ? ServerComponentMarker.Prerendered(sequence, serverComponent) : ServerComponentMarker.NonPrerendered(sequence, serverComponent);
++        return prerendered ? ServerComponentMarker.Prerendered(sequence, serverComponent, key) : ServerComponentMarker.NonPrerendered(sequence, serverComponent, key);
+     }
+ 
+     private (int sequence, string payload) CreateSerializedServerComponent(
+diff --git a/src/Components/Endpoints/src/DependencyInjection/WebAssemblyComponentSerializer.cs b/src/Components/Endpoints/src/DependencyInjection/WebAssemblyComponentSerializer.cs
+index 3ed0e22f75..e8b8e2a0d1 100644
+--- a/src/Components/Endpoints/src/DependencyInjection/WebAssemblyComponentSerializer.cs
++++ b/src/Components/Endpoints/src/DependencyInjection/WebAssemblyComponentSerializer.cs
+@@ -8,7 +8,7 @@ namespace Microsoft.AspNetCore.Components.Endpoints;
+ // See the details of the component serialization protocol in WebAssemblyComponentDeserializer.cs on the Components solution.
+ internal sealed class WebAssemblyComponentSerializer
+ {
+-    public static WebAssemblyComponentMarker SerializeInvocation(Type type, ParameterView parameters, bool prerendered)
++    public static WebAssemblyComponentMarker SerializeInvocation(Type type, ParameterView parameters, string? key, bool prerendered)
+     {
+         var assembly = type.Assembly.GetName().Name ?? throw new InvalidOperationException("Cannot prerender components from assemblies with a null name");
+         var typeFullName = type.FullName ?? throw new InvalidOperationException("Cannot prerender component types with a null name");
+@@ -19,8 +19,8 @@ internal sealed class WebAssemblyComponentSerializer
+         var serializedDefinitions = Convert.ToBase64String(JsonSerializer.SerializeToUtf8Bytes(definitions, WebAssemblyComponentSerializationSettings.JsonSerializationOptions));
+         var serializedValues = Convert.ToBase64String(JsonSerializer.SerializeToUtf8Bytes(values, WebAssemblyComponentSerializationSettings.JsonSerializationOptions));
+ 
+-        return prerendered ? WebAssemblyComponentMarker.Prerendered(assembly, typeFullName, serializedDefinitions, serializedValues) :
+-            WebAssemblyComponentMarker.NonPrerendered(assembly, typeFullName, serializedDefinitions, serializedValues);
++        return prerendered ? WebAssemblyComponentMarker.Prerendered(assembly, typeFullName, serializedDefinitions, serializedValues, key) :
++            WebAssemblyComponentMarker.NonPrerendered(assembly, typeFullName, serializedDefinitions, serializedValues, key);
+     }
+ 
+     internal static void AppendPreamble(TextWriter writer, WebAssemblyComponentMarker record)
+diff --git a/src/Components/Endpoints/src/Rendering/EndpointHtmlRenderer.Streaming.cs b/src/Components/Endpoints/src/Rendering/EndpointHtmlRenderer.Streaming.cs
+index 6301b123cd..4316b745b6 100644
+--- a/src/Components/Endpoints/src/Rendering/EndpointHtmlRenderer.Streaming.cs
++++ b/src/Components/Endpoints/src/Rendering/EndpointHtmlRenderer.Streaming.cs
+@@ -185,7 +185,14 @@ internal partial class EndpointHtmlRenderer
+     protected override void WriteComponentHtml(int componentId, TextWriter output)
+         => WriteComponentHtml(componentId, output, allowBoundaryMarkers: true);
+ 
+-    private void WriteComponentHtml(int componentId, TextWriter output, bool allowBoundaryMarkers)
++    protected override void RenderChildComponent(TextWriter output, ref RenderTreeFrame componentFrame)
++    {
++        var componentId = componentFrame.ComponentId;
++        var sequenceAndKey = new SequenceAndKey(componentFrame.Sequence, componentFrame.ComponentKey);
++        WriteComponentHtml(componentId, output, allowBoundaryMarkers: true, sequenceAndKey);
++    }
++
++    private void WriteComponentHtml(int componentId, TextWriter output, bool allowBoundaryMarkers, SequenceAndKey sequenceAndKey = default)
+     {
+         _visitedComponentIdsInCurrentStreamingBatch?.Add(componentId);
+ 
+@@ -198,9 +205,8 @@ internal partial class EndpointHtmlRenderer
+         // It may be better to use a custom element like <blazor-component ...>[prerendered]<blazor-component>
+         // so it's easier for the JS code to react automatically whenever this gets inserted or updated during
+         // streaming SSR or progressively-enhanced navigation.
+-
+         var (serverMarker, webAssemblyMarker) = componentState.Component is SSRRenderModeBoundary boundary
+-            ? boundary.ToMarkers(_httpContext)
++            ? boundary.ToMarkers(_httpContext, sequenceAndKey.Sequence, sequenceAndKey.Key)
+             : default;
+ 
+         if (serverMarker.HasValue)
+@@ -246,4 +252,5 @@ internal partial class EndpointHtmlRenderer
+     }
+ 
+     private readonly record struct ComponentIdAndDepth(int ComponentId, int Depth);
++    private readonly record struct SequenceAndKey(int Sequence, object? Key);
+ }
+diff --git a/src/Components/Endpoints/src/Rendering/SSRRenderModeBoundary.cs b/src/Components/Endpoints/src/Rendering/SSRRenderModeBoundary.cs
+index 26e639d856..aae553da69 100644
+--- a/src/Components/Endpoints/src/Rendering/SSRRenderModeBoundary.cs
++++ b/src/Components/Endpoints/src/Rendering/SSRRenderModeBoundary.cs
+@@ -1,6 +1,10 @@
+ // Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using System.Collections.Concurrent;
++using System.Globalization;
++using System.Security.Cryptography;
++using System.Text;
+ using Microsoft.AspNetCore.Components.Rendering;
+ using Microsoft.AspNetCore.Components.Web;
+ using Microsoft.AspNetCore.Http;
+@@ -14,11 +18,14 @@ namespace Microsoft.AspNetCore.Components.Endpoints;
+ /// </summary>
+ internal class SSRRenderModeBoundary : IComponent
+ {
++    private static readonly ConcurrentDictionary<Type, string> _componentTypeNameHashCache = new();
++
+     private readonly Type _componentType;
+     private readonly IComponentRenderMode _renderMode;
+     private readonly bool _prerender;
+     private RenderHandle _renderHandle;
+     private IReadOnlyDictionary<string, object?>? _latestParameters;
++    private string? _markerKey;
+ 
+     public SSRRenderModeBoundary(Type componentType, IComponentRenderMode renderMode)
+     {
+@@ -92,8 +99,12 @@ internal class SSRRenderModeBoundary : IComponent
+         builder.CloseComponent();
+     }
+ 
+-    public (ServerComponentMarker?, WebAssemblyComponentMarker?) ToMarkers(HttpContext httpContext)
++    public (ServerComponentMarker?, WebAssemblyComponentMarker?) ToMarkers(HttpContext httpContext, int sequence, object? key)
+     {
++        // We expect that the '@key' and sequence number shouldn't change for a given component instance,
++        // so we lazily compute the marker key once.
++        _markerKey ??= GenerateMarkerKey(sequence, key);
++
+         var parameters = _latestParameters is null
+             ? ParameterView.Empty
+             : ParameterView.FromDictionary((IDictionary<string, object?>)_latestParameters);
+@@ -106,15 +117,41 @@ internal class SSRRenderModeBoundary : IComponent
+             var serverComponentSerializer = httpContext.RequestServices.GetRequiredService<ServerComponentSerializer>();
+ 
+             var invocationId = EndpointHtmlRenderer.GetOrCreateInvocationId(httpContext);
+-            serverMarker = serverComponentSerializer.SerializeInvocation(invocationId, _componentType, parameters, _prerender);
++            serverMarker = serverComponentSerializer.SerializeInvocation(invocationId, _componentType, parameters, _markerKey, _prerender);
+         }
+ 
+         WebAssemblyComponentMarker? webAssemblyMarker = null;
+         if (_renderMode is WebAssemblyRenderMode or AutoRenderMode)
+         {
+-            webAssemblyMarker = WebAssemblyComponentSerializer.SerializeInvocation(_componentType, parameters, _prerender);
++            webAssemblyMarker = WebAssemblyComponentSerializer.SerializeInvocation(_componentType, parameters, _markerKey, _prerender);
+         }
+ 
+         return (serverMarker, webAssemblyMarker);
+     }
++
++    private string GenerateMarkerKey(int sequence, object? key)
++    {
++        var componentTypeNameHash = _componentTypeNameHashCache.GetOrAdd(_componentType, ComputeComponentTypeNameHash);
++        return $"{componentTypeNameHash}:{sequence}:{(key as IFormattable)?.ToString(null, CultureInfo.InvariantCulture)}";
++    }
++
++    private static string ComputeComponentTypeNameHash(Type componentType)
++    {
++        if (componentType.FullName is not { } typeName)
++        {
++            throw new InvalidOperationException($"An invalid component type was used in {nameof(SSRRenderModeBoundary)}.");
++        }
++
++        var typeNameLength = typeName.Length;
++        var typeNameBytes = typeNameLength < 1024
++            ? stackalloc byte[typeNameLength]
++            : new byte[typeNameLength];
++
++        Encoding.UTF8.GetBytes(typeName, typeNameBytes);
++
++        Span<byte> typeNameHashBytes = stackalloc byte[SHA1.HashSizeInBytes];
++        SHA1.HashData(typeNameBytes, typeNameHashBytes);
++
++        return Convert.ToHexString(typeNameHashBytes);
++    }
+ }
+diff --git a/src/Components/Server/src/Circuits/CircuitFactory.cs b/src/Components/Server/src/Circuits/CircuitFactory.cs
+index 08bcc72673..7fce7503f3 100644
+--- a/src/Components/Server/src/Circuits/CircuitFactory.cs
++++ b/src/Components/Server/src/Circuits/CircuitFactory.cs
+@@ -64,12 +64,14 @@ internal sealed partial class CircuitFactory : ICircuitFactory
+         var appLifetime = scope.ServiceProvider.GetRequiredService<ComponentStatePersistenceManager>();
+         await appLifetime.RestoreStateAsync(store);
+ 
++        var serverComponentDeserializer = scope.ServiceProvider.GetRequiredService<IServerComponentDeserializer>();
+         var jsComponentInterop = new CircuitJSComponentInterop(_options);
+         var renderer = new RemoteRenderer(
+             scope.ServiceProvider,
+             _loggerFactory,
+             _options,
+             client,
++            serverComponentDeserializer,
+             _loggerFactory.CreateLogger<RemoteRenderer>(),
+             jsRuntime,
+             jsComponentInterop);
+diff --git a/src/Components/Server/src/Circuits/IServerComponentDeserializer.cs b/src/Components/Server/src/Circuits/IServerComponentDeserializer.cs
+index d51fdf8e09..70a6d25ade 100644
+--- a/src/Components/Server/src/Circuits/IServerComponentDeserializer.cs
++++ b/src/Components/Server/src/Circuits/IServerComponentDeserializer.cs
+@@ -1,6 +1,8 @@
+ // Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using System.Diagnostics.CodeAnalysis;
++
+ namespace Microsoft.AspNetCore.Components.Server;
+ 
+ internal interface IServerComponentDeserializer
+@@ -8,4 +10,6 @@ internal interface IServerComponentDeserializer
+     bool TryDeserializeComponentDescriptorCollection(
+         string serializedComponentRecords,
+         out List<ComponentDescriptor> descriptors);
++
++    bool TryDeserializeSingleComponentDescriptor(ServerComponentMarker record, [NotNullWhen(true)] out ComponentDescriptor? result);
+ }
+diff --git a/src/Components/Server/src/Circuits/RemoteRenderer.cs b/src/Components/Server/src/Circuits/RemoteRenderer.cs
+index 7afb72deec..240aafe3fe 100644
+--- a/src/Components/Server/src/Circuits/RemoteRenderer.cs
++++ b/src/Components/Server/src/Circuits/RemoteRenderer.cs
+@@ -3,7 +3,9 @@
+ 
+ using System.Collections.Concurrent;
+ using System.Diagnostics.CodeAnalysis;
++using System.Globalization;
+ using System.Linq;
++using System.Text.Json;
+ using Microsoft.AspNetCore.Components.RenderTree;
+ using Microsoft.AspNetCore.Components.Web;
+ using Microsoft.AspNetCore.SignalR;
+@@ -21,6 +23,7 @@ internal partial class RemoteRenderer : WebRenderer
+ 
+     private readonly CircuitClientProxy _client;
+     private readonly CircuitOptions _options;
++    private readonly IServerComponentDeserializer _serverComponentDeserializer;
+     private readonly ILogger _logger;
+     internal readonly ConcurrentQueue<UnacknowledgedRenderBatch> _unacknowledgedRenderBatches = new ConcurrentQueue<UnacknowledgedRenderBatch>();
+     private long _nextRenderId = 1;
+@@ -39,6 +42,7 @@ internal partial class RemoteRenderer : WebRenderer
+         ILoggerFactory loggerFactory,
+         CircuitOptions options,
+         CircuitClientProxy client,
++        IServerComponentDeserializer serverComponentDeserializer,
+         ILogger logger,
+         RemoteJSRuntime jsRuntime,
+         CircuitJSComponentInterop jsComponentInterop)
+@@ -46,6 +50,7 @@ internal partial class RemoteRenderer : WebRenderer
+     {
+         _client = client;
+         _options = options;
++        _serverComponentDeserializer = serverComponentDeserializer;
+         _logger = logger;
+ 
+         ElementReferenceContext = jsRuntime.ElementReferenceContext;
+@@ -59,12 +64,90 @@ internal partial class RemoteRenderer : WebRenderer
+         return RenderRootComponentAsync(componentId, parameters);
+     }
+ 
++    protected override int GetWebRendererId() => (int)WebRendererId.Server;
++
+     protected override void AttachRootComponentToBrowser(int componentId, string domElementSelector)
+     {
+         var attachComponentTask = _client.SendAsync("JS.AttachComponent", componentId, domElementSelector);
+         _ = CaptureAsyncExceptions(attachComponentTask);
+     }
+ 
++    protected override void UpdateRootComponents(string operationsJson)
++    {
++        var operations = JsonSerializer.Deserialize<IEnumerable<RootComponentOperation<ServerComponentMarker>>>(
++            operationsJson,
++            ServerComponentSerializationSettings.JsonSerializationOptions);
++
++        foreach (var operation in operations)
++        {
++            switch (operation.Type)
++            {
++                case RootComponentOperationType.Add:
++                    AddRootComponent(operation);
++                    break;
++                case RootComponentOperationType.Update:
++                    UpdateRootComponent(operation);
++                    break;
++                case RootComponentOperationType.Remove:
++                    RemoveRootComponent(operation);
++                    break;
++            }
++        }
++
++        return;
++
++        void AddRootComponent(RootComponentOperation<ServerComponentMarker> operation)
++        {
++            if (operation.SelectorId is not { } selectorId)
++            {
++                Log.InvalidRootComponentOperation(_logger, operation.Type, message: "Missing selector ID.");
++                return;
++            }
++
++            if (!_serverComponentDeserializer.TryDeserializeSingleComponentDescriptor(operation.Marker, out var descriptor))
++            {
++                throw new InvalidOperationException("Failed to deserialize a component descriptor when adding a new root component.");
++            }
++
++            _ = AddComponentAsync(descriptor.ComponentType, descriptor.Parameters, selectorId.ToString(CultureInfo.InvariantCulture));
++        }
++
++        void UpdateRootComponent(RootComponentOperation<ServerComponentMarker> operation)
++        {
++            if (operation.ComponentId is not { } componentId)
++            {
++                Log.InvalidRootComponentOperation(_logger, operation.Type, message: "Missing component ID.");
++                return;
++            }
++
++            var componentState = GetComponentState(componentId);
++
++            if (!_serverComponentDeserializer.TryDeserializeSingleComponentDescriptor(operation.Marker, out var descriptor))
++            {
++                throw new InvalidOperationException("Failed to deserialize a component descriptor when updating an existing root component.");
++            }
++
++            if (descriptor.ComponentType != componentState.Component.GetType())
++            {
++                Log.InvalidRootComponentOperation(_logger, operation.Type, message: "Component type mismatch.");
++                return;
++            }
++
++            _ = RenderRootComponentAsync(componentId, descriptor.Parameters);
++        }
++
++        void RemoveRootComponent(RootComponentOperation<ServerComponentMarker> operation)
++        {
++            if (operation.ComponentId is not { } componentId)
++            {
++                Log.InvalidRootComponentOperation(_logger, operation.Type, message: "Missing component ID.");
++                return;
++            }
++
++            this.RemoveRootComponent(componentId);
++        }
++    }
++
+     protected override void ProcessPendingRender()
+     {
+         if (_unacknowledgedRenderBatches.Count >= _options.MaxBufferedUnacknowledgedRenderBatches)
+@@ -388,6 +471,9 @@ internal partial class RemoteRenderer : WebRenderer
+ 
+         [LoggerMessage(107, LogLevel.Debug, "The queue of unacknowledged render batches is full.", EventName = "FullUnacknowledgedRenderBatchesQueue")]
+         public static partial void FullUnacknowledgedRenderBatchesQueue(ILogger logger);
++
++        [LoggerMessage(108, LogLevel.Debug, "The root component operation of type '{OperationType}' was invalid: {Message}", EventName = "InvalidRootComponentOperation")]
++        public static partial void InvalidRootComponentOperation(ILogger logger, RootComponentOperationType operationType, string message);
+     }
+ }
+ 
+diff --git a/src/Components/Server/src/Circuits/ServerComponentDeserializer.cs b/src/Components/Server/src/Circuits/ServerComponentDeserializer.cs
+index dc0d63f53b..3e070d548a 100644
+--- a/src/Components/Server/src/Circuits/ServerComponentDeserializer.cs
++++ b/src/Components/Server/src/Circuits/ServerComponentDeserializer.cs
+@@ -1,6 +1,7 @@
+ // Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using System.Diagnostics.CodeAnalysis;
+ using System.Text;
+ using System.Text.Json;
+ using Microsoft.AspNetCore.DataProtection;
+@@ -60,6 +61,13 @@ internal sealed partial class ServerComponentDeserializer : IServerComponentDese
+     private readonly RootComponentTypeCache _rootComponentTypeCache;
+     private readonly ComponentParameterDeserializer _parametersDeserializer;
+ 
++    // The following fields are only used in TryDeserializeSingleComponentDescriptor.
++    // The TryDeserializeComponentDescriptorCollection method uses a stateless
++    // approach to efficiently detect invalid component records.
++    private readonly HashSet<Guid> _expiredInvocationIds = new();
++    private readonly HashSet<int> _seenSequenceNumbersForCurrentInvocation = new();
++    private Guid? _currentInvocationId;
++
+     public ServerComponentDeserializer(
+         IDataProtectionProvider dataProtectionProvider,
+         ILogger<ServerComponentDeserializer> logger,
+@@ -91,16 +99,9 @@ internal sealed partial class ServerComponentDeserializer : IServerComponentDese
+         var previousInstance = new ServerComponent();
+         foreach (var marker in markers)
+         {
+-            if (marker.Type != ServerComponentMarker.ServerMarkerType)
+-            {
+-                Log.InvalidMarkerType(_logger, marker.Type);
+-                descriptors.Clear();
+-                return false;
+-            }
+-
+-            if (marker.Descriptor == null)
++            if (!IsWellFormedServerComponent(marker))
+             {
+-                Log.MissingMarkerDescriptor(_logger);
++                // The client sent us a marker with missing or obviously incorrect info.
+                 descriptors.Clear();
+                 return false;
+             }
+@@ -147,6 +148,75 @@ internal sealed partial class ServerComponentDeserializer : IServerComponentDese
+         return true;
+     }
+ 
++    public bool TryDeserializeSingleComponentDescriptor(ServerComponentMarker record, [NotNullWhen(true)] out ComponentDescriptor? result)
++    {
++        result = default;
++
++        if (!IsWellFormedServerComponent(record))
++        {
++            // The client sent us a marker with missing or obviously incorrect info.
++            return false;
++        }
++
++        var (descriptor, serverComponent) = DeserializeServerComponent(record);
++        if (descriptor is null)
++        {
++            // We failed to deserialize the component descriptor for some reason.
++            return false;
++        }
++
++        // We're seeing a different invocation ID than we did the last time we processed a component.
++        // There are two possibilities:
++        // [1] A new invocation has started, in which case we should stop accepting components from the previous one.
++        // [2] The client is attempting to use an already-expired invocation ID. We should reject the component in
++        //     this case because we only want to accept components from the current invocation.
++        if (serverComponent.InvocationId != _currentInvocationId)
++        {
++            if (_expiredInvocationIds.Contains(serverComponent.InvocationId))
++            {
++                Log.ExpiredInvocationId(_logger, serverComponent.InvocationId.ToString("N"));
++                return false;
++            }
++
++            if (_currentInvocationId.HasValue)
++            {
++                _expiredInvocationIds.Add(_currentInvocationId.Value);
++            }
++
++            _currentInvocationId = serverComponent.InvocationId;
++            _seenSequenceNumbersForCurrentInvocation.Clear();
++        }
++
++        // We've already seen this sequence number for this invocation. We fail to avoid processing the same
++        // component twice.
++        if (_seenSequenceNumbersForCurrentInvocation.Contains(serverComponent.Sequence))
++        {
++            Log.ReusedDescriptorSequence(_logger, serverComponent.Sequence, serverComponent.InvocationId.ToString("N"));
++            return false;
++        }
++
++        _seenSequenceNumbersForCurrentInvocation.Add(serverComponent.Sequence);
++        result = descriptor;
++        return true;
++    }
++
++    private bool IsWellFormedServerComponent(ServerComponentMarker record)
++    {
++        if (record.Type != ServerComponentMarker.ServerMarkerType)
++        {
++            Log.InvalidMarkerType(_logger, record.Type);
++            return false;
++        }
++
++        if (record.Descriptor == null)
++        {
++            Log.MissingMarkerDescriptor(_logger);
++            return false;
++        }
++
++        return true;
++    }
++
+     private (ComponentDescriptor, ServerComponent) DeserializeServerComponent(ServerComponentMarker record)
+     {
+         string unprotected;
+@@ -225,5 +295,11 @@ internal sealed partial class ServerComponentDeserializer : IServerComponentDese
+ 
+         [LoggerMessage(8, LogLevel.Debug, "The descriptor sequence '{sequence}' is an invalid start sequence.", EventName = "DescriptorSequenceMustStartAtZero")]
+         public static partial void DescriptorSequenceMustStartAtZero(ILogger<ServerComponentDeserializer> logger, int sequence);
++
++        [LoggerMessage(9, LogLevel.Debug, "The descriptor invocationId '{invocationId}' has expired.", EventName = "ExpiredInvocationId")]
++        public static partial void ExpiredInvocationId(ILogger<ServerComponentDeserializer> logger, string invocationId);
++
++        [LoggerMessage(10, LogLevel.Debug, "The descriptor with sequence '{sequence}' was already used for the current invocationId '{invocationId}'.", EventName = "ReusedDescriptorSequence")]
++        public static partial void ReusedDescriptorSequence(ILogger<ServerComponentDeserializer> logger, int sequence, string invocationId);
+     }
+ }
+diff --git a/src/Components/Server/src/Microsoft.AspNetCore.Components.Server.csproj b/src/Components/Server/src/Microsoft.AspNetCore.Components.Server.csproj
+index b8e3ce92ee..013c6affc0 100644
+--- a/src/Components/Server/src/Microsoft.AspNetCore.Components.Server.csproj
++++ b/src/Components/Server/src/Microsoft.AspNetCore.Components.Server.csproj
+@@ -59,8 +59,11 @@
+     <Compile Include="$(ComponentsSharedSourceRoot)src\ArrayBuilderMemoryStream.cs" LinkBase="Circuits" />
+     <Compile Include="$(ComponentsSharedSourceRoot)src\ElementReferenceJsonConverter.cs" />
+     <Compile Include="$(ComponentsSharedSourceRoot)src\ComponentParametersTypeCache.cs" />
++    <Compile Include="$(ComponentsSharedSourceRoot)src\RootComponentOperation.cs" />
++    <Compile Include="$(ComponentsSharedSourceRoot)src\RootComponentOperationType.cs" />
+     <Compile Include="$(ComponentsSharedSourceRoot)src\RootComponentTypeCache.cs" />
+     <Compile Include="$(ComponentsSharedSourceRoot)src\DefaultAntiforgeryStateProvider.cs" LinkBase="Forms" />
++    <Compile Include="$(ComponentsSharedSourceRoot)src\WebRendererId.cs" />
+ 
+     <Compile Include="..\..\Shared\src\BrowserNavigationManagerInterop.cs" />
+     <Compile Include="..\..\Shared\src\JsonSerializerOptionsProvider.cs" />
+diff --git a/src/Components/Server/test/Circuits/CircuitHostTest.cs b/src/Components/Server/test/Circuits/CircuitHostTest.cs
+index d41485e5a1..2684118967 100644
+--- a/src/Components/Server/test/Circuits/CircuitHostTest.cs
++++ b/src/Components/Server/test/Circuits/CircuitHostTest.cs
+@@ -1,6 +1,7 @@
+ // Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using System.Diagnostics.CodeAnalysis;
+ using System.Reflection;
+ using Microsoft.AspNetCore.DataProtection;
+ using Microsoft.AspNetCore.SignalR;
+@@ -441,6 +442,7 @@ public class CircuitHostTest
+                   NullLoggerFactory.Instance,
+                   new CircuitOptions(),
+                   new CircuitClientProxy(client, "connection"),
++                  new TestServerComponentDeserializer(),
+                   NullLogger.Instance,
+                   CreateJSRuntime(new CircuitOptions()),
+                   new CircuitJSComponentInterop(new CircuitOptions()))
+@@ -569,4 +571,19 @@ public class CircuitHostTest
+             }
+         }
+     }
++
++    private class TestServerComponentDeserializer : IServerComponentDeserializer
++    {
++        public bool TryDeserializeComponentDescriptorCollection(string serializedComponentRecords, out List<ComponentDescriptor> descriptors)
++        {
++            descriptors = default;
++            return true;
++        }
++
++        public bool TryDeserializeSingleComponentDescriptor(ServerComponentMarker record, [NotNullWhen(true)] out ComponentDescriptor result)
++        {
++            result = default;
++            return true;
++        }
++    }
+ }
+diff --git a/src/Components/Server/test/Circuits/ComponentHubTest.cs b/src/Components/Server/test/Circuits/ComponentHubTest.cs
+index ba20840471..274080dae1 100644
+--- a/src/Components/Server/test/Circuits/ComponentHubTest.cs
++++ b/src/Components/Server/test/Circuits/ComponentHubTest.cs
+@@ -1,6 +1,7 @@
+ // Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using System.Diagnostics.CodeAnalysis;
+ using System.Security.Claims;
+ using System.Text.RegularExpressions;
+ using Microsoft.AspNetCore.Components.Server.Circuits;
+@@ -168,6 +169,12 @@ public class ComponentHubTest
+             descriptors = default;
+             return true;
+         }
++
++        public bool TryDeserializeSingleComponentDescriptor(ServerComponentMarker record, [NotNullWhen(true)] out ComponentDescriptor result)
++        {
++            result = default;
++            return true;
++        }
+     }
+ 
+     private class TestCircuitFactory : ICircuitFactory
+diff --git a/src/Components/Server/test/Circuits/RemoteRendererTest.cs b/src/Components/Server/test/Circuits/RemoteRendererTest.cs
+index 0392add99c..b2ae972e4b 100644
+--- a/src/Components/Server/test/Circuits/RemoteRendererTest.cs
++++ b/src/Components/Server/test/Circuits/RemoteRendererTest.cs
+@@ -2,8 +2,12 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System.Diagnostics;
++using System.Text.Json;
++using Microsoft.AspNetCore.Components.Endpoints;
++using Microsoft.AspNetCore.Components.Rendering;
+ using Microsoft.AspNetCore.Components.Server;
+ using Microsoft.AspNetCore.Components.Server.Circuits;
++using Microsoft.AspNetCore.DataProtection;
+ using Microsoft.AspNetCore.SignalR;
+ using Microsoft.Extensions.DependencyInjection;
+ using Microsoft.Extensions.Logging;
+@@ -20,6 +24,9 @@ public class RemoteRendererTest
+     // failures.
+     private static readonly TimeSpan Timeout = Debugger.IsAttached ? System.Threading.Timeout.InfiniteTimeSpan : TimeSpan.FromSeconds(10);
+ 
++    private readonly IDataProtectionProvider _ephemeralDataProtectionProvider = new EphemeralDataProtectionProvider();
++    private readonly ServerComponentInvocationSequence _invocationSequence = new();
++
+     [Fact]
+     public void WritesAreBufferedWhenTheClientIsOffline()
+     {
+@@ -419,6 +426,239 @@ public class RemoteRendererTest
+             exception.Message);
+     }
+ 
++    [Fact]
++    public async Task UpdateRootComponents_CanAddNewRootComponent()
++    {
++        // Arrange
++        var serviceProvider = CreateServiceProvider();
++        var renderer = GetRemoteRenderer(serviceProvider);
++        var expectedMessage = "Hello, world!";
++        var operation = new RootComponentOperation<ServerComponentMarker>
++        {
++            Type = RootComponentOperationType.Add,
++            SelectorId = 1,
++            Marker = CreateMarker(typeof(DynamicallyAddedComponent), new()
++            {
++                [nameof(DynamicallyAddedComponent.Message)] = expectedMessage,
++            }),
++        };
++        var operationsJson = JsonSerializer.Serialize(
++            new[] { operation },
++            ServerComponentSerializationSettings.JsonSerializationOptions);
++
++        // Act
++        await renderer.Dispatcher.InvokeAsync(() => renderer.UpdateRootComponents(operationsJson));
++        var componentState = renderer.GetComponentState(0);
++
++        // Assert
++        var component = Assert.IsType<DynamicallyAddedComponent>(componentState.Component);
++        Assert.Equal(expectedMessage, component.Message);
++    }
++
++    [Fact]
++    public async Task UpdateRootComponents_DoesNotAddNewRootComponent_WhenSelectorIdIsMissing()
++    {
++        // Arrange
++        var serviceProvider = CreateServiceProvider();
++        var renderer = GetRemoteRenderer(serviceProvider);
++        var operation = new RootComponentOperation<ServerComponentMarker>
++        {
++            Type = RootComponentOperationType.Add,
++            Marker = CreateMarker(typeof(DynamicallyAddedComponent)),
++        };
++        var operationsJson = JsonSerializer.Serialize(
++            new[] { operation },
++            ServerComponentSerializationSettings.JsonSerializationOptions);
++
++        // Act
++        await renderer.Dispatcher.InvokeAsync(() => renderer.UpdateRootComponents(operationsJson));
++        renderer.UpdateRootComponents(operationsJson);
++
++        // Assert
++        var ex = Assert.Throws<ArgumentException>(() => renderer.GetComponentState(0));
++        Assert.StartsWith("The renderer does not have a component with ID", ex.Message);
++    }
++
++    [Fact]
++    public async Task UpdateRootComponents_Throws_WhenAddingComponentFromInvalidDescriptor()
++    {
++        // Arrange
++        var serviceProvider = CreateServiceProvider();
++        var renderer = GetRemoteRenderer(serviceProvider);
++        var operation = new RootComponentOperation<ServerComponentMarker>
++        {
++            Type = RootComponentOperationType.Add,
++            SelectorId = 1,
++            Marker = new ServerComponentMarker()
++            {
++                Descriptor = "some random text",
++            },
++        };
++        var operationsJson = JsonSerializer.Serialize(
++            new[] { operation },
++            ServerComponentSerializationSettings.JsonSerializationOptions);
++
++        // Act
++        var task = renderer.Dispatcher.InvokeAsync(() => renderer.UpdateRootComponents(operationsJson));
++
++        // Assert
++        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await task);
++        Assert.StartsWith("Failed to deserialize a component descriptor when adding", ex.Message);
++    }
++
++    [Fact]
++    public async Task UpdateRootComponents_CanUpdateExistingRootComponent()
++    {
++        // Arrange
++        var serviceProvider = CreateServiceProvider();
++        var renderer = GetRemoteRenderer(serviceProvider);
++        var component = new DynamicallyAddedComponent()
++        {
++            Message = "Existing message",
++        };
++        var expectedMessage = "Updated message";
++        var componentId = renderer.AssignRootComponentId(component);
++        var operation = new RootComponentOperation<ServerComponentMarker>
++        {
++            Type = RootComponentOperationType.Update,
++            ComponentId = componentId,
++            Marker = CreateMarker(typeof(DynamicallyAddedComponent), new()
++            {
++                [nameof(DynamicallyAddedComponent.Message)] = expectedMessage,
++            }),
++        };
++        var operationsJson = JsonSerializer.Serialize(
++            new[] { operation },
++            ServerComponentSerializationSettings.JsonSerializationOptions);
++
++        // Act
++        await renderer.Dispatcher.InvokeAsync(() => renderer.UpdateRootComponents(operationsJson));
++
++        // Assert
++        Assert.Equal(expectedMessage, component.Message);
++    }
++
++    [Fact]
++    public async Task UpdateRootComponents_DoesNotUpdateExistingRootComponent_WhenComponentIdIsMissing()
++    {
++        // Arrange
++        var serviceProvider = CreateServiceProvider();
++        var renderer = GetRemoteRenderer(serviceProvider);
++        var expectedMessage = "Existing message";
++        var component = new DynamicallyAddedComponent()
++        {
++            Message = expectedMessage,
++        };
++        var componentId = renderer.AssignRootComponentId(component);
++        var operation = new RootComponentOperation<ServerComponentMarker>
++        {
++            Type = RootComponentOperationType.Update,
++            Marker = CreateMarker(typeof(DynamicallyAddedComponent), new()
++            {
++                [nameof(DynamicallyAddedComponent.Message)] = "Some other message",
++            }),
++        };
++        var operationsJson = JsonSerializer.Serialize(
++            new[] { operation },
++            ServerComponentSerializationSettings.JsonSerializationOptions);
++
++        // Act
++        await renderer.Dispatcher.InvokeAsync(() => renderer.UpdateRootComponents(operationsJson));
++
++        // Assert
++        Assert.Equal(expectedMessage, component.Message);
++    }
++
++    [Fact]
++    public async Task UpdateRootComponents_DoesNotUpdateExistingRootComponent_WhenDescriptorComponentTypeDoesNotMatchRootComponentType()
++    {
++        // Arrange
++        var serviceProvider = CreateServiceProvider();
++        var renderer = GetRemoteRenderer(serviceProvider);
++        var expectedMessage = "Existing message";
++        var component1 = new DynamicallyAddedComponent()
++        {
++            Message = expectedMessage,
++        };
++        var component2 = new TestComponent();
++        var component1Id = renderer.AssignRootComponentId(component1);
++        var component2Id = renderer.AssignRootComponentId(component2);
++        var operation = new RootComponentOperation<ServerComponentMarker>
++        {
++            Type = RootComponentOperationType.Update,
++            ComponentId = component1Id,
++            Marker = CreateMarker(typeof(TestComponent) /* Note the incorrect component type */, new()
++            {
++                [nameof(DynamicallyAddedComponent.Message)] = "Updated message",
++            }),
++        };
++        var operationsJson = JsonSerializer.Serialize(
++            new[] { operation },
++            ServerComponentSerializationSettings.JsonSerializationOptions);
++
++        // Act
++        await renderer.Dispatcher.InvokeAsync(() => renderer.UpdateRootComponents(operationsJson));
++
++        // Assert
++        Assert.Equal(expectedMessage, component1.Message);
++    }
++
++    [Fact]
++    public async Task UpdateRootComponents_Throws_WhenUpdatingComponentFromInvalidDescriptor()
++    {
++        // Arrange
++        var serviceProvider = CreateServiceProvider();
++        var renderer = GetRemoteRenderer(serviceProvider);
++        var component = new DynamicallyAddedComponent()
++        {
++            Message = "Existing message",
++        };
++        var componentId = renderer.AssignRootComponentId(component);
++        var operation = new RootComponentOperation<ServerComponentMarker>
++        {
++            Type = RootComponentOperationType.Update,
++            ComponentId = componentId,
++            Marker = new()
++            {
++                Descriptor = "some random text",
++            },
++        };
++        var operationsJson = JsonSerializer.Serialize(
++            new[] { operation },
++            ServerComponentSerializationSettings.JsonSerializationOptions);
++
++        // Act
++        var task = renderer.Dispatcher.InvokeAsync(() => renderer.UpdateRootComponents(operationsJson));
++
++        // Assert
++        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await task);
++        Assert.StartsWith("Failed to deserialize a component descriptor when updating", ex.Message);
++    }
++
++    [Fact]
++    public async Task UpdateRootComponents_CanRemoveExistingRootComponent()
++    {
++        // Arrange
++        var serviceProvider = CreateServiceProvider();
++        var renderer = GetRemoteRenderer(serviceProvider);
++        var component = new DynamicallyAddedComponent();
++        var componentId = renderer.AssignRootComponentId(component);
++        var operation = new RootComponentOperation<ServerComponentMarker>
++        {
++            Type = RootComponentOperationType.Remove,
++            ComponentId = componentId,
++        };
++        var operationsJson = JsonSerializer.Serialize(
++            new[] { operation },
++            ServerComponentSerializationSettings.JsonSerializationOptions);
++
++        // Act
++        await renderer.Dispatcher.InvokeAsync(() => renderer.UpdateRootComponents(operationsJson));
++
++        // Assert
++        await component.WaitForDisposeAsync().WaitAsync(Timeout); // Will timeout and throw if not disposed
++    }
++
+     private IServiceProvider CreateServiceProvider()
+     {
+         var serviceCollection = new ServiceCollection();
+@@ -428,18 +668,38 @@ public class RemoteRendererTest
+ 
+     private TestRemoteRenderer GetRemoteRenderer(IServiceProvider serviceProvider, CircuitClientProxy circuitClient = null)
+     {
++        var serverComponentDeserializer = new ServerComponentDeserializer(
++            _ephemeralDataProtectionProvider,
++            NullLogger<ServerComponentDeserializer>.Instance,
++            new RootComponentTypeCache(),
++            new ComponentParameterDeserializer(
++                NullLogger<ComponentParameterDeserializer>.Instance,
++                new ComponentParametersTypeCache()));
++
+         return new TestRemoteRenderer(
+             serviceProvider,
+             NullLoggerFactory.Instance,
+             new CircuitOptions(),
+             circuitClient ?? new CircuitClientProxy(),
++            serverComponentDeserializer,
+             NullLogger.Instance);
+     }
+ 
++    private ServerComponentMarker CreateMarker(Type type, Dictionary<string, object> parameters = null)
++    {
++        var serializer = new ServerComponentSerializer(_ephemeralDataProtectionProvider);
++        return serializer.SerializeInvocation(
++            _invocationSequence,
++            type,
++            parameters is null ? ParameterView.Empty : ParameterView.FromDictionary(parameters),
++            null,
++            false);
++    }
++
+     private class TestRemoteRenderer : RemoteRenderer
+     {
+-        public TestRemoteRenderer(IServiceProvider serviceProvider, ILoggerFactory loggerFactory, CircuitOptions options, CircuitClientProxy client, ILogger logger)
+-            : base(serviceProvider, loggerFactory, options, client, logger, CreateJSRuntime(options), new CircuitJSComponentInterop(options))
++        public TestRemoteRenderer(IServiceProvider serviceProvider, ILoggerFactory loggerFactory, CircuitOptions options, CircuitClientProxy client, IServerComponentDeserializer serverComponentDeserializer, ILogger logger)
++            : base(serviceProvider, loggerFactory, options, client, serverComponentDeserializer, logger, CreateJSRuntime(options), new CircuitJSComponentInterop(options))
+         {
+         }
+ 
+@@ -450,6 +710,20 @@ public class RemoteRendererTest
+             await RenderRootComponentAsync(componentId, initialParameters);
+         }
+ 
++        protected override void AttachRootComponentToBrowser(int componentId, string domElementSelector)
++        {
++        }
++
++        public new void UpdateRootComponents(string operationsJson)
++        {
++            base.UpdateRootComponents(operationsJson);
++        }
++
++        public new ComponentState GetComponentState(int componentId)
++        {
++            return base.GetComponentState(componentId);
++        }
++
+         private static RemoteJSRuntime CreateJSRuntime(CircuitOptions options)
+             => new RemoteJSRuntime(Options.Create(options), Options.Create(new HubOptions<ComponentHub>()), null);
+     }
+@@ -536,4 +810,48 @@ public class RemoteRendererTest
+             Component.TriggerRender();
+         }
+     }
++
++    private class DynamicallyAddedComponent : IComponent, IDisposable
++    {
++        private readonly TaskCompletionSource _disposeTcs = new();
++        private RenderHandle _renderHandle;
++
++        [Parameter]
++        public string Message { get; set; } = "Default message";
++
++        private void Render(RenderTreeBuilder builder)
++        {
++            builder.AddContent(0, Message);
++        }
++
++        public void Attach(RenderHandle renderHandle)
++        {
++            _renderHandle = renderHandle;
++        }
++
++        public Task SetParametersAsync(ParameterView parameters)
++        {
++            if (parameters.TryGetValue<string>(nameof(Message), out var message))
++            {
++                Message = message;
++            }
++
++            TriggerRender();
++            return Task.CompletedTask;
++        }
++
++        public void TriggerRender()
++        {
++            var task = _renderHandle.Dispatcher.InvokeAsync(() => _renderHandle.Render(Render));
++            Assert.True(task.IsCompletedSuccessfully);
++        }
++
++        public Task WaitForDisposeAsync()
++            => _disposeTcs.Task;
++
++        public void Dispose()
++        {
++            _disposeTcs.SetResult();
++        }
++    }
+ }
+diff --git a/src/Components/Server/test/Circuits/ServerComponentDeserializerTest.cs b/src/Components/Server/test/Circuits/ServerComponentDeserializerTest.cs
+index 0957f67358..07550a582f 100644
+--- a/src/Components/Server/test/Circuits/ServerComponentDeserializerTest.cs
++++ b/src/Components/Server/test/Circuits/ServerComponentDeserializerTest.cs
+@@ -12,7 +12,7 @@ public class ServerComponentDeserializerTest
+ {
+     private readonly IDataProtectionProvider _ephemeralDataProtectionProvider;
+     private readonly ITimeLimitedDataProtector _protector;
+-    private readonly ServerComponentInvocationSequence _invocationSequence = new ServerComponentInvocationSequence();
++    private ServerComponentInvocationSequence _invocationSequence = new();
+ 
+     public ServerComponentDeserializerTest()
+     {
+@@ -303,6 +303,97 @@ public class ServerComponentDeserializerTest
+         Assert.Empty(descriptors);
+     }
+ 
++    [Fact]
++    public void TryDeserializeSingleComponentDescriptor_CanParseSingleMarker()
++    {
++        // Arrange
++        var markers = CreateMarkers(typeof(TestComponent));
++        var serverComponentDeserializer = CreateServerComponentDeserializer();
++
++        // Act & assert
++        Assert.True(serverComponentDeserializer.TryDeserializeSingleComponentDescriptor(markers[0], out var descriptor));
++        Assert.Equal(typeof(TestComponent).FullName, descriptor.ComponentType.FullName);
++        Assert.Equal(0, descriptor.Sequence);
++    }
++
++    [Fact]
++    public void TryDeserializeSingleComponentDescriptor_CanParseMultipleMarkersWithAndWithoutParameters()
++    {
++        // Arrange
++        var markers = CreateMarkers(
++            (typeof(TestComponent), new Dictionary<string, object> { ["First"] = "Value" }),
++            (typeof(TestComponent), null));
++        var serverComponentDeserializer = CreateServerComponentDeserializer();
++
++        // Act & assert
++        Assert.True(serverComponentDeserializer.TryDeserializeSingleComponentDescriptor(markers[0], out var firstDescriptor));
++        Assert.True(serverComponentDeserializer.TryDeserializeSingleComponentDescriptor(markers[1], out var secondDescriptor));
++
++        Assert.Equal(typeof(TestComponent).FullName, firstDescriptor.ComponentType.FullName);
++        Assert.Equal(0, firstDescriptor.Sequence);
++        var firstParameters = firstDescriptor.Parameters.ToDictionary();
++        Assert.Single(firstParameters);
++        Assert.Contains("First", firstParameters.Keys);
++        Assert.Equal("Value", firstParameters["First"]);
++
++        Assert.Equal(typeof(TestComponent).FullName, secondDescriptor.ComponentType.FullName);
++        Assert.Equal(1, secondDescriptor.Sequence);
++        Assert.Empty(secondDescriptor.Parameters.ToDictionary());
++    }
++
++    [Fact]
++    public void TryDeserializeSingleComponentDescriptor_AllowsParsingMarkersOutOfOrder()
++    {
++        // Arrange
++        var markers = CreateMarkers(typeof(TestComponent), typeof(TestComponent));
++        var serverComponentDeserializer = CreateServerComponentDeserializer();
++
++        // Act & assert
++        Assert.True(serverComponentDeserializer.TryDeserializeSingleComponentDescriptor(markers[1], out _));
++        Assert.True(serverComponentDeserializer.TryDeserializeSingleComponentDescriptor(markers[0], out _));
++    }
++
++    [Fact]
++    public void TryDeserializeSingleComponentDescriptor_AllowsParsingMarkersFromMultipleInvocations()
++    {
++        // Arrange
++        var firstInvocationMarkers = CreateMarkers(typeof(TestComponent));
++        StartNewInvocation();
++        var secondInvocationMarkers = CreateMarkers(typeof(TestComponent));
++        var serverComponentDeserializer = CreateServerComponentDeserializer();
++
++        // Act & assert
++        Assert.True(serverComponentDeserializer.TryDeserializeSingleComponentDescriptor(firstInvocationMarkers[0], out _));
++        Assert.True(serverComponentDeserializer.TryDeserializeSingleComponentDescriptor(secondInvocationMarkers[0], out _));
++    }
++
++    [Fact]
++    public void TryDeserializeSingleComponentDescriptor_DoesNotParseTheSameMarkerTwice()
++    {
++        // Arrange
++        var markers = CreateMarkers(typeof(TestComponent));
++        var serverComponentDeserializer = CreateServerComponentDeserializer();
++
++        // Act & assert
++        Assert.True(serverComponentDeserializer.TryDeserializeSingleComponentDescriptor(markers[0], out _));
++        Assert.False(serverComponentDeserializer.TryDeserializeSingleComponentDescriptor(markers[0], out _));
++    }
++
++    [Fact]
++    public void TryDeserializeSingleComponentDescriptor_DoesNotParseMarkerFromOldInvocation()
++    {
++        // Arrange
++        var firstInvocationMarkers = CreateMarkers(typeof(TestComponent), typeof(TestComponent));
++        StartNewInvocation();
++        var secondInvocationMarkers = CreateMarkers(typeof(TestComponent));
++        var serverComponentDeserializer = CreateServerComponentDeserializer();
++
++        // Act & assert
++        Assert.True(serverComponentDeserializer.TryDeserializeSingleComponentDescriptor(firstInvocationMarkers[0], out _));
++        Assert.True(serverComponentDeserializer.TryDeserializeSingleComponentDescriptor(secondInvocationMarkers[0], out _));
++        Assert.False(serverComponentDeserializer.TryDeserializeSingleComponentDescriptor(firstInvocationMarkers[0], out _));
++    }
++
+     private string SerializeComponent(string assembly, string type) =>
+         JsonSerializer.Serialize(
+             new ServerComponent(0, assembly, type, Array.Empty<ComponentParameter>(), Array.Empty<object>(), Guid.NewGuid()),
+@@ -326,7 +417,7 @@ public class ServerComponentDeserializerTest
+         var markers = new ServerComponentMarker[types.Length];
+         for (var i = 0; i < types.Length; i++)
+         {
+-            markers[i] = serializer.SerializeInvocation(_invocationSequence, types[i], ParameterView.Empty, false);
++            markers[i] = serializer.SerializeInvocation(_invocationSequence, types[i], ParameterView.Empty, null, false);
+         }
+ 
+         return markers;
+@@ -343,6 +434,7 @@ public class ServerComponentDeserializerTest
+                 _invocationSequence,
+                 type,
+                 parameters == null ? ParameterView.Empty : ParameterView.FromDictionary(parameters),
++                null,
+                 false);
+         }
+ 
+@@ -355,12 +447,17 @@ public class ServerComponentDeserializerTest
+         var markers = new ServerComponentMarker[types.Length];
+         for (var i = 0; i < types.Length; i++)
+         {
+-            markers[i] = serializer.SerializeInvocation(sequence, types[i], ParameterView.Empty, false);
++            markers[i] = serializer.SerializeInvocation(sequence, types[i], ParameterView.Empty, null, false);
+         }
+ 
+         return markers;
+     }
+ 
++    private void StartNewInvocation()
++    {
++        _invocationSequence = new();
++    }
++
+     private class TestComponent : IComponent
+     {
+         public void Attach(RenderHandle renderHandle) => throw new NotImplementedException();
+diff --git a/src/Components/Server/test/Circuits/TestCircuitHost.cs b/src/Components/Server/test/Circuits/TestCircuitHost.cs
+index edfb90a417..c0b09cb451 100644
+--- a/src/Components/Server/test/Circuits/TestCircuitHost.cs
++++ b/src/Components/Server/test/Circuits/TestCircuitHost.cs
+@@ -34,6 +34,7 @@ internal class TestCircuitHost : CircuitHost
+         serviceProvider
+             .Setup(services => services.GetService(typeof(IJSRuntime)))
+             .Returns(jsRuntime);
++        var serverComponentDeserializer = Mock.Of<IServerComponentDeserializer>();
+ 
+         if (remoteRenderer == null)
+         {
+@@ -42,6 +43,7 @@ internal class TestCircuitHost : CircuitHost
+                 NullLoggerFactory.Instance,
+                 new CircuitOptions(),
+                 clientProxy,
++                serverComponentDeserializer,
+                 NullLogger.Instance,
+                 jsRuntime,
+                 new CircuitJSComponentInterop(new CircuitOptions()));
+diff --git a/src/Components/Shared/src/RootComponentOperation.cs b/src/Components/Shared/src/RootComponentOperation.cs
+new file mode 100644
+index 0000000000..164552717a
+--- /dev/null
++++ b/src/Components/Shared/src/RootComponentOperation.cs
+@@ -0,0 +1,22 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++namespace Microsoft.AspNetCore.Components;
++
++internal sealed class RootComponentOperation<TMarker>
++{
++    // Represents the type of root component operation to perform.
++    public RootComponentOperationType Type { get; set; }
++
++    // When adding a root component, this is the selector ID
++    // to round-trip back to the client so it knows which DOM
++    // element the component should be attached to.
++    public int? SelectorId { get; set; }
++
++    // The ID of the component to use during an update or remove
++    // operation.
++    public int? ComponentId { get; set; }
++
++    // The type of the marker that was initially rendered to the page.
++    public TMarker? Marker { get; set; }
++}
+diff --git a/src/Components/Shared/src/RootComponentOperationType.cs b/src/Components/Shared/src/RootComponentOperationType.cs
+new file mode 100644
+index 0000000000..e3335c6d8a
+--- /dev/null
++++ b/src/Components/Shared/src/RootComponentOperationType.cs
+@@ -0,0 +1,14 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System.Text.Json.Serialization;
++
++namespace Microsoft.AspNetCore.Components;
++
++[JsonConverter(typeof(JsonStringEnumConverter<RootComponentOperationType>))]
++internal enum RootComponentOperationType
++{
++    Add,
++    Update,
++    Remove,
++}
+diff --git a/src/Components/Shared/src/WebRendererId.cs b/src/Components/Shared/src/WebRendererId.cs
+new file mode 100644
+index 0000000000..c92e4e1424
+--- /dev/null
++++ b/src/Components/Shared/src/WebRendererId.cs
+@@ -0,0 +1,14 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++namespace Microsoft.AspNetCore.Components;
++
++// Represents the renderer ID for a web renderer.
++// This should be kept in sync with WebRendererId.ts.
++internal enum WebRendererId
++{
++    Default = 0,
++    Server = 1,
++    WebAssembly = 2,
++    WebView = 3,
++}
+diff --git a/src/Components/Web.JS/src/Boot.Server.Common.ts b/src/Components/Web.JS/src/Boot.Server.Common.ts
+index a21c383f13..185e171db5 100644
+--- a/src/Components/Web.JS/src/Boot.Server.Common.ts
++++ b/src/Components/Web.JS/src/Boot.Server.Common.ts
+@@ -16,13 +16,15 @@ import { attachRootComponentToLogicalElement } from './Rendering/Renderer';
+ import { discoverPersistedState, ServerComponentDescriptor } from './Services/ComponentDescriptorDiscovery';
+ import { sendJSDataStream } from './Platform/Circuits/CircuitStreamingInterop';
+ import { fetchAndInvokeInitializers } from './JSInitializers/JSInitializers.Server';
++import { WebRendererId } from './Rendering/WebRendererId';
++import { RootComponentManager } from './Services/RootComponentManager';
+ 
+ let renderingFailed = false;
+ let connection: HubConnection;
+ let circuit: CircuitDescriptor;
+ let dispatcher: DotNet.ICallDispatcher;
+ 
+-export async function startCircuit(userOptions?: Partial<CircuitStartOptions>, components?: ServerComponentDescriptor[]): Promise<void> {
++export async function startCircuit(userOptions?: Partial<CircuitStartOptions>, components?: ServerComponentDescriptor[] | RootComponentManager): Promise<void> {
+   // Establish options to be used
+   const options = resolveOptions(userOptions);
+   const jsInitializer = await fetchAndInvokeInitializers(options);
+@@ -113,7 +115,7 @@ async function initializeConnection(options: CircuitStartOptions, logger: Logger
+ 
+   const newConnection = connectionBuilder.build();
+ 
+-  newConnection.on('JS.AttachComponent', (componentId, selector) => attachRootComponentToLogicalElement(0, circuit.resolveElement(selector), componentId, false));
++  newConnection.on('JS.AttachComponent', (componentId, selector) => attachRootComponentToLogicalElement(WebRendererId.Server, circuit.resolveElement(selector, componentId), componentId, false));
+   newConnection.on('JS.BeginInvokeJS', dispatcher.beginInvokeJSFromDotNet.bind(dispatcher));
+   newConnection.on('JS.EndInvokeDotNet', dispatcher.endInvokeDotNetFromJS.bind(dispatcher));
+   newConnection.on('JS.ReceiveByteArray', dispatcher.receiveByteArray.bind(dispatcher));
+diff --git a/src/Components/Web.JS/src/Boot.Web.ts b/src/Components/Web.JS/src/Boot.Web.ts
+index 072ff0bfac..dfcb7407f3 100644
+--- a/src/Components/Web.JS/src/Boot.Web.ts
++++ b/src/Components/Web.JS/src/Boot.Web.ts
+@@ -15,50 +15,88 @@ import { shouldAutoStart } from './BootCommon';
+ import { Blazor } from './GlobalExports';
+ import { WebStartOptions } from './Platform/WebStartOptions';
+ import { attachStreamingRenderingListener } from './Rendering/StreamingRendering';
+-import { attachProgressivelyEnhancedNavigationListener, detachProgressivelyEnhancedNavigationListener } from './Services/NavigationEnhancement';
++import { NavigationEnhancementCallbacks, attachProgressivelyEnhancedNavigationListener, isPerformingEnhancedPageLoad } from './Services/NavigationEnhancement';
+ import { WebAssemblyComponentDescriptor } from './Services/ComponentDescriptorDiscovery';
+-import { ServerComponentDescriptor, discoverComponents } from './Services/ComponentDescriptorDiscovery';
++import { ServerComponentDescriptor } from './Services/ComponentDescriptorDiscovery';
++import { RootComponentManager } from './Services/RootComponentManager';
++import { WebRendererId } from './Rendering/WebRendererId';
++import { DescriptorHandler, attachComponentDescriptorHandler, registerAllComponentDescriptors } from './Rendering/DomMerging/DomSync';
++import { waitForRendererAttached } from './Rendering/WebRendererInteropMethods';
+ 
+ let started = false;
+ let webStartOptions: Partial<WebStartOptions> | undefined;
+ 
+-async function boot(options?: Partial<WebStartOptions>): Promise<void> {
++const circuitRootComponents = new RootComponentManager(WebRendererId.Server);
++const webAssemblyRootComponents = new RootComponentManager(WebRendererId.WebAssembly);
++
++function boot(options?: Partial<WebStartOptions>) : Promise<void> {
+   if (started) {
+     throw new Error('Blazor has already started.');
+   }
+   started = true;
+   webStartOptions = options;
+ 
+-  attachStreamingRenderingListener(options?.ssr);
++  const navigationEnhancementCallbacks: NavigationEnhancementCallbacks = {
++    documentUpdated: handleUpdatedComponentDescriptors,
++  };
++
++  const descriptorHandler: DescriptorHandler = {
++    registerComponentDescriptor,
++  };
++
++  attachComponentDescriptorHandler(descriptorHandler);
++  attachStreamingRenderingListener(options?.ssr, navigationEnhancementCallbacks);
+ 
+   if (!options?.ssr?.disableDomPreservation) {
+-    attachProgressivelyEnhancedNavigationListener(activateInteractiveComponents);
++    attachProgressivelyEnhancedNavigationListener(navigationEnhancementCallbacks);
+   }
+ 
+-  await activateInteractiveComponents();
++  registerAllComponentDescriptors(document);
++
++  return Promise.resolve();
+ }
+ 
+-async function activateInteractiveComponents() {
+-  const serverComponents = discoverComponents(document, 'server') as ServerComponentDescriptor[];
+-  const webAssemblyComponents = discoverComponents(document, 'webassembly') as WebAssemblyComponentDescriptor[];
++function registerComponentDescriptor(descriptor: ServerComponentDescriptor | WebAssemblyComponentDescriptor) {
++  switch (descriptor.type) {
++    case 'server':
++      startCircuitIfNotStarted();
++      circuitRootComponents.registerComponentDescriptor(descriptor);
++      break;
++    case 'webassembly':
++      startWebAssemblyIfNotStarted();
++      webAssemblyRootComponents.registerComponentDescriptor(descriptor);
++      break;
++  }
++}
+ 
+-  if (serverComponents.length) {
+-    // TEMPORARY until https://github.com/dotnet/aspnetcore/issues/48763 is implemented
+-    // As soon we we see you have interactive components, we'll stop doing enhanced nav even if you don't have an interactive router
+-    // This is because, otherwise, we would need a way to add new interactive root components to an existing circuit and that's #48763
+-    detachProgressivelyEnhancedNavigationListener();
++function handleUpdatedComponentDescriptors() {
++  const shouldAddNewRootComponents = !isPerformingEnhancedPageLoad();
++  circuitRootComponents.handleUpdatedRootComponents(shouldAddNewRootComponents);
++  webAssemblyRootComponents.handleUpdatedRootComponents(shouldAddNewRootComponents);
++}
+ 
+-    await startCircuit(webStartOptions?.circuit, serverComponents);
++let circuitStarted = false;
++async function startCircuitIfNotStarted() {
++  if (circuitStarted) {
++    return;
+   }
+ 
+-  if (webAssemblyComponents.length) {
+-    // TEMPORARY until https://github.com/dotnet/aspnetcore/issues/48763 is implemented
+-    // As soon we we see you have interactive components, we'll stop doing enhanced nav even if you don't have an interactive router
+-    // This is because, otherwise, we would need a way to add new interactive root components to an existing WebAssembly runtime and that's #48763
+-    detachProgressivelyEnhancedNavigationListener();
++  circuitStarted = true;
++  await startCircuit(webStartOptions?.circuit, circuitRootComponents);
++  await waitForRendererAttached(WebRendererId.Server);
++  handleUpdatedComponentDescriptors();
++}
+ 
+-    await startWebAssembly(webStartOptions?.webAssembly, webAssemblyComponents);
++let webAssemblyStarted = false;
++async function startWebAssemblyIfNotStarted() {
++  if (webAssemblyStarted) {
++    return;
+   }
++
++  webAssemblyStarted = true;
++  await startWebAssembly(webStartOptions?.webAssembly, webAssemblyRootComponents);
++  await waitForRendererAttached(WebRendererId.WebAssembly);
++  handleUpdatedComponentDescriptors();
+ }
+ 
+ Blazor.start = boot;
+diff --git a/src/Components/Web.JS/src/Boot.WebAssembly.Common.ts b/src/Components/Web.JS/src/Boot.WebAssembly.Common.ts
+index 895f52ff67..7c95984d89 100644
+--- a/src/Components/Web.JS/src/Boot.WebAssembly.Common.ts
++++ b/src/Components/Web.JS/src/Boot.WebAssembly.Common.ts
+@@ -15,8 +15,9 @@ import { JSInitializer } from './JSInitializers/JSInitializers';
+ import { WebAssemblyComponentDescriptor, discoverPersistedState } from './Services/ComponentDescriptorDiscovery';
+ import { receiveDotNetDataStream } from './StreamingInterop';
+ import { WebAssemblyComponentAttacher } from './Platform/WebAssemblyComponentAttacher';
++import { RootComponentManager } from './Services/RootComponentManager';
+ 
+-export async function startWebAssembly(options?: Partial<WebAssemblyStartOptions>, components?: WebAssemblyComponentDescriptor[]): Promise<void> {
++export async function startWebAssembly(options?: Partial<WebAssemblyStartOptions>, components?: WebAssemblyComponentDescriptor[] | RootComponentManager): Promise<void> {
+   if (inAuthRedirectIframe()) {
+     // eslint-disable-next-line @typescript-eslint/no-empty-function
+     await new Promise(() => { }); // See inAuthRedirectIframe for explanation
+@@ -98,7 +99,7 @@ export async function startWebAssembly(options?: Partial<WebAssemblyStartOptions
+   Blazor._internal.getPersistedState = () => discoverPersistedState(document) || '';
+ 
+   Blazor._internal.attachRootComponentToElement = (selector, componentId, rendererId: any) => {
+-    const element = componentAttacher.resolveRegisteredElement(selector);
++    const element = componentAttacher.resolveRegisteredElement(selector, componentId);
+     if (!element) {
+       attachRootComponentToElement(selector, componentId, rendererId);
+     } else {
+diff --git a/src/Components/Web.JS/src/JSInitializers/JSInitializers.ts b/src/Components/Web.JS/src/JSInitializers/JSInitializers.ts
+index 7cd81e392b..41e8ee37c0 100644
+--- a/src/Components/Web.JS/src/JSInitializers/JSInitializers.ts
++++ b/src/Components/Web.JS/src/JSInitializers/JSInitializers.ts
+@@ -2,7 +2,7 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ import { Blazor } from '../GlobalExports';
+-import { rendererAttached } from '../Rendering/WebRendererInteropMethods';
++import { firstRendererAttached } from '../Rendering/WebRendererInteropMethods';
+ 
+ type BeforeBlazorStartedCallback = (...args: unknown[]) => Promise<void>;
+ export type AfterBlazorStartedCallback = (blazor: typeof Blazor) => Promise<void>;
+@@ -41,7 +41,7 @@ export class JSInitializer {
+   }
+ 
+   async invokeAfterStartedCallbacks(blazor: typeof Blazor): Promise<void> {
+-    await rendererAttached;
++    await firstRendererAttached;
+     await Promise.all(this.afterStartedCallbacks.map(callback => callback(blazor)));
+   }
+ }
+diff --git a/src/Components/Web.JS/src/Platform/Circuits/CircuitManager.ts b/src/Components/Web.JS/src/Platform/Circuits/CircuitManager.ts
+index 9dd52c0f59..e04dca6adb 100644
+--- a/src/Components/Web.JS/src/Platform/Circuits/CircuitManager.ts
++++ b/src/Components/Web.JS/src/Platform/Circuits/CircuitManager.ts
+@@ -6,18 +6,19 @@ import { toLogicalRootCommentElement, LogicalElement, toLogicalElement } from '.
+ import { ServerComponentDescriptor } from '../../Services/ComponentDescriptorDiscovery';
+ import { HubConnectionState } from '@microsoft/signalr';
+ import { getAndRemovePendingRootComponentContainer } from '../../Rendering/JSRootComponents';
++import { RootComponentManager } from '../../Services/RootComponentManager';
+ 
+ export class CircuitDescriptor {
+   public circuitId?: string;
+ 
+-  public components: ServerComponentDescriptor[];
++  public components: ServerComponentDescriptor[] | RootComponentManager;
+ 
+   public applicationState: string;
+ 
+-  public constructor(components: ServerComponentDescriptor[], appState: string) {
++  public constructor(components: ServerComponentDescriptor[] | RootComponentManager, appState: string) {
+     this.circuitId = undefined;
+-    this.components = components;
+     this.applicationState = appState;
++    this.components = components;
+   }
+ 
+   public reconnect(reconnection: signalR.HubConnection): Promise<boolean> {
+@@ -43,11 +44,16 @@ export class CircuitDescriptor {
+     if (connection.state !== HubConnectionState.Connected) {
+       return false;
+     }
++
++    const componentsJson = this.components instanceof RootComponentManager
++      ? '[]'
++      : JSON.stringify(this.components.map(c => c.toRecord()));
++
+     const result = await connection.invoke<string>(
+       'StartCircuit',
+       navigationManagerFunctions.getBaseURI(),
+       navigationManagerFunctions.getLocationHref(),
+-      JSON.stringify(this.components.map(c => c.toRecord())),
++      componentsJson,
+       this.applicationState || ''
+     );
+ 
+@@ -59,7 +65,7 @@ export class CircuitDescriptor {
+     }
+   }
+ 
+-  public resolveElement(sequenceOrIdentifier: string): LogicalElement {
++  public resolveElement(sequenceOrIdentifier: string, componentId: number): LogicalElement {
+     // It may be a root component added by JS
+     const jsAddedComponentContainer = getAndRemovePendingRootComponentContainer(sequenceOrIdentifier);
+     if (jsAddedComponentContainer) {
+@@ -69,7 +75,10 @@ export class CircuitDescriptor {
+     // ... or it may be a root component added by .NET
+     const parsedSequence = Number.parseInt(sequenceOrIdentifier);
+     if (!Number.isNaN(parsedSequence)) {
+-      return toLogicalRootCommentElement(this.components[parsedSequence].start as Comment, this.components[parsedSequence].end as Comment);
++      const descriptor = this.components instanceof RootComponentManager
++        ? this.components.resolveRootComponent(parsedSequence, componentId)
++        : this.components[parsedSequence];
++      return toLogicalRootCommentElement(descriptor);
+     }
+ 
+     throw new Error(`Invalid sequence number or identifier '${sequenceOrIdentifier}'.`);
+diff --git a/src/Components/Web.JS/src/Platform/Circuits/RenderQueue.ts b/src/Components/Web.JS/src/Platform/Circuits/RenderQueue.ts
+index 165b2e0d15..e5973d634b 100644
+--- a/src/Components/Web.JS/src/Platform/Circuits/RenderQueue.ts
++++ b/src/Components/Web.JS/src/Platform/Circuits/RenderQueue.ts
+@@ -5,6 +5,7 @@ import { renderBatch } from '../../Rendering/Renderer';
+ import { OutOfProcessRenderBatch } from '../../Rendering/RenderBatch/OutOfProcessRenderBatch';
+ import { Logger, LogLevel } from '../Logging/Logger';
+ import { HubConnection } from '@microsoft/signalr';
++import { WebRendererId } from '../../Rendering/WebRendererId';
+ 
+ export class RenderQueue {
+   private static instance: RenderQueue;
+@@ -13,18 +14,15 @@ export class RenderQueue {
+ 
+   private fatalError?: string;
+ 
+-  public browserRendererId: number;
+-
+   public logger: Logger;
+ 
+-  public constructor(browserRendererId: number, logger: Logger) {
+-    this.browserRendererId = browserRendererId;
++  public constructor(logger: Logger) {
+     this.logger = logger;
+   }
+ 
+   public static getOrCreate(logger: Logger): RenderQueue {
+     if (!RenderQueue.instance) {
+-      RenderQueue.instance = new RenderQueue(0, logger);
++      RenderQueue.instance = new RenderQueue(logger);
+     }
+ 
+     return this.instance;
+@@ -54,7 +52,7 @@ export class RenderQueue {
+     try {
+       this.nextBatchId++;
+       this.logger.log(LogLevel.Debug, `Applying batch ${receivedBatchId}.`);
+-      renderBatch(this.browserRendererId, new OutOfProcessRenderBatch(batchData));
++      renderBatch(WebRendererId.Server, new OutOfProcessRenderBatch(batchData));
+       await this.completeBatch(connection, receivedBatchId);
+     } catch (error) {
+       this.fatalError = (error as Error).toString();
+diff --git a/src/Components/Web.JS/src/Platform/WebAssemblyComponentAttacher.ts b/src/Components/Web.JS/src/Platform/WebAssemblyComponentAttacher.ts
+index 9c6fcabc47..093c62ecfb 100644
+--- a/src/Components/Web.JS/src/Platform/WebAssemblyComponentAttacher.ts
++++ b/src/Components/Web.JS/src/Platform/WebAssemblyComponentAttacher.ts
+@@ -3,26 +3,34 @@
+ 
+ import { LogicalElement, toLogicalRootCommentElement } from '../Rendering/LogicalElements';
+ import { WebAssemblyComponentDescriptor } from '../Services/ComponentDescriptorDiscovery';
++import { RootComponentManager } from '../Services/RootComponentManager';
+ 
+ export class WebAssemblyComponentAttacher {
+   public preregisteredComponents: WebAssemblyComponentDescriptor[];
+ 
+   private componentsById: { [index: number]: WebAssemblyComponentDescriptor };
+ 
+-  public constructor(components: WebAssemblyComponentDescriptor[]) {
+-    this.preregisteredComponents = components;
+-    const componentsById = {};
+-    for (let index = 0; index < components.length; index++) {
+-      const component = components[index];
+-      componentsById[component.id] = component;
++  private rootComponentManager?: RootComponentManager;
++
++  public constructor(components: WebAssemblyComponentDescriptor[] | RootComponentManager) {
++    this.componentsById = {};
++    if (components instanceof RootComponentManager) {
++      this.preregisteredComponents = [];
++      this.rootComponentManager = components;
++    } else {
++      this.preregisteredComponents = components;
++      for (let index = 0; index < components.length; index++) {
++        const component = components[index];
++        this.componentsById[component.id] = component;
++      }
+     }
+-    this.componentsById = componentsById;
+   }
+ 
+-  public resolveRegisteredElement(id: string): LogicalElement | undefined {
++  public resolveRegisteredElement(id: string, componentId: number): LogicalElement | undefined {
+     const parsedId = Number.parseInt(id);
+     if (!Number.isNaN(parsedId)) {
+-      return toLogicalRootCommentElement(this.componentsById[parsedId].start as Comment, this.componentsById[parsedId].end as Comment);
++      const component = this.rootComponentManager?.resolveRootComponent(parsedId, componentId) || this.componentsById[parsedId];
++      return toLogicalRootCommentElement(component);
+     } else {
+       return undefined;
+     }
+diff --git a/src/Components/Web.JS/src/Rendering/BrowserRenderer.ts b/src/Components/Web.JS/src/Rendering/BrowserRenderer.ts
+index 9b0bf156a1..74a14d4a38 100644
+--- a/src/Components/Web.JS/src/Rendering/BrowserRenderer.ts
++++ b/src/Components/Web.JS/src/Rendering/BrowserRenderer.ts
+@@ -3,7 +3,7 @@
+ 
+ import { RenderBatch, ArrayBuilderSegment, RenderTreeEdit, RenderTreeFrame, EditType, FrameType, ArrayValues } from './RenderBatch/RenderBatch';
+ import { EventDelegator } from './Events/EventDelegator';
+-import { LogicalElement, PermutationListEntry, toLogicalElement, insertLogicalChild, removeLogicalChild, getLogicalParent, getLogicalChild, createAndInsertLogicalContainer, isSvgElement, getLogicalChildrenArray, getLogicalSiblingEnd, permuteLogicalChildren, getClosestDomElement, emptyLogicalElement } from './LogicalElements';
++import { LogicalElement, PermutationListEntry, toLogicalElement, insertLogicalChild, removeLogicalChild, getLogicalParent, getLogicalChild, createAndInsertLogicalContainer, isSvgElement, permuteLogicalChildren, getClosestDomElement, emptyLogicalElement } from './LogicalElements';
+ import { applyCaptureIdToElement } from './ElementReferenceCapture';
+ import { attachToEventDelegator as attachNavigationManagerToEventDelegator } from '../Services/NavigationManager';
+ import { applyAnyDeferredValue, tryApplySpecialProperty } from './DomSpecialPropertyUtil';
+@@ -13,6 +13,7 @@ const elementsToClearOnRootComponentRender: { [componentId: number]: LogicalElem
+ const internalAttributeNamePrefix = '__internal_';
+ const eventPreventDefaultAttributeNamePrefix = 'preventDefault_';
+ const eventStopPropagationAttributeNamePrefix = 'stopPropagation_';
++const interactiveRootComponentPropname = Symbol();
+ 
+ export class BrowserRenderer {
+   public eventDelegator: EventDelegator;
+@@ -31,6 +32,11 @@ export class BrowserRenderer {
+   }
+ 
+   public attachRootComponentToLogicalElement(componentId: number, element: LogicalElement, appendContent: boolean): void {
++    if (isInteractiveRootComponentElement(element)) {
++      throw new Error(`Root component '${componentId}' could not be attached because its target element is already associated with a root component`);
++    }
++
++    markAsInteractiveRootComponentElement(element, true);
+     this.attachComponentToElement(componentId, element);
+     this.rootComponentIds.add(componentId);
+ 
+@@ -50,13 +56,13 @@ export class BrowserRenderer {
+     // On the first render for each root component, clear any existing content (e.g., prerendered)
+     const rootElementToClear = elementsToClearOnRootComponentRender[componentId];
+     if (rootElementToClear) {
+-      const rootElementToClearEnd = getLogicalSiblingEnd(rootElementToClear);
+       delete elementsToClearOnRootComponentRender[componentId];
++      emptyLogicalElement(rootElementToClear);
+ 
+-      if (!rootElementToClearEnd) {
+-        clearElement(rootElementToClear as unknown as Element);
+-      } else {
+-        clearBetween(rootElementToClear as unknown as Node, rootElementToClearEnd as unknown as Comment);
++      if (rootElementToClear instanceof Comment) {
++        // We sanitize start comments by removing all the information from it now that we don't need it anymore
++        // as it adds noise to the DOM.
++        rootElementToClear.textContent = '!';
+       }
+     }
+ 
+@@ -76,7 +82,9 @@ export class BrowserRenderer {
+       // When disposing a root component, the container element won't be removed from the DOM (because there's
+       // no parent to remove that child), so we empty it to restore it to the state it was in before the root
+       // component was added.
+-      emptyLogicalElement(this.childComponentLocations[componentId]);
++      const logicalElement = this.childComponentLocations[componentId];
++      markAsInteractiveRootComponentElement(logicalElement, false);
++      emptyLogicalElement(logicalElement);
+     }
+ 
+     delete this.childComponentLocations[componentId];
+@@ -357,6 +365,14 @@ export class BrowserRenderer {
+   }
+ }
+ 
++function markAsInteractiveRootComponentElement(element: LogicalElement, isInteractive: boolean) {
++  element[interactiveRootComponentPropname] = isInteractive;
++}
++
++export function isInteractiveRootComponentElement(element: LogicalElement): boolean | undefined {
++  return element[interactiveRootComponentPropname];
++}
++
+ export interface ComponentDescriptor {
+   start: Node;
+   end: Node;
+@@ -387,32 +403,6 @@ function countDescendantFrames(batch: RenderBatch, frame: RenderTreeFrame): numb
+   }
+ }
+ 
+-function clearElement(element: Element) {
+-  let childNode: Node | null;
+-  while ((childNode = element.firstChild)) {
+-    element.removeChild(childNode);
+-  }
+-}
+-
+-function clearBetween(start: Node, end: Node): void {
+-  const logicalParent = getLogicalParent(start as unknown as LogicalElement);
+-  if (!logicalParent) {
+-    throw new Error("Can't clear between nodes. The start node does not have a logical parent.");
+-  }
+-  const children = getLogicalChildrenArray(logicalParent);
+-  const removeStart = children.indexOf(start as unknown as LogicalElement) + 1;
+-  const endIndex = children.indexOf(end as unknown as LogicalElement);
+-
+-  // We remove the end component comment from the DOM as we don't need it after this point.
+-  for (let i = removeStart; i <= endIndex; i++) {
+-    removeLogicalChild(logicalParent, removeStart);
+-  }
+-
+-  // We sanitize the start comment by removing all the information from it now that we don't need it anymore
+-  // as it adds noise to the DOM.
+-  start.textContent = '!';
+-}
+-
+ function stripOnPrefix(attributeName: string) {
+   if (attributeName.startsWith('on')) {
+     return attributeName.substring(2);
+diff --git a/src/Components/Web.JS/src/Rendering/DomMerging/DomSync.ts b/src/Components/Web.JS/src/Rendering/DomMerging/DomSync.ts
+index bc607f8e37..94b23b36ca 100644
+--- a/src/Components/Web.JS/src/Rendering/DomMerging/DomSync.ts
++++ b/src/Components/Web.JS/src/Rendering/DomMerging/DomSync.ts
+@@ -1,38 +1,102 @@
+ // Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++import { ComponentDescriptor, ServerComponentDescriptor, WebAssemblyComponentDescriptor, discoverComponents } from '../../Services/ComponentDescriptorDiscovery';
++import { isInteractiveRootComponentElement } from '../BrowserRenderer';
+ import { applyAnyDeferredValue } from '../DomSpecialPropertyUtil';
++import { LogicalElement, getLogicalChildrenArray, getLogicalNextSibling, getLogicalParent, getLogicalRootDescriptor, insertLogicalChild, insertLogicalChildBefore, isLogicalElement, toLogicalElement, toLogicalRootCommentElement } from '../LogicalElements';
+ import { synchronizeAttributes } from './AttributeSync';
+ import { UpdateCost, ItemList, Operation, computeEditScript } from './EditScript';
+ 
+-export function synchronizeDomContent(destination: CommentBoundedRange | Node, newContent: Node) {
+-  let destinationParent: Node;
+-  let nextDestinationNode: Node | null;
+-  let originalNodesForDiff: ItemList<Node>;
++let descriptorHandler: DescriptorHandler | null = null;
++
++export interface DescriptorHandler {
++  registerComponentDescriptor(descriptor: ComponentDescriptor): void;
++}
++
++export function attachComponentDescriptorHandler(handler: DescriptorHandler) {
++  descriptorHandler = handler;
++}
++
++export function registerAllComponentDescriptors(root: Node) {
++  const descriptors = upgradeComponentCommentsToLogicalRootComments(root);
+ 
+-  // Figure out how to interpret the 'destination' parameter, since it can come in two very different forms
++  for (const descriptor of descriptors) {
++    descriptorHandler?.registerComponentDescriptor(descriptor);
++  }
++}
++
++export { preprocessAndSynchronizeDomContent as synchronizeDomContent };
++
++function preprocessAndSynchronizeDomContent(destination: CommentBoundedRange | Node, newContent: Node) {
++  // Start by recursively identifying component markers in the new content
++  // and converting them into logical elements so they correctly participate
++  // in logical element synchronization
++  upgradeComponentCommentsToLogicalRootComments(newContent);
++
++  // Then, synchronize the preprocessed DOM content
++  synchronizeDomContentCore(destination, newContent);
++}
++
++function synchronizeDomContentCore(destination: CommentBoundedRange | Node, newContent: Node) {
++  // Determine the destination's parent node, i.e., the node containing the children
++  // we intend to synchronize. This might sometimes be a logical parent.
++  let destinationParent: Node;
+   if (destination instanceof Node) {
+     destinationParent = destination;
+-    nextDestinationNode = destination.firstChild;
+-    originalNodesForDiff = destination.childNodes;
+   } else {
+-    destinationParent = destination.startExclusive.parentNode!;
+-    nextDestinationNode = destination.startExclusive.nextSibling;
+-    originalNodesForDiff = new SiblingSubsetNodeList(destination);
++    destinationParent =
++      getLogicalParent(destination.startExclusive as unknown as LogicalElement) as unknown as Node ??
++      destination.startExclusive.parentNode!;
++  }
++
++  // If only one out of the destination and new content is a logical element, we normalize
++  // the other to also be a logical element
++  const isSynchronizingLogicalElements = isLogicalElement(destinationParent) || isLogicalElement(newContent);
++  if (isSynchronizingLogicalElements) {
++    toLogicalElement(destinationParent, /* allowExistingContents */ true);
++    toLogicalElement(newContent, /* allowExistingContents */ true);
++  }
++
++  // Create abstract lists of child nodes
++  let originalNodesForDiff: ItemList<Node>;
++  let newNodesForDiff: ItemList<Node>;
++  if (isSynchronizingLogicalElements) {
++    originalNodesForDiff = new LogicalElementNodeList(destinationParent as unknown as LogicalElement);
++    newNodesForDiff = new LogicalElementNodeList(newContent as unknown as LogicalElement);
++  } else {
++    originalNodesForDiff = destinationParent.childNodes;
++    newNodesForDiff = newContent.childNodes;
++  }
++
++  // If the destination is a comment bounded range, limit the node list to a subset defined
++  // by that range
++  if (!(destination instanceof Node)) {
++    originalNodesForDiff = new SiblingSubsetNodeList(originalNodesForDiff, destination);
+   }
+ 
+   // Run the diff
+   const editScript = computeEditScript(
+     originalNodesForDiff,
+-    newContent.childNodes,
+-    domNodeComparer);
++    newNodesForDiff,
++    domNodeComparer
++  );
++
++  let destinationWalker: EditWalker;
++  let sourceWalker: EditWalker;
++  if (isSynchronizingLogicalElements) {
++    destinationWalker = new LogicalElementEditWalker(originalNodesForDiff.item(0) as unknown as LogicalElement);
++    sourceWalker = new LogicalElementEditWalker(newNodesForDiff.item(0) as unknown as LogicalElement);
++  } else {
++    destinationWalker = new DomNodeEditWalker(originalNodesForDiff.item(0)!);
++    sourceWalker = new DomNodeEditWalker(newNodesForDiff.item(0)!);
++  }
+ 
+   // Handle any common leading items
+-  let nextNewContentNode = newContent.firstChild; // Could be null
+   for (let i = 0; i < editScript.skipCount; i++) {
+-    treatAsMatch(nextDestinationNode!, nextNewContentNode!);
+-    nextDestinationNode = nextDestinationNode!.nextSibling!;
+-    nextNewContentNode = nextNewContentNode!.nextSibling;
++    treatAsMatch(destinationWalker.current, sourceWalker.current);
++    destinationWalker.advance();
++    sourceWalker.advance();
+   }
+ 
+   // Handle any edited region
+@@ -43,26 +107,30 @@ export function synchronizeDomContent(destination: CommentBoundedRange | Node, n
+     for (let editIndex = 0; editIndex < editsLength; editIndex++) {
+       const operation = edits[editIndex];
+       switch (operation) {
+-        case Operation.Keep:
+-          treatAsMatch(nextDestinationNode!, nextNewContentNode!);
+-          nextDestinationNode = nextDestinationNode!.nextSibling;
+-          nextNewContentNode = nextNewContentNode!.nextSibling;
++        case Operation.Keep: {
++          treatAsMatch(destinationWalker.current, sourceWalker.current);
++          destinationWalker.advance();
++          sourceWalker.advance();
+           break;
+-        case Operation.Update:
+-          treatAsSubstitution(nextDestinationNode!, nextNewContentNode!);
+-          nextDestinationNode = nextDestinationNode!.nextSibling;
+-          nextNewContentNode = nextNewContentNode!.nextSibling;
++        }
++        case Operation.Update: {
++          treatAsSubstitution(destinationWalker.current, sourceWalker.current);
++          destinationWalker.advance();
++          sourceWalker.advance();
+           break;
+-        case Operation.Delete:
+-          const nodeToRemove = nextDestinationNode!;
+-          nextDestinationNode = nodeToRemove.nextSibling;
+-          destinationParent.removeChild(nodeToRemove);
++        }
++        case Operation.Delete: {
++          const nodeToRemove = destinationWalker.current;
++          destinationWalker.advance();
++          treatAsDeletion(nodeToRemove, destinationParent);
+           break;
+-        case Operation.Insert:
+-          const nodeToInsert = nextNewContentNode!;
+-          nextNewContentNode = nodeToInsert.nextSibling;
+-          destinationParent.insertBefore(nodeToInsert, nextDestinationNode);
++        }
++        case Operation.Insert: {
++          const nodeToInsert = sourceWalker.current;
++          sourceWalker.advance();
++          treatAsInsertion(nodeToInsert, destinationWalker.current, destinationParent);
+           break;
++        }
+         default:
+           throw new Error(`Unexpected operation: '${operation}'`);
+       }
+@@ -71,12 +139,12 @@ export function synchronizeDomContent(destination: CommentBoundedRange | Node, n
+     // Handle any common trailing items
+     // These can only exist if there were some edits, otherwise everything would be in the set of common leading items
+     const endAtNodeExclOrNull = destination instanceof Node ? null : destination.endExclusive;
+-    while (nextDestinationNode !== endAtNodeExclOrNull) {
+-      treatAsMatch(nextDestinationNode!, nextNewContentNode!);
+-      nextDestinationNode = nextDestinationNode!.nextSibling;
+-      nextNewContentNode = nextNewContentNode!.nextSibling;
++    while (destinationWalker.current !== endAtNodeExclOrNull) {
++      treatAsMatch(destinationWalker.current, sourceWalker.current);
++      destinationWalker.advance();
++      sourceWalker.advance();
+     }
+-    if (nextNewContentNode) {
++    if (sourceWalker.current) {
+       // Should never be possible, as it would imply a bug in the edit script calculation, or possibly an unsupported
+       // scenario like a DOM mutation observer modifying the destination nodes while we are working on them
+       throw new Error('Updating the DOM failed because the sets of trailing nodes had inconsistent lengths.');
+@@ -87,13 +155,36 @@ export function synchronizeDomContent(destination: CommentBoundedRange | Node, n
+ function treatAsMatch(destination: Node, source: Node) {
+   switch (destination.nodeType) {
+     case Node.TEXT_NODE:
+-    case Node.COMMENT_NODE:
+       break;
+-    case Node.ELEMENT_NODE:
++    case Node.COMMENT_NODE: {
++      const destinationAsLogicalElement = destination as unknown as LogicalElement;
++      const sourceAsLogicalElement = source as unknown as LogicalElement;
++      const destinationRootDescriptor = getLogicalRootDescriptor(destinationAsLogicalElement);
++      const sourceRootDescriptor = getLogicalRootDescriptor(sourceAsLogicalElement);
++
++      if (!destinationRootDescriptor !== !sourceRootDescriptor) {
++        throw new Error('Not supported: merging component comment nodes with non-component comment nodes');
++      }
++
++      if (destinationRootDescriptor) {
++        // Update the existing descriptor with hte new descriptor's data
++        destinationRootDescriptor.update(sourceRootDescriptor);
++
++        const isDestinationInteractive = isInteractiveRootComponentElement(destinationAsLogicalElement);
++        if (isDestinationInteractive) {
++          // Don't sync DOM content for already-interactive components becuase their content is managed
++          // by the renderer.
++        } else {
++          synchronizeDomContentCore(destination, source);
++        }
++      }
++      break;
++    }
++    case Node.ELEMENT_NODE: {
+       const editableElementValue = getEditableElementValue(source as Element);
+       synchronizeAttributes(destination as Element, source as Element);
+       applyAnyDeferredValue(destination as Element);
+-      synchronizeDomContent(destination as Element, source as Element);
++      synchronizeDomContentCore(destination as Element, source as Element);
+ 
+       // This is a much simpler alternative to the deferred-value-assignment logic we use in interactive rendering.
+       // Because this sync algorithm goes depth-first, we know all the attributes and descendants are fully in sync
+@@ -103,6 +194,7 @@ function treatAsMatch(destination: Node, source: Node) {
+         ensureEditableValueSynchronized(destination as Element, editableElementValue);
+       }
+       break;
++    }
+     case Node.DOCUMENT_TYPE_NODE:
+       // See comment below about doctype nodes. We leave them alone.
+       break;
+@@ -122,17 +214,72 @@ function treatAsSubstitution(destination: Node, source: Node) {
+   }
+ }
+ 
++function treatAsDeletion(nodeToDelete: Node, parentNode: Node) {
++  if (isLogicalElement(parentNode)) {
++    // It's not safe to call 'removeLogicalChild' here because it recursively removes
++    // logical descendants from their parents, and that can potentially interfere with
++    // renderer-managed DOM. Instead, we insert the logical element into a new document
++    // fragment, which allows the renderer to continue applying render batches until
++    // related components get disposed.
++    const docFrag = toLogicalElement(document.createDocumentFragment());
++    insertLogicalChild(nodeToDelete, docFrag, 0);
++  } else {
++    parentNode.removeChild(nodeToDelete);
++  }
++}
++
++function treatAsInsertion(nodeToInsert: Node, nextNode: Node | null, parentNode: Node) {
++  if (isLogicalElement(parentNode)) {
++    insertLogicalChildBefore(nodeToInsert, parentNode as unknown as LogicalElement, nextNode as unknown as LogicalElement);
++  } else {
++    // If the parent node is not a logical element, that means
++    // the node we're inserting is either a root logical element, or not a logical
++    // element at all. In either case, it's safe to treat the node we're inserting
++    // as a single node because root logical nodes cannot be component comments.
++    parentNode.insertBefore(nodeToInsert, nextNode);
++  }
++
++  // Find and register descriptors in new content
++  const iterator = document.createNodeIterator(nodeToInsert, NodeFilter.SHOW_COMMENT);
++  while (iterator.nextNode()) {
++    const logicalRootDescriptor = getLogicalRootDescriptor(iterator.referenceNode as unknown as LogicalElement);
++    if (logicalRootDescriptor) {
++      descriptorHandler?.registerComponentDescriptor(logicalRootDescriptor);
++    }
++  }
++}
++
+ function domNodeComparer(a: Node, b: Node): UpdateCost {
+   if (a.nodeType !== b.nodeType) {
+     return UpdateCost.Infinite;
+   }
+ 
++  if (isLogicalElement(a) !== isLogicalElement(b)) {
++    // We cannot merge logical elements with non-logical elements.
++    return UpdateCost.Infinite;
++  }
++
+   switch (a.nodeType) {
+     case Node.TEXT_NODE:
+-    case Node.COMMENT_NODE:
+-      // We're willing to update text and comment nodes in place, but treat the update operation as being
++      // We're willing to update text nodes in place, but treat the update operation as being
+       // as costly as an insertion or deletion
+       return a.textContent === b.textContent ? UpdateCost.None : UpdateCost.Some;
++    case Node.COMMENT_NODE: {
++      const rootDescriptorA = getLogicalRootDescriptor(a as unknown as LogicalElement);
++      const rootDescriptorB = getLogicalRootDescriptor(b as unknown as LogicalElement);
++
++      if (rootDescriptorA || rootDescriptorB) {
++        // If either node represents a root component comment, they must both be components of with matching keys.
++        // We will update a component with a non-component or a component with a different key.
++        return rootDescriptorA && rootDescriptorB && rootDescriptorA.matches(rootDescriptorB)
++          ? UpdateCost.None
++          : UpdateCost.Infinite;
++      } else {
++        // We're willing to update non-component comment nodes in place, but treat the update operation as being
++        // as costly as an insertion or deletion
++        return a.textContent === b.textContent ? UpdateCost.None : UpdateCost.Some;
++      }
++    }
+     case Node.ELEMENT_NODE:
+       // For elements, we're only doing a shallow comparison and don't know if attributes/descendants are different.
+       // We never 'update' one element type into another. We regard the update cost for same-type elements as zero because
+@@ -152,6 +299,33 @@ function domNodeComparer(a: Node, b: Node): UpdateCost {
+   }
+ }
+ 
++function upgradeComponentCommentsToLogicalRootComments(root: Node): ComponentDescriptor[] {
++  const serverDescriptors = discoverComponents(root, 'server') as ServerComponentDescriptor[];
++  const webAssemblyDescriptors = discoverComponents(root, 'webassembly') as WebAssemblyComponentDescriptor[];
++  const allDescriptors: ComponentDescriptor[] = [];
++
++  for (const descriptor of [...serverDescriptors, ...webAssemblyDescriptors]) {
++    const existingDescriptor = getLogicalRootDescriptor(descriptor.start as unknown as LogicalElement);
++    if (existingDescriptor) {
++      allDescriptors.push(existingDescriptor);
++    } else {
++      toLogicalRootCommentElement(descriptor);
++
++      // Since we've already parsed the payloads from the start and end comments,
++      // we sanitize them to reduce noise in the DOM.
++      const { start, end } = descriptor;
++      start.textContent = 'bl-root';
++      if (end) {
++        end.textContent = '/bl-root';
++      }
++
++      allDescriptors.push(descriptor);
++    }
++  }
++
++  return allDescriptors;
++}
++
+ function ensureEditableValueSynchronized(destination: Element, value: any) {
+   if (destination instanceof HTMLTextAreaElement && destination.value !== value) {
+     destination.value = value as string;
+@@ -183,8 +357,46 @@ export interface CommentBoundedRange {
+   endExclusive: Comment,
+ }
+ 
++interface EditWalker {
++  current: Node;
++  advance(): void;
++}
++
++class DomNodeEditWalker implements EditWalker {
++  current: Node;
++
++  constructor(startNode: Node) {
++    this.current = startNode;
++  }
++
++  advance() {
++    if (!this.current) {
++      throw new Error('Cannot advance beyond the end of the sibling array');
++    }
++
++    this.current = this.current.nextSibling!;
++  }
++}
++
++class LogicalElementEditWalker implements EditWalker {
++  current: Node;
++
++  constructor(startNode: LogicalElement) {
++    this.current = startNode as unknown as Node;
++  }
++
++  advance() {
++    if (!this.current) {
++      throw new Error('Cannot advance beyond the end of the logical children array');
++    }
++
++    const nextSibling = getLogicalNextSibling(this.current as unknown as LogicalElement);
++    this.current = nextSibling as unknown as Node;
++  }
++}
++
+ class SiblingSubsetNodeList implements ItemList<Node> {
+-  private readonly siblings: NodeList;
++  private readonly siblings: ItemList<Node>;
+   private readonly startIndex: number;
+   private readonly endIndexExcl: number;
+ 
+@@ -200,14 +412,34 @@ class SiblingSubsetNodeList implements ItemList<Node> {
+     }
+   }
+ 
+-  constructor(range: CommentBoundedRange) {
+-    if (!range.startExclusive.parentNode || range.startExclusive.parentNode !== range.endExclusive.parentNode) {
+-      throw new Error('Invalid CommentBoundedRange. The start and end markers have no common parent.');
+-    }
+-
+-    this.siblings = range.startExclusive.parentNode!.childNodes;
++  constructor(childNodes: ItemList<Node>, range: CommentBoundedRange) {
++    this.siblings = childNodes;
+     this.startIndex = Array.prototype.indexOf.call(this.siblings, range.startExclusive) + 1;
+     this.endIndexExcl = Array.prototype.indexOf.call(this.siblings, range.endExclusive);
+     this.length = this.endIndexExcl - this.startIndex;
+   }
+ }
++
++class LogicalElementNodeList implements ItemList<Node> {
++  readonly length: number;
++
++  constructor(element: LogicalElement) {
++    const childNodes = getLogicalChildrenArray(element);
++    this.length = childNodes.length;
++
++    // This is done for compatibility with Array.prototype.indexOf, which expects an array-like object
++    Object.assign(this, childNodes);
++  }
++
++  [index: number]: Node;
++
++  item(index: number): Node | null {
++    return this[index] as unknown as Node;
++  }
++
++  forEach(callbackfn: (value: Node, key: number, parent: ItemList<Node>) => void, thisArg?: any): void {
++    for (let i = 0; i < this.length; i++) {
++      callbackfn.call(thisArg, this.item(i)!, i, this);
++    }
++  }
++}
+diff --git a/src/Components/Web.JS/src/Rendering/LogicalElements.ts b/src/Components/Web.JS/src/Rendering/LogicalElements.ts
+index f5b897ac9b..30b7357ba6 100644
+--- a/src/Components/Web.JS/src/Rendering/LogicalElements.ts
++++ b/src/Components/Web.JS/src/Rendering/LogicalElements.ts
+@@ -1,6 +1,8 @@
+ // Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++import { ServerComponentDescriptor, WebAssemblyComponentDescriptor } from '../Services/ComponentDescriptorDiscovery';
++
+ /*
+   A LogicalElement plays the same role as an Element instance from the point of view of the
+   API consumer. Inserting and removing logical elements updates the browser DOM just the same.
+@@ -28,11 +30,11 @@
+   - Whenever a logical child is added or removed, we update the parent's array of logical children
+ */
+ 
+-const logicalChildrenPropname = createSymbolOrFallback('_blazorLogicalChildren');
+-const logicalParentPropname = createSymbolOrFallback('_blazorLogicalParent');
+-const logicalEndSiblingPropname = createSymbolOrFallback('_blazorLogicalEnd');
++const logicalChildrenPropname = Symbol();
++const logicalParentPropname = Symbol();
++const logicalRootDescriptorPropname = Symbol();
+ 
+-export function toLogicalRootCommentElement(start: Comment, end: Comment): LogicalElement {
++export function toLogicalRootCommentElement(descriptor: ServerComponentDescriptor | WebAssemblyComponentDescriptor): LogicalElement {
+   // Now that we support start/end comments as component delimiters we are going to be setting up
+   // adding the components rendered output as siblings of the start/end tags (between).
+   // For that to work, we need to appropriately configure the parent element to be a logical element
+@@ -49,36 +51,71 @@ export function toLogicalRootCommentElement(start: Comment, end: Comment): Logic
+   // |- *div
+   // |- *component
+   // |- *footer
+-  if (!start.parentNode) {
+-    throw new Error(`Comment not connected to the DOM ${start.textContent}`);
++  const { start, end } = descriptor;
++  const existingDescriptor = start[logicalRootDescriptorPropname];
++  if (existingDescriptor) {
++    if (existingDescriptor !== descriptor) {
++      throw new Error('The start component comment was already associated with another component descriptor.');
++    }
++    return start as unknown as LogicalElement;
+   }
+ 
+   const parent = start.parentNode;
++  if (!parent) {
++    throw new Error(`Comment not connected to the DOM ${start.textContent}`);
++  }
++
+   const parentLogicalElement = toLogicalElement(parent, /* allow existing contents */ true);
+   const children = getLogicalChildrenArray(parentLogicalElement);
+-  Array.from(parent.childNodes).forEach(n => children.push(n as unknown as LogicalElement));
+ 
+   start[logicalParentPropname] = parentLogicalElement;
+-  // We might not have an end comment in the case of non-prerendered components.
++  start[logicalRootDescriptorPropname] = descriptor;
++  const startLogicalElement = toLogicalElement(start);
++
+   if (end) {
+-    start[logicalEndSiblingPropname] = end;
+-    toLogicalElement(end);
++    // We need to make each element between the start and end comments a logical child
++    // of the start node.
++    const rootCommentChildren = getLogicalChildrenArray(startLogicalElement);
++    const startNextChildIndex = Array.prototype.indexOf.call(children, startLogicalElement) + 1;
++    let lastMovedChild: LogicalElement | null = null;
++
++    while (lastMovedChild !== end as unknown as LogicalElement) {
++      const childToMove = children.splice(startNextChildIndex, 1)[0];
++      if (!childToMove) {
++        throw new Error('Could not find the end component comment in the parent logical node list');
++      }
++      childToMove[logicalParentPropname] = start;
++      rootCommentChildren.push(childToMove);
++      lastMovedChild = childToMove;
++    }
+   }
+-  return toLogicalElement(start);
++
++  return startLogicalElement;
+ }
+ 
+ export function toLogicalElement(element: Node, allowExistingContents?: boolean): LogicalElement {
+-  // Normally it's good to assert that the element has started empty, because that's the usual
+-  // situation and we probably have a bug if it's not. But for the element that contain prerendered
+-  // root components, we want to let them keep their content until we replace it.
+-  if (element.childNodes.length > 0 && !allowExistingContents) {
+-    throw new Error('New logical elements must start empty, or allowExistingContents must be true');
++  if (logicalChildrenPropname in element) { // If it's already a logical element, leave it alone
++    return element as unknown as LogicalElement;
+   }
+ 
+-  if (!(logicalChildrenPropname in element)) { // If it's already a logical element, leave it alone
+-    element[logicalChildrenPropname] = [];
++  const childrenArray: LogicalElement[] = [];
++
++  if (element.childNodes.length > 0) {
++    // Normally it's good to assert that the element has started empty, because that's the usual
++    // situation and we probably have a bug if it's not. But for the elements that contain prerendered
++    // root components, we want to let them keep their content until we replace it.
++    if (!allowExistingContents) {
++      throw new Error('New logical elements must start empty, or allowExistingContents must be true');
++    }
++
++    element.childNodes.forEach(child => {
++      const childLogicalElement = toLogicalElement(child, /* allowExistingContents */ true);
++      childLogicalElement[logicalParentPropname] = element;
++      childrenArray.push(childLogicalElement);
++    });
+   }
+ 
++  element[logicalChildrenPropname] = childrenArray;
+   return element as unknown as LogicalElement;
+ }
+ 
+@@ -95,37 +132,55 @@ export function createAndInsertLogicalContainer(parent: LogicalElement, childInd
+   return containerElement as unknown as LogicalElement;
+ }
+ 
++export function insertLogicalChildBefore(child: Node, parent: LogicalElement, before: LogicalElement | null): void {
++  const childrenArray = getLogicalChildrenArray(parent);
++  let childIndex: number;
++  if (before) {
++    childIndex = Array.prototype.indexOf.call(childrenArray, before);
++    if (childIndex < 0) {
++      throw new Error('Could not find logical element in the parent logical node list');
++    }
++  } else {
++    childIndex = childrenArray.length;
++  }
++  insertLogicalChild(child, parent, childIndex);
++}
++
+ export function insertLogicalChild(child: Node, parent: LogicalElement, childIndex: number): void {
+   const childAsLogicalElement = child as unknown as LogicalElement;
+-  if (child instanceof Comment) {
+-    const existingGrandchildren = getLogicalChildrenArray(childAsLogicalElement);
+-    if (existingGrandchildren && getLogicalChildrenArray(childAsLogicalElement).length > 0) {
+-      // There's nothing to stop us implementing support for this scenario, and it's not difficult
+-      // (after inserting 'child' itself, also iterate through its logical children and physically
+-      // put them as following-siblings in the DOM). However there's no scenario that requires it
+-      // presently, so if we did implement it there'd be no good way to have tests for it.
+-      throw new Error('Not implemented: inserting non-empty logical container');
++
++  // If the child is a component comment with logical siblings, its siblings also
++  // need to be inserted into the parent node
++  let nodeToInsert = child;
++  if (isLogicalElement(child)) {
++    const lastNodeToInsert = findLastDomNodeInRange(childAsLogicalElement);
++    if (lastNodeToInsert !== child) {
++      const range = new Range();
++      range.setStartBefore(child);
++      range.setEndAfter(lastNodeToInsert);
++      nodeToInsert = range.extractContents();
+     }
+   }
+ 
+-  if (getLogicalParent(childAsLogicalElement)) {
+-    // Likewise, we could easily support this scenario too (in this 'if' block, just splice
+-    // out 'child' from the logical children array of its previous logical parent by using
+-    // Array.prototype.indexOf to determine its previous sibling index).
+-    // But again, since there's not currently any scenario that would use it, we would not
+-    // have any test coverage for such an implementation.
+-    throw new Error('Not implemented: moving existing logical children');
++  // If the node we're inserting already has a logical parent,
++  // remove it from its sibling array
++  const existingLogicalParent = getLogicalParent(childAsLogicalElement);
++  if (existingLogicalParent) {
++    const existingSiblingArray = getLogicalChildrenArray(existingLogicalParent);
++    const existingChildIndex = Array.prototype.indexOf.call(existingSiblingArray, childAsLogicalElement);
++    existingSiblingArray.splice(existingChildIndex, 1);
++    delete childAsLogicalElement[logicalParentPropname];
+   }
+ 
+   const newSiblings = getLogicalChildrenArray(parent);
+   if (childIndex < newSiblings.length) {
+     // Insert
+     const nextSibling = newSiblings[childIndex] as any as Node;
+-    nextSibling.parentNode!.insertBefore(child, nextSibling);
++    nextSibling.parentNode!.insertBefore(nodeToInsert, nextSibling);
+     newSiblings.splice(childIndex, 0, childAsLogicalElement);
+   } else {
+     // Append
+-    appendDomNode(child, parent);
++    appendDomNode(nodeToInsert, parent);
+     newSiblings.push(childAsLogicalElement);
+   }
+ 
+@@ -158,14 +213,14 @@ export function getLogicalParent(element: LogicalElement): LogicalElement | null
+   return (element[logicalParentPropname] as LogicalElement) || null;
+ }
+ 
+-export function getLogicalSiblingEnd(element: LogicalElement): LogicalElement | null {
+-  return (element[logicalEndSiblingPropname] as LogicalElement) || null;
+-}
+-
+ export function getLogicalChild(parent: LogicalElement, childIndex: number): LogicalElement {
+   return getLogicalChildrenArray(parent)[childIndex];
+ }
+ 
++export function getLogicalRootDescriptor(element: LogicalElement): ServerComponentDescriptor | WebAssemblyComponentDescriptor {
++  return element[logicalRootDescriptorPropname] || null;
++}
++
+ // SVG elements support `foreignObject` children that can hold arbitrary HTML.
+ // For these scenarios, the parent SVG and `foreignObject` elements should
+ // be rendered under the SVG namespace, while the HTML content should be rendered
+@@ -184,6 +239,16 @@ export function getLogicalChildrenArray(element: LogicalElement): LogicalElement
+   return element[logicalChildrenPropname] as LogicalElement[];
+ }
+ 
++export function getLogicalNextSibling(element: LogicalElement): LogicalElement | null {
++  const siblings = getLogicalChildrenArray(getLogicalParent(element)!);
++  const siblingIndex = Array.prototype.indexOf.call(siblings, element);
++  return siblings[siblingIndex + 1] || null;
++}
++
++export function isLogicalElement(element: Node): boolean {
++  return logicalChildrenPropname in element;
++}
++
+ export function permuteLogicalChildren(parent: LogicalElement, permutationList: PermutationListEntry[]): void {
+   // The permutationList must represent a valid permutation, i.e., the list of 'from' indices
+   // is distinct, and the list of 'to' indices is a permutation of it. The algorithm here
+@@ -260,12 +325,6 @@ interface PermutationListEntryWithTrackingData extends PermutationListEntry {
+   moveToBeforeMarker?: Node,
+ }
+ 
+-function getLogicalNextSibling(element: LogicalElement): LogicalElement | null {
+-  const siblings = getLogicalChildrenArray(getLogicalParent(element)!);
+-  const siblingIndex = Array.prototype.indexOf.call(siblings, element);
+-  return siblings[siblingIndex + 1] || null;
+-}
+-
+ function appendDomNode(child: Node, parent: LogicalElement) {
+   // This function only puts 'child' into the DOM in the right place relative to 'parent'
+   // It does not update the logical children array of anything
+@@ -289,7 +348,7 @@ function appendDomNode(child: Node, parent: LogicalElement) {
+ 
+ // Returns the final node (in depth-first evaluation order) that is a descendant of the logical element.
+ // As such, the entire subtree is between 'element' and 'findLastDomNodeInRange(element)' inclusive.
+-function findLastDomNodeInRange(element: LogicalElement) {
++function findLastDomNodeInRange(element: LogicalElement): Node {
+   if (element instanceof Element || element instanceof DocumentFragment) {
+     return element;
+   }
+@@ -297,20 +356,16 @@ function findLastDomNodeInRange(element: LogicalElement) {
+   const nextSibling = getLogicalNextSibling(element);
+   if (nextSibling) {
+     // Simple case: not the last logical sibling, so take the node before the next sibling
+-    return (nextSibling as any as Node).previousSibling;
++    return (nextSibling as any as Node).previousSibling!;
+   } else {
+     // Harder case: there's no logical next-sibling, so recurse upwards until we find
+     // a logical ancestor that does have one, or a physical element
+     const logicalParent = getLogicalParent(element)!;
+     return logicalParent instanceof Element || logicalParent instanceof DocumentFragment
+-      ? logicalParent.lastChild
++      ? logicalParent.lastChild!
+       : findLastDomNodeInRange(logicalParent);
+   }
+ }
+ 
+-function createSymbolOrFallback(fallback: string): symbol | string {
+-  return typeof Symbol === 'function' ? Symbol() : fallback;
+-}
+-
+ // Nominal type to represent a logical element without needing to allocate any object for instances
+ export interface LogicalElement { LogicalElement__DO_NOT_IMPLEMENT: any }
+diff --git a/src/Components/Web.JS/src/Rendering/StreamingRendering.ts b/src/Components/Web.JS/src/Rendering/StreamingRendering.ts
+index c804cfc806..05e29c232d 100644
+--- a/src/Components/Web.JS/src/Rendering/StreamingRendering.ts
++++ b/src/Components/Web.JS/src/Rendering/StreamingRendering.ts
+@@ -1,14 +1,17 @@
+ // Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+-import { SsrStartOptions } from "../Platform/SsrStartOptions";
+-import { performEnhancedPageLoad, replaceDocumentWithPlainText } from "../Services/NavigationEnhancement";
+-import { isWithinBaseUriSpace } from "../Services/NavigationUtils";
+-import { synchronizeDomContent } from "./DomMerging/DomSync";
++import { SsrStartOptions } from '../Platform/SsrStartOptions';
++import { NavigationEnhancementCallbacks, performEnhancedPageLoad, replaceDocumentWithPlainText } from '../Services/NavigationEnhancement';
++import { isWithinBaseUriSpace } from '../Services/NavigationUtils';
++import { synchronizeDomContent } from './DomMerging/DomSync';
+ 
+ let enableDomPreservation = true;
++let navigationEnhancementCallbacks: NavigationEnhancementCallbacks;
++
++export function attachStreamingRenderingListener(options: SsrStartOptions | undefined, callbacks: NavigationEnhancementCallbacks) {
++  navigationEnhancementCallbacks = callbacks;
+ 
+-export function attachStreamingRenderingListener(options: SsrStartOptions | undefined) {
+   if (options?.disableDomPreservation) {
+     enableDomPreservation = false;
+   }
+@@ -64,20 +67,23 @@ class BlazorStreamingUpdate extends HTMLElement {
+ function insertStreamingContentIntoDocument(componentIdAsString: string, docFrag: DocumentFragment): void {
+   const markers = findStreamingMarkers(componentIdAsString);
+   if (markers) {
++    const { startMarker, endMarker } = markers;
+     if (enableDomPreservation) {
+-      synchronizeDomContent({ startExclusive: markers.startMarker, endExclusive: markers.endMarker }, docFrag);
++      synchronizeDomContent({ startExclusive: startMarker, endExclusive: endMarker }, docFrag);
+     } else {
+       // In this mode we completely delete the old content before inserting the new content
+-      const { startMarker, endMarker } = markers;
++      const destinationRoot = endMarker.parentNode!;
+       const existingContent = new Range();
+       existingContent.setStart(startMarker, startMarker.textContent!.length);
+       existingContent.setEnd(endMarker, 0);
+       existingContent.deleteContents();
+ 
+       while (docFrag.childNodes[0]) {
+-        endMarker.parentNode!.insertBefore(docFrag.childNodes[0], endMarker);
++        destinationRoot.insertBefore(docFrag.childNodes[0], endMarker);
+       }
+     }
++
++    navigationEnhancementCallbacks.documentUpdated();
+   }
+ }
+ 
+diff --git a/src/Components/Web.JS/src/Rendering/WebRendererId.ts b/src/Components/Web.JS/src/Rendering/WebRendererId.ts
+new file mode 100644
+index 0000000000..bf0c35fef5
+--- /dev/null
++++ b/src/Components/Web.JS/src/Rendering/WebRendererId.ts
+@@ -0,0 +1,10 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++// These IDs need to be kept in sync with RendererId.cs
++export enum WebRendererId {
++  Default = 0,
++  Server = 1,
++  WebAssembly = 2,
++  WebView = 3,
++}
+diff --git a/src/Components/Web.JS/src/Rendering/WebRendererInteropMethods.ts b/src/Components/Web.JS/src/Rendering/WebRendererInteropMethods.ts
+index 91d7ffd64c..e50a3513de 100644
+--- a/src/Components/Web.JS/src/Rendering/WebRendererInteropMethods.ts
++++ b/src/Components/Web.JS/src/Rendering/WebRendererInteropMethods.ts
+@@ -5,29 +5,64 @@ import { DotNet } from '@microsoft/dotnet-js-interop';
+ import { EventDescriptor } from './Events/EventDelegator';
+ import { enableJSRootComponents, JSComponentParametersByIdentifier, JSComponentIdentifiersByInitializer } from './JSRootComponents';
+ 
+-const interopMethodsByRendererId: DotNet.DotNetObject[] = [];
++const interopMethodsByRenderer = new Map<number, DotNet.DotNetObject>();
++const resolveAttachedPromiseByRenderer = new Map<number, () => void>();
++const attachedPromisesByRenderer = new Map<number, Promise<void>>();
+ 
+-let resolveRendererAttached : () => void;
++let resolveFirstRendererAttached : () => void;
+ 
+-export const rendererAttached = new Promise<void>((resolve) => {
+-  resolveRendererAttached = resolve;
++export const firstRendererAttached = new Promise<void>((resolve) => {
++  resolveFirstRendererAttached = resolve;
+ });
+ 
+ export function attachWebRendererInterop(
++  rendererId: number,
+   interopMethods: DotNet.DotNetObject,
+   jsComponentParameters: JSComponentParametersByIdentifier,
+   jsComponentInitializers: JSComponentIdentifiersByInitializer,
+-): number {
+-  const rendererId = interopMethodsByRendererId.length;
+-  interopMethodsByRendererId.push(interopMethods);
++): void {
++  if (interopMethodsByRenderer.has(rendererId)) {
++    throw new Error(`Interop methods are already registered for renderer ${rendererId}`);
++  }
++
++  interopMethodsByRenderer.set(rendererId, interopMethods);
+ 
+   if (Object.keys(jsComponentParameters).length > 0) {
+     const manager = getInteropMethods(rendererId);
+     enableJSRootComponents(manager, jsComponentParameters, jsComponentInitializers);
+   }
+ 
+-  resolveRendererAttached();
+-  return rendererId;
++  resolveFirstRendererAttached();
++  resolveRendererAttached(rendererId);
++}
++
++export function isRendererAttached(browserRendererId: number): boolean {
++  return interopMethodsByRenderer.has(browserRendererId);
++}
++
++export function waitForRendererAttached(browserRendererId: number): Promise<void> {
++  if (isRendererAttached(browserRendererId)) {
++    return Promise.resolve();
++  }
++
++  let attachedPromise = attachedPromisesByRenderer.get(browserRendererId);
++  if (!attachedPromise) {
++    attachedPromise = new Promise<void>((resolve) => {
++      resolveAttachedPromiseByRenderer.set(browserRendererId, resolve);
++    });
++    attachedPromisesByRenderer.set(browserRendererId, attachedPromise);
++  }
++
++  return attachedPromise;
++}
++
++function resolveRendererAttached(browserRendererId: number): void {
++  const resolveRendererAttached = resolveAttachedPromiseByRenderer.get(browserRendererId);
++  if (resolveRendererAttached) {
++    resolveAttachedPromiseByRenderer.delete(browserRendererId);
++    attachedPromisesByRenderer.delete(browserRendererId);
++    resolveRendererAttached();
++  }
+ }
+ 
+ export function dispatchEvent(browserRendererId: number, eventDescriptor: EventDescriptor, eventArgs: any): void {
+@@ -37,8 +72,13 @@ export function dispatchEvent(browserRendererId: number, eventDescriptor: EventD
+   });
+ }
+ 
++export function updateRootComponents(browserRendererId: number, operationsJson: string): Promise<void> {
++  const interopMethods = getInteropMethods(browserRendererId);
++  return interopMethods.invokeMethodAsync('UpdateRootComponents', operationsJson);
++}
++
+ function getInteropMethods(rendererId: number): DotNet.DotNetObject {
+-  const interopMethods = interopMethodsByRendererId[rendererId];
++  const interopMethods = interopMethodsByRenderer.get(rendererId);
+   if (!interopMethods) {
+     throw new Error(`No interop methods are registered for renderer ${rendererId}`);
+   }
+diff --git a/src/Components/Web.JS/src/Services/ComponentDescriptorDiscovery.ts b/src/Components/Web.JS/src/Services/ComponentDescriptorDiscovery.ts
+index 5e53f5ac57..f4a86c0264 100644
+--- a/src/Components/Web.JS/src/Services/ComponentDescriptorDiscovery.ts
++++ b/src/Components/Web.JS/src/Services/ComponentDescriptorDiscovery.ts
+@@ -1,17 +1,17 @@
+ // Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+-export function discoverComponents(document: Document, type: 'webassembly' | 'server'): ServerComponentDescriptor[] | WebAssemblyComponentDescriptor[] {
+-  switch (type){
++export function discoverComponents(root: Node, type: 'webassembly' | 'server'): ServerComponentDescriptor[] | WebAssemblyComponentDescriptor[] {
++  switch (type) {
+     case 'webassembly':
+-      return discoverWebAssemblyComponents(document);
++      return discoverWebAssemblyComponents(root);
+     case 'server':
+-      return discoverServerComponents(document);
++      return discoverServerComponents(root);
+   }
+ }
+ 
+-function discoverServerComponents(document: Document): ServerComponentDescriptor[] {
+-  const componentComments = resolveComponentComments(document, 'server') as ServerComponentComment[];
++function discoverServerComponents(root: Node): ServerComponentDescriptor[] {
++  const componentComments = resolveComponentComments(root, 'server') as ServerComponentComment[];
+   const discoveredComponents: ServerComponentDescriptor[] = [];
+   for (let i = 0; i < componentComments.length; i++) {
+     const componentComment = componentComments[i];
+@@ -21,6 +21,7 @@ function discoverServerComponents(document: Document): ServerComponentDescriptor
+       componentComment.end,
+       componentComment.sequence,
+       componentComment.descriptor,
++      componentComment.key
+     );
+ 
+     discoveredComponents.push(entry);
+@@ -58,8 +59,8 @@ export function discoverPersistedState(node: Node): string | null | undefined {
+   return;
+ }
+ 
+-function discoverWebAssemblyComponents(document: Document): WebAssemblyComponentDescriptor[] {
+-  const componentComments = resolveComponentComments(document, 'webassembly') as WebAssemblyComponentDescriptor[];
++function discoverWebAssemblyComponents(node: Node): WebAssemblyComponentDescriptor[] {
++  const componentComments = resolveComponentComments(node, 'webassembly') as WebAssemblyComponentDescriptor[];
+   const discoveredComponents: WebAssemblyComponentDescriptor[] = [];
+   for (let i = 0; i < componentComments.length; i++) {
+     const componentComment = componentComments[i];
+@@ -71,6 +72,7 @@ function discoverWebAssemblyComponents(document: Document): WebAssemblyComponent
+       componentComment.typeName,
+       componentComment.parameterDefinitions,
+       componentComment.parameterValues,
++      componentComment.key
+     );
+ 
+     discoveredComponents.push(entry);
+@@ -88,9 +90,10 @@ interface ServerComponentComment {
+   type: 'server';
+   sequence: number;
+   descriptor: string;
+-  start: Node;
+-  end?: Node;
++  start: Comment;
++  end?: Comment;
+   prerenderId?: string;
++  key?: string;
+ }
+ 
+ interface WebAssemblyComponentComment {
+@@ -100,22 +103,19 @@ interface WebAssemblyComponentComment {
+   parameterDefinitions?: string;
+   parameterValues?: string;
+   prerenderId?: string;
+-  start: Node;
+-  end?: Node;
++  start: Comment;
++  end?: Comment;
++  key?: string;
+ }
+ 
+ function resolveComponentComments(node: Node, type: 'webassembly' | 'server'): ComponentComment[] {
+-  if (!node.hasChildNodes()) {
+-    return [];
+-  }
+-
+   const result: ComponentComment[] = [];
+   const childNodeIterator = new ComponentCommentIterator(node.childNodes);
+   while (childNodeIterator.next() && childNodeIterator.currentElement) {
+     const componentComment = getComponentComment(childNodeIterator, type);
+     if (componentComment) {
+       result.push(componentComment);
+-    } else {
++    } else if (childNodeIterator.currentElement.hasChildNodes()) {
+       const childResults = resolveComponentComments(childNodeIterator.currentElement, type);
+       for (let j = 0; j < childResults.length; j++) {
+         const childResult = childResults[j];
+@@ -145,9 +145,9 @@ function getComponentComment(commentNodeIterator: ComponentCommentIterator, type
+         const componentComment = parseCommentPayload(json);
+         switch (type) {
+           case 'webassembly':
+-            return createWebAssemblyComponentComment(componentComment as WebAssemblyComponentComment, candidateStart, commentNodeIterator);
++            return createWebAssemblyComponentComment(componentComment as WebAssemblyComponentComment, candidateStart as Comment, commentNodeIterator);
+           case 'server':
+-            return createServerComponentComment(componentComment as ServerComponentComment, candidateStart, commentNodeIterator);
++            return createServerComponentComment(componentComment as ServerComponentComment, candidateStart as Comment, commentNodeIterator);
+         }
+       } catch (error) {
+         throw new Error(`Found malformed component comment at ${candidateStart.textContent}`);
+@@ -174,8 +174,8 @@ function assertNotDirectlyOnDocument(marker: Node) {
+   }
+ }
+ 
+-function createServerComponentComment(payload: ServerComponentComment, start: Node, iterator: ComponentCommentIterator): ServerComponentComment | undefined {
+-  const { type, descriptor, sequence, prerenderId } = payload;
++function createServerComponentComment(payload: ServerComponentComment, start: Comment, iterator: ComponentCommentIterator): ServerComponentComment | undefined {
++  const { type, descriptor, sequence, prerenderId, key } = payload;
+ 
+   // Regardless of whether this comment matches the type we're looking for (i.e., 'server'), we still need to move the iterator
+   // on to its end position since we don't want to recurse into unrelated prerendered components, nor do we want to get confused
+@@ -208,11 +208,12 @@ function createServerComponentComment(payload: ServerComponentComment, start: No
+     start,
+     prerenderId,
+     end,
++    key,
+   };
+ }
+ 
+-function createWebAssemblyComponentComment(payload: WebAssemblyComponentComment, start: Node, iterator: ComponentCommentIterator): WebAssemblyComponentComment | undefined {
+-  const { type, assembly, typeName, parameterDefinitions, parameterValues, prerenderId } = payload;
++function createWebAssemblyComponentComment(payload: WebAssemblyComponentComment, start: Comment, iterator: ComponentCommentIterator): WebAssemblyComponentComment | undefined {
++  const { type, assembly, typeName, parameterDefinitions, parameterValues, prerenderId, key } = payload;
+ 
+   // Regardless of whether this comment matches the type we're looking for (i.e., 'webassembly'), we still need to move the iterator
+   // on to its end position since we don't want to recurse into unrelated prerendered components, nor do we want to get confused
+@@ -247,10 +248,11 @@ function createWebAssemblyComponentComment(payload: WebAssemblyComponentComment,
+     start,
+     prerenderId,
+     end,
++    key,
+   };
+ }
+ 
+-function getComponentEndComment(prerenderedId: string, iterator: ComponentCommentIterator): ChildNode | undefined {
++function getComponentEndComment(prerenderedId: string, iterator: ComponentCommentIterator): Comment | undefined {
+   while (iterator.next() && iterator.currentElement) {
+     const node = iterator.currentElement;
+     if (node.nodeType !== Node.COMMENT_NODE) {
+@@ -268,7 +270,7 @@ function getComponentEndComment(prerenderedId: string, iterator: ComponentCommen
+ 
+     validateEndComponentPayload(json, prerenderedId);
+ 
+-    return node;
++    return node as Comment;
+   }
+ 
+   return undefined;
+@@ -316,34 +318,72 @@ class ComponentCommentIterator {
+   }
+ }
+ 
+-interface ServerComponentMarker {
+-  type: string;
++export type ComponentMarker = ServerComponentMarker | WebAssemblyComponentMarker;
++
++type ServerComponentMarker = {
++  type: 'server';
+   sequence: number;
+   descriptor: string;
+ }
+ 
++type WebAssemblyComponentMarker = {
++  type: 'webassembly';
++  typeName: string;
++  assembly: string;
++  parameterDefinitions?: string;
++  parameterValues?: string;
++}
++
++export type ComponentDescriptor = ServerComponentDescriptor | WebAssemblyComponentDescriptor;
++
+ export class ServerComponentDescriptor {
+-  public type: string;
++  private static globalId = 1;
++
++  public type: 'server';
++
++  public start: Comment;
+ 
+-  public start: Node;
++  public end?: Comment;
+ 
+-  public end?: Node;
++  public id: number;
+ 
+   public sequence: number;
+ 
+   public descriptor: string;
+ 
+-  public constructor(type: string, start: Node, end: Node | undefined, sequence: number, descriptor: string) {
++  public key?: string;
++
++  public constructor(type: 'server', start: Comment, end: Comment | undefined, sequence: number, descriptor: string, key: string | undefined) {
++    this.id = ServerComponentDescriptor.globalId++;
+     this.type = type;
+     this.start = start;
+     this.end = end;
+     this.sequence = sequence;
+     this.descriptor = descriptor;
++    this.key = key;
++  }
++
++  public matches(other: ComponentDescriptor): other is ServerComponentDescriptor {
++    return this.key === other.key && this.type === other.type;
++  }
++
++  public update(other: ComponentDescriptor) {
++    if (!this.matches(other)) {
++      throw new Error(`Cannot merge mismatching component descriptors:\n${JSON.stringify(this)}\nand\n${JSON.stringify(other)}`);
++    }
++
++    this.end = other.end;
++    this.sequence = other.sequence;
++    this.descriptor = other.descriptor;
++    this.id = other.id;
+   }
+ 
+   public toRecord(): ServerComponentMarker {
+-    const result = { type: this.type, sequence: this.sequence, descriptor: this.descriptor };
+-    return result;
++    return {
++      type: this.type,
++      sequence: this.sequence,
++      descriptor: this.descriptor,
++    };
+   }
+ }
+ 
+@@ -362,11 +402,13 @@ export class WebAssemblyComponentDescriptor {
+ 
+   public id: number;
+ 
+-  public start: Node;
++  public start: Comment;
++
++  public end?: Comment;
+ 
+-  public end?: Node;
++  public key?: string;
+ 
+-  public constructor(type: 'webassembly', start: Node, end: Node | undefined, assembly: string, typeName: string, parameterDefinitions?: string, parameterValues?: string) {
++  public constructor(type: 'webassembly', start: Comment, end: Comment | undefined, assembly: string, typeName: string, parameterDefinitions?: string, parameterValues?: string, key?: string) {
+     this.id = WebAssemblyComponentDescriptor.globalId++;
+     this.type = type;
+     this.assembly = assembly;
+@@ -375,5 +417,30 @@ export class WebAssemblyComponentDescriptor {
+     this.parameterValues = parameterValues;
+     this.start = start;
+     this.end = end;
++    this.key = key;
++  }
++
++  public matches(other: ComponentDescriptor): other is WebAssemblyComponentDescriptor {
++    return this.key === other.key && this.type === other.type && this.typeName === other.typeName && this.assembly === other.assembly;
++  }
++
++  public update(other: ComponentDescriptor) {
++    if (!this.matches(other)) {
++      throw new Error(`Cannot merge mismatching component descriptors:\n${JSON.stringify(this)}\nand\n${JSON.stringify(other)}`);
++    }
++
++    this.parameterDefinitions = other.parameterDefinitions;
++    this.parameterValues = other.parameterValues;
++    this.id = other.id;
++  }
++
++  public toRecord(): WebAssemblyComponentMarker {
++    return {
++      type: this.type,
++      typeName: this.typeName,
++      assembly: this.assembly,
++      parameterDefinitions: this.parameterDefinitions,
++      parameterValues: this.parameterValues,
++    };
+   }
+ }
+diff --git a/src/Components/Web.JS/src/Services/NavigationEnhancement.ts b/src/Components/Web.JS/src/Services/NavigationEnhancement.ts
+index 5faf12e1b5..8d5453a16e 100644
+--- a/src/Components/Web.JS/src/Services/NavigationEnhancement.ts
++++ b/src/Components/Web.JS/src/Services/NavigationEnhancement.ts
+@@ -1,3 +1,6 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
+ import { synchronizeDomContent } from '../Rendering/DomMerging/DomSync';
+ import { handleClickForNavigationInterception, hasInteractiveRouter } from './NavigationUtils';
+ 
+@@ -29,10 +32,19 @@ different bundles that only contain minimal content.
+ */
+ 
+ let currentEnhancedNavigationAbortController: AbortController | null;
+-let onDocumentUpdatedCallback: Function = () => {};
++let navigationEnhancementCallbacks: NavigationEnhancementCallbacks;
++let performingEnhancedPageLoad: boolean;
++
++export interface NavigationEnhancementCallbacks {
++  documentUpdated: () => void;
++}
++
++export function isPerformingEnhancedPageLoad() {
++  return performingEnhancedPageLoad;
++}
+ 
+-export function attachProgressivelyEnhancedNavigationListener(onDocumentUpdated: Function) {
+-  onDocumentUpdatedCallback = onDocumentUpdated;
++export function attachProgressivelyEnhancedNavigationListener(callbacks: NavigationEnhancementCallbacks) {
++  navigationEnhancementCallbacks = callbacks;
+   document.addEventListener('click', onDocumentClick);
+   document.addEventListener('submit', onDocumentSubmit);
+   window.addEventListener('popstate', onPopState);
+@@ -98,6 +110,8 @@ function onDocumentSubmit(event: SubmitEvent) {
+ }
+ 
+ export async function performEnhancedPageLoad(internalDestinationHref: string, fetchOptions?: RequestInit) {
++  performingEnhancedPageLoad = true;
++
+   // First, stop any preceding enhanced page load
+   currentEnhancedNavigationAbortController?.abort();
+ 
+@@ -122,6 +136,7 @@ export async function performEnhancedPageLoad(internalDestinationHref: string, f
+         // For HTML responses, regardless of the status code, display it
+         const parsedHtml = new DOMParser().parseFromString(initialContent, 'text/html');
+         synchronizeDomContent(document, parsedHtml);
++        navigationEnhancementCallbacks.documentUpdated();
+       } else if (responseContentType?.startsWith('text/') && initialContent) {
+         // For any other text-based content, we'll just display it, because that's what
+         // would happen if this was a non-enhanced request.
+@@ -153,13 +168,6 @@ export async function performEnhancedPageLoad(internalDestinationHref: string, f
+     });
+ 
+   if (!abortSignal.aborted) {
+-    // TEMPORARY until https://github.com/dotnet/aspnetcore/issues/48763 is implemented
+-    // We should really be doing this on the `onInitialDocument` callback *and* inside the <blazor-ssr> custom element logic
+-    // so we can add interactive components immediately on each update. Until #48763 is implemented, the stopgap implementation
+-    // is just to do it when the enhanced nav process completes entirely, and then if we do add any interactive components, we
+-    // disable enhanced nav completely.
+-    onDocumentUpdatedCallback();
+-
+     // The whole response including any streaming SSR is now finished, and it was not aborted (no other navigation
+     // has since started). So finally, recreate the native "scroll to hash" behavior.
+     const hashPosition = internalDestinationHref.indexOf('#');
+@@ -168,6 +176,9 @@ export async function performEnhancedPageLoad(internalDestinationHref: string, f
+       const targetElem = document.getElementById(hash);
+       targetElem?.scrollIntoView();
+     }
++
++    performingEnhancedPageLoad = false;
++    navigationEnhancementCallbacks.documentUpdated();
+   }
+ }
+ 
+diff --git a/src/Components/Web.JS/src/Services/NavigationUtils.ts b/src/Components/Web.JS/src/Services/NavigationUtils.ts
+index d736ae434d..1ebcd2f7ae 100644
+--- a/src/Components/Web.JS/src/Services/NavigationUtils.ts
++++ b/src/Components/Web.JS/src/Services/NavigationUtils.ts
+@@ -1,3 +1,6 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
+ let hasInteractiveRouterValue = false;
+ 
+ /**
+diff --git a/src/Components/Web.JS/src/Services/RootComponentManager.ts b/src/Components/Web.JS/src/Services/RootComponentManager.ts
+new file mode 100644
+index 0000000000..634a59dc5b
+--- /dev/null
++++ b/src/Components/Web.JS/src/Services/RootComponentManager.ts
+@@ -0,0 +1,167 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++import { ComponentDescriptor, ComponentMarker } from './ComponentDescriptorDiscovery';
++import { isRendererAttached, updateRootComponents } from '../Rendering/WebRendererInteropMethods';
++
++type RootComponentOperation = RootComponentAddOperation | RootComponentUpdateOperation | RootComponentRemoveOperation;
++
++type RootComponentAddOperation = {
++  type: 'add';
++  selectorId: number;
++  marker: ComponentMarker;
++};
++
++type RootComponentUpdateOperation = {
++  type: 'update';
++  componentId: number;
++  marker: ComponentMarker;
++};
++
++type RootComponentRemoveOperation = {
++  type: 'remove';
++  componentId: number;
++};
++
++export class RootComponentManager {
++  private readonly _registeredDescriptors = new Set<ComponentDescriptor>();
++
++  private readonly _descriptorsToResolveById: { [id: number]: ComponentDescriptor } = {};
++
++  private readonly _lastUpdatedIdByDescriptor = new Map<ComponentDescriptor, number>();
++
++  private readonly _componentIdsByDescriptor = new Map<ComponentDescriptor, number>();
++
++  constructor(private readonly _browserRendererId: number) { }
++
++  public registerComponentDescriptor(descriptor: ComponentDescriptor) {
++    this._registeredDescriptors.add(descriptor);
++  }
++
++  private unregisterComponentDescriptor(descriptor: ComponentDescriptor) {
++    this._registeredDescriptors.delete(descriptor);
++  }
++
++  public async handleUpdatedRootComponents(addNewRootComponents: boolean) {
++    await this.handleUpdatedRootComponentsCore(this._registeredDescriptors, addNewRootComponents);
++  }
++
++  private async handleUpdatedRootComponentsCore(descriptors: Iterable<ComponentDescriptor>, addNewRootComponents: boolean) {
++    if (!isRendererAttached(this._browserRendererId)) {
++      // There's no attached renderer to update interactive root components, so we'll no-op.
++      // An alternative would be to asynchronously wait for the renderer to attach before
++      // continuing, but that might happen at an inconvenient point in the future. For example,
++      // 'addNewRootComponents' might have been specified as 'true', but this method could
++      // continue execution at a time when the caller would have preferred it to be 'false'.
++      return;
++    }
++
++    const operations: RootComponentOperation[] = [];
++
++    for (const descriptor of descriptors) {
++      if (isDescriptorInDocument(descriptor)) {
++        if (!this.doesComponentNeedUpdate(descriptor)) {
++          // The descriptor has not changed.
++          continue;
++        }
++
++        if (!this.hasComponentEverBeenUpdated(descriptor)) {
++          if (addNewRootComponents) {
++            // This is the first time we're seeing this marker.
++            this.markComponentAsUpdated(descriptor);
++            this.markComponentAsPendingResolution(descriptor);
++            operations.push({ type: 'add', selectorId: descriptor.id, marker: descriptor.toRecord() });
++          }
++          continue;
++        }
++
++        const componentId = this.getInteractiveComponentId(descriptor);
++        if (componentId !== undefined) {
++          // The component has become interactive, so we'll update its parameters.
++          this.markComponentAsUpdated(descriptor);
++          operations.push({ type: 'update', componentId, marker: descriptor.toRecord() });
++          continue;
++        }
++
++        // We have started to add the component, but it has not become interactive yet.
++        // We'll wait until we have a component ID to work with before sending parameter
++        // updates.
++      } else {
++        this.unregisterComponentDescriptor(descriptor);
++
++        const componentId = this.getInteractiveComponentId(descriptor);
++        if (componentId !== undefined) {
++          // We have an interactive component for this marker, so we'll remove it.
++          operations.push({ type: 'remove', componentId });
++          continue;
++        }
++
++        // If we make it here, that means we either:
++        // 1. Haven't started to make the component interactive, in which case we have no further action to take.
++        // 2. Have started to make the component interactive, but it hasn't become interactive yet. In this case,
++        //    we'll wait to remove the component until after we have a component ID to provide.
++      }
++    }
++
++    if (!operations.length) {
++      return;
++    }
++
++    const operationsJson = JSON.stringify(operations);
++    await updateRootComponents(this._browserRendererId, operationsJson);
++  }
++
++  public resolveRootComponent(resolutionId: number, componentId: number): ComponentDescriptor {
++    const descriptor = this.resolveComponentById(resolutionId);
++    if (!descriptor) {
++      throw new Error(`Could not resolve a root component for descriptor with ID '${resolutionId}'.`);
++    }
++
++    if (this.getInteractiveComponentId(descriptor) !== undefined) {
++      throw new Error('Cannot resolve a root component for the same descriptor multiple times.');
++    }
++
++    this.setInteractiveComponentId(descriptor, componentId);
++
++    // The descriptor may have changed since the last call to handleUpdatedRootComponentsCore().
++    // We'll update this single descriptor so that the component receives the most up-to-date parameters
++    // or gets removed if it no longer exists on the page.
++    this.handleUpdatedRootComponentsCore([descriptor], false);
++
++    return descriptor;
++  }
++
++  private doesComponentNeedUpdate(descriptor: ComponentDescriptor) {
++    return this._lastUpdatedIdByDescriptor.get(descriptor) !== descriptor.id;
++  }
++
++  private markComponentAsUpdated(descriptor: ComponentDescriptor) {
++    this._lastUpdatedIdByDescriptor.set(descriptor, descriptor.id);
++  }
++
++  private markComponentAsPendingResolution(descriptor: ComponentDescriptor) {
++    this._descriptorsToResolveById[descriptor.id] = descriptor;
++  }
++
++  private resolveComponentById(id: number): ComponentDescriptor | undefined {
++    const result = this._descriptorsToResolveById[id];
++    delete this._descriptorsToResolveById[id];
++    return result;
++  }
++
++  private hasComponentEverBeenUpdated(descriptor: ComponentDescriptor) {
++    return this._lastUpdatedIdByDescriptor.has(descriptor);
++  }
++
++  private getInteractiveComponentId(descriptor: ComponentDescriptor): number | undefined {
++    return this._componentIdsByDescriptor.get(descriptor);
++  }
++
++  private setInteractiveComponentId(descriptor: ComponentDescriptor, componentId: number): void {
++    this._componentIdsByDescriptor.set(descriptor, componentId);
++  }
++}
++
++function isDescriptorInDocument(descriptor: ComponentDescriptor): boolean {
++  return document.contains(descriptor.start);
++}
+diff --git a/src/Components/Web/src/HtmlRendering/StaticHtmlRenderer.HtmlWriting.cs b/src/Components/Web/src/HtmlRendering/StaticHtmlRenderer.HtmlWriting.cs
+index c285ec4b75..7a475f7056 100644
+--- a/src/Components/Web/src/HtmlRendering/StaticHtmlRenderer.HtmlWriting.cs
++++ b/src/Components/Web/src/HtmlRendering/StaticHtmlRenderer.HtmlWriting.cs
+@@ -39,6 +39,16 @@ public partial class StaticHtmlRenderer
+         RenderFrames(componentId, output, frames, 0, frames.Count);
+     }
+ 
++    /// <summary>
++    /// Renders the specified component frame as HTML to the output.
++    /// </summary>
++    /// <param name="output">The output destination.</param>
++    /// <param name="componentFrame">The <see cref="RenderTreeFrame"/> representing the component to be rendered.</param>
++    protected virtual void RenderChildComponent(TextWriter output, ref RenderTreeFrame componentFrame)
++    {
++        WriteComponentHtml(componentFrame.ComponentId, output);
++    }
++
+     private int RenderFrames(int componentId, TextWriter output, ArrayRange<RenderTreeFrame> frames, int position, int maxElements)
+     {
+         var nextPosition = position;
+@@ -306,7 +316,7 @@ public partial class StaticHtmlRenderer
+     {
+         ref var frame = ref frames.Array[position];
+ 
+-        WriteComponentHtml(frame.ComponentId, output);
++        RenderChildComponent(output, ref frame);
+ 
+         return position + frame.ComponentSubtreeLength;
+     }
+diff --git a/src/Components/Web/src/PublicAPI.Unshipped.txt b/src/Components/Web/src/PublicAPI.Unshipped.txt
+index 3215ee46ed..341bc7e08f 100644
+--- a/src/Components/Web/src/PublicAPI.Unshipped.txt
++++ b/src/Components/Web/src/PublicAPI.Unshipped.txt
+@@ -62,7 +62,6 @@ Microsoft.AspNetCore.Components.HtmlRendering.Infrastructure.StaticHtmlRenderer.
+ Microsoft.AspNetCore.Components.HtmlRendering.Infrastructure.StaticHtmlRenderer.BeginRenderingComponent(System.Type! componentType, Microsoft.AspNetCore.Components.ParameterView initialParameters) -> Microsoft.AspNetCore.Components.Web.HtmlRendering.HtmlRootComponent
+ Microsoft.AspNetCore.Components.HtmlRendering.Infrastructure.StaticHtmlRenderer.StaticHtmlRenderer(System.IServiceProvider! serviceProvider, Microsoft.Extensions.Logging.ILoggerFactory! loggerFactory) -> void
+ Microsoft.AspNetCore.Components.HtmlRendering.Infrastructure.StaticHtmlRenderer.TryCreateScopeQualifiedEventName(int componentId, string! assignedEventName, out string? scopeQualifiedEventName) -> bool
+-Microsoft.AspNetCore.Components.RenderTree.WebRenderer.WaitUntilAttachedAsync() -> System.Threading.Tasks.Task!
+ Microsoft.AspNetCore.Components.SupplyParameterFromFormAttribute
+ Microsoft.AspNetCore.Components.SupplyParameterFromFormAttribute.Handler.get -> string?
+ Microsoft.AspNetCore.Components.SupplyParameterFromFormAttribute.Handler.set -> void
+@@ -121,6 +120,9 @@ static Microsoft.AspNetCore.Components.Forms.Mapping.SupplyParameterFromFormServ
+ static Microsoft.AspNetCore.Components.Web.RenderMode.Auto.get -> Microsoft.AspNetCore.Components.Web.AutoRenderMode!
+ static Microsoft.AspNetCore.Components.Web.RenderMode.Server.get -> Microsoft.AspNetCore.Components.Web.ServerRenderMode!
+ static Microsoft.AspNetCore.Components.Web.RenderMode.WebAssembly.get -> Microsoft.AspNetCore.Components.Web.WebAssemblyRenderMode!
++virtual Microsoft.AspNetCore.Components.HtmlRendering.Infrastructure.StaticHtmlRenderer.RenderChildComponent(System.IO.TextWriter! output, ref Microsoft.AspNetCore.Components.RenderTree.RenderTreeFrame componentFrame) -> void
+ virtual Microsoft.AspNetCore.Components.HtmlRendering.Infrastructure.StaticHtmlRenderer.WriteComponentHtml(int componentId, System.IO.TextWriter! output) -> void
++virtual Microsoft.AspNetCore.Components.RenderTree.WebRenderer.GetWebRendererId() -> int
++virtual Microsoft.AspNetCore.Components.RenderTree.WebRenderer.UpdateRootComponents(string! operationsJson) -> void
+ Microsoft.AspNetCore.Components.Web.Virtualization.Virtualize<TItem>.EmptyContent.get -> Microsoft.AspNetCore.Components.RenderFragment?
+ Microsoft.AspNetCore.Components.Web.Virtualization.Virtualize<TItem>.EmptyContent.set -> void
+diff --git a/src/Components/Web/src/WebRenderer.cs b/src/Components/Web/src/WebRenderer.cs
+index 240b207c4e..9430f33106 100644
+--- a/src/Components/Web/src/WebRenderer.cs
++++ b/src/Components/Web/src/WebRenderer.cs
+@@ -18,7 +18,7 @@ namespace Microsoft.AspNetCore.Components.RenderTree;
+ public abstract class WebRenderer : Renderer
+ {
+     private readonly DotNetObjectReference<WebRendererInteropMethods> _interopMethodsReference;
+-    private readonly Task<int> _attachTask;
++    private readonly int _rendererId;
+ 
+     /// <summary>
+     /// Constructs an instance of <see cref="WebRenderer"/>.
+@@ -36,48 +36,40 @@ public abstract class WebRenderer : Renderer
+     {
+         _interopMethodsReference = DotNetObjectReference.Create(
+             new WebRendererInteropMethods(this, jsonOptions, jsComponentInterop));
++        _rendererId = GetWebRendererId();
+ 
+         // Supply a DotNetObjectReference to JS that it can use to call us back for events etc.
+         jsComponentInterop.AttachToRenderer(this);
+         var jsRuntime = serviceProvider.GetRequiredService<IJSRuntime>();
+-        _attachTask = jsRuntime.InvokeAsync<int>(
++        jsRuntime.InvokeVoidAsync(
+             "Blazor._internal.attachWebRendererInterop",
++            _rendererId,
+             _interopMethodsReference,
+             jsComponentInterop.Configuration.JSComponentParametersByIdentifier,
+-            jsComponentInterop.Configuration.JSComponentIdentifiersByInitializer)
+-            .AsTask();
++            jsComponentInterop.Configuration.JSComponentIdentifiersByInitializer).Preserve();
+     }
+ 
+     /// <summary>
+     /// Gets the identifier for the renderer.
+     /// </summary>
+-    /// <remarks>
+-    /// Accessing <see cref="RendererId"/> before the renderer is attached will throw an <see cref="InvalidOperationException"/>. Call
+-    /// <see cref="WaitUntilAttachedAsync"/> to wait until the renderer gets attached to the browser.
+-    /// </remarks>
+     protected int RendererId
+     {
+-        get
+-        {
+-            if (!_attachTask.IsCompletedSuccessfully)
+-            {
+-                throw new InvalidOperationException($"'{nameof(RendererId)}' does not have a value until {nameof(WaitUntilAttachedAsync)} completes successfully.");
+-            }
+-
+-            return _attachTask.Result;
+-        }
++        get => _rendererId;
+ 
+-        [Obsolete($"The renderer ID gets assigned automatically upon construction.")]
++        [Obsolete($"The renderer ID can be assigned by overriding '{nameof(GetWebRendererId)}'.")]
+         init { /* No-op */ }
+     }
+ 
+     /// <summary>
+-    /// Waits until the renderer is attached to the browser. The renderer must be attached before
+-    /// renders can be processed.
++    /// Allocates an identifier for the renderer.
+     /// </summary>
+-    /// <returns></returns>
+-    public Task WaitUntilAttachedAsync()
+-        => _attachTask;
++    protected virtual int GetWebRendererId()
++    {
++        // We return '0' by default, which is reserved so that classes deriving from this
++        // type don't need to worry about allocating an ID unless they're using multiple renderers.
++        // As soon as multiple renderers are used, this needs to return a unique identifier.
++        return 0;
++    }
+ 
+     /// <summary>
+     /// Instantiates a root component and attaches it to the browser within the specified element.
+@@ -93,6 +85,14 @@ public abstract class WebRenderer : Renderer
+         return componentId;
+     }
+ 
++    /// <summary>
++    /// Performs the specified operations on the renderer's root components.
++    /// </summary>
++    /// <param name="operationsJson">A JSON-serialized list of operations to perform on the renderer's root components.</param>
++    protected virtual void UpdateRootComponents(string operationsJson)
++    {
++    }
++
+     /// <summary>
+     /// Called by the framework to give a location for the specified root component in the browser DOM.
+     /// </summary>
+@@ -123,6 +123,7 @@ public abstract class WebRenderer : Renderer
+         private readonly JSComponentInterop _jsComponentInterop;
+ 
+         [DynamicDependency(nameof(DispatchEventAsync))]
++        [DynamicDependency(nameof(UpdateRootComponents))]
+         public WebRendererInteropMethods(WebRenderer renderer, JsonSerializerOptions jsonOptions, JSComponentInterop jsComponentInterop)
+         {
+             _renderer = renderer;
+@@ -140,6 +141,10 @@ public abstract class WebRenderer : Renderer
+                 webEventData.EventArgs);
+         }
+ 
++        [JSInvokable]
++        public void UpdateRootComponents(string operationsJson)
++            => _renderer.UpdateRootComponents(operationsJson);
++
+         [JSInvokable] // Linker preserves this if you call RootComponents.Add
+         public int AddRootComponent(string identifier, string domElementSelector)
+             => _jsComponentInterop.AddRootComponent(identifier, domElementSelector);
+diff --git a/src/Components/WebAssembly/WebAssembly/src/Hosting/WebAssemblyHost.cs b/src/Components/WebAssembly/WebAssembly/src/Hosting/WebAssemblyHost.cs
+index 78af496244..fdc1ffbf56 100644
+--- a/src/Components/WebAssembly/WebAssembly/src/Hosting/WebAssemblyHost.cs
++++ b/src/Components/WebAssembly/WebAssembly/src/Hosting/WebAssemblyHost.cs
+@@ -147,9 +147,7 @@ public sealed class WebAssemblyHost : IAsyncDisposable
+         {
+             var loggerFactory = Services.GetRequiredService<ILoggerFactory>();
+             var jsComponentInterop = new JSComponentInterop(_rootComponents.JSComponents);
+-
+             _renderer = new WebAssemblyRenderer(Services, loggerFactory, jsComponentInterop);
+-            await _renderer.WaitUntilAttachedAsync();
+ 
+             WebAssemblyNavigationManager.Instance.CreateLogger(loggerFactory);
+ 
+diff --git a/src/Components/WebAssembly/WebAssembly/src/Hosting/WebAssemblyHostBuilder.cs b/src/Components/WebAssembly/WebAssembly/src/Hosting/WebAssemblyHostBuilder.cs
+index 1088029a35..761c256db2 100644
+--- a/src/Components/WebAssembly/WebAssembly/src/Hosting/WebAssemblyHostBuilder.cs
++++ b/src/Components/WebAssembly/WebAssembly/src/Hosting/WebAssemblyHostBuilder.cs
+@@ -107,13 +107,20 @@ public sealed class WebAssemblyHostBuilder
+             var typeName = jsMethods.RegisteredComponents_GetTypeName(id);
+             var serializedParameterDefinitions = jsMethods.RegisteredComponents_GetParameterDefinitions(id);
+             var serializedParameterValues = jsMethods.RegisteredComponents_GetParameterValues(id);
+-            registeredComponents[i] = new WebAssemblyComponentMarker(WebAssemblyComponentMarker.ClientMarkerType, assembly, typeName, serializedParameterDefinitions, serializedParameterValues, id.ToString(CultureInfo.InvariantCulture));
++            registeredComponents[i] = new WebAssemblyComponentMarker(
++                WebAssemblyComponentMarker.ClientMarkerType,
++                assembly,
++                typeName,
++                serializedParameterDefinitions,
++                serializedParameterValues,
++                key: null,
++                id.ToString(CultureInfo.InvariantCulture));
+         }
+ 
++        _rootComponentCache = new RootComponentTypeCache();
+         var componentDeserializer = WebAssemblyComponentParameterDeserializer.Instance;
+         foreach (var registeredComponent in registeredComponents)
+         {
+-            _rootComponentCache = new RootComponentTypeCache();
+             var componentType = _rootComponentCache.GetRootComponent(registeredComponent.Assembly!, registeredComponent.TypeName!);
+             if (componentType is null)
+             {
+@@ -253,6 +260,7 @@ public sealed class WebAssemblyHostBuilder
+         Services.AddSingleton<INavigationInterception>(WebAssemblyNavigationInterception.Instance);
+         Services.AddSingleton<IScrollToLocationHash>(WebAssemblyScrollToLocationHash.Instance);
+         Services.AddSingleton(new LazyAssemblyLoader(DefaultWebAssemblyJSRuntime.Instance));
++        Services.AddSingleton<RootComponentTypeCache>(_ => _rootComponentCache ?? new());
+         Services.AddSingleton<ComponentStatePersistenceManager>();
+         Services.AddSingleton<PersistentComponentState>(sp => sp.GetRequiredService<ComponentStatePersistenceManager>().State);
+         Services.AddSingleton<AntiforgeryStateProvider, DefaultAntiforgeryStateProvider>();
+diff --git a/src/Components/WebAssembly/WebAssembly/src/Microsoft.AspNetCore.Components.WebAssembly.csproj b/src/Components/WebAssembly/WebAssembly/src/Microsoft.AspNetCore.Components.WebAssembly.csproj
+index ea7753c90d..f42214bede 100644
+--- a/src/Components/WebAssembly/WebAssembly/src/Microsoft.AspNetCore.Components.WebAssembly.csproj
++++ b/src/Components/WebAssembly/WebAssembly/src/Microsoft.AspNetCore.Components.WebAssembly.csproj
+@@ -36,7 +36,10 @@
+     <Compile Include="$(ComponentsSharedSourceRoot)src\JsonSerializerOptionsProvider.cs" />
+     <Compile Include="$(ComponentsSharedSourceRoot)src\ElementReferenceJsonConverter.cs" />
+     <Compile Include="$(ComponentsSharedSourceRoot)src\ComponentParametersTypeCache.cs" />
++    <Compile Include="$(ComponentsSharedSourceRoot)src\RootComponentOperation.cs" />
++    <Compile Include="$(ComponentsSharedSourceRoot)src\RootComponentOperationType.cs" />
+     <Compile Include="$(ComponentsSharedSourceRoot)src\RootComponentTypeCache.cs" />
++    <Compile Include="$(ComponentsSharedSourceRoot)src\WebRendererId.cs" />
+     <Compile Include="$(SharedSourceRoot)Components\WebAssemblyComponentSerializationSettings.cs" Link="Prerendering/WebAssemblyComponentSerializationSettings.cs" />
+     <Compile Include="$(SharedSourceRoot)Components\WebAssemblyComponentMarker.cs" Link="Prerendering/WebAssemblyComponentMarker.cs" />
+     <Compile Include="$(SharedSourceRoot)Components\ComponentParameter.cs" Link="Prerendering/ComponentParameter.cs" />
+diff --git a/src/Components/WebAssembly/WebAssembly/src/Rendering/WebAssemblyRenderer.cs b/src/Components/WebAssembly/WebAssembly/src/Rendering/WebAssemblyRenderer.cs
+index f5234edc5f..254dafecbc 100644
+--- a/src/Components/WebAssembly/WebAssembly/src/Rendering/WebAssemblyRenderer.cs
++++ b/src/Components/WebAssembly/WebAssembly/src/Rendering/WebAssemblyRenderer.cs
+@@ -2,13 +2,16 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ using System.Diagnostics.CodeAnalysis;
++using System.Globalization;
+ using System.Runtime.CompilerServices;
+ using System.Runtime.InteropServices.JavaScript;
++using System.Text.Json;
+ using Microsoft.AspNetCore.Components.RenderTree;
+ using Microsoft.AspNetCore.Components.Web;
+ using Microsoft.AspNetCore.Components.Web.Infrastructure;
+ using Microsoft.AspNetCore.Components.WebAssembly.Hosting;
+ using Microsoft.AspNetCore.Components.WebAssembly.Services;
++using Microsoft.Extensions.DependencyInjection;
+ using Microsoft.Extensions.Logging;
+ using Microsoft.JSInterop;
+ using static Microsoft.AspNetCore.Internal.LinkerFlags;
+@@ -21,11 +24,13 @@ namespace Microsoft.AspNetCore.Components.WebAssembly.Rendering;
+ /// </summary>
+ internal sealed partial class WebAssemblyRenderer : WebRenderer
+ {
++    private readonly RootComponentTypeCache _rootComponentCache;
+     private readonly ILogger _logger;
+ 
+     public WebAssemblyRenderer(IServiceProvider serviceProvider, ILoggerFactory loggerFactory, JSComponentInterop jsComponentInterop)
+         : base(serviceProvider, loggerFactory, DefaultWebAssemblyJSRuntime.Instance.ReadJsonSerializerOptions(), jsComponentInterop)
+     {
++        _rootComponentCache = serviceProvider.GetRequiredService<RootComponentTypeCache>();
+         _logger = loggerFactory.CreateLogger<WebAssemblyRenderer>();
+ 
+         ElementReferenceContext = DefaultWebAssemblyJSRuntime.Instance.ElementReferenceContext;
+@@ -39,6 +44,8 @@ internal sealed partial class WebAssemblyRenderer : WebRenderer
+         return RenderRootComponentAsync(componentId, parameters);
+     }
+ 
++    protected override int GetWebRendererId() => (int)WebRendererId.WebAssembly;
++
+     protected override void AttachRootComponentToBrowser(int componentId, string domElementSelector)
+     {
+         DefaultWebAssemblyJSRuntime.Instance.InvokeVoid(
+@@ -48,6 +55,81 @@ internal sealed partial class WebAssemblyRenderer : WebRenderer
+             RendererId);
+     }
+ 
++    [DynamicDependency(JsonSerialized, typeof(RootComponentOperation<WebAssemblyComponentMarker>))]
++    [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "The correct members will be preserved by the above DynamicDependency")]
++    protected override void UpdateRootComponents(string operationsJson)
++    {
++        var operations = JsonSerializer.Deserialize<IEnumerable<RootComponentOperation<WebAssemblyComponentMarker>>>(
++            operationsJson,
++            WebAssemblyComponentSerializationSettings.JsonSerializationOptions)!;
++
++        foreach (var operation in operations)
++        {
++            switch (operation.Type)
++            {
++                case RootComponentOperationType.Add:
++                    AddRootComponent(operation);
++                    break;
++                case RootComponentOperationType.Update:
++                    UpdateRootComponent(operation);
++                    break;
++                case RootComponentOperationType.Remove:
++                    RemoveRootComponent(operation);
++                    break;
++            }
++        }
++
++        return;
++
++        [UnconditionalSuppressMessage("Trimming", "IL2072", Justification = "Root components are expected to be defined in assemblies that do not get trimmed.")]
++        void AddRootComponent(RootComponentOperation<WebAssemblyComponentMarker> operation)
++        {
++            if (operation.SelectorId is not { } selectorId)
++            {
++                throw new InvalidOperationException($"The component operation of type '{operation.Type}' requires a '{nameof(operation.SelectorId)}' to be specified.");
++            }
++
++            var marker = operation.Marker;
++            var componentType = _rootComponentCache.GetRootComponent(marker.Assembly!, marker.TypeName!)
++                ?? throw new InvalidOperationException($"Root component type '{marker.TypeName}' could not be found in the assembly '{marker.Assembly}'.");
++
++            var parameters = DeserializeComponentParameters(marker);
++            _ = AddComponentAsync(componentType, parameters, selectorId.ToString(CultureInfo.InvariantCulture));
++        }
++
++        void UpdateRootComponent(RootComponentOperation<WebAssemblyComponentMarker> operation)
++        {
++            if (operation.ComponentId is not { } componentId)
++            {
++                throw new InvalidOperationException($"The component operation of type '{operation.Type}' requires a '{nameof(operation.ComponentId)}' to be specified.");
++            }
++
++            var marker = operation.Marker;
++            var parameters = DeserializeComponentParameters(marker);
++            _ = RenderRootComponentAsync(componentId, parameters);
++        }
++
++        void RemoveRootComponent(RootComponentOperation<WebAssemblyComponentMarker> operation)
++        {
++            if (operation.ComponentId is not { } componentId)
++            {
++                throw new InvalidOperationException($"The component operation of type '{operation.Type}' requires a '{nameof(operation.ComponentId)}' to be specified.");
++            }
++
++            this.RemoveRootComponent(componentId);
++        }
++
++        static ParameterView DeserializeComponentParameters(WebAssemblyComponentMarker marker)
++        {
++            var definitions = WebAssemblyComponentParameterDeserializer.GetParameterDefinitions(marker.ParameterDefinitions!);
++            var values = WebAssemblyComponentParameterDeserializer.GetParameterValues(marker.ParameterValues!);
++            var componentDeserializer = WebAssemblyComponentParameterDeserializer.Instance;
++            var parameters = componentDeserializer.DeserializeParameters(definitions, values);
++
++            return parameters;
++        }
++    }
++
+     /// <inheritdoc />
+     protected override void Dispose(bool disposing)
+     {
+diff --git a/src/Components/WebView/WebView/src/Microsoft.AspNetCore.Components.WebView.csproj b/src/Components/WebView/WebView/src/Microsoft.AspNetCore.Components.WebView.csproj
+index 762431c770..5d9fc8dad8 100644
+--- a/src/Components/WebView/WebView/src/Microsoft.AspNetCore.Components.WebView.csproj
++++ b/src/Components/WebView/WebView/src/Microsoft.AspNetCore.Components.WebView.csproj
+@@ -30,6 +30,7 @@
+     <Compile Include="$(ComponentsSharedSourceRoot)src\ArrayBuilder.cs" LinkBase="Shared" />
+     <Compile Include="$(ComponentsSharedSourceRoot)src\RenderBatchWriter.cs" LinkBase="Shared" />
+     <Compile Include="$(ComponentsSharedSourceRoot)src\ArrayBuilderMemoryStream.cs" LinkBase="Shared" />
++    <Compile Include="$(ComponentsSharedSourceRoot)src\WebRendererId.cs" LinkBase="Shared" />
+   </ItemGroup>
+ 
+   <ItemGroup>
+diff --git a/src/Components/WebView/WebView/src/Services/WebViewRenderer.cs b/src/Components/WebView/WebView/src/Services/WebViewRenderer.cs
+index dfe3f8ba6f..1284df8ebd 100644
+--- a/src/Components/WebView/WebView/src/Services/WebViewRenderer.cs
++++ b/src/Components/WebView/WebView/src/Services/WebViewRenderer.cs
+@@ -31,6 +31,8 @@ internal sealed class WebViewRenderer : WebRenderer
+ 
+     public override Dispatcher Dispatcher => _dispatcher;
+ 
++    protected override int GetWebRendererId() => (int)WebRendererId.WebView;
++
+     protected override void HandleException(Exception exception)
+     {
+         // Notify the JS code so it can show the in-app UI
+diff --git a/src/Components/test/E2ETest/ServerRenderingTests/InteractivityTest.cs b/src/Components/test/E2ETest/ServerRenderingTests/InteractivityTest.cs
+index 53ab3d6e67..0fc8760ebb 100644
+--- a/src/Components/test/E2ETest/ServerRenderingTests/InteractivityTest.cs
++++ b/src/Components/test/E2ETest/ServerRenderingTests/InteractivityTest.cs
+@@ -179,6 +179,257 @@ public class InteractivityTest : ServerTestBase<BasicTestAppServerSiteFixture<Ra
+         Browser.Equal("10", () => countServerElem.Text);
+     }
+ 
++    private const string AddServerId = "add-server-counter-link";
++    private const string AddServerPrerenderedId = "add-server-counter-prerendered-link";
++    private const string AddWebAssemblyId = "add-webassembly-counter-link";
++    private const string AddWebAssemblyPrerenderedId = "add-webassembly-counter-prerendered-link";
++
++    public static readonly TheoryData<string[]> AddCounterLinkSequences = new()
++    {
++        // One component
++        new[] { AddServerPrerenderedId },
++        new[] { AddWebAssemblyPrerenderedId },
++
++        // Multiple components, mixing all combinations of Server/WebAssembly and prerendered/non-prerendered
++        new[] { AddServerPrerenderedId, AddWebAssemblyId, AddWebAssemblyPrerenderedId, AddServerId },
++    };
++
++    [Theory]
++    [InlineData(AddServerId)]
++    [InlineData(AddServerPrerenderedId)]
++    [InlineData(AddWebAssemblyId)]
++    [InlineData(AddWebAssemblyPrerenderedId)]
++    public void DynamicallyAddedSsrComponent_CanBecomeInteractive_AfterEnhancedNavigation(string addCounterLinkId)
++    {
++        Navigate($"{ServerPathBase}/streaming-interactivity");
++
++        Browser.Equal("Not streaming", () => Browser.FindElement(By.Id("status")).Text);
++
++        Browser.Click(By.Id(addCounterLinkId));
++        Browser.Equal("True", () => Browser.FindElement(By.Id("is-interactive-0")).Text);
++
++        Browser.Click(By.Id("increment-0"));
++        Browser.Equal("1", () => Browser.FindElement(By.Id("count-0")).Text);
++
++        AssertBrowserLogDoesNotContainErrors();
++    }
++
++    [Theory]
++    [MemberData(nameof(AddCounterLinkSequences))]
++    public void MultipleDynamicallyAddedSsrComponents_CanBecomeInteractive_AfterEnhancedNavigation(string[] addCounterLinkIds)
++    {
++        Navigate($"{ServerPathBase}/streaming-interactivity");
++
++        Browser.Equal("Not streaming", () => Browser.FindElement(By.Id("status")).Text);
++
++        for (var i = 0; i < addCounterLinkIds.Length; i++)
++        {
++            Browser.Click(By.Id(addCounterLinkIds[i]));
++            Browser.Equal("True", () => Browser.FindElement(By.Id($"is-interactive-{i}")).Text);
++            
++            Browser.Click(By.Id($"increment-{i}"));
++            Browser.Equal("1", () => Browser.FindElement(By.Id($"count-{i}")).Text);
++        }
++
++        AssertBrowserLogDoesNotContainErrors();
++    }
++
++    [Theory]
++    [MemberData(nameof(AddCounterLinkSequences))]
++    public void DynamicallyAddedSsrComponents_CanBecomeInteractive_AfterStreamingRenderingCompletes(string[] addCounterLinkIds)
++    {
++        Navigate($"{ServerPathBase}/streaming-interactivity");
++
++        Browser.Equal("Not streaming", () => Browser.FindElement(By.Id("status")).Text);
++        Browser.Click(By.Id("start-streaming-link"));
++        Browser.Equal("Streaming", () => Browser.FindElement(By.Id("status")).Text);
++
++        for (var i = 0; i < addCounterLinkIds.Length; i++)
++        {
++            Browser.Click(By.Id(addCounterLinkIds[i]));
++
++            // To verify that components use the most up-to-date parameters when they become interactive, we
++            // perform SSR updates with new parameter values.
++            // The first counter will have an increment amount of 1, the second 2, etc.
++            for (var j = 0; j < i; j++)
++            {
++                Browser.Click(By.Id($"update-counter-link-{i}"));
++            }
++
++            if (addCounterLinkIds[i].Contains("prerendered"))
++            {
++                Browser.Equal("False", () => Browser.FindElement(By.Id($"is-interactive-{i}")).Text);
++                Browser.Click(By.Id($"increment-{i}"));
++                Browser.Equal("0", () => Browser.FindElement(By.Id($"count-{i}")).Text);
++            }
++            else
++            {
++                // Non-prerendered components won't produce any output until they become interactive.
++                // We verify this by ensuring that the "action links" exist on the page,
++                // but the interactive component does not.
++                Browser.Exists(By.Id($"remove-counter-link-{i}"));
++                Browser.DoesNotExist(By.Id($"is-interactive-{i}"));
++            }
++        }
++
++        Browser.Click(By.Id("stop-streaming-link"));
++
++        for (var i = 0; i < addCounterLinkIds.Length; i++)
++        {
++            Browser.Equal("True", () => Browser.FindElement(By.Id($"is-interactive-{i}")).Text);
++
++            Browser.Click(By.Id($"increment-{i}"));
++            Browser.Equal($"{i + 1}", () => Browser.FindElement(By.Id($"count-{i}")).Text);
++        }
++
++        AssertBrowserLogDoesNotContainErrors();
++    }
++
++    [Theory]
++    [MemberData(nameof(AddCounterLinkSequences))]
++    public void InteractiveRootComponents_CanReceiveSsrParameterUpdates_FromEnhancedNavigation(string[] addCounterLinkIds)
++    {
++        Navigate($"{ServerPathBase}/streaming-interactivity");
++
++        Browser.Equal("Not streaming", () => Browser.FindElement(By.Id("status")).Text);
++
++        for (var i = 0; i < addCounterLinkIds.Length; i++)
++        {
++            Browser.Click(By.Id(addCounterLinkIds[i]));
++            Browser.Equal("True", () => Browser.FindElement(By.Id($"is-interactive-{i}")).Text);
++
++            Browser.Click(By.Id($"increment-{i}"));
++            Browser.Equal("1", () => Browser.FindElement(By.Id($"count-{i}")).Text);
++
++            Browser.Click(By.Id($"update-counter-link-{i}"));
++            Browser.Equal("2", () => Browser.FindElement(By.Id($"increment-amount-{i}")).Text);
++
++            Browser.Click(By.Id($"increment-{i}"));
++            Browser.Equal("3", () => Browser.FindElement(By.Id($"count-{i}")).Text);
++        }
++
++        AssertBrowserLogDoesNotContainErrors();
++    }
++
++    [Theory]
++    [MemberData(nameof(AddCounterLinkSequences))]
++    public void InteractiveRootComponents_CanReceiveSsrParameterUpdates_FromStreamingRenderingUpdate(string[] addCounterLinkIds)
++    {
++        Navigate($"{ServerPathBase}/streaming-interactivity");
++
++        Browser.Equal("Not streaming", () => Browser.FindElement(By.Id("status")).Text);
++
++        // Components don't become interactive during streaming rendering, so we need to
++        // add then via enhanced navigation first
++        for (var i = 0; i < addCounterLinkIds.Length; i++)
++        {
++            Browser.Click(By.Id(addCounterLinkIds[i]));
++            Browser.Equal("True", () => Browser.FindElement(By.Id($"is-interactive-{i}")).Text);
++        }
++
++        Browser.Click(By.Id("start-streaming-link"));
++        Browser.Equal("Streaming", () => Browser.FindElement(By.Id("status")).Text);
++
++        for (var i = 0; i < addCounterLinkIds.Length; i++)
++        {
++            Browser.Click(By.Id($"increment-{i}"));
++            Browser.Equal("1", () => Browser.FindElement(By.Id($"count-{i}")).Text);
++
++            Browser.Click(By.Id($"update-counter-link-{i}"));
++            Browser.Equal("2", () => Browser.FindElement(By.Id($"increment-amount-{i}")).Text);
++
++            Browser.Click(By.Id($"increment-{i}"));
++            Browser.Equal("3", () => Browser.FindElement(By.Id($"count-{i}")).Text);
++        }
++
++        Browser.Click(By.Id("stop-streaming-link"));
++
++        AssertBrowserLogDoesNotContainErrors();
++    }
++
++    [Theory]
++    [MemberData(nameof(AddCounterLinkSequences))]
++    public void InteractiveRootComponents_CanGetDisposed_FromEnhancedNavigation(string[] addCounterLinkIds)
++    {
++        Navigate($"{ServerPathBase}/streaming-interactivity");
++
++        Browser.Equal("Not streaming", () => Browser.FindElement(By.Id("status")).Text);
++
++        for (var i = 0; i < addCounterLinkIds.Length; i++)
++        {
++            Browser.Click(By.Id(addCounterLinkIds[i]));
++            Browser.Equal("True", () => Browser.FindElement(By.Id($"is-interactive-{i}")).Text);
++        }
++
++        for (var i = 0; i < addCounterLinkIds.Length; i++)
++        {
++            Browser.Click(By.Id($"remove-counter-link-{i}"));
++            Browser.DoesNotExist(By.Id($"remove-counter-link-{i}"));
++            AssertBrowserLogContainsMessage($"Counter {i} was disposed");
++        }
++
++        AssertBrowserLogDoesNotContainErrors();
++    }
++
++    [Theory]
++    [MemberData(nameof(AddCounterLinkSequences))]
++    public void InteractiveRootComponents_CanGetDisposed_FromStreamingRenderingUpdate(string[] addCounterLinkIds)
++    {
++        Navigate($"{ServerPathBase}/streaming-interactivity");
++
++        Browser.Equal("Not streaming", () => Browser.FindElement(By.Id("status")).Text);
++
++        // Components don't become interactive during streaming rendering, so we need to
++        // add then via enhanced navigation first
++        for (var i = 0; i < addCounterLinkIds.Length; i++)
++        {
++            Browser.Click(By.Id(addCounterLinkIds[i]));
++            Browser.Equal("True", () => Browser.FindElement(By.Id($"is-interactive-{i}")).Text);
++        }
++
++        Browser.Click(By.Id("start-streaming-link"));
++        Browser.Equal("Streaming", () => Browser.FindElement(By.Id("status")).Text);
++
++        for (var i = 0; i < addCounterLinkIds.Length; i++)
++        {
++            Browser.Click(By.Id($"remove-counter-link-{i}"));
++            Browser.DoesNotExist(By.Id($"remove-counter-link-{i}"));
++            AssertBrowserLogContainsMessage($"Counter {i} was disposed");
++        }
++
++        Browser.Click(By.Id("stop-streaming-link"));
++
++        AssertBrowserLogDoesNotContainErrors();
++    }
++
++    [Theory]
++    [MemberData(nameof(AddCounterLinkSequences))]
++    public void DynamicallyAddedSsrComponents_CanGetRemoved_BeforeStreamingRenderingCompletes(string[] addCounterLinkIds)
++    {
++        Navigate($"{ServerPathBase}/streaming-interactivity");
++
++        Browser.Equal("Not streaming", () => Browser.FindElement(By.Id("status")).Text);
++        Browser.Click(By.Id("start-streaming-link"));
++        Browser.Equal("Streaming", () => Browser.FindElement(By.Id("status")).Text);
++
++        for (var i = 0; i < addCounterLinkIds.Length; i++)
++        {
++            Browser.Click(By.Id(addCounterLinkIds[i]));
++            Browser.Exists(By.Id($"remove-counter-link-{i}"));
++        }
++
++        Browser.Click(By.Id($"remove-counter-link-0"));
++
++        Browser.Click(By.Id("stop-streaming-link"));
++
++        for (var i = 1; i < addCounterLinkIds.Length; i++)
++        {
++            Browser.Equal("True", () => Browser.FindElement(By.Id($"is-interactive-{i}")).Text);
++        }
++
++        AssertBrowserLogDoesNotContainErrors();
++    }
++
+     private string InteractiveCallsiteUrl(bool prerender, int? serverIncrement = default, int? webAssemblyIncrement = default)
+     {
+         var result = $"{ServerPathBase}/interactive-callsite?suppress-autostart&prerender={prerender}";
+@@ -195,4 +446,19 @@ public class InteractivityTest : ServerTestBase<BasicTestAppServerSiteFixture<Ra
+ 
+         return result;
+     }
++
++    private void AssertBrowserLogContainsMessage(string message)
++    {
++        Browser.True(() =>
++        {
++            var entries = Browser.Manage().Logs.GetLog(LogType.Browser);
++            return entries.Any(entry => entry.Message.Contains(message));
++        });
++    }
++
++    private void AssertBrowserLogDoesNotContainErrors()
++    {
++        var entries = Browser.Manage().Logs.GetLog(LogType.Browser);
++        Assert.DoesNotContain(entries, entry => entry.Level == LogLevel.Severe);
++    }
+ }
+diff --git a/src/Components/test/E2ETest/Tests/JSRootComponentsTest.cs b/src/Components/test/E2ETest/Tests/JSRootComponentsTest.cs
+index a3000e3f17..c94a9bc982 100644
+--- a/src/Components/test/E2ETest/Tests/JSRootComponentsTest.cs
++++ b/src/Components/test/E2ETest/Tests/JSRootComponentsTest.cs
+@@ -87,16 +87,6 @@ public class JSRootComponentsTest : ServerTestBase<ToggleExecutionModeServerFixt
+         AssertGlobalErrorState(false);
+     }
+ 
+-    [Fact]
+-    public void CannotAddMultipleRootComponentsToTheSameElementAtTheSameTime()
+-    {
+-        // Try adding a second without removing the first
+-        app.FindElement(By.Id("add-root-component-inside-blazor")).Click();
+-        app.FindElement(By.Id("add-root-component-inside-blazor")).Click();
+-
+-        AssertGlobalErrorState(true);
+-    }
+-
+     [Fact]
+     public void CanUpdateParameters()
+     {
+diff --git a/src/Components/test/testassets/Components.TestServer/RazorComponentEndpointsStartup.cs b/src/Components/test/testassets/Components.TestServer/RazorComponentEndpointsStartup.cs
+index 84ac8ef476..e47406f284 100644
+--- a/src/Components/test/testassets/Components.TestServer/RazorComponentEndpointsStartup.cs
++++ b/src/Components/test/testassets/Components.TestServer/RazorComponentEndpointsStartup.cs
+@@ -5,6 +5,7 @@ using System.Globalization;
+ using System.Security.Claims;
+ using Components.TestServer.RazorComponents;
+ using Components.TestServer.RazorComponents.Pages.Forms;
++using Components.TestServer.RazorComponents.Pages.StreamingRendering;
+ using Components.TestServer.Services;
+ 
+ namespace TestServer;
+@@ -63,6 +64,7 @@ public class RazorComponentEndpointsStartup<TRootComponent>
+ 
+                 NotEnabledStreamingRenderingComponent.MapEndpoints(endpoints);
+                 StreamingRenderingForm.MapEndpoints(endpoints);
++                InteractiveStreamingRenderingComponent.MapEndpoints(endpoints);
+ 
+                 MapEnhancedNavigationEndpoints(endpoints);
+             });
+diff --git a/src/Components/test/testassets/Components.TestServer/RazorComponents/Components/InteractiveStreamingRenderingComponent.razor b/src/Components/test/testassets/Components.TestServer/RazorComponents/Components/InteractiveStreamingRenderingComponent.razor
+new file mode 100644
+index 0000000000..92eed0e8de
+--- /dev/null
++++ b/src/Components/test/testassets/Components.TestServer/RazorComponents/Components/InteractiveStreamingRenderingComponent.razor
+@@ -0,0 +1,228 @@
++﻿@using System.Threading.Channels;
++@using System.Text.Json;
++@using System.Collections.Immutable;
++@using Microsoft.AspNetCore.Mvc;
++@using TestContentPackage;
++
++<h3>Current status:</h3>
++
++<p id="status">
++    @if (_isStreaming)
++    {
++        <text>Streaming</text>
++    }
++    else
++    {
++        <text>Not streaming</text>
++    }
++</p>
++
++@if (_isStreaming)
++{
++    <p>
++        All counter action links will work via streaming update. Interactivity will not start for
++        newly-added components until you click the "Stop streaming" link below.
++    </p>
++    <p>
++        When running this page manually, you should open each link in a background tab so you can see the streaming updates in real time.
++    </p>
++    <a id="stop-streaming-link" href="streaming-interactivity/end-response" target="_blank">Stop streaming</a>
++}
++else
++{
++    <p>
++        All counter action links will work via enhanced navigation. Interactivity will start immediately
++        for newly-added components.
++    </p>
++    <p>
++        When running this page manually, you can click the links normally and the page will refresh after each action.
++    </p>
++    <a id="start-streaming-link" href="@GetEnhancedNavigationUrl(_state, shouldStream: true)">Start streaming</a>
++}
++
++<div>
++    @foreach (var counter in _state.Counters)
++    {
++        <hr />
++
++        <Counter
++            @rendermode="@GetRenderMode(counter.RenderModeId)"
++            @key="@counter.Id"
++            IdSuffix="@counter.Id.ToString()"
++            IncrementAmount="counter.IncrementAmount"
++            DisposeBrowserConsoleMessage="@($"Counter {counter.Id} was disposed")" />
++
++        <br />
++
++        @GetActionLink($"remove-counter-link-{counter.Id}", "Remove", _state.WithRemovedCounter(counter))
++        <span> | </span>
++        @GetActionLink($"update-counter-link-{counter.Id}", "Change increment amount", _state.WithUpdatedCounter(counter))
++    }
++</div>
++
++<hr />
++
++<div>
++    Add new counter:
++    <br />
++
++    @GetActionLink("add-server-counter-prerendered-link", "Add Server counter", _state.WithAddedCounter(RenderModeId.ServerPrerendered))
++    <span> | </span>
++    @GetActionLink("add-server-counter-link", "(non-prerendered)", _state.WithAddedCounter(RenderModeId.ServerNonPrerendered))
++    <br />
++
++    @GetActionLink("add-webassembly-counter-prerendered-link", "Add WebAssembly counter", _state.WithAddedCounter(RenderModeId.WebAssemblyPrerendered))
++    <span> | </span>
++    @GetActionLink("add-webassembly-counter-link", "(non-prerendered)", _state.WithAddedCounter(RenderModeId.WebAssemblyNonPrerendered))
++    <br />
++
++    @GetActionLink("add-auto-counter-link", "Add Auto mode counter", _state.WithAddedCounter(RenderModeId.AutoPrerendered))
++    <span> | </span>
++    @GetActionLink("add-auto-counter-non-prerendered-link", "(non-prerendered)", _state.WithAddedCounter(RenderModeId.AutoNonPrerendered))
++</div>
++
++@code {
++
++    static Channel<ComponentState> StreamingStateChannel;
++
++    ComponentState _state = new(ImmutableArray<CounterInfo>.Empty, NextCounterId: 0);
++    bool _isStreaming = false;
++
++    [SupplyParameterFromQuery]
++    public string? InitialState { get; set; }
++
++    [SupplyParameterFromQuery]
++    public bool ShouldStream { get; set; }
++
++    protected override async Task OnInitializedAsync()
++    {
++        if (InitialState is not null)
++        {
++            _state = ReadStateFromJson(InitialState);
++        }
++
++        if (ShouldStream)
++        {
++            _isStreaming = true;
++
++            StreamingStateChannel = Channel.CreateUnbounded<ComponentState>();
++
++            await foreach (var state in StreamingStateChannel.Reader.ReadAllAsync())
++            {
++                _state = state;
++                StateHasChanged();
++            }
++        }
++
++        _isStreaming = false;
++    }
++
++    public static void MapEndpoints(IEndpointRouteBuilder endpoints)
++    {
++        endpoints.MapGet("streaming-interactivity/update-state", ([FromQuery(Name = "state")] string stateJson) =>
++        {
++            var state = ReadStateFromJson(stateJson);
++            StreamingStateChannel.Writer.TryWrite(state);
++            return "Updated state";
++        });
++
++        endpoints.MapGet("streaming-interactivity/end-response", () =>
++        {
++            StreamingStateChannel.Writer.Complete();
++            return "Response ended";
++        });
++    }
++
++    private RenderFragment GetActionLink(string id, string text, ComponentState state)
++    {
++        if (_isStreaming)
++        {
++            var url = GetStreamingUrl(state);
++            return @<a id="@id" href="@url" target="_blank">@text</a>;
++        }
++        else
++        {
++            var url = GetEnhancedNavigationUrl(state, shouldStream: false);
++            return @<a id="@id" href="@url">@text</a>;
++        }
++    }
++
++    private static ComponentState ReadStateFromJson(string stateJson)
++    {
++        return JsonSerializer.Deserialize<ComponentState>(stateJson)
++            ?? throw new InvalidOperationException($"Could not parse state from JSON value '{stateJson}'");
++    }
++
++    private static string GetEscapedStateJson(ComponentState state)
++    {
++        var stateJson = JsonSerializer.Serialize(state);
++        var escapedStateJson = Uri.EscapeDataString(stateJson);
++        return escapedStateJson;
++    }
++
++    private static string GetStreamingUrl(ComponentState state)
++    {
++        var stateJson = GetEscapedStateJson(state);
++        return $"streaming-interactivity/update-state?state={stateJson}";
++    }
++
++    private static string GetEnhancedNavigationUrl(ComponentState state, bool shouldStream)
++    {
++        var stateJson = GetEscapedStateJson(state);
++        return $"streaming-interactivity?{nameof(InitialState)}={stateJson}&{nameof(ShouldStream)}={shouldStream}";
++    }
++
++    private static IComponentRenderMode GetRenderMode(RenderModeId renderMode)
++    {
++        return renderMode switch
++        {
++            RenderModeId.ServerPrerendered => RenderMode.Server,
++            RenderModeId.ServerNonPrerendered => new ServerRenderMode(false),
++            RenderModeId.WebAssemblyPrerendered => RenderMode.WebAssembly,
++            RenderModeId.WebAssemblyNonPrerendered => new WebAssemblyRenderMode(false),
++            RenderModeId.AutoPrerendered => RenderMode.Auto,
++            RenderModeId.AutoNonPrerendered => new AutoRenderMode(false),
++            _ => throw new InvalidOperationException($"Unknown render mode: {renderMode}"),
++        };
++    }
++
++    private enum RenderModeId
++    {
++        ServerPrerendered = 0,
++        ServerNonPrerendered = 1,
++        WebAssemblyPrerendered = 2,
++        WebAssemblyNonPrerendered = 3,
++        AutoPrerendered = 4,
++        AutoNonPrerendered = 5,
++    }
++
++    private record struct CounterInfo(int Id, int IncrementAmount, RenderModeId RenderModeId);
++
++    private record ComponentState(ImmutableArray<CounterInfo> Counters, int NextCounterId)
++    {
++        public ComponentState WithAddedCounter(RenderModeId renderMode)
++        {
++            return this with
++            {
++                Counters = Counters.Add(new(NextCounterId, IncrementAmount: 1, renderMode)),
++                NextCounterId = NextCounterId + 1,
++            };
++        }
++
++        public ComponentState WithUpdatedCounter(in CounterInfo counter)
++        {
++            return this with
++            {
++                Counters = Counters.Replace(counter, counter with { IncrementAmount = counter.IncrementAmount + 1 }),
++            };
++        }
++
++        public ComponentState WithRemovedCounter(in CounterInfo counter)
++        {
++            return this with
++            {
++                Counters = Counters.Remove(counter),
++            };
++        }
++    }
++}
+diff --git a/src/Components/test/testassets/Components.TestServer/RazorComponents/Pages/Auth/InteractiveAuthenticationState.razor b/src/Components/test/testassets/Components.TestServer/RazorComponents/Pages/Auth/InteractiveAuthenticationState.razor
+index 77199f976a..c4383dc6eb 100644
+--- a/src/Components/test/testassets/Components.TestServer/RazorComponents/Pages/Auth/InteractiveAuthenticationState.razor
++++ b/src/Components/test/testassets/Components.TestServer/RazorComponents/Pages/Auth/InteractiveAuthenticationState.razor
+@@ -13,8 +13,8 @@
+ 
+ <hr />
+ 
+-<a href="@Nav.GetUriWithQueryParameter("username", "YourUsername")">Log in</a> |
+-<a href="@Nav.GetUriWithQueryParameter("username", "")">Log out</a>
++<a href="@Nav.GetUriWithQueryParameter("username", "YourUsername")" onclick="location.reload()">Log in</a> |
++<a href="@Nav.GetUriWithQueryParameter("username", "")" onclick="location.reload()">Log out</a>
+ 
+ @code {
+     bool _interactive = false;
+diff --git a/src/Components/test/testassets/Components.TestServer/RazorComponents/Pages/StreamingRendering/StreamingWithInteractivity.razor b/src/Components/test/testassets/Components.TestServer/RazorComponents/Pages/StreamingRendering/StreamingWithInteractivity.razor
+new file mode 100644
+index 0000000000..464998782a
+--- /dev/null
++++ b/src/Components/test/testassets/Components.TestServer/RazorComponents/Pages/StreamingRendering/StreamingWithInteractivity.razor
+@@ -0,0 +1,7 @@
++﻿@page "/streaming-interactivity"
++
++@attribute [StreamRendering(true)]
++
++<h1>Streaming Rendering with Interactivity</h1>
++
++<InteractiveStreamingRenderingComponent />
+diff --git a/src/Components/test/testassets/Components.TestServer/RazorComponents/Shared/EnhancedNavLayout.razor b/src/Components/test/testassets/Components.TestServer/RazorComponents/Shared/EnhancedNavLayout.razor
+index b1e0a8cc13..542f7e5684 100644
+--- a/src/Components/test/testassets/Components.TestServer/RazorComponents/Shared/EnhancedNavLayout.razor
++++ b/src/Components/test/testassets/Components.TestServer/RazorComponents/Shared/EnhancedNavLayout.razor
+@@ -2,6 +2,7 @@
+ <nav>
+     <NavLink href="nav">Home</NavLink> |
+     <NavLink href="streaming">Streaming</NavLink> |
++    <NavLink href="streaming-interactivity">Streaming with interactivity</NavLink> |
+     <NavLink href="nav/give-404-with-content">Error page with 404 content</NavLink> |
+     <NavLink href="nav/nonexistent-page">Error page with no content</NavLink> |
+     <NavLink href="nav/non-html-response">Non-HTML page</NavLink> |
+diff --git a/src/Components/test/testassets/TestContentPackage/Counter.razor b/src/Components/test/testassets/TestContentPackage/Counter.razor
+index 596f70bc40..a4d1503de4 100644
+--- a/src/Components/test/testassets/TestContentPackage/Counter.razor
++++ b/src/Components/test/testassets/TestContentPackage/Counter.razor
+@@ -1,4 +1,8 @@
+-﻿<p>Increment amount: @IncrementAmount</p>
++﻿@using Microsoft.JSInterop;
++@implements IAsyncDisposable
++@inject IJSRuntime JSRuntime
++
++<p>Increment amount: <span id=increment-amount-@IdSuffix>@IncrementAmount</span></p>
+ <p>Interactive: <span id="is-interactive-@IdSuffix">@_isInteractive</span></p>
+ <p>Current count: <span id="count-@IdSuffix">@_currentCount</span></p>
+ 
+@@ -14,6 +18,9 @@
+     [Parameter, EditorRequired]
+     public string IdSuffix { get; set; }
+ 
++    [Parameter]
++    public string DisposeBrowserConsoleMessage { get; set; }
++
+     private void IncrementCount()
+     {
+         _currentCount += IncrementAmount;
+@@ -27,4 +34,12 @@
+             StateHasChanged();
+         }
+     }
++
++    public async ValueTask DisposeAsync()
++    {
++        if (_isInteractive && DisposeBrowserConsoleMessage is not null)
++        {
++            await JSRuntime.InvokeVoidAsync("console.log", DisposeBrowserConsoleMessage);
++        }
++    }
+ }
+diff --git a/src/Shared/Components/ServerComponentMarker.cs b/src/Shared/Components/ServerComponentMarker.cs
+index 5d3cda3d8a..9c684a02e7 100644
+--- a/src/Shared/Components/ServerComponentMarker.cs
++++ b/src/Shared/Components/ServerComponentMarker.cs
+@@ -1,6 +1,9 @@
+ // Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using System.Globalization;
++using Microsoft.AspNetCore.Components.RenderTree;
++
+ namespace Microsoft.AspNetCore.Components;
+ 
+ #nullable enable // This is shared-source with Mvc.ViewFeatures which doesn't enable nullability by default
+@@ -12,12 +15,13 @@ internal struct ServerComponentMarker
+ {
+     public const string ServerMarkerType = "server";
+ 
+-    private ServerComponentMarker(string? type, string? descriptor, int? sequence, string? prerenderId) : this()
++    private ServerComponentMarker(string? type, string? descriptor, int? sequence, string? key, string? prerenderId) : this()
+     {
+         Type = type;
+         PrerenderId = prerenderId;
+         Descriptor = descriptor;
+         Sequence = sequence;
++        Key = key;
+     }
+ 
+     // The order in which this component was rendered/produced
+@@ -41,13 +45,17 @@ internal struct ServerComponentMarker
+     // The value will be null for end markers.
+     public string? Descriptor { get; set; }
+ 
++    // An additional string that the browser can use when comparing markers to determine
++    // whether they represent different component instances.
++    public string? Key { get; set; }
++
+     // Creates a marker for a prerendered component.
+-    public static ServerComponentMarker Prerendered(int sequence, string descriptor) =>
+-        new ServerComponentMarker(ServerMarkerType, descriptor, sequence, Guid.NewGuid().ToString("N"));
++    public static ServerComponentMarker Prerendered(int sequence, string descriptor, string? key) =>
++        new ServerComponentMarker(ServerMarkerType, descriptor, sequence, key, Guid.NewGuid().ToString("N"));
+ 
+     // Creates a marker for a non prerendered component
+-    public static ServerComponentMarker NonPrerendered(int sequence, string descriptor) =>
+-        new ServerComponentMarker(ServerMarkerType, descriptor, sequence, null);
++    public static ServerComponentMarker NonPrerendered(int sequence, string descriptor, string? key) =>
++        new ServerComponentMarker(ServerMarkerType, descriptor, sequence, key, null);
+ 
+     // Creates the end marker for a prerendered component.
+     public ServerComponentMarker GetEndRecord()
+@@ -57,6 +65,6 @@ internal struct ServerComponentMarker
+             throw new InvalidOperationException("Can't get an end record for non-prerendered components.");
+         }
+ 
+-        return new ServerComponentMarker(null, null, null, PrerenderId);
++        return new ServerComponentMarker(null, null, null, null, PrerenderId);
+     }
+ }
+diff --git a/src/Shared/Components/WebAssemblyComponentMarker.cs b/src/Shared/Components/WebAssemblyComponentMarker.cs
+index 50c36cdb4c..4e583be926 100644
+--- a/src/Shared/Components/WebAssemblyComponentMarker.cs
++++ b/src/Shared/Components/WebAssemblyComponentMarker.cs
+@@ -9,8 +9,8 @@ internal struct WebAssemblyComponentMarker
+ {
+     public const string ClientMarkerType = "webassembly";
+ 
+-    public WebAssemblyComponentMarker(string type, string assembly, string typeName, string parameterDefinitions, string parameterValues, string? prerenderId) =>
+-        (Type, Assembly, TypeName, ParameterDefinitions, ParameterValues, PrerenderId) = (type, assembly, typeName, parameterDefinitions, parameterValues, prerenderId);
++    public WebAssemblyComponentMarker(string type, string assembly, string typeName, string parameterDefinitions, string parameterValues, string? key, string? prerenderId) =>
++        (Type, Assembly, TypeName, ParameterDefinitions, ParameterValues, Key, PrerenderId) = (type, assembly, typeName, parameterDefinitions, parameterValues, key, prerenderId);
+ 
+     public string Type { get; set; }
+ 
+@@ -22,13 +22,15 @@ internal struct WebAssemblyComponentMarker
+ 
+     public string ParameterValues { get; set; }
+ 
++    public string? Key { get; set; }
++
+     public string? PrerenderId { get; set; }
+ 
+-    internal static WebAssemblyComponentMarker NonPrerendered(string assembly, string typeName, string parameterDefinitions, string parameterValues) =>
+-        new WebAssemblyComponentMarker(ClientMarkerType, assembly, typeName, parameterDefinitions, parameterValues, null);
++    internal static WebAssemblyComponentMarker NonPrerendered(string assembly, string typeName, string parameterDefinitions, string parameterValues, string? key) =>
++        new WebAssemblyComponentMarker(ClientMarkerType, assembly, typeName, parameterDefinitions, parameterValues, key, null);
+ 
+-    internal static WebAssemblyComponentMarker Prerendered(string assembly, string typeName, string parameterDefinitions, string parameterValues) =>
+-        new WebAssemblyComponentMarker(ClientMarkerType, assembly, typeName, parameterDefinitions, parameterValues, Guid.NewGuid().ToString("N"));
++    internal static WebAssemblyComponentMarker Prerendered(string assembly, string typeName, string parameterDefinitions, string parameterValues, string? key) =>
++        new WebAssemblyComponentMarker(ClientMarkerType, assembly, typeName, parameterDefinitions, parameterValues, key, Guid.NewGuid().ToString("N"));
+ 
+     public WebAssemblyEndComponentMarker GetEndRecord()
+     {

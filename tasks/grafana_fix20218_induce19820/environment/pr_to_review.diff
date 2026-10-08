@@ -1,0 +1,647 @@
+commit a45ce365667470725043c6b5053f9415b0eeb53e
+Author: Jon Gyllenswärd <jon.gyllensward@grafana.com>
+Date:   Thu Oct 31 14:27:31 2019 +0100
+
+    Allow saving of provisioned dashboards (#19820)
+    
+    Allows saving of provisioned dashboards if the config value allowUiUpdates is set to true
+    
+    Fixes #11778
+
+diff --git a/devenv/dashboards.yaml b/devenv/dashboards.yaml
+index 98c726408de..6517d708586 100644
+--- a/devenv/dashboards.yaml
++++ b/devenv/dashboards.yaml
+@@ -5,6 +5,7 @@ providers:
+    folder: 'gdev dashboards'
+    folderUid: ''
+    type: file
++   allowUiUpdates: false
+    updateIntervalSeconds: 60
+    options:
+      path: devenv/dev-dashboards
+diff --git a/docs/sources/administration/provisioning.md b/docs/sources/administration/provisioning.md
+index 44a58a48fc7..13d765159ea 100644
+--- a/docs/sources/administration/provisioning.md
++++ b/docs/sources/administration/provisioning.md
+@@ -227,6 +227,8 @@ providers:
+   editable: true
+   # <int> how often Grafana will scan for changed dashboards
+   updateIntervalSeconds: 10
++  # <bool> allow updating provisioned dashboards from the UI
++  allowUiUpdates: false
+   options:
+     # <string, required> path to dashboard files on disk. Required
+     path: /var/lib/grafana/dashboards
+@@ -235,13 +237,20 @@ providers:
+ When Grafana starts, it will update/insert all dashboards available in the configured path. Then later on poll that path every **updateIntervalSeconds** and look for updated json files and update/insert those into the database.
+ 
+ #### Making changes to a provisioned dashboard
++It's possible to make changes to a provisioned dashboard in the Grafana UI. However, it is not possible to automatically save the changes back to the provisioning source.
++If `allowUiUpdates` is set to `true` and you make changes to a provisioned dashboard, you can `Save` the dashboard then changes will be persisted to the Grafana database.
+ 
+-It's possible to make changes to a provisioned dashboard in Grafana UI, but there's currently no possibility to automatically save the changes back to the provisioning source.
+-However, if you make changes to a provisioned dashboard you can `Save` the dashboard which will bring up a *Cannot save provisioned dashboard* dialog like seen in the screenshot below.
+-Here available options will let you `Copy JSON to Clipboard` and/or `Save JSON to file` which can help you synchronize your dashboard changes back to the provisioning source.
++> **Note.** 
++> If a provisioned dashboard is saved from the UI and then later updated from the source, the dashboard stored in the database will always be overwritten. The `version` property in the JSON file will not affect this, even if it is lower than the existing dashboard.
++> 
++> If a provisioned dashboard is saved from the UI and the source is removed, the dashboard stored in the database will be deleted unless the configuration option `disableDeletion` is set to true.
+ 
+-Note: The JSON shown in input field and when using `Copy JSON to Clipboard` and/or `Save JSON to file` will have the `id` field automatically removed to aid the provisioning workflow.
++If `allowUiUpdates` is configured to `false`, you are not able to make changes to a provisioned dashboard. When you click `Save`, Grafana brings up a *Cannot save provisioned dashboard* dialog. The screenshot below illustrates this behavior.
+ 
++Grafana offers options to export the JSON definition of a dashboard. Either `Copy JSON to Clipboard` or `Save JSON to file` can help you synchronize your dashboard changes back to the provisioning source.
++
++Note: The JSON definition in the input field when using `Copy JSON to Clipboard` or `Save JSON to file` will have the `id` field automatically removed to aid the provisioning workflow.
++                                                                                                                                                                 
+ {{< docs-imagebox img="/img/docs/v51/provisioning_cannot_save_dashboard.png" max-width="500px" class="docs-image--no-shadow" >}}
+ 
+ ### Reusable Dashboard Urls
+diff --git a/pkg/api/dashboard.go b/pkg/api/dashboard.go
+index 782c716b37b..9e059ea85d2 100644
+--- a/pkg/api/dashboard.go
++++ b/pkg/api/dashboard.go
+@@ -113,7 +113,11 @@ func (hs *HTTPServer) GetDashboard(c *m.ReqContext) Response {
+ 	}
+ 
+ 	if provisioningData != nil {
+-		meta.Provisioned = true
++		allowUiUpdate := hs.ProvisioningService.GetAllowUiUpdatesFromConfig(provisioningData.Name)
++		if !allowUiUpdate {
++			meta.Provisioned = true
++		}
++
+ 		meta.ProvisionedExternalId, err = filepath.Rel(
+ 			hs.ProvisioningService.GetDashboardProvisionerResolvedPath(provisioningData.Name),
+ 			provisioningData.ExternalId,
+@@ -221,6 +225,13 @@ func (hs *HTTPServer) PostDashboard(c *m.ReqContext, cmd m.SaveDashboardCommand)
+ 		}
+ 	}
+ 
++	provisioningData, err := dashboards.NewProvisioningService().GetProvisionedDashboardDataByDashboardId(dash.Id)
++	if err != nil {
++		return Error(500, "Error while checking if dashboard is provisioned", err)
++	}
++
++	allowUiUpdate := hs.ProvisioningService.GetAllowUiUpdatesFromConfig(provisioningData.Name)
++
+ 	dashItem := &dashboards.SaveDashboardDTO{
+ 		Dashboard: dash,
+ 		Message:   cmd.Message,
+@@ -229,7 +240,7 @@ func (hs *HTTPServer) PostDashboard(c *m.ReqContext, cmd m.SaveDashboardCommand)
+ 		Overwrite: cmd.Overwrite,
+ 	}
+ 
+-	dashboard, err := dashboards.NewService().SaveDashboard(dashItem)
++	dashboard, err := dashboards.NewService().SaveDashboard(dashItem, allowUiUpdate)
+ 
+ 	if err == m.ErrDashboardTitleEmpty ||
+ 		err == m.ErrDashboardWithSameNameAsFolder ||
+diff --git a/pkg/api/dashboard_test.go b/pkg/api/dashboard_test.go
+index a3ddf76a7b8..01fc6d15130 100644
+--- a/pkg/api/dashboard_test.go
++++ b/pkg/api/dashboard_test.go
+@@ -958,6 +958,32 @@ func TestDashboardApiEndpoint(t *testing.T) {
+ 				So(dash.Meta.ProvisionedExternalId, ShouldEqual, "test/dashboard1.json")
+ 			})
+ 		})
++
++		loggedInUserScenarioWithRole("When allowUiUpdates is true and calling GET on", "GET", "/api/dashboards/uid/dash", "/api/dashboards/uid/:uid", m.ROLE_EDITOR, func(sc *scenarioContext) {
++			mock := provisioning.NewProvisioningServiceMock()
++			mock.GetDashboardProvisionerResolvedPathFunc = func(name string) string {
++				return "/tmp/grafana/dashboards"
++			}
++			mock.GetAllowUiUpdatesFromConfigFunc = func(name string) bool {
++				return true
++			}
++
++			hs := &HTTPServer{
++				Cfg:                 setting.NewCfg(),
++				ProvisioningService: mock,
++			}
++			CallGetDashboard(sc, hs)
++
++			So(sc.resp.Code, ShouldEqual, 200)
++
++			dash := dtos.DashboardFullWithMeta{}
++			err := json.NewDecoder(sc.resp.Body).Decode(&dash)
++			So(err, ShouldBeNil)
++
++			Convey("Should have metadata that says Provisioned is false", func() {
++				So(dash.Meta.Provisioned, ShouldEqual, false)
++			})
++		})
+ 	})
+ }
+ 
+@@ -1043,13 +1069,18 @@ func CallPostDashboardShouldReturnSuccess(sc *scenarioContext) {
+ 	So(sc.resp.Code, ShouldEqual, 200)
+ }
+ 
++func (m mockDashboardProvisioningService) DeleteProvisionedDashboard(dashboardId int64, orgId int64) error {
++	panic("implement me")
++}
++
+ func postDashboardScenario(desc string, url string, routePattern string, mock *dashboards.FakeDashboardService, cmd m.SaveDashboardCommand, fn scenarioFunc) {
+ 	Convey(desc+" "+url, func() {
+ 		defer bus.ClearBusHandlers()
+ 
+ 		hs := HTTPServer{
+-			Bus: bus.GetBus(),
+-			Cfg: setting.NewCfg(),
++			Bus:                 bus.GetBus(),
++			Cfg:                 setting.NewCfg(),
++			ProvisioningService: provisioning.NewProvisioningServiceMock(),
+ 		}
+ 
+ 		sc := setupScenarioContext(url)
+@@ -1063,10 +1094,16 @@ func postDashboardScenario(desc string, url string, routePattern string, mock *d
+ 		origNewDashboardService := dashboards.NewService
+ 		dashboards.MockDashboardService(mock)
+ 
++		origProvisioningService := dashboards.NewProvisioningService
++		dashboards.NewProvisioningService = func() dashboards.DashboardProvisioningService {
++			return mockDashboardProvisioningService{}
++		}
++
+ 		sc.m.Post(routePattern, sc.defaultHandler)
+ 
+ 		defer func() {
+ 			dashboards.NewService = origNewDashboardService
++			dashboards.NewProvisioningService = origProvisioningService
+ 		}()
+ 
+ 		fn(sc)
+@@ -1100,8 +1137,9 @@ func restoreDashboardVersionScenario(desc string, url string, routePattern strin
+ 		defer bus.ClearBusHandlers()
+ 
+ 		hs := HTTPServer{
+-			Cfg: setting.NewCfg(),
+-			Bus: bus.GetBus(),
++			Cfg:                 setting.NewCfg(),
++			Bus:                 bus.GetBus(),
++			ProvisioningService: provisioning.NewProvisioningServiceMock(),
+ 		}
+ 
+ 		sc := setupScenarioContext(url)
+@@ -1116,6 +1154,11 @@ func restoreDashboardVersionScenario(desc string, url string, routePattern strin
+ 			return hs.RestoreDashboardVersion(c, cmd)
+ 		})
+ 
++		origProvisioningService := dashboards.NewProvisioningService
++		dashboards.NewProvisioningService = func() dashboards.DashboardProvisioningService {
++			return mockDashboardProvisioningService{}
++		}
++
+ 		origNewDashboardService := dashboards.NewService
+ 		dashboards.MockDashboardService(mock)
+ 
+@@ -1123,6 +1166,7 @@ func restoreDashboardVersionScenario(desc string, url string, routePattern strin
+ 
+ 		defer func() {
+ 			dashboards.NewService = origNewDashboardService
++			dashboards.NewProvisioningService = origProvisioningService
+ 		}()
+ 
+ 		fn(sc)
+@@ -1135,3 +1179,26 @@ func (sc *scenarioContext) ToJSON() *simplejson.Json {
+ 	So(err, ShouldBeNil)
+ 	return result
+ }
++
++type mockDashboardProvisioningService struct {
++}
++
++func (m mockDashboardProvisioningService) SaveProvisionedDashboard(dto *dashboards.SaveDashboardDTO, provisioning *m.DashboardProvisioning, allowUiUpdates bool) (*m.Dashboard, error) {
++	panic("implement me")
++}
++
++func (m mockDashboardProvisioningService) SaveFolderForProvisionedDashboards(*dashboards.SaveDashboardDTO) (*m.Dashboard, error) {
++	panic("implement me")
++}
++
++func (m mockDashboardProvisioningService) GetProvisionedDashboardData(name string) ([]*m.DashboardProvisioning, error) {
++	panic("implement me")
++}
++
++func (mock mockDashboardProvisioningService) GetProvisionedDashboardDataByDashboardId(dashboardId int64) (*m.DashboardProvisioning, error) {
++	return &m.DashboardProvisioning{}, nil
++}
++
++func (m mockDashboardProvisioningService) UnprovisionDashboard(dashboardId int64) error {
++	panic("implement me")
++}
+diff --git a/pkg/api/http_server.go b/pkg/api/http_server.go
+index 21f2be0e49d..4be0c249fbf 100644
+--- a/pkg/api/http_server.go
++++ b/pkg/api/http_server.go
+@@ -47,6 +47,7 @@ type ProvisioningService interface {
+ 	ProvisionNotifications() error
+ 	ProvisionDashboards() error
+ 	GetDashboardProvisionerResolvedPath(name string) string
++	GetAllowUiUpdatesFromConfig(name string) bool
+ }
+ 
+ type HTTPServer struct {
+diff --git a/pkg/services/dashboards/dashboard_service.go b/pkg/services/dashboards/dashboard_service.go
+index bec718700a7..6e3a2248e64 100644
+--- a/pkg/services/dashboards/dashboard_service.go
++++ b/pkg/services/dashboards/dashboard_service.go
+@@ -14,14 +14,14 @@ import (
+ 
+ // DashboardService service for operating on dashboards
+ type DashboardService interface {
+-	SaveDashboard(dto *SaveDashboardDTO) (*models.Dashboard, error)
++	SaveDashboard(dto *SaveDashboardDTO, allowUiUpdate bool) (*models.Dashboard, error)
+ 	ImportDashboard(dto *SaveDashboardDTO) (*models.Dashboard, error)
+ 	DeleteDashboard(dashboardId int64, orgId int64) error
+ }
+ 
+ // DashboardProvisioningService service for operating on provisioned dashboards
+ type DashboardProvisioningService interface {
+-	SaveProvisionedDashboard(dto *SaveDashboardDTO, provisioning *models.DashboardProvisioning) (*models.Dashboard, error)
++	SaveProvisionedDashboard(dto *SaveDashboardDTO, provisioning *models.DashboardProvisioning, allowUiUpdates bool) (*models.Dashboard, error)
+ 	SaveFolderForProvisionedDashboards(*SaveDashboardDTO) (*models.Dashboard, error)
+ 	GetProvisionedDashboardData(name string) ([]*models.DashboardProvisioning, error)
+ 	GetProvisionedDashboardDataByDashboardId(dashboardId int64) (*models.DashboardProvisioning, error)
+@@ -182,14 +182,14 @@ func (dr *dashboardServiceImpl) updateAlerting(cmd *models.SaveDashboardCommand,
+ 	return bus.Dispatch(&alertCmd)
+ }
+ 
+-func (dr *dashboardServiceImpl) SaveProvisionedDashboard(dto *SaveDashboardDTO, provisioning *models.DashboardProvisioning) (*models.Dashboard, error) {
++func (dr *dashboardServiceImpl) SaveProvisionedDashboard(dto *SaveDashboardDTO, provisioning *models.DashboardProvisioning, allowUiUpdates bool) (*models.Dashboard, error) {
+ 	dto.User = &models.SignedInUser{
+ 		UserId:  0,
+ 		OrgRole: models.ROLE_ADMIN,
+ 		OrgId:   dto.OrgId,
+ 	}
+ 
+-	cmd, err := dr.buildSaveDashboardCommand(dto, true, false)
++	cmd, err := dr.buildSaveDashboardCommand(dto, true, !allowUiUpdates)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -237,8 +237,9 @@ func (dr *dashboardServiceImpl) SaveFolderForProvisionedDashboards(dto *SaveDash
+ 	return cmd.Result, nil
+ }
+ 
+-func (dr *dashboardServiceImpl) SaveDashboard(dto *SaveDashboardDTO) (*models.Dashboard, error) {
+-	cmd, err := dr.buildSaveDashboardCommand(dto, true, true)
++func (dr *dashboardServiceImpl) SaveDashboard(dto *SaveDashboardDTO, allowUiUpdate bool) (*models.Dashboard, error) {
++
++	cmd, err := dr.buildSaveDashboardCommand(dto, true, !allowUiUpdate)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -309,7 +310,7 @@ type FakeDashboardService struct {
+ 	SavedDashboards     []*SaveDashboardDTO
+ }
+ 
+-func (s *FakeDashboardService) SaveDashboard(dto *SaveDashboardDTO) (*models.Dashboard, error) {
++func (s *FakeDashboardService) SaveDashboard(dto *SaveDashboardDTO, allowUiUpdate bool) (*models.Dashboard, error) {
+ 	s.SavedDashboards = append(s.SavedDashboards, dto)
+ 
+ 	if s.SaveDashboardResult == nil && s.SaveDashboardError == nil {
+@@ -320,7 +321,7 @@ func (s *FakeDashboardService) SaveDashboard(dto *SaveDashboardDTO) (*models.Das
+ }
+ 
+ func (s *FakeDashboardService) ImportDashboard(dto *SaveDashboardDTO) (*models.Dashboard, error) {
+-	return s.SaveDashboard(dto)
++	return s.SaveDashboard(dto, true)
+ }
+ 
+ func (s *FakeDashboardService) DeleteDashboard(dashboardId int64, orgId int64) error {
+diff --git a/pkg/services/dashboards/dashboard_service_test.go b/pkg/services/dashboards/dashboard_service_test.go
+index db3ef997d65..f0589146963 100644
+--- a/pkg/services/dashboards/dashboard_service_test.go
++++ b/pkg/services/dashboards/dashboard_service_test.go
+@@ -27,7 +27,7 @@ func TestDashboardService(t *testing.T) {
+ 
+ 				for _, title := range titles {
+ 					dto.Dashboard = models.NewDashboard(title)
+-					_, err := service.SaveDashboard(dto)
++					_, err := service.SaveDashboard(dto, false)
+ 					So(err, ShouldEqual, models.ErrDashboardTitleEmpty)
+ 				}
+ 			})
+@@ -35,13 +35,13 @@ func TestDashboardService(t *testing.T) {
+ 			Convey("Should return validation error if it's a folder and have a folder id", func() {
+ 				dto.Dashboard = models.NewDashboardFolder("Folder")
+ 				dto.Dashboard.FolderId = 1
+-				_, err := service.SaveDashboard(dto)
++				_, err := service.SaveDashboard(dto, false)
+ 				So(err, ShouldEqual, models.ErrDashboardFolderCannotHaveParent)
+ 			})
+ 
+ 			Convey("Should return validation error if folder is named General", func() {
+ 				dto.Dashboard = models.NewDashboardFolder("General")
+-				_, err := service.SaveDashboard(dto)
++				_, err := service.SaveDashboard(dto, false)
+ 				So(err, ShouldEqual, models.ErrDashboardFolderNameExists)
+ 			})
+ 
+@@ -103,11 +103,36 @@ func TestDashboardService(t *testing.T) {
+ 				dto.Dashboard = models.NewDashboard("Dash")
+ 				dto.Dashboard.SetId(3)
+ 				dto.User = &models.SignedInUser{UserId: 1}
+-				_, err := service.SaveDashboard(dto)
++				_, err := service.SaveDashboard(dto, false)
+ 				So(provisioningValidated, ShouldBeTrue)
+ 				So(err, ShouldEqual, models.ErrDashboardCannotSaveProvisionedDashboard)
+ 			})
+ 
++			Convey("Should not return validation error if dashboard is provisioned but UI updates allowed", func() {
++				provisioningValidated := false
++				bus.AddHandler("test", func(cmd *models.GetProvisionedDashboardDataByIdQuery) error {
++					provisioningValidated = true
++					cmd.Result = &models.DashboardProvisioning{}
++					return nil
++				})
++
++				bus.AddHandler("test", func(cmd *models.ValidateDashboardAlertsCommand) error {
++					return nil
++				})
++
++				bus.AddHandler("test", func(cmd *models.ValidateDashboardBeforeSaveCommand) error {
++					cmd.Result = &models.ValidateDashboardBeforeSaveResult{}
++					return nil
++				})
++
++				dto.Dashboard = models.NewDashboard("Dash")
++				dto.Dashboard.SetId(3)
++				dto.User = &models.SignedInUser{UserId: 1}
++				_, err := service.SaveDashboard(dto, true)
++				So(provisioningValidated, ShouldBeFalse)
++				So(err, ShouldNotBeNil)
++			})
++
+ 			Convey("Should return validation error if alert data is invalid", func() {
+ 				bus.AddHandler("test", func(cmd *models.GetProvisionedDashboardDataByIdQuery) error {
+ 					cmd.Result = nil
+@@ -119,7 +144,7 @@ func TestDashboardService(t *testing.T) {
+ 				})
+ 
+ 				dto.Dashboard = models.NewDashboard("Dash")
+-				_, err := service.SaveDashboard(dto)
++				_, err := service.SaveDashboard(dto, false)
+ 				So(err.Error(), ShouldEqual, "Alert validation error")
+ 			})
+ 		})
+@@ -155,7 +180,7 @@ func TestDashboardService(t *testing.T) {
+ 				dto.Dashboard = models.NewDashboard("Dash")
+ 				dto.Dashboard.SetId(3)
+ 				dto.User = &models.SignedInUser{UserId: 1}
+-				_, err := service.SaveProvisionedDashboard(dto, nil)
++				_, err := service.SaveProvisionedDashboard(dto, nil, true)
+ 				So(err, ShouldBeNil)
+ 				So(provisioningValidated, ShouldBeFalse)
+ 			})
+diff --git a/pkg/services/provisioning/dashboards/dashboard.go b/pkg/services/provisioning/dashboards/dashboard.go
+index 108b1b126c9..b01e6f39712 100644
+--- a/pkg/services/provisioning/dashboards/dashboard.go
++++ b/pkg/services/provisioning/dashboards/dashboard.go
+@@ -12,6 +12,7 @@ import (
+ type DashboardProvisionerImpl struct {
+ 	log         log.Logger
+ 	fileReaders []*fileReader
++	configs     []*DashboardsAsConfig
+ }
+ 
+ func NewDashboardProvisionerImpl(configDirectory string) (*DashboardProvisionerImpl, error) {
+@@ -32,6 +33,7 @@ func NewDashboardProvisionerImpl(configDirectory string) (*DashboardProvisionerI
+ 	d := &DashboardProvisionerImpl{
+ 		log:         logger,
+ 		fileReaders: fileReaders,
++		configs:     configs,
+ 	}
+ 
+ 	return d, nil
+@@ -72,6 +74,15 @@ func (provider *DashboardProvisionerImpl) GetProvisionerResolvedPath(name string
+ 	return ""
+ }
+ 
++func (provider *DashboardProvisionerImpl) GetAllowUiUpdatesFromConfig(name string) bool {
++	for _, config := range provider.configs {
++		if config.Name == name {
++			return config.AllowUiUpdates
++		}
++	}
++	return false
++}
++
+ func getFileReaders(configs []*DashboardsAsConfig, logger log.Logger) ([]*fileReader, error) {
+ 	var readers []*fileReader
+ 
+diff --git a/pkg/services/provisioning/dashboards/dashboard_mock.go b/pkg/services/provisioning/dashboards/dashboard_mock.go
+index 2ad13744b29..c460f8f5e34 100644
+--- a/pkg/services/provisioning/dashboards/dashboard_mock.go
++++ b/pkg/services/provisioning/dashboards/dashboard_mock.go
+@@ -3,16 +3,18 @@ package dashboards
+ import "context"
+ 
+ type Calls struct {
+-	Provision                  []interface{}
+-	PollChanges                []interface{}
+-	GetProvisionerResolvedPath []interface{}
++	Provision                   []interface{}
++	PollChanges                 []interface{}
++	GetProvisionerResolvedPath  []interface{}
++	GetAllowUiUpdatesFromConfig []interface{}
+ }
+ 
+ type DashboardProvisionerMock struct {
+-	Calls                          *Calls
+-	ProvisionFunc                  func() error
+-	PollChangesFunc                func(ctx context.Context)
+-	GetProvisionerResolvedPathFunc func(name string) string
++	Calls                           *Calls
++	ProvisionFunc                   func() error
++	PollChangesFunc                 func(ctx context.Context)
++	GetProvisionerResolvedPathFunc  func(name string) string
++	GetAllowUiUpdatesFromConfigFunc func(name string) bool
+ }
+ 
+ func NewDashboardProvisionerMock() *DashboardProvisionerMock {
+@@ -37,9 +39,17 @@ func (dpm *DashboardProvisionerMock) PollChanges(ctx context.Context) {
+ }
+ 
+ func (dpm *DashboardProvisionerMock) GetProvisionerResolvedPath(name string) string {
+-	dpm.Calls.PollChanges = append(dpm.Calls.GetProvisionerResolvedPath, name)
++	dpm.Calls.GetProvisionerResolvedPath = append(dpm.Calls.GetProvisionerResolvedPath, name)
+ 	if dpm.GetProvisionerResolvedPathFunc != nil {
+ 		return dpm.GetProvisionerResolvedPathFunc(name)
+ 	}
+ 	return ""
+ }
++
++func (dpm *DashboardProvisionerMock) GetAllowUiUpdatesFromConfig(name string) bool {
++	dpm.Calls.GetAllowUiUpdatesFromConfig = append(dpm.Calls.GetAllowUiUpdatesFromConfig, name)
++	if dpm.GetAllowUiUpdatesFromConfigFunc != nil {
++		return dpm.GetAllowUiUpdatesFromConfigFunc(name)
++	}
++	return false
++}
+diff --git a/pkg/services/provisioning/dashboards/file_reader.go b/pkg/services/provisioning/dashboards/file_reader.go
+index ce1ebf37504..55ed5a84fbd 100644
+--- a/pkg/services/provisioning/dashboards/file_reader.go
++++ b/pkg/services/provisioning/dashboards/file_reader.go
+@@ -190,7 +190,7 @@ func (fr *fileReader) saveDashboard(path string, folderId int64, fileInfo os.Fil
+ 		CheckSum:   jsonFile.checkSum,
+ 	}
+ 
+-	_, err = fr.dashboardProvisioningService.SaveProvisionedDashboard(dash, dp)
++	_, err = fr.dashboardProvisioningService.SaveProvisionedDashboard(dash, dp, fr.Cfg.AllowUiUpdates)
+ 	return provisioningMetadata, err
+ }
+ 
+diff --git a/pkg/services/provisioning/dashboards/file_reader_test.go b/pkg/services/provisioning/dashboards/file_reader_test.go
+index 668608d79ec..a2aebd8727a 100644
+--- a/pkg/services/provisioning/dashboards/file_reader_test.go
++++ b/pkg/services/provisioning/dashboards/file_reader_test.go
+@@ -368,7 +368,7 @@ func (s *fakeDashboardProvisioningService) GetProvisionedDashboardData(name stri
+ 	return s.provisioned[name], nil
+ }
+ 
+-func (s *fakeDashboardProvisioningService) SaveProvisionedDashboard(dto *dashboards.SaveDashboardDTO, provisioning *models.DashboardProvisioning) (*models.Dashboard, error) {
++func (s *fakeDashboardProvisioningService) SaveProvisionedDashboard(dto *dashboards.SaveDashboardDTO, provisioning *models.DashboardProvisioning, allowUiUpdates bool) (*models.Dashboard, error) {
+ 	// Copy the structs as we need to change them but do not want to alter outside world.
+ 	var copyProvisioning = &models.DashboardProvisioning{}
+ 	*copyProvisioning = *provisioning
+diff --git a/pkg/services/provisioning/dashboards/types.go b/pkg/services/provisioning/dashboards/types.go
+index 547e5a4427c..ef373680e8e 100644
+--- a/pkg/services/provisioning/dashboards/types.go
++++ b/pkg/services/provisioning/dashboards/types.go
+@@ -20,6 +20,7 @@ type DashboardsAsConfig struct {
+ 	Options               map[string]interface{}
+ 	DisableDeletion       bool
+ 	UpdateIntervalSeconds int64
++	AllowUiUpdates        bool
+ }
+ 
+ type DashboardsAsConfigV0 struct {
+@@ -32,6 +33,7 @@ type DashboardsAsConfigV0 struct {
+ 	Options               map[string]interface{} `json:"options" yaml:"options"`
+ 	DisableDeletion       bool                   `json:"disableDeletion" yaml:"disableDeletion"`
+ 	UpdateIntervalSeconds int64                  `json:"updateIntervalSeconds" yaml:"updateIntervalSeconds"`
++	AllowUiUpdates        bool                   `json:"allowUiUpdates" yaml:"allowUiUpdates"`
+ }
+ 
+ type ConfigVersion struct {
+@@ -52,6 +54,7 @@ type DashboardProviderConfigs struct {
+ 	Options               values.JSONValue   `json:"options" yaml:"options"`
+ 	DisableDeletion       values.BoolValue   `json:"disableDeletion" yaml:"disableDeletion"`
+ 	UpdateIntervalSeconds values.Int64Value  `json:"updateIntervalSeconds" yaml:"updateIntervalSeconds"`
++	AllowUiUpdates        values.BoolValue   `json:"allowUiUpdates" yaml:"allowUiUpdates"`
+ }
+ 
+ func createDashboardJson(data *simplejson.Json, lastModified time.Time, cfg *DashboardsAsConfig, folderId int64) (*dashboards.SaveDashboardDTO, error) {
+@@ -84,6 +87,7 @@ func mapV0ToDashboardAsConfig(v0 []*DashboardsAsConfigV0) []*DashboardsAsConfig
+ 			Options:               v.Options,
+ 			DisableDeletion:       v.DisableDeletion,
+ 			UpdateIntervalSeconds: v.UpdateIntervalSeconds,
++			AllowUiUpdates:        v.AllowUiUpdates,
+ 		})
+ 	}
+ 
+@@ -104,6 +108,7 @@ func (dc *DashboardAsConfigV1) mapToDashboardAsConfig() []*DashboardsAsConfig {
+ 			Options:               v.Options.Value(),
+ 			DisableDeletion:       v.DisableDeletion.Value(),
+ 			UpdateIntervalSeconds: v.UpdateIntervalSeconds.Value(),
++			AllowUiUpdates:        v.AllowUiUpdates.Value(),
+ 		})
+ 	}
+ 
+diff --git a/pkg/services/provisioning/provisioning.go b/pkg/services/provisioning/provisioning.go
+index 025b5fe311d..e00214a9152 100644
+--- a/pkg/services/provisioning/provisioning.go
++++ b/pkg/services/provisioning/provisioning.go
+@@ -19,6 +19,7 @@ type DashboardProvisioner interface {
+ 	Provision() error
+ 	PollChanges(ctx context.Context)
+ 	GetProvisionerResolvedPath(name string) string
++	GetAllowUiUpdatesFromConfig(name string) bool
+ }
+ 
+ type DashboardProvisionerFactory func(string) (DashboardProvisioner, error)
+@@ -137,6 +138,10 @@ func (ps *provisioningServiceImpl) GetDashboardProvisionerResolvedPath(name stri
+ 	return ps.dashboardProvisioner.GetProvisionerResolvedPath(name)
+ }
+ 
++func (ps *provisioningServiceImpl) GetAllowUiUpdatesFromConfig(name string) bool {
++	return ps.dashboardProvisioner.GetAllowUiUpdatesFromConfig(name)
++}
++
+ func (ps *provisioningServiceImpl) cancelPolling() {
+ 	if ps.pollingCtxCancel != nil {
+ 		ps.log.Debug("Stop polling for dashboard changes")
+diff --git a/pkg/services/provisioning/provisioning_mock.go b/pkg/services/provisioning/provisioning_mock.go
+index dc487f56646..015b9d0f73b 100644
+--- a/pkg/services/provisioning/provisioning_mock.go
++++ b/pkg/services/provisioning/provisioning_mock.go
+@@ -5,6 +5,7 @@ type Calls struct {
+ 	ProvisionNotifications              []interface{}
+ 	ProvisionDashboards                 []interface{}
+ 	GetDashboardProvisionerResolvedPath []interface{}
++	GetAllowUiUpdatesFromConfig         []interface{}
+ }
+ 
+ type ProvisioningServiceMock struct {
+@@ -13,6 +14,7 @@ type ProvisioningServiceMock struct {
+ 	ProvisionNotificationsFunc              func() error
+ 	ProvisionDashboardsFunc                 func() error
+ 	GetDashboardProvisionerResolvedPathFunc func(name string) string
++	GetAllowUiUpdatesFromConfigFunc         func(name string) bool
+ }
+ 
+ func NewProvisioningServiceMock() *ProvisioningServiceMock {
+@@ -52,3 +54,11 @@ func (mock *ProvisioningServiceMock) GetDashboardProvisionerResolvedPath(name st
+ 	}
+ 	return ""
+ }
++
++func (mock *ProvisioningServiceMock) GetAllowUiUpdatesFromConfig(name string) bool {
++	mock.Calls.GetAllowUiUpdatesFromConfig = append(mock.Calls.GetAllowUiUpdatesFromConfig, name)
++	if mock.GetAllowUiUpdatesFromConfigFunc != nil {
++		return mock.GetAllowUiUpdatesFromConfigFunc(name)
++	}
++	return false
++}
+diff --git a/pkg/services/sqlstore/dashboard_service_integration_test.go b/pkg/services/sqlstore/dashboard_service_integration_test.go
+index 82e0d212130..582a4a0c5f1 100644
+--- a/pkg/services/sqlstore/dashboard_service_integration_test.go
++++ b/pkg/services/sqlstore/dashboard_service_integration_test.go
+@@ -964,13 +964,13 @@ func permissionScenario(desc string, canSave bool, fn dashboardPermissionScenari
+ 
+ func callSaveWithResult(cmd models.SaveDashboardCommand) *models.Dashboard {
+ 	dto := toSaveDashboardDto(cmd)
+-	res, _ := dashboards.NewService().SaveDashboard(&dto)
++	res, _ := dashboards.NewService().SaveDashboard(&dto, false)
+ 	return res
+ }
+ 
+ func callSaveWithError(cmd models.SaveDashboardCommand) error {
+ 	dto := toSaveDashboardDto(cmd)
+-	_, err := dashboards.NewService().SaveDashboard(&dto)
++	_, err := dashboards.NewService().SaveDashboard(&dto, false)
+ 	return err
+ }
+ 
+@@ -994,7 +994,7 @@ func saveTestDashboard(title string, orgId int64, folderId int64) *models.Dashbo
+ 		},
+ 	}
+ 
+-	res, err := dashboards.NewService().SaveDashboard(&dto)
++	res, err := dashboards.NewService().SaveDashboard(&dto, false)
+ 	So(err, ShouldBeNil)
+ 
+ 	return res
+@@ -1020,7 +1020,7 @@ func saveTestFolder(title string, orgId int64) *models.Dashboard {
+ 		},
+ 	}
+ 
+-	res, err := dashboards.NewService().SaveDashboard(&dto)
++	res, err := dashboards.NewService().SaveDashboard(&dto, false)
+ 	So(err, ShouldBeNil)
+ 
+ 	return res

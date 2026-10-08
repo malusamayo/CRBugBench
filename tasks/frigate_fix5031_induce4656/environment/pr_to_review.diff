@@ -1,0 +1,261 @@
+commit 037f3761e7d5b2e297557f31a5d1e4c50711e7af
+Author: Nicolas Mowen <nickmowen213@gmail.com>
+Date:   Sun Dec 11 06:45:32 2022 -0700
+
+    Use UTC for recordings (#4656)
+    
+    * Write files in UTC and update folder structure to not conflict
+    
+    * Add timezone arg for events summary
+    
+    * Fixes for timezone in calls
+    
+    * Use timezone for recording and recordings summary endpoints
+    
+    * Fix sqlite parsing
+    
+    * Fix sqlite parsing
+    
+    * Fix recordings summary with timezone
+    
+    * Fix
+    
+    * Formatting
+    
+    * Add pytz
+    
+    * Fix default timezone
+    
+    * Add note about times being displayed in localtime
+    
+    * Improve timezone wording and show actual timezone
+    
+    * Add alternate endpoint to cover existing usecase to avoid breaking change
+    
+    * Formatting
+
+diff --git a/frigate/http.py b/frigate/http.py
+index 43e03d0e6..29e5449cc 100644
+--- a/frigate/http.py
++++ b/frigate/http.py
+@@ -1,15 +1,18 @@
+ import base64
+-from datetime import datetime, timedelta
++from datetime import datetime, timedelta, timezone
+ import copy
+ import glob
+ import logging
+ import json
+ import os
+ import subprocess as sp
++import pytz
+ import time
+ import traceback
++
+ from functools import reduce
+ from pathlib import Path
++from tzlocal import get_localzone_name
+ from urllib.parse import unquote
+ 
+ import cv2
+@@ -86,6 +89,8 @@ def is_healthy():
+ 
+ @bp.route("/events/summary")
+ def events_summary():
++    tz_name = request.args.get("timezone", default="utc", type=str)
++    tz_offset = f"{int(datetime.now(pytz.timezone(tz_name)).utcoffset().total_seconds()/60/60)} hour"
+     has_clip = request.args.get("has_clip", type=int)
+     has_snapshot = request.args.get("has_snapshot", type=int)
+ 
+@@ -105,7 +110,7 @@ def events_summary():
+             Event.camera,
+             Event.label,
+             fn.strftime(
+-                "%Y-%m-%d", fn.datetime(Event.start_time, "unixepoch", "localtime")
++                "%Y-%m-%d", fn.datetime(Event.start_time, "unixepoch", tz_offset)
+             ).alias("day"),
+             Event.zones,
+             fn.COUNT(Event.id).alias("count"),
+@@ -115,7 +120,7 @@ def events_summary():
+             Event.camera,
+             Event.label,
+             fn.strftime(
+-                "%Y-%m-%d", fn.datetime(Event.start_time, "unixepoch", "localtime")
++                "%Y-%m-%d", fn.datetime(Event.start_time, "unixepoch", tz_offset)
+             ),
+             Event.zones,
+         )
+@@ -796,11 +801,13 @@ def get_recordings_storage_usage():
+ # return hourly summary for recordings of camera
+ @bp.route("/<camera_name>/recordings/summary")
+ def recordings_summary(camera_name):
++    tz_name = request.args.get("timezone", default="utc", type=str)
++    tz_offset = f"{int(datetime.now(pytz.timezone(tz_name)).utcoffset().total_seconds()/60/60)} hour"
+     recording_groups = (
+         Recordings.select(
+             fn.strftime(
+                 "%Y-%m-%d %H",
+-                fn.datetime(Recordings.start_time, "unixepoch", "localtime"),
++                fn.datetime(Recordings.start_time, "unixepoch", tz_offset),
+             ).alias("hour"),
+             fn.SUM(Recordings.duration).alias("duration"),
+             fn.SUM(Recordings.motion).alias("motion"),
+@@ -810,13 +817,13 @@ def recordings_summary(camera_name):
+         .group_by(
+             fn.strftime(
+                 "%Y-%m-%d %H",
+-                fn.datetime(Recordings.start_time, "unixepoch", "localtime"),
++                fn.datetime(Recordings.start_time, "unixepoch", tz_offset),
+             )
+         )
+         .order_by(
+             fn.strftime(
+                 "%Y-%m-%d H",
+-                fn.datetime(Recordings.start_time, "unixepoch", "localtime"),
++                fn.datetime(Recordings.start_time, "unixepoch", tz_offset),
+             ).desc()
+         )
+     )
+@@ -824,14 +831,16 @@ def recordings_summary(camera_name):
+     event_groups = (
+         Event.select(
+             fn.strftime(
+-                "%Y-%m-%d %H", fn.datetime(Event.start_time, "unixepoch", "localtime")
++                "%Y-%m-%d %H",
++                fn.datetime(Event.start_time, "unixepoch", tz_offset),
+             ).alias("hour"),
+             fn.COUNT(Event.id).alias("count"),
+         )
+         .where(Event.camera == camera_name, Event.has_clip)
+         .group_by(
+             fn.strftime(
+-                "%Y-%m-%d %H", fn.datetime(Event.start_time, "unixepoch", "localtime")
++                "%Y-%m-%d %H",
++                fn.datetime(Event.start_time, "unixepoch", tz_offset),
+             ),
+         )
+         .objects()
+@@ -1016,8 +1025,20 @@ def vod_ts(camera_name, start_ts, end_ts):
+ 
+ 
+ @bp.route("/vod/<year_month>/<day>/<hour>/<camera_name>")
+-def vod_hour(year_month, day, hour, camera_name):
+-    start_date = datetime.strptime(f"{year_month}-{day} {hour}", "%Y-%m-%d %H")
++def vod_hour_no_timezone(year_month, day, hour, camera_name):
++    return vod_hour(
++        year_month, day, hour, camera_name, get_localzone_name().replace("/", "_")
++    )
++
++
++# TODO make this nicer when vod module is removed
++@bp.route("/vod/<year_month>/<day>/<hour>/<camera_name>/<tz_name>")
++def vod_hour(year_month, day, hour, camera_name, tz_name):
++    tz_name = tz_name.replace("_", "/")
++    parts = year_month.split("-")
++    start_date = datetime(
++        int(parts[0]), int(parts[1]), int(day), int(hour), tzinfo=pytz.timezone(tz_name)
++    ).astimezone(timezone.utc)
+     end_date = start_date + timedelta(hours=1) - timedelta(milliseconds=1)
+     start_ts = start_date.timestamp()
+     end_ts = end_date.timestamp()
+diff --git a/frigate/record.py b/frigate/record.py
+index 51e4a9d70..9025898c8 100644
+--- a/frigate/record.py
++++ b/frigate/record.py
+@@ -261,8 +261,8 @@ class RecordingMaintainer(threading.Thread):
+     def store_segment(
+         self,
+         camera,
+-        start_time,
+-        end_time,
++        start_time: datetime.datetime,
++        end_time: datetime.datetime,
+         duration,
+         cache_path,
+         store_mode: RetainModeEnum,
+@@ -277,12 +277,20 @@ class RecordingMaintainer(threading.Thread):
+             self.end_time_cache.pop(cache_path, None)
+             return
+ 
+-        directory = os.path.join(RECORD_DIR, start_time.strftime("%Y-%m/%d/%H"), camera)
++        directory = os.path.join(
++            RECORD_DIR,
++            start_time.replace(tzinfo=datetime.timezone.utc)
++            .astimezone(tz=None)
++            .strftime("%Y-%m-%d/%H"),
++            camera,
++        )
+ 
+         if not os.path.exists(directory):
+             os.makedirs(directory)
+ 
+-        file_name = f"{start_time.strftime('%M.%S.mp4')}"
++        file_name = (
++            f"{start_time.replace(tzinfo=datetime.timezone.utc).strftime('%M.%S.mp4')}"
++        )
+         file_path = os.path.join(directory, file_name)
+ 
+         try:
+diff --git a/requirements-wheels.txt b/requirements-wheels.txt
+index 9952a2d72..930ab9e47 100644
+--- a/requirements-wheels.txt
++++ b/requirements-wheels.txt
+@@ -11,6 +11,8 @@ peewee_migrate == 1.4.*
+ psutil == 5.9.*
+ pydantic == 1.10.*
+ PyYAML == 6.0
++pytz == 2022.6
++tzlocal == 4.2
+ types-PyYAML == 6.0.*
+ requests == 2.28.*
+ types-requests == 2.28.*
+diff --git a/web/src/routes/Recording.jsx b/web/src/routes/Recording.jsx
+index 1b018138b..48a49c70f 100644
+--- a/web/src/routes/Recording.jsx
++++ b/web/src/routes/Recording.jsx
+@@ -9,13 +9,16 @@ import { useApiHost } from '../api';
+ import useSWR from 'swr';
+ 
+ export default function Recording({ camera, date, hour = '00', minute = '00', second = '00' }) {
++  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+   const currentDate = useMemo(
+     () => (date ? parseISO(`${date}T${hour || '00'}:${minute || '00'}:${second || '00'}`) : new Date()),
+     [date, hour, minute, second]
+   );
+ 
+   const apiHost = useApiHost();
+-  const { data: recordingsSummary } = useSWR(`${camera}/recordings/summary`, { revalidateOnFocus: false });
++  const { data: recordingsSummary } = useSWR([`${camera}/recordings/summary`, { timezone }], {
++    revalidateOnFocus: false,
++  });
+ 
+   const recordingParams = {
+     before: getUnixTime(endOfHour(currentDate)),
+@@ -66,14 +69,17 @@ export default function Recording({ camera, date, hour = '00', minute = '00', se
+           description: `${camera} recording @ ${h.hour}:00.`,
+           sources: [
+             {
+-              src: `${apiHost}/vod/${year}-${month}/${day}/${h.hour}/${camera}/master.m3u8`,
++              src: `${apiHost}/vod/${year}-${month}/${day}/${h.hour}/${camera}/${timezone.replaceAll(
++                '/',
++                '_'
++              )}/master.m3u8`,
+               type: 'application/vnd.apple.mpegurl',
+             },
+           ],
+         };
+       })
+       .reverse();
+-  }, [apiHost, date, recordingsSummary, camera]);
++  }, [apiHost, date, recordingsSummary, camera, timezone]);
+ 
+   const playlistIndex = useMemo(() => {
+     const index = playlist.findIndex((item) => item.name === hour);
+@@ -126,6 +132,7 @@ export default function Recording({ camera, date, hour = '00', minute = '00', se
+   return (
+     <div className="space-y-4 p-2 px-4">
+       <Heading>{camera.replaceAll('_', ' ')} Recordings</Heading>
++      <div className="text-xs">Dates and times are based on the browser's timezone {timezone}</div>
+ 
+       <VideoPlayer
+         onReady={(player) => {

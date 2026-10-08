@@ -1,0 +1,3327 @@
+commit a1b735a4c09974ff25920c975ade19eb3d5a2d42
+Author: Maries <xh001x@hotmail.com>
+Date:   Thu Nov 20 10:15:23 2025 +0800
+
+    feat: trigger billing (#28335)
+    
+    Signed-off-by: lyzno1 <yuanyouhuilyz@gmail.com>
+    Co-authored-by: lyzno1 <yuanyouhuilyz@gmail.com>
+    Co-authored-by: lyzno1 <92089059+lyzno1@users.noreply.github.com>
+    Co-authored-by: autofix-ci[bot] <114827586+autofix-ci[bot]@users.noreply.github.com>
+
+diff --git a/api/configs/feature/__init__.py b/api/configs/feature/__init__.py
+index ff1f983f94..7cce3847b4 100644
+--- a/api/configs/feature/__init__.py
++++ b/api/configs/feature/__init__.py
+@@ -77,10 +77,6 @@ class AppExecutionConfig(BaseSettings):
+         description="Maximum number of concurrent active requests per app (0 for unlimited)",
+         default=0,
+     )
+-    APP_DAILY_RATE_LIMIT: NonNegativeInt = Field(
+-        description="Maximum number of requests per app per day",
+-        default=5000,
+-    )
+ 
+ 
+ class CodeExecutionSandboxConfig(BaseSettings):
+@@ -1086,7 +1082,7 @@ class CeleryScheduleTasksConfig(BaseSettings):
+     )
+     TRIGGER_PROVIDER_CREDENTIAL_THRESHOLD_SECONDS: int = Field(
+         description="Proactive credential refresh threshold in seconds",
+-        default=180,
++        default=60 * 60,
+     )
+     TRIGGER_PROVIDER_SUBSCRIPTION_THRESHOLD_SECONDS: int = Field(
+         description="Proactive subscription refresh threshold in seconds",
+diff --git a/api/enums/quota_type.py b/api/enums/quota_type.py
+new file mode 100644
+index 0000000000..9f511b88ef
+--- /dev/null
++++ b/api/enums/quota_type.py
+@@ -0,0 +1,209 @@
++import logging
++from dataclasses import dataclass
++from enum import StrEnum, auto
++
++logger = logging.getLogger(__name__)
++
++
++@dataclass
++class QuotaCharge:
++    """
++    Result of a quota consumption operation.
++
++    Attributes:
++        success: Whether the quota charge succeeded
++        charge_id: UUID for refund, or None if failed/disabled
++    """
++
++    success: bool
++    charge_id: str | None
++    _quota_type: "QuotaType"
++
++    def refund(self) -> None:
++        """
++        Refund this quota charge.
++
++        Safe to call even if charge failed or was disabled.
++        This method guarantees no exceptions will be raised.
++        """
++        if self.charge_id:
++            self._quota_type.refund(self.charge_id)
++            logger.info("Refunded quota for %s with charge_id: %s", self._quota_type.value, self.charge_id)
++
++
++class QuotaType(StrEnum):
++    """
++    Supported quota types for tenant feature usage.
++
++    Add additional types here whenever new billable features become available.
++    """
++
++    # Trigger execution quota
++    TRIGGER = auto()
++
++    # Workflow execution quota
++    WORKFLOW = auto()
++
++    UNLIMITED = auto()
++
++    @property
++    def billing_key(self) -> str:
++        """
++        Get the billing key for the feature.
++        """
++        match self:
++            case QuotaType.TRIGGER:
++                return "trigger_event"
++            case QuotaType.WORKFLOW:
++                return "api_rate_limit"
++            case _:
++                raise ValueError(f"Invalid quota type: {self}")
++
++    def consume(self, tenant_id: str, amount: int = 1) -> QuotaCharge:
++        """
++        Consume quota for the feature.
++
++        Args:
++            tenant_id: The tenant identifier
++            amount: Amount to consume (default: 1)
++
++        Returns:
++            QuotaCharge with success status and charge_id for refund
++
++        Raises:
++            QuotaExceededError: When quota is insufficient
++        """
++        from configs import dify_config
++        from services.billing_service import BillingService
++        from services.errors.app import QuotaExceededError
++
++        if not dify_config.BILLING_ENABLED:
++            logger.debug("Billing disabled, allowing request for %s", tenant_id)
++            return QuotaCharge(success=True, charge_id=None, _quota_type=self)
++
++        logger.info("Consuming %d %s quota for tenant %s", amount, self.value, tenant_id)
++
++        if amount <= 0:
++            raise ValueError("Amount to consume must be greater than 0")
++
++        try:
++            response = BillingService.update_tenant_feature_plan_usage(tenant_id, self.billing_key, delta=amount)
++
++            if response.get("result") != "success":
++                logger.warning(
++                    "Failed to consume quota for %s, feature %s details: %s",
++                    tenant_id,
++                    self.value,
++                    response.get("detail"),
++                )
++                raise QuotaExceededError(feature=self.value, tenant_id=tenant_id, required=amount)
++
++            charge_id = response.get("history_id")
++            logger.debug(
++                "Successfully consumed %d %s quota for tenant %s, charge_id: %s",
++                amount,
++                self.value,
++                tenant_id,
++                charge_id,
++            )
++            return QuotaCharge(success=True, charge_id=charge_id, _quota_type=self)
++
++        except QuotaExceededError:
++            raise
++        except Exception:
++            # fail-safe: allow request on billing errors
++            logger.exception("Failed to consume quota for %s, feature %s", tenant_id, self.value)
++            return unlimited()
++
++    def check(self, tenant_id: str, amount: int = 1) -> bool:
++        """
++        Check if tenant has sufficient quota without consuming.
++
++        Args:
++            tenant_id: The tenant identifier
++            amount: Amount to check (default: 1)
++
++        Returns:
++            True if quota is sufficient, False otherwise
++        """
++        from configs import dify_config
++
++        if not dify_config.BILLING_ENABLED:
++            return True
++
++        if amount <= 0:
++            raise ValueError("Amount to check must be greater than 0")
++
++        try:
++            remaining = self.get_remaining(tenant_id)
++            return remaining >= amount if remaining != -1 else True
++        except Exception:
++            logger.exception("Failed to check quota for %s, feature %s", tenant_id, self.value)
++            # fail-safe: allow request on billing errors
++            return True
++
++    def refund(self, charge_id: str) -> None:
++        """
++        Refund quota using charge_id from consume().
++
++        This method guarantees no exceptions will be raised.
++        All errors are logged but silently handled.
++
++        Args:
++            charge_id: The UUID returned from consume()
++        """
++        try:
++            from configs import dify_config
++            from services.billing_service import BillingService
++
++            if not dify_config.BILLING_ENABLED:
++                return
++
++            if not charge_id:
++                logger.warning("Cannot refund: charge_id is empty")
++                return
++
++            logger.info("Refunding %s quota with charge_id: %s", self.value, charge_id)
++
++            response = BillingService.refund_tenant_feature_plan_usage(charge_id)
++            if response.get("result") == "success":
++                logger.debug("Successfully refunded %s quota, charge_id: %s", self.value, charge_id)
++            else:
++                logger.warning("Refund failed for charge_id: %s", charge_id)
++
++        except Exception:
++            # Catch ALL exceptions - refund must never fail
++            logger.exception("Failed to refund quota for charge_id: %s", charge_id)
++            # Don't raise - refund is best-effort and must be silent
++
++    def get_remaining(self, tenant_id: str) -> int:
++        """
++        Get remaining quota for the tenant.
++
++        Args:
++            tenant_id: The tenant identifier
++
++        Returns:
++            Remaining quota amount
++        """
++        from services.billing_service import BillingService
++
++        try:
++            usage_info = BillingService.get_tenant_feature_plan_usage(tenant_id, self.billing_key)
++            # Assuming the API returns a dict with 'remaining' or 'limit' and 'used'
++            if isinstance(usage_info, dict):
++                return usage_info.get("remaining", 0)
++            # If it returns a simple number, treat it as remaining
++            return int(usage_info) if usage_info else 0
++        except Exception:
++            logger.exception("Failed to get remaining quota for %s, feature %s", tenant_id, self.value)
++            return -1
++
++
++def unlimited() -> QuotaCharge:
++    """
++    Return a quota charge for unlimited quota.
++
++    This is useful for features that are not subject to quota limits, such as the UNLIMITED quota type.
++    """
++    return QuotaCharge(success=True, charge_id=None, _quota_type=QuotaType.UNLIMITED)
+diff --git a/api/libs/email_i18n.py b/api/libs/email_i18n.py
+index 37ff1a438e..ff74ccbe8e 100644
+--- a/api/libs/email_i18n.py
++++ b/api/libs/email_i18n.py
+@@ -38,6 +38,12 @@ class EmailType(StrEnum):
+     EMAIL_REGISTER = auto()
+     EMAIL_REGISTER_WHEN_ACCOUNT_EXIST = auto()
+     RESET_PASSWORD_WHEN_ACCOUNT_NOT_EXIST_NO_REGISTER = auto()
++    TRIGGER_EVENTS_LIMIT_SANDBOX = auto()
++    TRIGGER_EVENTS_LIMIT_PROFESSIONAL = auto()
++    TRIGGER_EVENTS_USAGE_WARNING_SANDBOX = auto()
++    TRIGGER_EVENTS_USAGE_WARNING_PROFESSIONAL = auto()
++    API_RATE_LIMIT_LIMIT_SANDBOX = auto()
++    API_RATE_LIMIT_WARNING_SANDBOX = auto()
+ 
+ 
+ class EmailLanguage(StrEnum):
+@@ -445,6 +451,78 @@ def create_default_email_config() -> EmailI18nConfig:
+                 branded_template_path="clean_document_job_mail_template_zh-CN.html",
+             ),
+         },
++        EmailType.TRIGGER_EVENTS_LIMIT_SANDBOX: {
++            EmailLanguage.EN_US: EmailTemplate(
++                subject="You’ve reached your Sandbox Trigger Events limit",
++                template_path="trigger_events_limit_template_en-US.html",
++                branded_template_path="without-brand/trigger_events_limit_template_en-US.html",
++            ),
++            EmailLanguage.ZH_HANS: EmailTemplate(
++                subject="您的 Sandbox 触发事件额度已用尽",
++                template_path="trigger_events_limit_template_zh-CN.html",
++                branded_template_path="without-brand/trigger_events_limit_template_zh-CN.html",
++            ),
++        },
++        EmailType.TRIGGER_EVENTS_LIMIT_PROFESSIONAL: {
++            EmailLanguage.EN_US: EmailTemplate(
++                subject="You’ve reached your monthly Trigger Events limit",
++                template_path="trigger_events_limit_template_en-US.html",
++                branded_template_path="without-brand/trigger_events_limit_template_en-US.html",
++            ),
++            EmailLanguage.ZH_HANS: EmailTemplate(
++                subject="您的月度触发事件额度已用尽",
++                template_path="trigger_events_limit_template_zh-CN.html",
++                branded_template_path="without-brand/trigger_events_limit_template_zh-CN.html",
++            ),
++        },
++        EmailType.TRIGGER_EVENTS_USAGE_WARNING_SANDBOX: {
++            EmailLanguage.EN_US: EmailTemplate(
++                subject="You’re nearing your Sandbox Trigger Events limit",
++                template_path="trigger_events_usage_warning_template_en-US.html",
++                branded_template_path="without-brand/trigger_events_usage_warning_template_en-US.html",
++            ),
++            EmailLanguage.ZH_HANS: EmailTemplate(
++                subject="您的 Sandbox 触发事件额度接近上限",
++                template_path="trigger_events_usage_warning_template_zh-CN.html",
++                branded_template_path="without-brand/trigger_events_usage_warning_template_zh-CN.html",
++            ),
++        },
++        EmailType.TRIGGER_EVENTS_USAGE_WARNING_PROFESSIONAL: {
++            EmailLanguage.EN_US: EmailTemplate(
++                subject="You’re nearing your Monthly Trigger Events limit",
++                template_path="trigger_events_usage_warning_template_en-US.html",
++                branded_template_path="without-brand/trigger_events_usage_warning_template_en-US.html",
++            ),
++            EmailLanguage.ZH_HANS: EmailTemplate(
++                subject="您的月度触发事件额度接近上限",
++                template_path="trigger_events_usage_warning_template_zh-CN.html",
++                branded_template_path="without-brand/trigger_events_usage_warning_template_zh-CN.html",
++            ),
++        },
++        EmailType.API_RATE_LIMIT_LIMIT_SANDBOX: {
++            EmailLanguage.EN_US: EmailTemplate(
++                subject="You’ve reached your API Rate Limit",
++                template_path="api_rate_limit_limit_template_en-US.html",
++                branded_template_path="without-brand/api_rate_limit_limit_template_en-US.html",
++            ),
++            EmailLanguage.ZH_HANS: EmailTemplate(
++                subject="您的 API 速率额度已用尽",
++                template_path="api_rate_limit_limit_template_zh-CN.html",
++                branded_template_path="without-brand/api_rate_limit_limit_template_zh-CN.html",
++            ),
++        },
++        EmailType.API_RATE_LIMIT_WARNING_SANDBOX: {
++            EmailLanguage.EN_US: EmailTemplate(
++                subject="You’re nearing your API Rate Limit",
++                template_path="api_rate_limit_warning_template_en-US.html",
++                branded_template_path="without-brand/api_rate_limit_warning_template_en-US.html",
++            ),
++            EmailLanguage.ZH_HANS: EmailTemplate(
++                subject="您的 API 速率额度接近上限",
++                template_path="api_rate_limit_warning_template_zh-CN.html",
++                branded_template_path="without-brand/api_rate_limit_warning_template_zh-CN.html",
++            ),
++        },
+         EmailType.EMAIL_REGISTER: {
+             EmailLanguage.EN_US: EmailTemplate(
+                 subject="Register Your {application_title} Account",
+diff --git a/api/models/enums.py b/api/models/enums.py
+index d06d0d5ebc..8cd3d4cf2a 100644
+--- a/api/models/enums.py
++++ b/api/models/enums.py
+@@ -64,6 +64,7 @@ class AppTriggerStatus(StrEnum):
+     ENABLED = "enabled"
+     DISABLED = "disabled"
+     UNAUTHORIZED = "unauthorized"
++    RATE_LIMITED = "rate_limited"
+ 
+ 
+ class AppTriggerType(StrEnum):
+diff --git a/api/schedule/workflow_schedule_task.py b/api/schedule/workflow_schedule_task.py
+index 41e2232353..d68b9565ec 100644
+--- a/api/schedule/workflow_schedule_task.py
++++ b/api/schedule/workflow_schedule_task.py
+@@ -9,7 +9,6 @@ from extensions.ext_database import db
+ from libs.datetime_utils import naive_utc_now
+ from libs.schedule_utils import calculate_next_run_at
+ from models.trigger import AppTrigger, AppTriggerStatus, AppTriggerType, WorkflowSchedulePlan
+-from services.workflow.queue_dispatcher import QueueDispatcherManager
+ from tasks.workflow_schedule_tasks import run_schedule_trigger
+ 
+ logger = logging.getLogger(__name__)
+@@ -29,7 +28,6 @@ def poll_workflow_schedules() -> None:
+ 
+     with session_factory() as session:
+         total_dispatched = 0
+-        total_rate_limited = 0
+ 
+         # Process in batches until we've handled all due schedules or hit the limit
+         while True:
+@@ -38,11 +36,10 @@ def poll_workflow_schedules() -> None:
+             if not due_schedules:
+                 break
+ 
+-            dispatched_count, rate_limited_count = _process_schedules(session, due_schedules)
++            dispatched_count = _process_schedules(session, due_schedules)
+             total_dispatched += dispatched_count
+-            total_rate_limited += rate_limited_count
+ 
+-            logger.debug("Batch processed: %d dispatched, %d rate limited", dispatched_count, rate_limited_count)
++            logger.debug("Batch processed: %d dispatched", dispatched_count)
+ 
+             # Circuit breaker: check if we've hit the per-tick limit (if enabled)
+             if (
+@@ -55,8 +52,8 @@ def poll_workflow_schedules() -> None:
+                 )
+                 break
+ 
+-        if total_dispatched > 0 or total_rate_limited > 0:
+-            logger.info("Total processed: %d dispatched, %d rate limited", total_dispatched, total_rate_limited)
++        if total_dispatched > 0:
++            logger.info("Total processed: %d dispatched", total_dispatched)
+ 
+ 
+ def _fetch_due_schedules(session: Session) -> list[WorkflowSchedulePlan]:
+@@ -93,15 +90,12 @@ def _fetch_due_schedules(session: Session) -> list[WorkflowSchedulePlan]:
+     return list(due_schedules)
+ 
+ 
+-def _process_schedules(session: Session, schedules: list[WorkflowSchedulePlan]) -> tuple[int, int]:
++def _process_schedules(session: Session, schedules: list[WorkflowSchedulePlan]) -> int:
+     """Process schedules: check quota, update next run time and dispatch to Celery in parallel."""
+     if not schedules:
+-        return 0, 0
++        return 0
+ 
+-    dispatcher_manager = QueueDispatcherManager()
+     tasks_to_dispatch: list[str] = []
+-    rate_limited_count = 0
+-
+     for schedule in schedules:
+         next_run_at = calculate_next_run_at(
+             schedule.cron_expression,
+@@ -109,12 +103,7 @@ def _process_schedules(session: Session, schedules: list[WorkflowSchedulePlan])
+         )
+         schedule.next_run_at = next_run_at
+ 
+-        dispatcher = dispatcher_manager.get_dispatcher(schedule.tenant_id)
+-        if not dispatcher.check_daily_quota(schedule.tenant_id):
+-            logger.info("Tenant %s rate limited, skipping schedule_plan %s", schedule.tenant_id, schedule.id)
+-            rate_limited_count += 1
+-        else:
+-            tasks_to_dispatch.append(schedule.id)
++        tasks_to_dispatch.append(schedule.id)
+ 
+     if tasks_to_dispatch:
+         job = group(run_schedule_trigger.s(schedule_id) for schedule_id in tasks_to_dispatch)
+@@ -124,4 +113,4 @@ def _process_schedules(session: Session, schedules: list[WorkflowSchedulePlan])
+ 
+     session.commit()
+ 
+-    return len(tasks_to_dispatch), rate_limited_count
++    return len(tasks_to_dispatch)
+diff --git a/api/services/app_generate_service.py b/api/services/app_generate_service.py
+index 5b09bd9593..bb1ea742d0 100644
+--- a/api/services/app_generate_service.py
++++ b/api/services/app_generate_service.py
+@@ -10,19 +10,14 @@ from core.app.apps.completion.app_generator import CompletionAppGenerator
+ from core.app.apps.workflow.app_generator import WorkflowAppGenerator
+ from core.app.entities.app_invoke_entities import InvokeFrom
+ from core.app.features.rate_limiting import RateLimit
+-from enums.cloud_plan import CloudPlan
+-from libs.helper import RateLimiter
++from enums.quota_type import QuotaType, unlimited
+ from models.model import Account, App, AppMode, EndUser
+ from models.workflow import Workflow
+-from services.billing_service import BillingService
+-from services.errors.app import WorkflowIdFormatError, WorkflowNotFoundError
+-from services.errors.llm import InvokeRateLimitError
++from services.errors.app import InvokeRateLimitError, QuotaExceededError, WorkflowIdFormatError, WorkflowNotFoundError
+ from services.workflow_service import WorkflowService
+ 
+ 
+ class AppGenerateService:
+-    system_rate_limiter = RateLimiter("app_daily_rate_limiter", dify_config.APP_DAILY_RATE_LIMIT, 86400)
+-
+     @classmethod
+     def generate(
+         cls,
+@@ -42,17 +37,12 @@ class AppGenerateService:
+         :param streaming: streaming
+         :return:
+         """
+-        # system level rate limiter
++        quota_charge = unlimited()
+         if dify_config.BILLING_ENABLED:
+-            # check if it's free plan
+-            limit_info = BillingService.get_info(app_model.tenant_id)
+-            if limit_info["subscription"]["plan"] == CloudPlan.SANDBOX:
+-                if cls.system_rate_limiter.is_rate_limited(app_model.tenant_id):
+-                    raise InvokeRateLimitError(
+-                        "Rate limit exceeded, please upgrade your plan "
+-                        f"or your RPD was {dify_config.APP_DAILY_RATE_LIMIT} requests/day"
+-                    )
+-                cls.system_rate_limiter.increment_rate_limit(app_model.tenant_id)
++            try:
++                quota_charge = QuotaType.WORKFLOW.consume(app_model.tenant_id)
++            except QuotaExceededError:
++                raise InvokeRateLimitError(f"Workflow execution quota limit reached for tenant {app_model.tenant_id}")
+ 
+         # app level rate limiter
+         max_active_request = cls._get_max_active_requests(app_model)
+@@ -124,6 +114,7 @@ class AppGenerateService:
+             else:
+                 raise ValueError(f"Invalid app mode {app_model.mode}")
+         except Exception:
++            quota_charge.refund()
+             rate_limit.exit(request_id)
+             raise
+         finally:
+diff --git a/api/services/async_workflow_service.py b/api/services/async_workflow_service.py
+index 034d7ffedb..8d62f121e2 100644
+--- a/api/services/async_workflow_service.py
++++ b/api/services/async_workflow_service.py
+@@ -13,18 +13,17 @@ from celery.result import AsyncResult
+ from sqlalchemy import select
+ from sqlalchemy.orm import Session
+ 
++from enums.quota_type import QuotaType
+ from extensions.ext_database import db
+-from extensions.ext_redis import redis_client
+ from models.account import Account
+ from models.enums import CreatorUserRole, WorkflowTriggerStatus
+ from models.model import App, EndUser
+ from models.trigger import WorkflowTriggerLog
+ from models.workflow import Workflow
+ from repositories.sqlalchemy_workflow_trigger_log_repository import SQLAlchemyWorkflowTriggerLogRepository
+-from services.errors.app import InvokeDailyRateLimitError, WorkflowNotFoundError
++from services.errors.app import InvokeRateLimitError, QuotaExceededError, WorkflowNotFoundError
+ from services.workflow.entities import AsyncTriggerResponse, TriggerData, WorkflowTaskData
+ from services.workflow.queue_dispatcher import QueueDispatcherManager, QueuePriority
+-from services.workflow.rate_limiter import TenantDailyRateLimiter
+ from services.workflow_service import WorkflowService
+ from tasks.async_workflow_tasks import (
+     execute_workflow_professional,
+@@ -82,7 +81,6 @@ class AsyncWorkflowService:
+         trigger_log_repo = SQLAlchemyWorkflowTriggerLogRepository(session)
+         dispatcher_manager = QueueDispatcherManager()
+         workflow_service = WorkflowService()
+-        rate_limiter = TenantDailyRateLimiter(redis_client)
+ 
+         # 1. Validate app exists
+         app_model = session.scalar(select(App).where(App.id == trigger_data.app_id))
+@@ -127,25 +125,19 @@ class AsyncWorkflowService:
+         trigger_log = trigger_log_repo.create(trigger_log)
+         session.commit()
+ 
+-        # 7. Check and consume daily quota
+-        if not dispatcher.consume_quota(trigger_data.tenant_id):
++        # 7. Check and consume quota
++        try:
++            QuotaType.WORKFLOW.consume(trigger_data.tenant_id)
++        except QuotaExceededError as e:
+             # Update trigger log status
+             trigger_log.status = WorkflowTriggerStatus.RATE_LIMITED
+-            trigger_log.error = f"Daily limit reached for {dispatcher.get_queue_name()}"
++            trigger_log.error = f"Quota limit reached: {e}"
+             trigger_log_repo.update(trigger_log)
+             session.commit()
+ 
+-            tenant_owner_tz = rate_limiter.get_tenant_owner_timezone(trigger_data.tenant_id)
+-
+-            remaining = rate_limiter.get_remaining_quota(trigger_data.tenant_id, dispatcher.get_daily_limit())
+-
+-            reset_time = rate_limiter.get_quota_reset_time(trigger_data.tenant_id, tenant_owner_tz)
+-
+-            raise InvokeDailyRateLimitError(
+-                f"Daily workflow execution limit reached. "
+-                f"Limit resets at {reset_time.strftime('%Y-%m-%d %H:%M:%S %Z')}. "
+-                f"Remaining quota: {remaining}"
+-            )
++            raise InvokeRateLimitError(
++                f"Workflow execution quota limit reached for tenant {trigger_data.tenant_id}"
++            ) from e
+ 
+         # 8. Create task data
+         queue_name = dispatcher.get_queue_name()
+diff --git a/api/services/billing_service.py b/api/services/billing_service.py
+index 1650bad0f5..1f1aea709f 100644
+--- a/api/services/billing_service.py
++++ b/api/services/billing_service.py
+@@ -24,6 +24,13 @@ class BillingService:
+         billing_info = cls._send_request("GET", "/subscription/info", params=params)
+         return billing_info
+ 
++    @classmethod
++    def get_tenant_feature_plan_usage_info(cls, tenant_id: str):
++        params = {"tenant_id": tenant_id}
++
++        usage_info = cls._send_request("GET", "/tenant-feature-usage/info", params=params)
++        return usage_info
++
+     @classmethod
+     def get_knowledge_rate_limit(cls, tenant_id: str):
+         params = {"tenant_id": tenant_id}
+@@ -55,6 +62,44 @@ class BillingService:
+         params = {"prefilled_email": prefilled_email, "tenant_id": tenant_id}
+         return cls._send_request("GET", "/invoices", params=params)
+ 
++    @classmethod
++    def update_tenant_feature_plan_usage(cls, tenant_id: str, feature_key: str, delta: int) -> dict:
++        """
++        Update tenant feature plan usage.
++
++        Args:
++            tenant_id: Tenant identifier
++            feature_key: Feature key (e.g., 'trigger', 'workflow')
++            delta: Usage delta (positive to add, negative to consume)
++
++        Returns:
++            Response dict with 'result' and 'history_id'
++            Example: {"result": "success", "history_id": "uuid"}
++        """
++        return cls._send_request(
++            "POST",
++            "/tenant-feature-usage/usage",
++            params={"tenant_id": tenant_id, "feature_key": feature_key, "delta": delta},
++        )
++
++    @classmethod
++    def refund_tenant_feature_plan_usage(cls, history_id: str) -> dict:
++        """
++        Refund a previous usage charge.
++
++        Args:
++            history_id: The history_id returned from update_tenant_feature_plan_usage
++
++        Returns:
++            Response dict with 'result' and 'history_id'
++        """
++        return cls._send_request("POST", "/tenant-feature-usage/refund", params={"quota_usage_history_id": history_id})
++
++    @classmethod
++    def get_tenant_feature_plan_usage(cls, tenant_id: str, feature_key: str):
++        params = {"tenant_id": tenant_id, "feature_key": feature_key}
++        return cls._send_request("GET", "/billing/tenant_feature_plan/usage", params=params)
++
+     @classmethod
+     @retry(
+         wait=wait_fixed(2),
+@@ -69,6 +114,8 @@ class BillingService:
+         response = httpx.request(method, url, json=json, params=params, headers=headers)
+         if method == "GET" and response.status_code != httpx.codes.OK:
+             raise ValueError("Unable to retrieve billing information. Please try again later or contact support.")
++        if method == "POST" and response.status_code != httpx.codes.OK:
++            raise ValueError(f"Unable to send request to {url}. Please try again later or contact support.")
+         return response.json()
+ 
+     @staticmethod
+diff --git a/api/services/errors/app.py b/api/services/errors/app.py
+index 338636d9b6..24e4760acc 100644
+--- a/api/services/errors/app.py
++++ b/api/services/errors/app.py
+@@ -18,7 +18,29 @@ class WorkflowIdFormatError(Exception):
+     pass
+ 
+ 
+-class InvokeDailyRateLimitError(Exception):
+-    """Raised when daily rate limit is exceeded for workflow invocations."""
++class InvokeRateLimitError(Exception):
++    """Raised when rate limit is exceeded for workflow invocations."""
+ 
+     pass
++
++
++class QuotaExceededError(ValueError):
++    """Raised when billing quota is exceeded for a feature."""
++
++    def __init__(self, feature: str, tenant_id: str, required: int):
++        self.feature = feature
++        self.tenant_id = tenant_id
++        self.required = required
++        super().__init__(f"Quota exceeded for feature '{feature}' (tenant: {tenant_id}). Required: {required}")
++
++
++class TriggerNodeLimitExceededError(ValueError):
++    """Raised when trigger node count exceeds the plan limit."""
++
++    def __init__(self, count: int, limit: int):
++        self.count = count
++        self.limit = limit
++        super().__init__(
++            f"Trigger node count ({count}) exceeds the limit ({limit}) for your subscription plan. "
++            f"Please upgrade your plan or reduce the number of trigger nodes."
++        )
+diff --git a/api/services/feature_service.py b/api/services/feature_service.py
+index 44bea57769..8035adc734 100644
+--- a/api/services/feature_service.py
++++ b/api/services/feature_service.py
+@@ -54,6 +54,12 @@ class LicenseLimitationModel(BaseModel):
+         return (self.limit - self.size) >= required
+ 
+ 
++class Quota(BaseModel):
++    usage: int = 0
++    limit: int = 0
++    reset_date: int = -1
++
++
+ class LicenseStatus(StrEnum):
+     NONE = "none"
+     INACTIVE = "inactive"
+@@ -129,6 +135,8 @@ class FeatureModel(BaseModel):
+     webapp_copyright_enabled: bool = False
+     workspace_members: LicenseLimitationModel = LicenseLimitationModel(enabled=False, size=0, limit=0)
+     is_allow_transfer_workspace: bool = True
++    trigger_event: Quota = Quota(usage=0, limit=3000, reset_date=0)
++    api_rate_limit: Quota = Quota(usage=0, limit=5000, reset_date=0)
+     # pydantic configs
+     model_config = ConfigDict(protected_namespaces=())
+     knowledge_pipeline: KnowledgePipeline = KnowledgePipeline()
+@@ -236,6 +244,8 @@ class FeatureService:
+     def _fulfill_params_from_billing_api(cls, features: FeatureModel, tenant_id: str):
+         billing_info = BillingService.get_info(tenant_id)
+ 
++        features_usage_info = BillingService.get_tenant_feature_plan_usage_info(tenant_id)
++
+         features.billing.enabled = billing_info["enabled"]
+         features.billing.subscription.plan = billing_info["subscription"]["plan"]
+         features.billing.subscription.interval = billing_info["subscription"]["interval"]
+@@ -246,6 +256,16 @@ class FeatureService:
+         else:
+             features.is_allow_transfer_workspace = False
+ 
++        if "trigger_event" in features_usage_info:
++            features.trigger_event.usage = features_usage_info["trigger_event"]["usage"]
++            features.trigger_event.limit = features_usage_info["trigger_event"]["limit"]
++            features.trigger_event.reset_date = features_usage_info["trigger_event"].get("reset_date", -1)
++
++        if "api_rate_limit" in features_usage_info:
++            features.api_rate_limit.usage = features_usage_info["api_rate_limit"]["usage"]
++            features.api_rate_limit.limit = features_usage_info["api_rate_limit"]["limit"]
++            features.api_rate_limit.reset_date = features_usage_info["api_rate_limit"].get("reset_date", -1)
++
+         if "members" in billing_info:
+             features.members.size = billing_info["members"]["size"]
+             features.members.limit = billing_info["members"]["limit"]
+diff --git a/api/services/trigger/app_trigger_service.py b/api/services/trigger/app_trigger_service.py
+new file mode 100644
+index 0000000000..6d5a719f63
+--- /dev/null
++++ b/api/services/trigger/app_trigger_service.py
+@@ -0,0 +1,46 @@
++"""
++AppTrigger management service.
++
++Handles AppTrigger model CRUD operations and status management.
++This service centralizes all AppTrigger-related business logic.
++"""
++
++import logging
++
++from sqlalchemy import update
++from sqlalchemy.orm import Session
++
++from extensions.ext_database import db
++from models.enums import AppTriggerStatus
++from models.trigger import AppTrigger
++
++logger = logging.getLogger(__name__)
++
++
++class AppTriggerService:
++    """Service for managing AppTrigger lifecycle and status."""
++
++    @staticmethod
++    def mark_tenant_triggers_rate_limited(tenant_id: str) -> None:
++        """
++        Mark all enabled triggers for a tenant as rate limited due to quota exceeded.
++
++        This method is called when a tenant's quota is exhausted. It updates all
++        enabled triggers to RATE_LIMITED status to prevent further executions until
++        quota is restored.
++
++        Args:
++            tenant_id: Tenant ID whose triggers should be marked as rate limited
++
++        """
++        try:
++            with Session(db.engine) as session:
++                session.execute(
++                    update(AppTrigger)
++                    .where(AppTrigger.tenant_id == tenant_id, AppTrigger.status == AppTriggerStatus.ENABLED)
++                    .values(status=AppTriggerStatus.RATE_LIMITED)
++                )
++                session.commit()
++                logger.info("Marked all enabled triggers as rate limited for tenant %s", tenant_id)
++        except Exception:
++            logger.exception("Failed to mark all enabled triggers as rate limited for tenant %s", tenant_id)
+diff --git a/api/services/trigger/webhook_service.py b/api/services/trigger/webhook_service.py
+index 946764c35c..e2be4934e9 100644
+--- a/api/services/trigger/webhook_service.py
++++ b/api/services/trigger/webhook_service.py
+@@ -18,6 +18,7 @@ from core.file.models import FileTransferMethod
+ from core.tools.tool_file_manager import ToolFileManager
+ from core.variables.types import SegmentType
+ from core.workflow.enums import NodeType
++from enums.quota_type import QuotaType
+ from extensions.ext_database import db
+ from extensions.ext_redis import redis_client
+ from factories import file_factory
+@@ -27,6 +28,8 @@ from models.trigger import AppTrigger, WorkflowWebhookTrigger
+ from models.workflow import Workflow
+ from services.async_workflow_service import AsyncWorkflowService
+ from services.end_user_service import EndUserService
++from services.errors.app import QuotaExceededError
++from services.trigger.app_trigger_service import AppTriggerService
+ from services.workflow.entities import WebhookTriggerData
+ 
+ logger = logging.getLogger(__name__)
+@@ -98,6 +101,12 @@ class WebhookService:
+                     raise ValueError(f"App trigger not found for webhook {webhook_id}")
+ 
+                 # Only check enabled status if not in debug mode
++
++                if app_trigger.status == AppTriggerStatus.RATE_LIMITED:
++                    raise ValueError(
++                        f"Webhook trigger is rate limited for webhook {webhook_id}, please upgrade your plan."
++                    )
++
+                 if app_trigger.status != AppTriggerStatus.ENABLED:
+                     raise ValueError(f"Webhook trigger is disabled for webhook {webhook_id}")
+ 
+@@ -729,6 +738,18 @@ class WebhookService:
+                     user_id=None,
+                 )
+ 
++                # consume quota before triggering workflow execution
++                try:
++                    QuotaType.TRIGGER.consume(webhook_trigger.tenant_id)
++                except QuotaExceededError:
++                    AppTriggerService.mark_tenant_triggers_rate_limited(webhook_trigger.tenant_id)
++                    logger.info(
++                        "Tenant %s rate limited, skipping webhook trigger %s",
++                        webhook_trigger.tenant_id,
++                        webhook_trigger.webhook_id,
++                    )
++                    raise
++
+                 # Trigger workflow execution asynchronously
+                 AsyncWorkflowService.trigger_workflow_async(
+                     session,
+diff --git a/api/services/workflow/queue_dispatcher.py b/api/services/workflow/queue_dispatcher.py
+index c55de7a085..cc366482c8 100644
+--- a/api/services/workflow/queue_dispatcher.py
++++ b/api/services/workflow/queue_dispatcher.py
+@@ -2,16 +2,14 @@
+ Queue dispatcher system for async workflow execution.
+ 
+ Implements an ABC-based pattern for handling different subscription tiers
+-with appropriate queue routing and rate limiting.
++with appropriate queue routing and priority assignment.
+ """
+ 
+ from abc import ABC, abstractmethod
+ from enum import StrEnum
+ 
+ from configs import dify_config
+-from extensions.ext_redis import redis_client
+ from services.billing_service import BillingService
+-from services.workflow.rate_limiter import TenantDailyRateLimiter
+ 
+ 
+ class QueuePriority(StrEnum):
+@@ -25,50 +23,16 @@ class QueuePriority(StrEnum):
+ class BaseQueueDispatcher(ABC):
+     """Abstract base class for queue dispatchers"""
+ 
+-    def __init__(self):
+-        self.rate_limiter = TenantDailyRateLimiter(redis_client)
+-
+     @abstractmethod
+     def get_queue_name(self) -> str:
+         """Get the queue name for this dispatcher"""
+         pass
+ 
+-    @abstractmethod
+-    def get_daily_limit(self) -> int:
+-        """Get daily execution limit"""
+-        pass
+-
+     @abstractmethod
+     def get_priority(self) -> int:
+         """Get task priority level"""
+         pass
+ 
+-    def check_daily_quota(self, tenant_id: str) -> bool:
+-        """
+-        Check if tenant has remaining daily quota
+-
+-        Args:
+-            tenant_id: The tenant identifier
+-
+-        Returns:
+-            True if quota available, False otherwise
+-        """
+-        # Check without consuming
+-        remaining = self.rate_limiter.get_remaining_quota(tenant_id=tenant_id, max_daily_limit=self.get_daily_limit())
+-        return remaining > 0
+-
+-    def consume_quota(self, tenant_id: str) -> bool:
+-        """
+-        Consume one execution from daily quota
+-
+-        Args:
+-            tenant_id: The tenant identifier
+-
+-        Returns:
+-            True if quota consumed successfully, False if limit reached
+-        """
+-        return self.rate_limiter.check_and_consume(tenant_id=tenant_id, max_daily_limit=self.get_daily_limit())
+-
+ 
+ class ProfessionalQueueDispatcher(BaseQueueDispatcher):
+     """Dispatcher for professional tier"""
+@@ -76,9 +40,6 @@ class ProfessionalQueueDispatcher(BaseQueueDispatcher):
+     def get_queue_name(self) -> str:
+         return QueuePriority.PROFESSIONAL
+ 
+-    def get_daily_limit(self) -> int:
+-        return int(1e9)
+-
+     def get_priority(self) -> int:
+         return 100
+ 
+@@ -89,9 +50,6 @@ class TeamQueueDispatcher(BaseQueueDispatcher):
+     def get_queue_name(self) -> str:
+         return QueuePriority.TEAM
+ 
+-    def get_daily_limit(self) -> int:
+-        return int(1e9)
+-
+     def get_priority(self) -> int:
+         return 50
+ 
+@@ -102,9 +60,6 @@ class SandboxQueueDispatcher(BaseQueueDispatcher):
+     def get_queue_name(self) -> str:
+         return QueuePriority.SANDBOX
+ 
+-    def get_daily_limit(self) -> int:
+-        return dify_config.APP_DAILY_RATE_LIMIT
+-
+     def get_priority(self) -> int:
+         return 10
+ 
+diff --git a/api/services/workflow/rate_limiter.py b/api/services/workflow/rate_limiter.py
+deleted file mode 100644
+index 1ccb4e1961..0000000000
+--- a/api/services/workflow/rate_limiter.py
++++ /dev/null
+@@ -1,183 +0,0 @@
+-"""
+-Day-based rate limiter for workflow executions.
+-
+-Implements UTC-based daily quotas that reset at midnight UTC for consistent rate limiting.
+-"""
+-
+-from datetime import UTC, datetime, time, timedelta
+-from typing import Union
+-
+-import pytz
+-from redis import Redis
+-from sqlalchemy import select
+-
+-from extensions.ext_database import db
+-from extensions.ext_redis import RedisClientWrapper
+-from models.account import Account, TenantAccountJoin, TenantAccountRole
+-
+-
+-class TenantDailyRateLimiter:
+-    """
+-    Day-based rate limiter that resets at midnight UTC
+-
+-    This class provides Redis-based rate limiting with the following features:
+-    - Daily quotas that reset at midnight UTC for consistency
+-    - Atomic check-and-consume operations
+-    - Automatic cleanup of stale counters
+-    - Timezone-aware error messages for better UX
+-    """
+-
+-    def __init__(self, redis_client: Union[Redis, RedisClientWrapper]):
+-        self.redis = redis_client
+-
+-    def get_tenant_owner_timezone(self, tenant_id: str) -> str:
+-        """
+-        Get timezone of tenant owner
+-
+-        Args:
+-            tenant_id: The tenant identifier
+-
+-        Returns:
+-            Timezone string (e.g., 'America/New_York', 'UTC')
+-        """
+-        # Query to get tenant owner's timezone using scalar and select
+-        owner = db.session.scalar(
+-            select(Account)
+-            .join(TenantAccountJoin, TenantAccountJoin.account_id == Account.id)
+-            .where(TenantAccountJoin.tenant_id == tenant_id, TenantAccountJoin.role == TenantAccountRole.OWNER)
+-        )
+-
+-        if not owner:
+-            return "UTC"
+-
+-        return owner.timezone or "UTC"
+-
+-    def _get_day_key(self, tenant_id: str) -> str:
+-        """
+-        Get Redis key for current UTC day
+-
+-        Args:
+-            tenant_id: The tenant identifier
+-
+-        Returns:
+-            Redis key for the current UTC day
+-        """
+-        utc_now = datetime.now(UTC)
+-        date_str = utc_now.strftime("%Y-%m-%d")
+-        return f"workflow:daily_limit:{tenant_id}:{date_str}"
+-
+-    def _get_ttl_seconds(self) -> int:
+-        """
+-        Calculate seconds until UTC midnight
+-
+-        Returns:
+-            Number of seconds until UTC midnight
+-        """
+-        utc_now = datetime.now(UTC)
+-
+-        # Get next midnight in UTC
+-        next_midnight = datetime.combine(utc_now.date() + timedelta(days=1), time.min)
+-        next_midnight = next_midnight.replace(tzinfo=UTC)
+-
+-        return int((next_midnight - utc_now).total_seconds())
+-
+-    def check_and_consume(self, tenant_id: str, max_daily_limit: int) -> bool:
+-        """
+-        Check if quota available and consume one execution
+-
+-        Args:
+-            tenant_id: The tenant identifier
+-            max_daily_limit: Maximum daily limit
+-
+-        Returns:
+-            True if quota consumed successfully, False if limit reached
+-        """
+-        key = self._get_day_key(tenant_id)
+-        ttl = self._get_ttl_seconds()
+-
+-        # Check current usage
+-        current = self.redis.get(key)
+-
+-        if current is None:
+-            # First execution of the day - set to 1
+-            self.redis.setex(key, ttl, 1)
+-            return True
+-
+-        current_count = int(current)
+-        if current_count < max_daily_limit:
+-            # Within limit, increment
+-            new_count = self.redis.incr(key)
+-            # Update TTL
+-            self.redis.expire(key, ttl)
+-
+-            # Double-check in case of race condition
+-            if new_count <= max_daily_limit:
+-                return True
+-            else:
+-                # Race condition occurred, decrement back
+-                self.redis.decr(key)
+-                return False
+-        else:
+-            # Limit exceeded
+-            return False
+-
+-    def get_remaining_quota(self, tenant_id: str, max_daily_limit: int) -> int:
+-        """
+-        Get remaining quota for the day
+-
+-        Args:
+-            tenant_id: The tenant identifier
+-            max_daily_limit: Maximum daily limit
+-
+-        Returns:
+-            Number of remaining executions for the day
+-        """
+-        key = self._get_day_key(tenant_id)
+-        used = int(self.redis.get(key) or 0)
+-        return max(0, max_daily_limit - used)
+-
+-    def get_current_usage(self, tenant_id: str) -> int:
+-        """
+-        Get current usage for the day
+-
+-        Args:
+-            tenant_id: The tenant identifier
+-
+-        Returns:
+-            Number of executions used today
+-        """
+-        key = self._get_day_key(tenant_id)
+-        return int(self.redis.get(key) or 0)
+-
+-    def reset_quota(self, tenant_id: str) -> bool:
+-        """
+-        Reset quota for testing purposes
+-
+-        Args:
+-            tenant_id: The tenant identifier
+-
+-        Returns:
+-            True if key was deleted, False if key didn't exist
+-        """
+-        key = self._get_day_key(tenant_id)
+-        return bool(self.redis.delete(key))
+-
+-    def get_quota_reset_time(self, tenant_id: str, timezone_str: str) -> datetime:
+-        """
+-        Get the time when quota will reset (next UTC midnight in tenant's timezone)
+-
+-        Args:
+-            tenant_id: The tenant identifier
+-            timezone_str: Tenant's timezone for display purposes
+-
+-        Returns:
+-            Datetime when quota resets (next UTC midnight in tenant's timezone)
+-        """
+-        tz = pytz.timezone(timezone_str)
+-        utc_now = datetime.now(UTC)
+-
+-        # Get next midnight in UTC, then convert to tenant's timezone
+-        next_utc_midnight = datetime.combine(utc_now.date() + timedelta(days=1), time.min)
+-        next_utc_midnight = pytz.UTC.localize(next_utc_midnight)
+-
+-        return next_utc_midnight.astimezone(tz)
+diff --git a/api/services/workflow_service.py b/api/services/workflow_service.py
+index e8088e17c1..b6764f1fa7 100644
+--- a/api/services/workflow_service.py
++++ b/api/services/workflow_service.py
+@@ -7,6 +7,7 @@ from typing import Any, cast
+ from sqlalchemy import exists, select
+ from sqlalchemy.orm import Session, sessionmaker
+ 
++from configs import dify_config
+ from core.app.app_config.entities import VariableEntityType
+ from core.app.apps.advanced_chat.app_config_manager import AdvancedChatAppConfigManager
+ from core.app.apps.workflow.app_config_manager import WorkflowAppConfigManager
+@@ -25,6 +26,7 @@ from core.workflow.nodes.node_mapping import LATEST_VERSION, NODE_TYPE_CLASSES_M
+ from core.workflow.nodes.start.entities import StartNodeData
+ from core.workflow.system_variable import SystemVariable
+ from core.workflow.workflow_entry import WorkflowEntry
++from enums.cloud_plan import CloudPlan
+ from events.app_event import app_draft_workflow_was_synced, app_published_workflow_was_updated
+ from extensions.ext_database import db
+ from extensions.ext_storage import storage
+@@ -35,8 +37,9 @@ from models.model import App, AppMode
+ from models.tools import WorkflowToolProvider
+ from models.workflow import Workflow, WorkflowNodeExecutionModel, WorkflowNodeExecutionTriggeredFrom, WorkflowType
+ from repositories.factory import DifyAPIRepositoryFactory
++from services.billing_service import BillingService
+ from services.enterprise.plugin_manager_service import PluginCredentialType
+-from services.errors.app import IsDraftWorkflowError, WorkflowHashNotEqualError
++from services.errors.app import IsDraftWorkflowError, TriggerNodeLimitExceededError, WorkflowHashNotEqualError
+ from services.workflow.workflow_converter import WorkflowConverter
+ 
+ from .errors.workflow_service import DraftWorkflowDeletionError, WorkflowInUseError
+@@ -272,6 +275,21 @@ class WorkflowService:
+         # validate graph structure
+         self.validate_graph_structure(graph=draft_workflow.graph_dict)
+ 
++        # billing check
++        if dify_config.BILLING_ENABLED:
++            limit_info = BillingService.get_info(app_model.tenant_id)
++            if limit_info["subscription"]["plan"] == CloudPlan.SANDBOX:
++                # Check trigger node count limit for SANDBOX plan
++                trigger_node_count = sum(
++                    1
++                    for _, node_data in draft_workflow.walk_nodes()
++                    if (node_type_str := node_data.get("type"))
++                    and isinstance(node_type_str, str)
++                    and NodeType(node_type_str).is_trigger_node
++                )
++                if trigger_node_count > 2:
++                    raise TriggerNodeLimitExceededError(count=trigger_node_count, limit=2)
++
+         # create new workflow
+         workflow = Workflow.new(
+             tenant_id=app_model.tenant_id,
+diff --git a/api/tasks/trigger_processing_tasks.py b/api/tasks/trigger_processing_tasks.py
+index 985125e66b..2619d8dd28 100644
+--- a/api/tasks/trigger_processing_tasks.py
++++ b/api/tasks/trigger_processing_tasks.py
+@@ -26,14 +26,22 @@ from core.trigger.provider import PluginTriggerProviderController
+ from core.trigger.trigger_manager import TriggerManager
+ from core.workflow.enums import NodeType, WorkflowExecutionStatus
+ from core.workflow.nodes.trigger_plugin.entities import TriggerEventNodeData
++from enums.quota_type import QuotaType, unlimited
+ from extensions.ext_database import db
+-from models.enums import AppTriggerType, CreatorUserRole, WorkflowRunTriggeredFrom, WorkflowTriggerStatus
++from models.enums import (
++    AppTriggerType,
++    CreatorUserRole,
++    WorkflowRunTriggeredFrom,
++    WorkflowTriggerStatus,
++)
+ from models.model import EndUser
+ from models.provider_ids import TriggerProviderID
+ from models.trigger import TriggerSubscription, WorkflowPluginTrigger, WorkflowTriggerLog
+ from models.workflow import Workflow, WorkflowAppLog, WorkflowAppLogCreatedFrom, WorkflowRun
+ from services.async_workflow_service import AsyncWorkflowService
+ from services.end_user_service import EndUserService
++from services.errors.app import QuotaExceededError
++from services.trigger.app_trigger_service import AppTriggerService
+ from services.trigger.trigger_provider_service import TriggerProviderService
+ from services.trigger.trigger_request_service import TriggerHttpRequestCachingService
+ from services.trigger.trigger_subscription_operator_service import TriggerSubscriptionOperatorService
+@@ -287,6 +295,17 @@ def dispatch_triggered_workflow(
+                 icon_dark_filename=trigger_entity.identity.icon_dark or "",
+             )
+ 
++            # consume quota before invoking trigger
++            quota_charge = unlimited()
++            try:
++                quota_charge = QuotaType.TRIGGER.consume(subscription.tenant_id)
++            except QuotaExceededError:
++                AppTriggerService.mark_tenant_triggers_rate_limited(subscription.tenant_id)
++                logger.info(
++                    "Tenant %s rate limited, skipping plugin trigger %s", subscription.tenant_id, plugin_trigger.id
++                )
++                return 0
++
+             node_data: TriggerEventNodeData = TriggerEventNodeData.model_validate(event_node)
+             invoke_response: TriggerInvokeEventResponse | None = None
+             try:
+@@ -305,6 +324,8 @@ def dispatch_triggered_workflow(
+                     payload=payload,
+                 )
+             except PluginInvokeError as e:
++                quota_charge.refund()
++
+                 error_message = e.to_user_friendly_error(plugin_name=trigger_entity.identity.name)
+                 try:
+                     end_user = end_users.get(plugin_trigger.app_id)
+@@ -326,6 +347,8 @@ def dispatch_triggered_workflow(
+                     )
+                 continue
+             except Exception:
++                quota_charge.refund()
++
+                 logger.exception(
+                     "Failed to invoke trigger event for app %s",
+                     plugin_trigger.app_id,
+@@ -333,6 +356,8 @@ def dispatch_triggered_workflow(
+                 continue
+ 
+             if invoke_response is not None and invoke_response.cancelled:
++                quota_charge.refund()
++
+                 logger.info(
+                     "Trigger ignored for app %s with trigger event %s",
+                     plugin_trigger.app_id,
+@@ -366,6 +391,8 @@ def dispatch_triggered_workflow(
+                     event_name,
+                 )
+             except Exception:
++                quota_charge.refund()
++
+                 logger.exception(
+                     "Failed to trigger workflow for app %s",
+                     plugin_trigger.app_id,
+diff --git a/api/tasks/trigger_subscription_refresh_tasks.py b/api/tasks/trigger_subscription_refresh_tasks.py
+index 11324df881..ed92f3f3c5 100644
+--- a/api/tasks/trigger_subscription_refresh_tasks.py
++++ b/api/tasks/trigger_subscription_refresh_tasks.py
+@@ -6,6 +6,7 @@ from typing import Any
+ from celery import shared_task
+ from sqlalchemy.orm import Session
+ 
++from configs import dify_config
+ from core.plugin.entities.plugin_daemon import CredentialType
+ from core.trigger.utils.locks import build_trigger_refresh_lock_key
+ from extensions.ext_database import db
+@@ -25,9 +26,10 @@ def _load_subscription(session: Session, tenant_id: str, subscription_id: str) -
+ 
+ 
+ def _refresh_oauth_if_expired(tenant_id: str, subscription: TriggerSubscription, now: int) -> None:
++    threshold_seconds: int = int(dify_config.TRIGGER_PROVIDER_CREDENTIAL_THRESHOLD_SECONDS)
+     if (
+         subscription.credential_expires_at != -1
+-        and int(subscription.credential_expires_at) <= now
++        and int(subscription.credential_expires_at) <= now + threshold_seconds
+         and CredentialType.of(subscription.credential_type) == CredentialType.OAUTH2
+     ):
+         logger.info(
+@@ -53,13 +55,15 @@ def _refresh_subscription_if_expired(
+     subscription: TriggerSubscription,
+     now: int,
+ ) -> None:
+-    if subscription.expires_at == -1 or int(subscription.expires_at) > now:
++    threshold_seconds: int = int(dify_config.TRIGGER_PROVIDER_SUBSCRIPTION_THRESHOLD_SECONDS)
++    if subscription.expires_at == -1 or int(subscription.expires_at) > now + threshold_seconds:
+         logger.debug(
+-            "Subscription not due: tenant=%s subscription_id=%s expires_at=%s now=%s",
++            "Subscription not due: tenant=%s subscription_id=%s expires_at=%s now=%s threshold=%s",
+             tenant_id,
+             subscription.id,
+             subscription.expires_at,
+             now,
++            threshold_seconds,
+         )
+         return
+ 
+diff --git a/api/tasks/workflow_schedule_tasks.py b/api/tasks/workflow_schedule_tasks.py
+index f0596a8f4a..f54e02a219 100644
+--- a/api/tasks/workflow_schedule_tasks.py
++++ b/api/tasks/workflow_schedule_tasks.py
+@@ -8,9 +8,12 @@ from core.workflow.nodes.trigger_schedule.exc import (
+     ScheduleNotFoundError,
+     TenantOwnerNotFoundError,
+ )
++from enums.quota_type import QuotaType, unlimited
+ from extensions.ext_database import db
+ from models.trigger import WorkflowSchedulePlan
+ from services.async_workflow_service import AsyncWorkflowService
++from services.errors.app import QuotaExceededError
++from services.trigger.app_trigger_service import AppTriggerService
+ from services.trigger.schedule_service import ScheduleService
+ from services.workflow.entities import ScheduleTriggerData
+ 
+@@ -30,6 +33,7 @@ def run_schedule_trigger(schedule_id: str) -> None:
+         TenantOwnerNotFoundError: If no owner/admin for tenant
+         ScheduleExecutionError: If workflow trigger fails
+     """
++
+     session_factory = sessionmaker(bind=db.engine, expire_on_commit=False)
+ 
+     with session_factory() as session:
+@@ -41,6 +45,14 @@ def run_schedule_trigger(schedule_id: str) -> None:
+         if not tenant_owner:
+             raise TenantOwnerNotFoundError(f"No owner or admin found for tenant {schedule.tenant_id}")
+ 
++        quota_charge = unlimited()
++        try:
++            quota_charge = QuotaType.TRIGGER.consume(schedule.tenant_id)
++        except QuotaExceededError:
++            AppTriggerService.mark_tenant_triggers_rate_limited(schedule.tenant_id)
++            logger.info("Tenant %s rate limited, skipping schedule trigger %s", schedule.tenant_id, schedule_id)
++            return
++
+         try:
+             # Production dispatch: Trigger the workflow normally
+             response = AsyncWorkflowService.trigger_workflow_async(
+@@ -55,6 +67,7 @@ def run_schedule_trigger(schedule_id: str) -> None:
+             )
+             logger.info("Schedule %s triggered workflow: %s", schedule_id, response.workflow_trigger_log_id)
+         except Exception as e:
++            quota_charge.refund()
+             raise ScheduleExecutionError(
+                 f"Failed to trigger workflow for schedule {schedule_id}, app {schedule.app_id}"
+             ) from e
+diff --git a/api/tests/test_containers_integration_tests/services/test_app_generate_service.py b/api/tests/test_containers_integration_tests/services/test_app_generate_service.py
+index 8b8739d557..0f9ed94017 100644
+--- a/api/tests/test_containers_integration_tests/services/test_app_generate_service.py
++++ b/api/tests/test_containers_integration_tests/services/test_app_generate_service.py
+@@ -5,12 +5,10 @@ import pytest
+ from faker import Faker
+ 
+ from core.app.entities.app_invoke_entities import InvokeFrom
+-from enums.cloud_plan import CloudPlan
+ from models.model import EndUser
+ from models.workflow import Workflow
+ from services.app_generate_service import AppGenerateService
+ from services.errors.app import WorkflowIdFormatError, WorkflowNotFoundError
+-from services.errors.llm import InvokeRateLimitError
+ 
+ 
+ class TestAppGenerateService:
+@@ -20,10 +18,9 @@ class TestAppGenerateService:
+     def mock_external_service_dependencies(self):
+         """Mock setup for external service dependencies."""
+         with (
+-            patch("services.app_generate_service.BillingService") as mock_billing_service,
++            patch("services.billing_service.BillingService") as mock_billing_service,
+             patch("services.app_generate_service.WorkflowService") as mock_workflow_service,
+             patch("services.app_generate_service.RateLimit") as mock_rate_limit,
+-            patch("services.app_generate_service.RateLimiter") as mock_rate_limiter,
+             patch("services.app_generate_service.CompletionAppGenerator") as mock_completion_generator,
+             patch("services.app_generate_service.ChatAppGenerator") as mock_chat_generator,
+             patch("services.app_generate_service.AgentChatAppGenerator") as mock_agent_chat_generator,
+@@ -31,9 +28,13 @@ class TestAppGenerateService:
+             patch("services.app_generate_service.WorkflowAppGenerator") as mock_workflow_generator,
+             patch("services.account_service.FeatureService") as mock_account_feature_service,
+             patch("services.app_generate_service.dify_config") as mock_dify_config,
++            patch("configs.dify_config") as mock_global_dify_config,
+         ):
+             # Setup default mock returns for billing service
+-            mock_billing_service.get_info.return_value = {"subscription": {"plan": CloudPlan.SANDBOX}}
++            mock_billing_service.update_tenant_feature_plan_usage.return_value = {
++                "result": "success",
++                "history_id": "test_history_id",
++            }
+ 
+             # Setup default mock returns for workflow service
+             mock_workflow_service_instance = mock_workflow_service.return_value
+@@ -47,10 +48,6 @@ class TestAppGenerateService:
+             mock_rate_limit_instance.generate.return_value = ["test_response"]
+             mock_rate_limit_instance.exit.return_value = None
+ 
+-            mock_rate_limiter_instance = mock_rate_limiter.return_value
+-            mock_rate_limiter_instance.is_rate_limited.return_value = False
+-            mock_rate_limiter_instance.increment_rate_limit.return_value = None
+-
+             # Setup default mock returns for app generators
+             mock_completion_generator_instance = mock_completion_generator.return_value
+             mock_completion_generator_instance.generate.return_value = ["completion_response"]
+@@ -87,11 +84,14 @@ class TestAppGenerateService:
+             mock_dify_config.APP_MAX_ACTIVE_REQUESTS = 100
+             mock_dify_config.APP_DAILY_RATE_LIMIT = 1000
+ 
++            mock_global_dify_config.BILLING_ENABLED = False
++            mock_global_dify_config.APP_MAX_ACTIVE_REQUESTS = 100
++            mock_global_dify_config.APP_DAILY_RATE_LIMIT = 1000
++
+             yield {
+                 "billing_service": mock_billing_service,
+                 "workflow_service": mock_workflow_service,
+                 "rate_limit": mock_rate_limit,
+-                "rate_limiter": mock_rate_limiter,
+                 "completion_generator": mock_completion_generator,
+                 "chat_generator": mock_chat_generator,
+                 "agent_chat_generator": mock_agent_chat_generator,
+@@ -99,6 +99,7 @@ class TestAppGenerateService:
+                 "workflow_generator": mock_workflow_generator,
+                 "account_feature_service": mock_account_feature_service,
+                 "dify_config": mock_dify_config,
++                "global_dify_config": mock_global_dify_config,
+             }
+ 
+     def _create_test_app_and_account(self, db_session_with_containers, mock_external_service_dependencies, mode="chat"):
+@@ -429,13 +430,9 @@ class TestAppGenerateService:
+             db_session_with_containers, mock_external_service_dependencies, mode="completion"
+         )
+ 
+-        # Setup billing service mock for sandbox plan
+-        mock_external_service_dependencies["billing_service"].get_info.return_value = {
+-            "subscription": {"plan": CloudPlan.SANDBOX}
+-        }
+-
+         # Set BILLING_ENABLED to True for this test
+         mock_external_service_dependencies["dify_config"].BILLING_ENABLED = True
++        mock_external_service_dependencies["global_dify_config"].BILLING_ENABLED = True
+ 
+         # Setup test arguments
+         args = {"inputs": {"query": fake.text(max_nb_chars=50)}, "response_mode": "streaming"}
+@@ -448,41 +445,8 @@ class TestAppGenerateService:
+         # Verify the result
+         assert result == ["test_response"]
+ 
+-        # Verify billing service was called
+-        mock_external_service_dependencies["billing_service"].get_info.assert_called_once_with(app.tenant_id)
+-
+-    def test_generate_with_rate_limit_exceeded(self, db_session_with_containers, mock_external_service_dependencies):
+-        """
+-        Test generation when rate limit is exceeded.
+-        """
+-        fake = Faker()
+-        app, account = self._create_test_app_and_account(
+-            db_session_with_containers, mock_external_service_dependencies, mode="completion"
+-        )
+-
+-        # Setup billing service mock for sandbox plan
+-        mock_external_service_dependencies["billing_service"].get_info.return_value = {
+-            "subscription": {"plan": CloudPlan.SANDBOX}
+-        }
+-
+-        # Set BILLING_ENABLED to True for this test
+-        mock_external_service_dependencies["dify_config"].BILLING_ENABLED = True
+-
+-        # Setup system rate limiter to return rate limited
+-        with patch("services.app_generate_service.AppGenerateService.system_rate_limiter") as mock_system_rate_limiter:
+-            mock_system_rate_limiter.is_rate_limited.return_value = True
+-
+-            # Setup test arguments
+-            args = {"inputs": {"query": fake.text(max_nb_chars=50)}, "response_mode": "streaming"}
+-
+-            # Execute the method under test and expect rate limit error
+-            with pytest.raises(InvokeRateLimitError) as exc_info:
+-                AppGenerateService.generate(
+-                    app_model=app, user=account, args=args, invoke_from=InvokeFrom.SERVICE_API, streaming=True
+-                )
+-
+-            # Verify error message
+-            assert "Rate limit exceeded" in str(exc_info.value)
++        # Verify billing service was called to consume quota
++        mock_external_service_dependencies["billing_service"].update_tenant_feature_plan_usage.assert_called_once()
+ 
+     def test_generate_with_invalid_app_mode(self, db_session_with_containers, mock_external_service_dependencies):
+         """
+diff --git a/dev/start-worker b/dev/start-worker
+index b1e010975b..a01da11d86 100755
+--- a/dev/start-worker
++++ b/dev/start-worker
+@@ -11,6 +11,7 @@ show_help() {
+   echo "  -c, --concurrency NUM  Number of worker processes (default: 1)"
+   echo "  -P, --pool POOL        Pool implementation (default: gevent)"
+   echo "  --loglevel LEVEL       Log level (default: INFO)"
++  echo "  -e, --env-file FILE    Path to an env file to source before starting"
+   echo "  -h, --help             Show this help message"
+   echo ""
+   echo "Examples:"
+@@ -44,6 +45,8 @@ CONCURRENCY=1
+ POOL="gevent"
+ LOGLEVEL="INFO"
+ 
++ENV_FILE=""
++
+ while [[ $# -gt 0 ]]; do
+   case $1 in
+     -q|--queues)
+@@ -62,6 +65,10 @@ while [[ $# -gt 0 ]]; do
+       LOGLEVEL="$2"
+       shift 2
+       ;;
++    -e|--env-file)
++      ENV_FILE="$2"
++      shift 2
++      ;;
+     -h|--help)
+       show_help
+       exit 0
+@@ -77,6 +84,19 @@ done
+ SCRIPT_DIR="$(dirname "$(realpath "$0")")"
+ cd "$SCRIPT_DIR/.."
+ 
++if [[ -n "${ENV_FILE}" ]]; then
++  if [[ ! -f "${ENV_FILE}" ]]; then
++    echo "Env file ${ENV_FILE} not found"
++    exit 1
++  fi
++
++  echo "Loading environment variables from ${ENV_FILE}"
++  # Export everything sourced from the env file
++  set -a
++  source "${ENV_FILE}"
++  set +a
++fi
++
+ # If no queues specified, use edition-based defaults
+ if [[ -z "${QUEUES}" ]]; then
+   # Get EDITION from environment, default to SELF_HOSTED (community edition)
+diff --git a/web/app/components/app/app-publisher/index.tsx b/web/app/components/app/app-publisher/index.tsx
+index 64ce869c5d..a11af3b816 100644
+--- a/web/app/components/app/app-publisher/index.tsx
++++ b/web/app/components/app/app-publisher/index.tsx
+@@ -49,6 +49,7 @@ import { fetchInstalledAppList } from '@/service/explore'
+ import { AppModeEnum } from '@/types/app'
+ import type { PublishWorkflowParams } from '@/types/workflow'
+ import { basePath } from '@/utils/var'
++import UpgradeBtn from '@/app/components/billing/upgrade-btn'
+ 
+ const ACCESS_MODE_MAP: Record<AccessMode, { label: string, icon: React.ElementType }> = {
+   [AccessMode.ORGANIZATION]: {
+@@ -106,6 +107,7 @@ export type AppPublisherProps = {
+   workflowToolAvailable?: boolean
+   missingStartNode?: boolean
+   hasTriggerNode?: boolean // Whether workflow currently contains any trigger nodes (used to hide missing-start CTA when triggers exist).
++  startNodeLimitExceeded?: boolean
+ }
+ 
+ const PUBLISH_SHORTCUT = ['ctrl', '⇧', 'P']
+@@ -127,6 +129,7 @@ const AppPublisher = ({
+   workflowToolAvailable = true,
+   missingStartNode = false,
+   hasTriggerNode = false,
++  startNodeLimitExceeded = false,
+ }: AppPublisherProps) => {
+   const { t } = useTranslation()
+ 
+@@ -246,6 +249,13 @@ const AppPublisher = ({
+   const hasPublishedVersion = !!publishedAt
+   const workflowToolDisabled = !hasPublishedVersion || !workflowToolAvailable
+   const workflowToolMessage = workflowToolDisabled ? t('workflow.common.workflowAsToolDisabledHint') : undefined
++  const showStartNodeLimitHint = Boolean(startNodeLimitExceeded)
++  const upgradeHighlightStyle = useMemo(() => ({
++    background: 'linear-gradient(97deg, var(--components-input-border-active-prompt-1, rgba(11, 165, 236, 0.95)) -3.64%, var(--components-input-border-active-prompt-2, rgba(21, 90, 239, 0.95)) 45.14%)',
++    WebkitBackgroundClip: 'text',
++    backgroundClip: 'text',
++    WebkitTextFillColor: 'transparent',
++  }), [])
+ 
+   return (
+     <>
+@@ -304,29 +314,49 @@ const AppPublisher = ({
+                   />
+                 )
+                 : (
+-                  <Button
+-                    variant='primary'
+-                    className='mt-3 w-full'
+-                    onClick={() => handlePublish()}
+-                    disabled={publishDisabled || published}
+-                  >
+-                    {
+-                      published
+-                        ? t('workflow.common.published')
+-                        : (
+-                          <div className='flex gap-1'>
+-                            <span>{t('workflow.common.publishUpdate')}</span>
+-                            <div className='flex gap-0.5'>
+-                              {PUBLISH_SHORTCUT.map(key => (
+-                                <span key={key} className='system-kbd h-4 w-4 rounded-[4px] bg-components-kbd-bg-white text-text-primary-on-surface'>
+-                                  {getKeyboardKeyNameBySystem(key)}
+-                                </span>
+-                              ))}
++                  <>
++                    <Button
++                      variant='primary'
++                      className='mt-3 w-full'
++                      onClick={() => handlePublish()}
++                      disabled={publishDisabled || published}
++                    >
++                      {
++                        published
++                          ? t('workflow.common.published')
++                          : (
++                            <div className='flex gap-1'>
++                              <span>{t('workflow.common.publishUpdate')}</span>
++                              <div className='flex gap-0.5'>
++                                {PUBLISH_SHORTCUT.map(key => (
++                                  <span key={key} className='system-kbd h-4 w-4 rounded-[4px] bg-components-kbd-bg-white text-text-primary-on-surface'>
++                                    {getKeyboardKeyNameBySystem(key)}
++                                  </span>
++                                ))}
++                              </div>
+                             </div>
+-                          </div>
+-                        )
+-                    }
+-                  </Button>
++                          )
++                      }
++                    </Button>
++                    {showStartNodeLimitHint && (
++                      <div className='mt-3 flex flex-col items-stretch'>
++                        <p
++                          className='text-sm font-semibold leading-5 text-transparent'
++                          style={upgradeHighlightStyle}
++                        >
++                          <span className='block'>{t('workflow.publishLimit.startNodeTitlePrefix')}</span>
++                          <span className='block'>{t('workflow.publishLimit.startNodeTitleSuffix')}</span>
++                        </p>
++                        <p className='mt-1 text-xs leading-4 text-text-secondary'>
++                          {t('workflow.publishLimit.startNodeDesc')}
++                        </p>
++                        <UpgradeBtn
++                          isShort
++                          className='mb-[12px] mt-[9px] h-[32px] w-[93px] self-start'
++                        />
++                      </div>
++                    )}
++                  </>
+                 )
+               }
+             </div>
+diff --git a/web/app/components/billing/config.ts b/web/app/components/billing/config.ts
+index c0a21c1ebf..f343f4b487 100644
+--- a/web/app/components/billing/config.ts
++++ b/web/app/components/billing/config.ts
+@@ -90,4 +90,8 @@ export const defaultPlan = {
+     apiRateLimit: ALL_PLANS.sandbox.apiRateLimit,
+     triggerEvents: ALL_PLANS.sandbox.triggerEvents,
+   },
++  reset: {
++    apiRateLimit: null,
++    triggerEvents: null,
++  },
+ }
+diff --git a/web/app/components/billing/plan/index.tsx b/web/app/components/billing/plan/index.tsx
+index 4b68fcfb15..b695302965 100644
+--- a/web/app/components/billing/plan/index.tsx
++++ b/web/app/components/billing/plan/index.tsx
+@@ -6,15 +6,16 @@ import { useRouter } from 'next/navigation'
+ import {
+   RiBook2Line,
+   RiFileEditLine,
+-  RiFlashlightLine,
+   RiGraduationCapLine,
+   RiGroupLine,
+-  RiSpeedLine,
+ } from '@remixicon/react'
+ import { Plan, SelfHostedPlan } from '../type'
++import { NUM_INFINITE } from '../config'
++import { getDaysUntilEndOfMonth } from '@/utils/time'
+ import VectorSpaceInfo from '../usage-info/vector-space-info'
+ import AppsInfo from '../usage-info/apps-info'
+ import UpgradeBtn from '../upgrade-btn'
++import { ApiAggregate, TriggerAll } from '@/app/components/base/icons/src/vender/workflow'
+ import { useProviderContext } from '@/context/provider-context'
+ import { useAppContext } from '@/context/app-context'
+ import Button from '@/app/components/base/button'
+@@ -44,9 +45,20 @@ const PlanComp: FC<Props> = ({
+   const {
+     usage,
+     total,
++    reset,
+   } = plan
+-  const perMonthUnit = ` ${t('billing.usagePage.perMonth')}`
+-  const triggerEventUnit = plan.type === Plan.sandbox ? undefined : perMonthUnit
++  const triggerEventsResetInDays = type === Plan.professional && total.triggerEvents !== NUM_INFINITE
++    ? reset.triggerEvents ?? undefined
++    : undefined
++  const apiRateLimitResetInDays = (() => {
++    if (total.apiRateLimit === NUM_INFINITE)
++      return undefined
++    if (typeof reset.apiRateLimit === 'number')
++      return reset.apiRateLimit
++    if (type === Plan.sandbox)
++      return getDaysUntilEndOfMonth()
++    return undefined
++  })()
+ 
+   const [showModal, setShowModal] = React.useState(false)
+   const { mutateAsync } = useEducationVerify()
+@@ -79,7 +91,6 @@ const PlanComp: FC<Props> = ({
+           <div className='grow'>
+             <div className='mb-1 flex items-center gap-1'>
+               <div className='system-md-semibold-uppercase text-text-primary'>{t(`billing.plans.${type}.name`)}</div>
+-              <div className='system-2xs-medium-uppercase rounded-[5px] border border-divider-deep px-1 py-0.5 text-text-tertiary'>{t('billing.currentPlan')}</div>
+             </div>
+             <div className='system-xs-regular text-util-colors-gray-gray-600'>{t(`billing.plans.${type}.for`)}</div>
+           </div>
+@@ -124,18 +135,20 @@ const PlanComp: FC<Props> = ({
+           total={total.annotatedResponse}
+         />
+         <UsageInfo
+-          Icon={RiFlashlightLine}
++          Icon={TriggerAll}
+           name={t('billing.usagePage.triggerEvents')}
+           usage={usage.triggerEvents}
+           total={total.triggerEvents}
+-          unit={triggerEventUnit}
++          tooltip={t('billing.plansCommon.triggerEvents.tooltip') as string}
++          resetInDays={triggerEventsResetInDays}
+         />
+         <UsageInfo
+-          Icon={RiSpeedLine}
++          Icon={ApiAggregate}
+           name={t('billing.plansCommon.apiRateLimit')}
+           usage={usage.apiRateLimit}
+           total={total.apiRateLimit}
+-          unit={perMonthUnit}
++          tooltip={total.apiRateLimit === NUM_INFINITE ? undefined : t('billing.plansCommon.apiRateLimitTooltip') as string}
++          resetInDays={apiRateLimitResetInDays}
+         />
+ 
+       </div>
+diff --git a/web/app/components/billing/pricing/plans/cloud-plan-item/list/index.tsx b/web/app/components/billing/pricing/plans/cloud-plan-item/list/index.tsx
+index 0b35ee7e97..7674affc15 100644
+--- a/web/app/components/billing/pricing/plans/cloud-plan-item/list/index.tsx
++++ b/web/app/components/billing/pricing/plans/cloud-plan-item/list/index.tsx
+@@ -46,16 +46,10 @@ const List = ({
+         label={t('billing.plansCommon.documentsRequestQuota', { count: planInfo.documentsRequestQuota })}
+         tooltip={t('billing.plansCommon.documentsRequestQuotaTooltip')}
+       />
+-      <Item
+-        label={
+-          planInfo.apiRateLimit === NUM_INFINITE ? `${t('billing.plansCommon.unlimitedApiRate')}`
+-            : `${t('billing.plansCommon.apiRateLimitUnit', { count: planInfo.apiRateLimit })} ${t('billing.plansCommon.apiRateLimit')}`
+-        }
+-        tooltip={planInfo.apiRateLimit === NUM_INFINITE ? undefined : t('billing.plansCommon.apiRateLimitTooltip') as string}
+-      />
+       <Item
+         label={[t(`billing.plansCommon.priority.${planInfo.documentProcessingPriority}`), t('billing.plansCommon.documentProcessingPriority')].join('')}
+       />
++      <Divider bgStyle='gradient' />
+       <Item
+         label={
+           planInfo.triggerEvents === NUM_INFINITE
+@@ -64,22 +58,24 @@ const List = ({
+               ? t('billing.plansCommon.triggerEvents.sandbox', { count: planInfo.triggerEvents })
+               : t('billing.plansCommon.triggerEvents.professional', { count: planInfo.triggerEvents })
+         }
++        tooltip={t('billing.plansCommon.triggerEvents.tooltip') as string}
+       />
+       <Item
+         label={
+           plan === Plan.sandbox
+-            ? t('billing.plansCommon.workflowExecution.standard')
+-            : plan === Plan.professional
+-              ? t('billing.plansCommon.workflowExecution.faster')
+-              : t('billing.plansCommon.workflowExecution.priority')
++            ? t('billing.plansCommon.startNodes.limited', { count: 2 })
++            : t('billing.plansCommon.startNodes.unlimited')
+         }
+       />
+       <Item
+         label={
+           plan === Plan.sandbox
+-            ? t('billing.plansCommon.startNodes.limited', { count: 2 })
+-            : t('billing.plansCommon.startNodes.unlimited')
++            ? t('billing.plansCommon.workflowExecution.standard')
++            : plan === Plan.professional
++              ? t('billing.plansCommon.workflowExecution.faster')
++              : t('billing.plansCommon.workflowExecution.priority')
+         }
++        tooltip={t('billing.plansCommon.workflowExecution.tooltip') as string}
+       />
+       <Divider bgStyle='gradient' />
+       <Item
+@@ -89,6 +85,14 @@ const List = ({
+       <Item
+         label={t('billing.plansCommon.logsHistory', { days: planInfo.logHistory === NUM_INFINITE ? t('billing.plansCommon.unlimited') as string : `${planInfo.logHistory} ${t('billing.plansCommon.days')}` })}
+       />
++      <Item
++        label={
++          planInfo.apiRateLimit === NUM_INFINITE
++            ? t('billing.plansCommon.unlimitedApiRate')
++            : `${t('billing.plansCommon.apiRateLimitUnit', { count: planInfo.apiRateLimit })} ${t('billing.plansCommon.apiRateLimit')}/${t('billing.plansCommon.month')}`
++        }
++        tooltip={planInfo.apiRateLimit === NUM_INFINITE ? undefined : t('billing.plansCommon.apiRateLimitTooltip') as string}
++      />
+       <Divider bgStyle='gradient' />
+       <Item
+         label={t('billing.plansCommon.modelProviders')}
+diff --git a/web/app/components/billing/trigger-events-limit-modal/index.module.css b/web/app/components/billing/trigger-events-limit-modal/index.module.css
+new file mode 100644
+index 0000000000..e8e86719e6
+--- /dev/null
++++ b/web/app/components/billing/trigger-events-limit-modal/index.module.css
+@@ -0,0 +1,30 @@
++.surface {
++  border: 0.5px solid var(--color-components-panel-border, rgba(16, 24, 40, 0.08));
++  background:
++    linear-gradient(109deg, var(--color-background-section, #f9fafb) 0%, var(--color-background-section-burn, #f2f4f7) 100%),
++    var(--color-components-panel-bg, #fff);
++}
++
++.heroOverlay {
++  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='54' height='54' fill='none'%3E%3Crect x='1' y='1' width='48' height='48' rx='12' stroke='rgba(16, 24, 40, 0.3)' stroke-width='1' opacity='0.08'/%3E%3C/svg%3E");
++  background-size: 54px 54px;
++  background-position: 31px -23px;
++  background-repeat: repeat;
++  mask-image: linear-gradient(180deg, rgba(255, 255, 255, 1) 45%, rgba(255, 255, 255, 0) 75%);
++  -webkit-mask-image: linear-gradient(180deg, rgba(255, 255, 255, 1) 45%, rgba(255, 255, 255, 0) 75%);
++}
++
++.icon {
++  border: 0.5px solid transparent;
++  background:
++    linear-gradient(180deg, var(--color-components-avatar-bg-mask-stop-0, rgba(255, 255, 255, 0.12)) 0%, var(--color-components-avatar-bg-mask-stop-100, rgba(255, 255, 255, 0.08)) 100%),
++    var(--color-util-colors-blue-brand-blue-brand-500, #296dff);
++  box-shadow: 0 10px 20px color-mix(in srgb, var(--color-util-colors-blue-brand-blue-brand-500, #296dff) 35%, transparent);
++}
++
++.highlight {
++  background: linear-gradient(97deg, var(--color-components-input-border-active-prompt-1, rgba(11, 165, 236, 0.95)) -4%, var(--color-components-input-border-active-prompt-2, rgba(21, 90, 239, 0.95)) 45%);
++  -webkit-background-clip: text;
++  background-clip: text;
++  -webkit-text-fill-color: transparent;
++}
+diff --git a/web/app/components/billing/trigger-events-limit-modal/index.stories.tsx b/web/app/components/billing/trigger-events-limit-modal/index.stories.tsx
+new file mode 100644
+index 0000000000..eed6acac9b
+--- /dev/null
++++ b/web/app/components/billing/trigger-events-limit-modal/index.stories.tsx
+@@ -0,0 +1,97 @@
++import type { Meta, StoryObj } from '@storybook/nextjs'
++import React, { useEffect, useState } from 'react'
++import i18next from 'i18next'
++import { I18nextProvider } from 'react-i18next'
++import TriggerEventsLimitModal from '.'
++import { Plan } from '../type'
++
++const i18n = i18next.createInstance()
++i18n.init({
++  lng: 'en',
++  resources: {
++    en: {
++      translation: {
++        billing: {
++          triggerLimitModal: {
++            title: 'Upgrade to unlock unlimited triggers per workflow',
++            description: 'You’ve reached the limit of 2 triggers per workflow for this plan. Upgrade to publish this workflow.',
++            dismiss: 'Dismiss',
++            upgrade: 'Upgrade',
++            usageTitle: 'TRIGGER EVENTS',
++          },
++          usagePage: {
++            triggerEvents: 'Trigger Events',
++            resetsIn: 'Resets in {{count, number}} days',
++          },
++          upgradeBtn: {
++            encourage: 'Upgrade Now',
++            encourageShort: 'Upgrade',
++            plain: 'View Plan',
++          },
++        },
++      },
++    },
++  },
++})
++
++const Template = (args: React.ComponentProps<typeof TriggerEventsLimitModal>) => {
++  const [visible, setVisible] = useState<boolean>(args.show ?? true)
++  useEffect(() => {
++    setVisible(args.show ?? true)
++  }, [args.show])
++  const handleHide = () => setVisible(false)
++  return (
++    <I18nextProvider i18n={i18n}>
++      <div className="flex flex-col gap-4">
++        <button
++          className="rounded-lg border border-divider-subtle px-4 py-2 text-sm text-text-secondary hover:border-divider-deep hover:text-text-primary"
++          onClick={() => setVisible(true)}
++        >
++          Open Modal
++        </button>
++        <TriggerEventsLimitModal
++          {...args}
++          show={visible}
++          onDismiss={handleHide}
++          onUpgrade={handleHide}
++        />
++      </div>
++    </I18nextProvider>
++  )
++}
++
++const meta = {
++  title: 'Billing/TriggerEventsLimitModal',
++  component: TriggerEventsLimitModal,
++  parameters: {
++    layout: 'centered',
++  },
++  args: {
++    show: true,
++    usage: 120,
++    total: 120,
++    resetInDays: 5,
++    planType: Plan.professional,
++  },
++} satisfies Meta<typeof TriggerEventsLimitModal>
++
++export default meta
++type Story = StoryObj<typeof meta>
++
++export const Professional: Story = {
++  args: {
++    onDismiss: () => { /* noop */ },
++    onUpgrade: () => { /* noop */ },
++  },
++  render: args => <Template {...args} />,
++}
++
++export const Sandbox: Story = {
++  render: args => <Template {...args} />,
++  args: {
++    onDismiss: () => { /* noop */ },
++    onUpgrade: () => { /* noop */ },
++    resetInDays: undefined,
++    planType: Plan.sandbox,
++  },
++}
+diff --git a/web/app/components/billing/trigger-events-limit-modal/index.tsx b/web/app/components/billing/trigger-events-limit-modal/index.tsx
+new file mode 100644
+index 0000000000..c1065a7868
+--- /dev/null
++++ b/web/app/components/billing/trigger-events-limit-modal/index.tsx
+@@ -0,0 +1,90 @@
++'use client'
++import type { FC } from 'react'
++import React from 'react'
++import { useTranslation } from 'react-i18next'
++import Modal from '@/app/components/base/modal'
++import Button from '@/app/components/base/button'
++import { TriggerAll } from '@/app/components/base/icons/src/vender/workflow'
++import UsageInfo from '@/app/components/billing/usage-info'
++import UpgradeBtn from '@/app/components/billing/upgrade-btn'
++import type { Plan } from '@/app/components/billing/type'
++import styles from './index.module.css'
++
++type Props = {
++  show: boolean
++  onDismiss: () => void
++  onUpgrade: () => void
++  usage: number
++  total: number
++  resetInDays?: number
++  planType: Plan
++}
++
++const TriggerEventsLimitModal: FC<Props> = ({
++  show,
++  onDismiss,
++  onUpgrade,
++  usage,
++  total,
++  resetInDays,
++}) => {
++  const { t } = useTranslation()
++
++  return (
++    <Modal
++      isShow={show}
++      onClose={onDismiss}
++      closable={false}
++      clickOutsideNotClose
++      className={`${styles.surface} flex h-[360px] w-[580px] flex-col overflow-hidden rounded-2xl !p-0 shadow-xl`}
++    >
++      <div className='relative flex w-full flex-1 items-stretch justify-center'>
++        <div
++          aria-hidden
++          className={`${styles.heroOverlay} pointer-events-none absolute inset-0`}
++        />
++        <div className='relative z-10 flex w-full flex-col items-start gap-4 px-8 pt-8'>
++          <div className={`${styles.icon} flex h-12 w-12 items-center justify-center rounded-[12px]`}>
++            <TriggerAll className='h-5 w-5 text-text-primary-on-surface' />
++          </div>
++          <div className='flex flex-col items-start gap-2'>
++            <div className={`${styles.highlight} title-lg-semi-bold`}>
++              {t('billing.triggerLimitModal.title')}
++            </div>
++            <div className='body-md-regular text-text-secondary'>
++              {t('billing.triggerLimitModal.description')}
++            </div>
++          </div>
++          <UsageInfo
++            className='mb-5 w-full rounded-[12px] bg-components-panel-on-panel-item-bg'
++            Icon={TriggerAll}
++            name={t('billing.triggerLimitModal.usageTitle')}
++            usage={usage}
++            total={total}
++            resetInDays={resetInDays}
++            hideIcon
++          />
++        </div>
++      </div>
++
++      <div className='flex h-[76px] w-full items-center justify-end gap-2 px-8 pb-8 pt-5'>
++        <Button
++          className='h-8 w-[77px] min-w-[72px] !rounded-lg !border-[0.5px] px-3 py-2'
++          onClick={onDismiss}
++        >
++          {t('billing.triggerLimitModal.dismiss')}
++        </Button>
++        <UpgradeBtn
++          isShort
++          onClick={onUpgrade}
++          className='flex w-[93px] items-center justify-center !rounded-lg !px-2'
++          style={{ height: 32 }}
++          labelKey='billing.triggerLimitModal.upgrade'
++          loc='trigger-events-limit-modal'
++        />
++      </div>
++    </Modal>
++  )
++}
++
++export default React.memo(TriggerEventsLimitModal)
+diff --git a/web/app/components/billing/type.ts b/web/app/components/billing/type.ts
+index 081cfb4edd..53b8b5b352 100644
+--- a/web/app/components/billing/type.ts
++++ b/web/app/components/billing/type.ts
+@@ -55,6 +55,17 @@ export type SelfHostedPlanInfo = {
+ 
+ export type UsagePlanInfo = Pick<PlanInfo, 'buildApps' | 'teamMembers' | 'annotatedResponse' | 'documentsUploadQuota' | 'apiRateLimit' | 'triggerEvents'> & { vectorSpace: number }
+ 
++export type UsageResetInfo = {
++  apiRateLimit?: number | null
++  triggerEvents?: number | null
++}
++
++export type BillingQuota = {
++  usage: number
++  limit: number
++  reset_date?: number | null
++}
++
+ export enum DocumentProcessingPriority {
+   standard = 'standard',
+   priority = 'priority',
+@@ -88,14 +99,8 @@ export type CurrentPlanInfoBackend = {
+     size: number
+     limit: number // total. 0 means unlimited
+   }
+-  api_rate_limit?: {
+-    size: number
+-    limit: number // total. 0 means unlimited
+-  }
+-  trigger_events?: {
+-    size: number
+-    limit: number // total. 0 means unlimited
+-  }
++  api_rate_limit?: BillingQuota
++  trigger_event?: BillingQuota
+   docs_processing: DocumentProcessingPriority
+   can_replace_logo: boolean
+   model_load_balancing_enabled: boolean
+diff --git a/web/app/components/billing/upgrade-btn/index.tsx b/web/app/components/billing/upgrade-btn/index.tsx
+index f3ae95a10b..d576e07f3e 100644
+--- a/web/app/components/billing/upgrade-btn/index.tsx
++++ b/web/app/components/billing/upgrade-btn/index.tsx
+@@ -1,5 +1,5 @@
+ 'use client'
+-import type { FC } from 'react'
++import type { CSSProperties, FC } from 'react'
+ import React from 'react'
+ import { useTranslation } from 'react-i18next'
+ import PremiumBadge from '../../base/premium-badge'
+@@ -9,19 +9,24 @@ import { useModalContext } from '@/context/modal-context'
+ 
+ type Props = {
+   className?: string
++  style?: CSSProperties
+   isFull?: boolean
+   size?: 'md' | 'lg'
+   isPlain?: boolean
+   isShort?: boolean
+   onClick?: () => void
+   loc?: string
++  labelKey?: string
+ }
+ 
+ const UpgradeBtn: FC<Props> = ({
++  className,
++  style,
+   isPlain = false,
+   isShort = false,
+   onClick: _onClick,
+   loc,
++  labelKey,
+ }) => {
+   const { t } = useTranslation()
+   const { setShowPricingModal } = useModalContext()
+@@ -40,10 +45,17 @@ const UpgradeBtn: FC<Props> = ({
+     }
+   }
+ 
++  const defaultBadgeLabel = t(`billing.upgradeBtn.${isShort ? 'encourageShort' : 'encourage'}`)
++  const label = labelKey ? t(labelKey) : defaultBadgeLabel
++
+   if (isPlain) {
+     return (
+-      <Button onClick={onClick}>
+-        {t('billing.upgradeBtn.plain')}
++      <Button
++        className={className}
++        style={style}
++        onClick={onClick}
++      >
++        {labelKey ? label : t('billing.upgradeBtn.plain')}
+       </Button>
+     )
+   }
+@@ -54,11 +66,13 @@ const UpgradeBtn: FC<Props> = ({
+       color='blue'
+       allowHover={true}
+       onClick={onClick}
++      className={className}
++      style={style}
+     >
+       <SparklesSoft className='flex h-3.5 w-3.5 items-center py-[1px] pl-[3px] text-components-premium-badge-indigo-text-stop-0' />
+       <div className='system-xs-medium'>
+         <span className='p-1'>
+-          {t(`billing.upgradeBtn.${isShort ? 'encourageShort' : 'encourage'}`)}
++          {label}
+         </span>
+       </div>
+     </PremiumBadge>
+diff --git a/web/app/components/billing/usage-info/index.tsx b/web/app/components/billing/usage-info/index.tsx
+index 0ed8775772..668d49d698 100644
+--- a/web/app/components/billing/usage-info/index.tsx
++++ b/web/app/components/billing/usage-info/index.tsx
+@@ -16,10 +16,12 @@ type Props = {
+   total: number
+   unit?: string
+   unitPosition?: 'inline' | 'suffix'
++  resetHint?: string
++  resetInDays?: number
++  hideIcon?: boolean
+ }
+ 
+-const LOW = 50
+-const MIDDLE = 80
++const WARNING_THRESHOLD = 80
+ 
+ const UsageInfo: FC<Props> = ({
+   className,
+@@ -30,28 +32,39 @@ const UsageInfo: FC<Props> = ({
+   total,
+   unit,
+   unitPosition = 'suffix',
++  resetHint,
++  resetInDays,
++  hideIcon = false,
+ }) => {
+   const { t } = useTranslation()
+ 
+   const percent = usage / total * 100
+-  const color = (() => {
+-    if (percent < LOW)
+-      return 'bg-components-progress-bar-progress-solid'
+-
+-    if (percent < MIDDLE)
+-      return 'bg-components-progress-warning-progress'
+-
+-    return 'bg-components-progress-error-progress'
+-  })()
++  const color = percent >= 100
++    ? 'bg-components-progress-error-progress'
++    : (percent >= WARNING_THRESHOLD ? 'bg-components-progress-warning-progress' : 'bg-components-progress-bar-progress-solid')
+   const isUnlimited = total === NUM_INFINITE
+   let totalDisplay: string | number = isUnlimited ? t('billing.plansCommon.unlimited') : total
+   if (!isUnlimited && unit && unitPosition === 'inline')
+     totalDisplay = `${total}${unit}`
+   const showUnit = !!unit && !isUnlimited && unitPosition === 'suffix'
++  const resetText = resetHint ?? (typeof resetInDays === 'number' ? t('billing.usagePage.resetsIn', { count: resetInDays }) : undefined)
++  const rightInfo = resetText
++    ? (
++      <div className='system-xs-regular ml-auto flex-1 text-right text-text-tertiary'>
++        {resetText}
++      </div>
++    )
++    : (showUnit && (
++      <div className='system-xs-medium ml-auto text-text-tertiary'>
++        {unit}
++      </div>
++    ))
+ 
+   return (
+     <div className={cn('flex flex-col gap-2 rounded-xl bg-components-panel-bg p-4', className)}>
+-      <Icon className='h-4 w-4 text-text-tertiary' />
++      {!hideIcon && Icon && (
++        <Icon className='h-4 w-4 text-text-tertiary' />
++      )}
+       <div className='flex items-center gap-1'>
+         <div className='system-xs-medium text-text-tertiary'>{name}</div>
+         {tooltip && (
+@@ -70,11 +83,7 @@ const UsageInfo: FC<Props> = ({
+           <div className='system-md-regular text-text-quaternary'>/</div>
+           <div>{totalDisplay}</div>
+         </div>
+-        {showUnit && (
+-          <div className='system-xs-medium ml-auto text-text-tertiary'>
+-            {unit}
+-          </div>
+-        )}
++        {rightInfo}
+       </div>
+       <ProgressBar
+         percent={percent}
+diff --git a/web/app/components/billing/utils/index.ts b/web/app/components/billing/utils/index.ts
+index 00ab7913b5..22593d8190 100644
+--- a/web/app/components/billing/utils/index.ts
++++ b/web/app/components/billing/utils/index.ts
+@@ -1,4 +1,5 @@
+-import type { CurrentPlanInfoBackend } from '../type'
++import dayjs from 'dayjs'
++import type { BillingQuota, CurrentPlanInfoBackend } from '../type'
+ import { ALL_PLANS, NUM_INFINITE } from '@/app/components/billing/config'
+ 
+ const parseLimit = (limit: number) => {
+@@ -8,6 +9,40 @@ const parseLimit = (limit: number) => {
+   return limit
+ }
+ 
++const normalizeResetDate = (resetDate?: number | null) => {
++  if (typeof resetDate !== 'number' || resetDate <= 0)
++    return null
++
++  if (resetDate >= 1e12)
++    return dayjs(resetDate)
++
++  if (resetDate >= 1e9)
++    return dayjs(resetDate * 1000)
++
++  const digits = resetDate.toString()
++  if (digits.length === 8) {
++    const year = digits.slice(0, 4)
++    const month = digits.slice(4, 6)
++    const day = digits.slice(6, 8)
++    const parsed = dayjs(`${year}-${month}-${day}`)
++    return parsed.isValid() ? parsed : null
++  }
++
++  return null
++}
++
++const getResetInDaysFromDate = (resetDate?: number | null) => {
++  const resetDay = normalizeResetDate(resetDate)
++  if (!resetDay)
++    return null
++
++  const diff = resetDay.startOf('day').diff(dayjs().startOf('day'), 'day')
++  if (Number.isNaN(diff) || diff < 0)
++    return null
++
++  return diff
++}
++
+ export const parseCurrentPlan = (data: CurrentPlanInfoBackend) => {
+   const planType = data.billing.subscription.plan
+   const planPreset = ALL_PLANS[planType]
+@@ -15,6 +50,12 @@ export const parseCurrentPlan = (data: CurrentPlanInfoBackend) => {
+     const value = limit ?? fallback ?? 0
+     return parseLimit(value)
+   }
++  const getQuotaUsage = (quota?: BillingQuota) => quota?.usage ?? 0
++  const getQuotaResetInDays = (quota?: BillingQuota) => {
++    if (!quota)
++      return null
++    return getResetInDaysFromDate(quota.reset_date)
++  }
+ 
+   return {
+     type: planType,
+@@ -24,8 +65,8 @@ export const parseCurrentPlan = (data: CurrentPlanInfoBackend) => {
+       teamMembers: data.members.size,
+       annotatedResponse: data.annotation_quota_limit.size,
+       documentsUploadQuota: data.documents_upload_quota.size,
+-      apiRateLimit: data.api_rate_limit?.size ?? 0,
+-      triggerEvents: data.trigger_events?.size ?? 0,
++      apiRateLimit: getQuotaUsage(data.api_rate_limit),
++      triggerEvents: getQuotaUsage(data.trigger_event),
+     },
+     total: {
+       vectorSpace: parseLimit(data.vector_space.limit),
+@@ -34,7 +75,11 @@ export const parseCurrentPlan = (data: CurrentPlanInfoBackend) => {
+       annotatedResponse: parseLimit(data.annotation_quota_limit.limit),
+       documentsUploadQuota: parseLimit(data.documents_upload_quota.limit),
+       apiRateLimit: resolveLimit(data.api_rate_limit?.limit, planPreset?.apiRateLimit ?? NUM_INFINITE),
+-      triggerEvents: resolveLimit(data.trigger_events?.limit, planPreset?.triggerEvents),
++      triggerEvents: resolveLimit(data.trigger_event?.limit, planPreset?.triggerEvents),
++    },
++    reset: {
++      apiRateLimit: getQuotaResetInDays(data.api_rate_limit),
++      triggerEvents: getQuotaResetInDays(data.trigger_event),
+     },
+   }
+ }
+diff --git a/web/app/components/workflow-app/components/workflow-header/features-trigger.tsx b/web/app/components/workflow-app/components/workflow-header/features-trigger.tsx
+index d229006177..28a2f43fe5 100644
+--- a/web/app/components/workflow-app/components/workflow-header/features-trigger.tsx
++++ b/web/app/components/workflow-app/components/workflow-header/features-trigger.tsx
+@@ -40,6 +40,8 @@ import useTheme from '@/hooks/use-theme'
+ import cn from '@/utils/classnames'
+ import { useIsChatMode } from '@/app/components/workflow/hooks'
+ import type { StartNodeType } from '@/app/components/workflow/nodes/start/types'
++import { useProviderContext } from '@/context/provider-context'
++import { Plan } from '@/app/components/billing/type'
+ 
+ const FeaturesTrigger = () => {
+   const { t } = useTranslation()
+@@ -50,6 +52,7 @@ const FeaturesTrigger = () => {
+   const appID = appDetail?.id
+   const setAppDetail = useAppStore(s => s.setAppDetail)
+   const { nodesReadOnly, getNodesReadOnly } = useNodesReadOnly()
++  const { plan, isFetchedPlan } = useProviderContext()
+   const publishedAt = useStore(s => s.publishedAt)
+   const draftUpdatedAt = useStore(s => s.draftUpdatedAt)
+   const toolPublished = useStore(s => s.toolPublished)
+@@ -95,6 +98,15 @@ const FeaturesTrigger = () => {
+   const hasTriggerNode = useMemo(() => (
+     nodes.some(node => isTriggerNode(node.data.type as BlockEnum))
+   ), [nodes])
++  const startNodeLimitExceeded = useMemo(() => {
++    const entryCount = nodes.reduce((count, node) => {
++      const nodeType = node.data.type as BlockEnum
++      if (nodeType === BlockEnum.Start || isTriggerNode(nodeType))
++        return count + 1
++      return count
++    }, 0)
++    return isFetchedPlan && plan.type === Plan.sandbox && entryCount > 2
++  }, [nodes, plan.type, isFetchedPlan])
+ 
+   const resetWorkflowVersionHistory = useResetWorkflowVersionHistory()
+   const invalidateAppTriggers = useInvalidateAppTriggers()
+@@ -196,7 +208,8 @@ const FeaturesTrigger = () => {
+           crossAxisOffset: 4,
+           missingStartNode: !startNode,
+           hasTriggerNode,
+-          publishDisabled: !hasWorkflowNodes,
++          startNodeLimitExceeded,
++          publishDisabled: !hasWorkflowNodes || startNodeLimitExceeded,
+         }}
+       />
+     </>
+diff --git a/web/context/hooks/use-trigger-events-limit-modal.ts b/web/context/hooks/use-trigger-events-limit-modal.ts
+new file mode 100644
+index 0000000000..b55501ffaf
+--- /dev/null
++++ b/web/context/hooks/use-trigger-events-limit-modal.ts
+@@ -0,0 +1,130 @@
++import { type Dispatch, type SetStateAction, useCallback, useEffect, useRef, useState } from 'react'
++import dayjs from 'dayjs'
++import { NUM_INFINITE } from '@/app/components/billing/config'
++import { Plan } from '@/app/components/billing/type'
++import { IS_CLOUD_EDITION } from '@/config'
++import type { ModalState } from '../modal-context'
++
++export type TriggerEventsLimitModalPayload = {
++  usage: number
++  total: number
++  resetInDays?: number
++  planType: Plan
++  storageKey?: string
++  persistDismiss?: boolean
++}
++
++type TriggerPlanInfo = {
++  type: Plan
++  usage: { triggerEvents: number }
++  total: { triggerEvents: number }
++  reset: { triggerEvents?: number | null }
++}
++
++type UseTriggerEventsLimitModalOptions = {
++  plan: TriggerPlanInfo
++  isFetchedPlan: boolean
++  currentWorkspaceId?: string
++}
++
++type UseTriggerEventsLimitModalResult = {
++  showTriggerEventsLimitModal: ModalState<TriggerEventsLimitModalPayload> | null
++  setShowTriggerEventsLimitModal: Dispatch<SetStateAction<ModalState<TriggerEventsLimitModalPayload> | null>>
++  persistTriggerEventsLimitModalDismiss: () => void
++}
++
++const TRIGGER_EVENTS_LOCALSTORAGE_PREFIX = 'trigger-events-limit-dismissed'
++
++export const useTriggerEventsLimitModal = ({
++  plan,
++  isFetchedPlan,
++  currentWorkspaceId,
++}: UseTriggerEventsLimitModalOptions): UseTriggerEventsLimitModalResult => {
++  const [showTriggerEventsLimitModal, setShowTriggerEventsLimitModal] = useState<ModalState<TriggerEventsLimitModalPayload> | null>(null)
++  const dismissedTriggerEventsLimitStorageKeysRef = useRef<Record<string, boolean>>({})
++
++  useEffect(() => {
++    if (!IS_CLOUD_EDITION)
++      return
++    if (typeof window === 'undefined')
++      return
++    if (!currentWorkspaceId)
++      return
++    if (!isFetchedPlan) {
++      setShowTriggerEventsLimitModal(null)
++      return
++    }
++
++    const { type, usage, total, reset } = plan
++    const isUnlimited = total.triggerEvents === NUM_INFINITE
++    const reachedLimit = total.triggerEvents > 0 && usage.triggerEvents >= total.triggerEvents
++
++    if (type === Plan.team || isUnlimited || !reachedLimit) {
++      if (showTriggerEventsLimitModal)
++        setShowTriggerEventsLimitModal(null)
++      return
++    }
++
++    const triggerResetInDays = type === Plan.professional && total.triggerEvents !== NUM_INFINITE
++      ? reset.triggerEvents ?? undefined
++      : undefined
++    const cycleTag = (() => {
++      if (typeof reset.triggerEvents === 'number')
++        return dayjs().startOf('day').add(reset.triggerEvents, 'day').format('YYYY-MM-DD')
++      if (type === Plan.sandbox)
++        return dayjs().endOf('month').format('YYYY-MM-DD')
++      return 'none'
++    })()
++    const storageKey = `${TRIGGER_EVENTS_LOCALSTORAGE_PREFIX}-${currentWorkspaceId}-${type}-${total.triggerEvents}-${cycleTag}`
++    if (dismissedTriggerEventsLimitStorageKeysRef.current[storageKey])
++      return
++
++    let persistDismiss = true
++    let hasDismissed = false
++    try {
++      if (localStorage.getItem(storageKey) === '1')
++        hasDismissed = true
++    }
++    catch {
++      persistDismiss = false
++    }
++    if (hasDismissed)
++      return
++
++    if (showTriggerEventsLimitModal?.payload.storageKey === storageKey)
++      return
++
++    setShowTriggerEventsLimitModal({
++      payload: {
++        usage: usage.triggerEvents,
++        total: total.triggerEvents,
++        planType: type,
++        resetInDays: triggerResetInDays,
++        storageKey,
++        persistDismiss,
++      },
++    })
++  }, [plan, isFetchedPlan, showTriggerEventsLimitModal, currentWorkspaceId])
++
++  const persistTriggerEventsLimitModalDismiss = useCallback(() => {
++    const storageKey = showTriggerEventsLimitModal?.payload.storageKey
++    if (!storageKey)
++      return
++    if (showTriggerEventsLimitModal?.payload.persistDismiss) {
++      try {
++        localStorage.setItem(storageKey, '1')
++        return
++      }
++      catch {
++        // ignore error and fall back to in-memory guard
++      }
++    }
++    dismissedTriggerEventsLimitStorageKeysRef.current[storageKey] = true
++  }, [showTriggerEventsLimitModal])
++
++  return {
++    showTriggerEventsLimitModal,
++    setShowTriggerEventsLimitModal,
++    persistTriggerEventsLimitModalDismiss,
++  }
++}
+diff --git a/web/context/modal-context.test.tsx b/web/context/modal-context.test.tsx
+new file mode 100644
+index 0000000000..77bab5e3bd
+--- /dev/null
++++ b/web/context/modal-context.test.tsx
+@@ -0,0 +1,181 @@
++import React from 'react'
++import { act, render, screen, waitFor } from '@testing-library/react'
++import { ModalContextProvider } from '@/context/modal-context'
++import { Plan } from '@/app/components/billing/type'
++import { defaultPlan } from '@/app/components/billing/config'
++
++jest.mock('@/config', () => {
++  const actual = jest.requireActual('@/config')
++  return {
++    ...actual,
++    IS_CLOUD_EDITION: true,
++  }
++})
++
++jest.mock('next/navigation', () => ({
++  useSearchParams: jest.fn(() => new URLSearchParams()),
++}))
++
++const mockUseProviderContext = jest.fn()
++jest.mock('@/context/provider-context', () => ({
++  useProviderContext: () => mockUseProviderContext(),
++}))
++
++const mockUseAppContext = jest.fn()
++jest.mock('@/context/app-context', () => ({
++  useAppContext: () => mockUseAppContext(),
++}))
++
++let latestTriggerEventsModalProps: any = null
++const triggerEventsLimitModalMock = jest.fn((props: any) => {
++  latestTriggerEventsModalProps = props
++  return (
++    <div data-testid="trigger-limit-modal">
++      <button type="button" onClick={props.onDismiss}>dismiss</button>
++      <button type="button" onClick={props.onUpgrade}>upgrade</button>
++    </div>
++  )
++})
++
++jest.mock('@/app/components/billing/trigger-events-limit-modal', () => ({
++  __esModule: true,
++  default: (props: any) => triggerEventsLimitModalMock(props),
++}))
++
++type DefaultPlanShape = typeof defaultPlan
++type PlanOverrides = Partial<Omit<DefaultPlanShape, 'usage' | 'total' | 'reset'>> & {
++  usage?: Partial<DefaultPlanShape['usage']>
++  total?: Partial<DefaultPlanShape['total']>
++  reset?: Partial<DefaultPlanShape['reset']>
++}
++
++const createPlan = (overrides: PlanOverrides = {}): DefaultPlanShape => ({
++  ...defaultPlan,
++  ...overrides,
++  usage: {
++    ...defaultPlan.usage,
++    ...overrides.usage,
++  },
++  total: {
++    ...defaultPlan.total,
++    ...overrides.total,
++  },
++  reset: {
++    ...defaultPlan.reset,
++    ...overrides.reset,
++  },
++})
++
++const renderProvider = () => render(
++  <ModalContextProvider>
++    <div data-testid="modal-context-test-child" />
++  </ModalContextProvider>,
++)
++
++describe('ModalContextProvider trigger events limit modal', () => {
++  beforeEach(() => {
++    latestTriggerEventsModalProps = null
++    triggerEventsLimitModalMock.mockClear()
++    mockUseAppContext.mockReset()
++    mockUseProviderContext.mockReset()
++    window.localStorage.clear()
++    mockUseAppContext.mockReturnValue({
++      currentWorkspace: {
++        id: 'workspace-1',
++      },
++    })
++  })
++
++  afterEach(() => {
++    jest.restoreAllMocks()
++  })
++
++  it('opens the trigger events limit modal and persists dismissal in localStorage', async () => {
++    const plan = createPlan({
++      type: Plan.professional,
++      usage: { triggerEvents: 3000 },
++      total: { triggerEvents: 3000 },
++      reset: { triggerEvents: 5 },
++    })
++    mockUseProviderContext.mockReturnValue({
++      plan,
++      isFetchedPlan: true,
++    })
++    const setItemSpy = jest.spyOn(Storage.prototype, 'setItem')
++
++    renderProvider()
++
++    await waitFor(() => expect(screen.getByTestId('trigger-limit-modal')).toBeInTheDocument())
++    expect(latestTriggerEventsModalProps).toMatchObject({
++      usage: 3000,
++      total: 3000,
++      resetInDays: 5,
++      planType: Plan.professional,
++    })
++
++    act(() => {
++      latestTriggerEventsModalProps.onDismiss()
++    })
++
++    await waitFor(() => expect(screen.queryByTestId('trigger-limit-modal')).not.toBeInTheDocument())
++    const [key, value] = setItemSpy.mock.calls[0]
++    expect(key).toContain('trigger-events-limit-dismissed-workspace-1-professional-3000-')
++    expect(value).toBe('1')
++  })
++
++  it('relies on the in-memory guard when localStorage reads throw', async () => {
++    const plan = createPlan({
++      type: Plan.professional,
++      usage: { triggerEvents: 200 },
++      total: { triggerEvents: 200 },
++      reset: { triggerEvents: 3 },
++    })
++    mockUseProviderContext.mockReturnValue({
++      plan,
++      isFetchedPlan: true,
++    })
++    jest.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
++      throw new Error('Storage disabled')
++    })
++    const setItemSpy = jest.spyOn(Storage.prototype, 'setItem')
++
++    renderProvider()
++
++    await waitFor(() => expect(screen.getByTestId('trigger-limit-modal')).toBeInTheDocument())
++
++    act(() => {
++      latestTriggerEventsModalProps.onDismiss()
++    })
++
++    await waitFor(() => expect(screen.queryByTestId('trigger-limit-modal')).not.toBeInTheDocument())
++    expect(setItemSpy).not.toHaveBeenCalled()
++    await waitFor(() => expect(triggerEventsLimitModalMock).toHaveBeenCalledTimes(1))
++  })
++
++  it('falls back to the in-memory guard when localStorage.setItem fails', async () => {
++    const plan = createPlan({
++      type: Plan.professional,
++      usage: { triggerEvents: 120 },
++      total: { triggerEvents: 120 },
++      reset: { triggerEvents: 2 },
++    })
++    mockUseProviderContext.mockReturnValue({
++      plan,
++      isFetchedPlan: true,
++    })
++    jest.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
++      throw new Error('Quota exceeded')
++    })
++
++    renderProvider()
++
++    await waitFor(() => expect(screen.getByTestId('trigger-limit-modal')).toBeInTheDocument())
++
++    act(() => {
++      latestTriggerEventsModalProps.onDismiss()
++    })
++
++    await waitFor(() => expect(screen.queryByTestId('trigger-limit-modal')).not.toBeInTheDocument())
++    await waitFor(() => expect(triggerEventsLimitModalMock).toHaveBeenCalledTimes(1))
++  })
++})
+diff --git a/web/context/modal-context.tsx b/web/context/modal-context.tsx
+index e0228b8ca8..082b0f9c58 100644
+--- a/web/context/modal-context.tsx
++++ b/web/context/modal-context.tsx
+@@ -36,6 +36,12 @@ import { noop } from 'lodash-es'
+ import dynamic from 'next/dynamic'
+ import type { ExpireNoticeModalPayloadProps } from '@/app/education-apply/expire-notice-modal'
+ import type { ModelModalModeEnum } from '@/app/components/header/account-setting/model-provider-page/declarations'
++import { useProviderContext } from '@/context/provider-context'
++import { useAppContext } from '@/context/app-context'
++import {
++  type TriggerEventsLimitModalPayload,
++  useTriggerEventsLimitModal,
++} from './hooks/use-trigger-events-limit-modal'
+ 
+ const AccountSetting = dynamic(() => import('@/app/components/header/account-setting'), {
+   ssr: false,
+@@ -74,6 +80,9 @@ const UpdatePlugin = dynamic(() => import('@/app/components/plugins/update-plugi
+ const ExpireNoticeModal = dynamic(() => import('@/app/education-apply/expire-notice-modal'), {
+   ssr: false,
+ })
++const TriggerEventsLimitModal = dynamic(() => import('@/app/components/billing/trigger-events-limit-modal'), {
++  ssr: false,
++})
+ 
+ export type ModalState<T> = {
+   payload: T
+@@ -113,6 +122,7 @@ export type ModalContextState = {
+   }> | null>>
+   setShowUpdatePluginModal: Dispatch<SetStateAction<ModalState<UpdatePluginPayload> | null>>
+   setShowEducationExpireNoticeModal: Dispatch<SetStateAction<ModalState<ExpireNoticeModalPayloadProps> | null>>
++  setShowTriggerEventsLimitModal: Dispatch<SetStateAction<ModalState<TriggerEventsLimitModalPayload> | null>>
+ }
+ const PRICING_MODAL_QUERY_PARAM = 'pricing'
+ const PRICING_MODAL_QUERY_VALUE = 'open'
+@@ -130,6 +140,7 @@ const ModalContext = createContext<ModalContextState>({
+   setShowOpeningModal: noop,
+   setShowUpdatePluginModal: noop,
+   setShowEducationExpireNoticeModal: noop,
++  setShowTriggerEventsLimitModal: noop,
+ })
+ 
+ export const useModalContext = () => useContext(ModalContext)
+@@ -168,6 +179,7 @@ export const ModalContextProvider = ({
+   }> | null>(null)
+   const [showUpdatePluginModal, setShowUpdatePluginModal] = useState<ModalState<UpdatePluginPayload> | null>(null)
+   const [showEducationExpireNoticeModal, setShowEducationExpireNoticeModal] = useState<ModalState<ExpireNoticeModalPayloadProps> | null>(null)
++  const { currentWorkspace } = useAppContext()
+ 
+   const [showPricingModal, setShowPricingModal] = useState(
+     searchParams.get(PRICING_MODAL_QUERY_PARAM) === PRICING_MODAL_QUERY_VALUE,
+@@ -228,6 +240,17 @@ export const ModalContextProvider = ({
+     window.history.replaceState(null, '', url.toString())
+   }, [showPricingModal])
+ 
++  const { plan, isFetchedPlan } = useProviderContext()
++  const {
++    showTriggerEventsLimitModal,
++    setShowTriggerEventsLimitModal,
++    persistTriggerEventsLimitModalDismiss,
++  } = useTriggerEventsLimitModal({
++    plan,
++    isFetchedPlan,
++    currentWorkspaceId: currentWorkspace?.id,
++  })
++
+   const handleCancelModerationSettingModal = () => {
+     setShowModerationSettingModal(null)
+     if (showModerationSettingModal?.onCancelCallback)
+@@ -334,6 +357,7 @@ export const ModalContextProvider = ({
+       setShowOpeningModal,
+       setShowUpdatePluginModal,
+       setShowEducationExpireNoticeModal,
++      setShowTriggerEventsLimitModal,
+     }}>
+       <>
+         {children}
+@@ -455,6 +479,25 @@ export const ModalContextProvider = ({
+               onClose={() => setShowEducationExpireNoticeModal(null)}
+             />
+           )}
++        {
++          !!showTriggerEventsLimitModal && (
++            <TriggerEventsLimitModal
++              show
++              usage={showTriggerEventsLimitModal.payload.usage}
++              total={showTriggerEventsLimitModal.payload.total}
++              planType={showTriggerEventsLimitModal.payload.planType}
++              resetInDays={showTriggerEventsLimitModal.payload.resetInDays}
++              onDismiss={() => {
++                persistTriggerEventsLimitModalDismiss()
++                setShowTriggerEventsLimitModal(null)
++              }}
++              onUpgrade={() => {
++                persistTriggerEventsLimitModalDismiss()
++                setShowTriggerEventsLimitModal(null)
++                handleShowPricingModal()
++              }}
++            />
++          )}
+       </>
+     </ModalContext.Provider>
+   )
+diff --git a/web/context/provider-context.tsx b/web/context/provider-context.tsx
+index 90233fbc21..26617921f1 100644
+--- a/web/context/provider-context.tsx
++++ b/web/context/provider-context.tsx
+@@ -17,7 +17,7 @@ import {
+ } from '@/app/components/header/account-setting/model-provider-page/declarations'
+ import type { Model, ModelProvider } from '@/app/components/header/account-setting/model-provider-page/declarations'
+ import type { RETRIEVE_METHOD } from '@/types/app'
+-import type { Plan } from '@/app/components/billing/type'
++import type { Plan, UsageResetInfo } from '@/app/components/billing/type'
+ import type { UsagePlanInfo } from '@/app/components/billing/type'
+ import { fetchCurrentPlanInfo } from '@/service/billing'
+ import { parseCurrentPlan } from '@/app/components/billing/utils'
+@@ -40,6 +40,7 @@ type ProviderContextState = {
+     type: Plan
+     usage: UsagePlanInfo
+     total: UsagePlanInfo
++    reset: UsageResetInfo
+   }
+   isFetchedPlan: boolean
+   enableBilling: boolean
+diff --git a/web/i18n/de-DE/billing.ts b/web/i18n/de-DE/billing.ts
+index 6601bbb179..b921e5e341 100644
+--- a/web/i18n/de-DE/billing.ts
++++ b/web/i18n/de-DE/billing.ts
+@@ -83,7 +83,7 @@ const translation = {
+     cloud: 'Cloud-Dienst',
+     apiRateLimitTooltip: 'Die API-Datenbeschränkung gilt für alle Anfragen, die über die Dify-API gemacht werden, einschließlich Textgenerierung, Chat-Konversationen, Workflow-Ausführungen und Dokumentenverarbeitung.',
+     getStarted: 'Loslegen',
+-    apiRateLimitUnit: '{{count,number}}/Monat',
++    apiRateLimitUnit: '{{count,number}}',
+     documentsTooltip: 'Vorgabe für die Anzahl der Dokumente, die aus der Wissensdatenquelle importiert werden.',
+     apiRateLimit: 'API-Datenlimit',
+     documents: '{{count,number}} Wissensdokumente',
+diff --git a/web/i18n/en-US/billing.ts b/web/i18n/en-US/billing.ts
+index 0bd26c1075..f2b2b31835 100644
+--- a/web/i18n/en-US/billing.ts
++++ b/web/i18n/en-US/billing.ts
+@@ -9,8 +9,16 @@ const translation = {
+     vectorSpaceTooltip: 'Documents with the High Quality indexing mode will consume Knowledge Data Storage resources. When Knowledge Data Storage reaches the limit, new documents will not be uploaded.',
+     triggerEvents: 'Trigger Events',
+     perMonth: 'per month',
++    resetsIn: 'Resets in {{count,number}} days',
+   },
+   teamMembers: 'Team Members',
++  triggerLimitModal: {
++    title: 'Upgrade to unlock unlimited triggers per workflow',
++    description: 'You’ve reached the limit of 2 triggers per workflow for this plan. Upgrade to publish this workflow.',
++    dismiss: 'Dismiss',
++    upgrade: 'Upgrade',
++    usageTitle: 'TRIGGER EVENTS',
++  },
+   upgradeBtn: {
+     plain: 'View Plan',
+     encourage: 'Upgrade Now',
+@@ -61,11 +69,11 @@ const translation = {
+     documentsTooltip: 'Quota on the number of documents imported from the Knowledge Data Source.',
+     vectorSpace: '{{size}} Knowledge Data Storage',
+     vectorSpaceTooltip: 'Documents with the High Quality indexing mode will consume Knowledge Data Storage resources. When Knowledge Data Storage reaches the limit, new documents will not be uploaded.',
+-    documentsRequestQuota: '{{count,number}}/min Knowledge Request Rate Limit',
++    documentsRequestQuota: '{{count,number}} Knowledge Request/min',
+     documentsRequestQuotaTooltip: 'Specifies the total number of actions a workspace can perform per minute within the knowledge base, including dataset creation, deletion, updates, document uploads, modifications, archiving, and knowledge base queries. This metric is used to evaluate the performance of knowledge base requests. For example, if a Sandbox user performs 10 consecutive hit tests within one minute, their workspace will be temporarily restricted from performing the following actions for the next minute: dataset creation, deletion, updates, and document uploads or modifications. ',
+     apiRateLimit: 'API Rate Limit',
+-    apiRateLimitUnit: '{{count,number}}/month',
+-    unlimitedApiRate: 'No API Rate Limit',
++    apiRateLimitUnit: '{{count,number}}',
++    unlimitedApiRate: 'No Dify API Rate Limit',
+     apiRateLimitTooltip: 'API Rate Limit applies to all requests made through the Dify API, including text generation, chat conversations, workflow executions, and document processing.',
+     documentProcessingPriority: ' Document Processing',
+     documentProcessingPriorityUpgrade: 'Process more data with higher accuracy at faster speeds.',
+@@ -78,15 +86,17 @@ const translation = {
+       sandbox: '{{count,number}} Trigger Events',
+       professional: '{{count,number}} Trigger Events/month',
+       unlimited: 'Unlimited Trigger Events',
++      tooltip: 'The number of events that automatically start workflows through Plugin, Schedule, or Webhook triggers.',
+     },
+     workflowExecution: {
+       standard: 'Standard Workflow Execution',
+       faster: 'Faster Workflow Execution',
+       priority: 'Priority Workflow Execution',
++      tooltip: 'Workflow execution queue priority and speed.',
+     },
+     startNodes: {
+-      limited: 'Up to {{count}} Start Nodes per Workflow',
+-      unlimited: 'Unlimited Start Nodes per Workflow',
++      limited: 'Up to {{count}} Triggers/workflow',
++      unlimited: 'Unlimited Triggers/workflow',
+     },
+     logsHistory: '{{days}} Log history',
+     customTools: 'Custom Tools',
+diff --git a/web/i18n/en-US/workflow.ts b/web/i18n/en-US/workflow.ts
+index 92a0b110c7..0cd4a0a78b 100644
+--- a/web/i18n/en-US/workflow.ts
++++ b/web/i18n/en-US/workflow.ts
+@@ -123,6 +123,11 @@ const translation = {
+     noHistory: 'No History',
+     tagBound: 'Number of apps using this tag',
+   },
++  publishLimit: {
++    startNodeTitlePrefix: 'Upgrade to',
++    startNodeTitleSuffix: 'unlock unlimited triggers per workflow',
++    startNodeDesc: 'You’ve reached the limit of 2 triggers per workflow for this plan. Upgrade to publish this workflow.',
++  },
+   env: {
+     envPanelTitle: 'Environment Variables',
+     envDescription: 'Environment variables can be used to store private information and credentials. They are read-only and can be separated from the DSL file during export.',
+diff --git a/web/i18n/es-ES/billing.ts b/web/i18n/es-ES/billing.ts
+index 1632776e30..48377bbaa3 100644
+--- a/web/i18n/es-ES/billing.ts
++++ b/web/i18n/es-ES/billing.ts
+@@ -76,7 +76,7 @@ const translation = {
+     priceTip: 'por espacio de trabajo/',
+     teamMember_one: '{{count, número}} Miembro del Equipo',
+     getStarted: 'Comenzar',
+-    apiRateLimitUnit: '{{count, número}}/mes',
++    apiRateLimitUnit: '{{count, número}}',
+     freeTrialTipSuffix: 'No se requiere tarjeta de crédito',
+     unlimitedApiRate: 'Sin límite de tasa de API',
+     apiRateLimit: 'Límite de tasa de API',
+diff --git a/web/i18n/fa-IR/billing.ts b/web/i18n/fa-IR/billing.ts
+index e5121bb65b..24c7f749f9 100644
+--- a/web/i18n/fa-IR/billing.ts
++++ b/web/i18n/fa-IR/billing.ts
+@@ -73,7 +73,7 @@ const translation = {
+     },
+     ragAPIRequestTooltip: 'به تعداد درخواست‌های API که فقط قابلیت‌های پردازش پایگاه دانش Dify را فراخوانی می‌کنند اشاره دارد.',
+     receiptInfo: 'فقط صاحب تیم و مدیر تیم می‌توانند اشتراک تهیه کنند و اطلاعات صورتحساب را مشاهده کنند',
+-    apiRateLimitUnit: '{{count,number}}/ماه',
++    apiRateLimitUnit: '{{count,number}}',
+     cloud: 'سرویس ابری',
+     documents: '{{count,number}} سندهای دانش',
+     self: 'خود میزبان',
+diff --git a/web/i18n/fr-FR/billing.ts b/web/i18n/fr-FR/billing.ts
+index 9715a1e805..383b6bdca1 100644
+--- a/web/i18n/fr-FR/billing.ts
++++ b/web/i18n/fr-FR/billing.ts
+@@ -73,7 +73,7 @@ const translation = {
+     ragAPIRequestTooltip: 'Fait référence au nombre d\'appels API invoquant uniquement les capacités de traitement de la base de connaissances de Dify.',
+     receiptInfo: 'Seuls le propriétaire de l\'équipe et l\'administrateur de l\'équipe peuvent s\'abonner et consulter les informations de facturation',
+     annotationQuota: 'Quota d’annotation',
+-    apiRateLimitUnit: '{{count,number}}/mois',
++    apiRateLimitUnit: '{{count,number}}',
+     priceTip: 'par espace de travail/',
+     freeTrialTipSuffix: 'Aucune carte de crédit requise',
+     teamWorkspace: '{{count,number}} Espace de travail d\'équipe',
+@@ -106,7 +106,7 @@ const translation = {
+     professional: {
+       name: 'Professionnel',
+       description: 'Pour les individus et les petites équipes afin de débloquer plus de puissance à un prix abordable.',
+-      for: 'Pour les développeurs indépendants / petites équipes',
++      for: 'Pour les développeurs indépendants/petites équipes',
+     },
+     team: {
+       name: 'Équipe',
+diff --git a/web/i18n/hi-IN/billing.ts b/web/i18n/hi-IN/billing.ts
+index 7164a13d6f..eb970f38ab 100644
+--- a/web/i18n/hi-IN/billing.ts
++++ b/web/i18n/hi-IN/billing.ts
+@@ -96,7 +96,7 @@ const translation = {
+     freeTrialTip: '200 ओपनएआई कॉल्स का मुफ्त परीक्षण।',
+     documents: '{{count,number}} ज्ञान दस्तावेज़',
+     freeTrialTipSuffix: 'कोई क्रेडिट कार्ड की आवश्यकता नहीं है',
+-    apiRateLimitUnit: '{{count,number}}/माह',
++    apiRateLimitUnit: '{{count,number}}',
+     teamWorkspace: '{{count,number}} टीम कार्यक्षेत्र',
+     apiRateLimitTooltip: 'Dify API के माध्यम से की गई सभी अनुरोधों पर API दर सीमा लागू होती है, जिसमें टेक्स्ट जनरेशन, चैट वार्तालाप, कार्यप्रवाह निष्पादन और दस्तावेज़ प्रसंस्करण शामिल हैं।',
+     teamMember_one: '{{count,number}} टीम सदस्य',
+diff --git a/web/i18n/it-IT/billing.ts b/web/i18n/it-IT/billing.ts
+index fc5d67520b..175bfad10c 100644
+--- a/web/i18n/it-IT/billing.ts
++++ b/web/i18n/it-IT/billing.ts
+@@ -88,7 +88,7 @@ const translation = {
+     freeTrialTipPrefix: 'Iscriviti e ricevi un',
+     teamMember_one: '{{count,number}} membro del team',
+     documents: '{{count,number}} Documenti di Conoscenza',
+-    apiRateLimitUnit: '{{count,number}}/mese',
++    apiRateLimitUnit: '{{count,number}}',
+     documentsRequestQuota: '{{count,number}}/min Limite di richiesta di conoscenza',
+     teamMember_other: '{{count,number}} membri del team',
+     freeTrialTip: 'prova gratuita di 200 chiamate OpenAI.',
+@@ -115,7 +115,7 @@ const translation = {
+       name: 'Professional',
+       description:
+         'Per individui e piccoli team per sbloccare più potenza a prezzi accessibili.',
+-      for: 'Per sviluppatori indipendenti / piccoli team',
++      for: 'Per sviluppatori indipendenti/piccoli team',
+     },
+     team: {
+       name: 'Team',
+diff --git a/web/i18n/ja-JP/billing.ts b/web/i18n/ja-JP/billing.ts
+index b679ae571a..f1f07452d6 100644
+--- a/web/i18n/ja-JP/billing.ts
++++ b/web/i18n/ja-JP/billing.ts
+@@ -7,8 +7,16 @@ const translation = {
+     documentsUploadQuota: 'ドキュメント・アップロード・クォータ',
+     vectorSpace: 'ナレッジベースのデータストレージ',
+     vectorSpaceTooltip: '高品質インデックスモードのドキュメントは、ナレッジベースのデータストレージのリソースを消費します。ナレッジベースのデータストレージの上限に達すると、新しいドキュメントはアップロードされません。',
+-    triggerEvents: 'トリガーイベント',
++    triggerEvents: 'トリガーイベント数',
+     perMonth: '月あたり',
++    resetsIn: '{{count,number}}日後にリセット',
++  },
++  triggerLimitModal: {
++    title: 'アップグレードして、各ワークフローのトリガーを制限なく使用',
++    description: 'このプランでは、各ワークフローのトリガー数は最大2個までです。公開するにはアップグレードしてください。',
++    dismiss: '閉じる',
++    upgrade: 'アップグレード',
++    usageTitle: 'TRIGGER EVENTS',
+   },
+   upgradeBtn: {
+     plain: 'プランをアップグレード',
+@@ -59,10 +67,10 @@ const translation = {
+     documentsTooltip: 'ナレッジデータソースからインポートされたドキュメントの数に対するクォータ。',
+     vectorSpace: '{{size}}のナレッジベースのデータストレージ',
+     vectorSpaceTooltip: '高品質インデックスモードのドキュメントは、ナレッジベースのデータストレージのリソースを消費します。ナレッジベースのデータストレージの上限に達すると、新しいドキュメントはアップロードされません。',
+-    documentsRequestQuota: '{{count,number}}/分のナレッジ リクエストのレート制限',
++    documentsRequestQuota: '{{count,number}} のナレッジリクエスト上限/分',
+     documentsRequestQuotaTooltip: 'ナレッジベース内でワークスペースが 1 分間に実行できる操作の総数を示します。これには、データセットの作成、削除、更新、ドキュメントのアップロード、修正、アーカイブ、およびナレッジベースクエリが含まれます。この指標は、ナレッジベースリクエストのパフォーマンスを評価するために使用されます。例えば、Sandbox ユーザーが 1 分間に 10 回連続でヒットテストを実行した場合、そのワークスペースは次の 1 分間、データセットの作成、削除、更新、ドキュメントのアップロードや修正などの操作を一時的に実行できなくなります。',
+-    apiRateLimit: 'API レート制限',
+-    apiRateLimitUnit: '{{count,number}}/月',
++    apiRateLimit: 'API リクエスト制限',
++    apiRateLimitUnit: '{{count,number}} の',
+     unlimitedApiRate: '無制限の API コール',
+     apiRateLimitTooltip: 'API レート制限は、テキスト生成、チャットボット、ワークフロー、ドキュメント処理など、Dify API 経由のすべてのリクエストに適用されます。',
+     documentProcessingPriority: '文書処理',
+@@ -72,6 +80,22 @@ const translation = {
+       'priority': '優先',
+       'top-priority': '最優先',
+     },
++    triggerEvents: {
++      sandbox: '{{count,number}} トリガーイベント数',
++      professional: '{{count,number}} トリガーイベント数/月',
++      unlimited: '無制限のトリガーイベント数',
++      tooltip: 'プラグイントリガー、タイマートリガー、または Webhook トリガーによって自動的にワークフローを起動するイベントの回数です。',
++    },
++    workflowExecution: {
++      standard: '標準ワークフロー実行キュー',
++      faster: '高速ワークフロー実行キュー',
++      priority: '優先度の高いワークフロー実行キュー',
++      tooltip: 'ワークフローの実行キューの優先度と実行速度。',
++    },
++    startNodes: {
++      limited: '各ワークフローは最大{{count}}つのトリガーまで',
++      unlimited: '各ワークフローのトリガーは無制限',
++    },
+     logsHistory: '{{days}}のログ履歴',
+     customTools: 'カスタムツール',
+     unavailable: '利用不可',
+diff --git a/web/i18n/ja-JP/workflow.ts b/web/i18n/ja-JP/workflow.ts
+index 07241b8c4f..19b8d4eb3e 100644
+--- a/web/i18n/ja-JP/workflow.ts
++++ b/web/i18n/ja-JP/workflow.ts
+@@ -119,6 +119,11 @@ const translation = {
+     tagBound: 'このタグを使用しているアプリの数',
+     moreActions: 'さらにアクション',
+   },
++  publishLimit: {
++    startNodeTitlePrefix: 'アップグレードして、',
++    startNodeTitleSuffix: '各ワークフローのトリガーを制限なしで使用できます。',
++    startNodeDesc: 'このプランでは、各ワークフローのトリガー数は最大 2 個まで設定できます。公開するにはアップグレードが必要です。',
++  },
+   env: {
+     envPanelTitle: '環境変数',
+     envDescription: '環境変数は、個人情報や認証情報を格納するために使用することができます。これらは読み取り専用であり、DSL ファイルからエクスポートする際には分離されます。',
+diff --git a/web/i18n/ko-KR/billing.ts b/web/i18n/ko-KR/billing.ts
+index 112fa1bc63..632b629792 100644
+--- a/web/i18n/ko-KR/billing.ts
++++ b/web/i18n/ko-KR/billing.ts
+@@ -88,7 +88,7 @@ const translation = {
+     freeTrialTip: '200 회의 OpenAI 호출 무료 체험을 받으세요. ',
+     annualBilling: '연간 청구',
+     getStarted: '시작하기',
+-    apiRateLimitUnit: '{{count,number}}/월',
++    apiRateLimitUnit: '{{count,number}}',
+     freeTrialTipSuffix: '신용카드 없음',
+     teamWorkspace: '{{count,number}} 팀 작업 공간',
+     self: '자체 호스팅',
+diff --git a/web/i18n/pl-PL/billing.ts b/web/i18n/pl-PL/billing.ts
+index 31aa337478..0aa230e4d3 100644
+--- a/web/i18n/pl-PL/billing.ts
++++ b/web/i18n/pl-PL/billing.ts
+@@ -91,7 +91,7 @@ const translation = {
+     freeTrialTipPrefix: 'Zarejestruj się i zdobądź',
+     teamMember_other: '{{count,number}} członków zespołu',
+     teamWorkspace: '{{count,number}} Zespół Workspace',
+-    apiRateLimitUnit: '{{count,number}}/miesiąc',
++    apiRateLimitUnit: '{{count,number}}',
+     cloud: 'Usługa chmurowa',
+     teamMember_one: '{{count,number}} Członek zespołu',
+     priceTip: 'na przestrzeń roboczą/',
+diff --git a/web/i18n/pt-BR/billing.ts b/web/i18n/pt-BR/billing.ts
+index 9e58b24af4..94c7c967f9 100644
+--- a/web/i18n/pt-BR/billing.ts
++++ b/web/i18n/pt-BR/billing.ts
+@@ -80,7 +80,7 @@ const translation = {
+     documentsRequestQuota: '{{count,number}}/min Limite de Taxa de Solicitação de Conhecimento',
+     cloud: 'Serviço de Nuvem',
+     teamWorkspace: '{{count,number}} Espaço de Trabalho da Equipe',
+-    apiRateLimitUnit: '{{count,number}}/mês',
++    apiRateLimitUnit: '{{count,number}}',
+     freeTrialTipSuffix: 'Nenhum cartão de crédito necessário',
+     teamMember_other: '{{count,number}} Membros da Equipe',
+     comparePlanAndFeatures: 'Compare planos e recursos',
+diff --git a/web/i18n/ro-RO/billing.ts b/web/i18n/ro-RO/billing.ts
+index 0d787bb661..7e0118fa31 100644
+--- a/web/i18n/ro-RO/billing.ts
++++ b/web/i18n/ro-RO/billing.ts
+@@ -82,7 +82,7 @@ const translation = {
+     documentsTooltip: 'Cota pe numărul de documente importate din Sursele de Date de Cunoștințe.',
+     getStarted: 'Întrebați-vă',
+     cloud: 'Serviciu de cloud',
+-    apiRateLimitUnit: '{{count,number}}/lună',
++    apiRateLimitUnit: '{{count,number}}',
+     comparePlanAndFeatures: 'Compară planurile și caracteristicile',
+     documentsRequestQuota: '{{count,number}}/min Limita de rată a cererilor de cunoștințe',
+     documents: '{{count,number}} Documente de Cunoaștere',
+@@ -106,7 +106,7 @@ const translation = {
+     professional: {
+       name: 'Professional',
+       description: 'Pentru persoane fizice și echipe mici pentru a debloca mai multă putere la un preț accesibil.',
+-      for: 'Pentru dezvoltatori independenți / echipe mici',
++      for: 'Pentru dezvoltatori independenți/echipe mici',
+     },
+     team: {
+       name: 'Echipă',
+diff --git a/web/i18n/ru-RU/billing.ts b/web/i18n/ru-RU/billing.ts
+index 1f3071a325..68466e0df8 100644
+--- a/web/i18n/ru-RU/billing.ts
++++ b/web/i18n/ru-RU/billing.ts
+@@ -78,7 +78,7 @@ const translation = {
+     apiRateLimit: 'Ограничение скорости API',
+     self: 'Самостоятельно размещенный',
+     teamMember_other: '{{count,number}} Члены команды',
+-    apiRateLimitUnit: '{{count,number}}/месяц',
++    apiRateLimitUnit: '{{count,number}}',
+     unlimitedApiRate: 'Нет ограничений на количество запросов к API',
+     freeTrialTip: 'бесплатная пробная версия из 200 вызовов OpenAI.',
+     freeTrialTipSuffix: 'Кредитная карта не требуется',
+diff --git a/web/i18n/sl-SI/billing.ts b/web/i18n/sl-SI/billing.ts
+index ef8c767090..33dde5dec3 100644
+--- a/web/i18n/sl-SI/billing.ts
++++ b/web/i18n/sl-SI/billing.ts
+@@ -86,7 +86,7 @@ const translation = {
+     teamMember_one: '{{count,number}} član ekipe',
+     teamMember_other: '{{count,number}} Članov ekipe',
+     documentsRequestQuota: '{{count,number}}/min Omejitev stopnje zahtev po znanju',
+-    apiRateLimitUnit: '{{count,number}}/mesec',
++    apiRateLimitUnit: '{{count,number}}',
+     priceTip: 'na delovnem prostoru/',
+     freeTrialTipPrefix: 'Prijavite se in prejmite',
+     cloud: 'Oblačna storitev',
+diff --git a/web/i18n/th-TH/billing.ts b/web/i18n/th-TH/billing.ts
+index a3bd5b85bc..e486de61d4 100644
+--- a/web/i18n/th-TH/billing.ts
++++ b/web/i18n/th-TH/billing.ts
+@@ -82,7 +82,7 @@ const translation = {
+     teamMember_one: '{{count,number}} สมาชิกทีม',
+     unlimitedApiRate: 'ไม่มีข้อจำกัดอัตราการเรียก API',
+     self: 'โฮสต์ด้วยตัวเอง',
+-    apiRateLimitUnit: '{{count,number}}/เดือน',
++    apiRateLimitUnit: '{{count,number}}',
+     teamMember_other: '{{count,number}} สมาชิกทีม',
+     teamWorkspace: '{{count,number}} ทีมทำงาน',
+     priceTip: 'ต่อพื้นที่ทำงาน/',
+diff --git a/web/i18n/tr-TR/billing.ts b/web/i18n/tr-TR/billing.ts
+index 93c54fd1ed..36fcadb404 100644
+--- a/web/i18n/tr-TR/billing.ts
++++ b/web/i18n/tr-TR/billing.ts
+@@ -78,7 +78,7 @@ const translation = {
+     freeTrialTipPrefix: 'Kaydolun ve bir',
+     priceTip: 'iş alanı başına/',
+     documentsRequestQuota: '{{count,number}}/dakika Bilgi İsteği Oran Limiti',
+-    apiRateLimitUnit: '{{count,number}}/ay',
++    apiRateLimitUnit: '{{count,number}}',
+     documents: '{{count,number}} Bilgi Belgesi',
+     comparePlanAndFeatures: 'Planları ve özellikleri karşılaştır',
+     self: 'Kendi Barındırılan',
+diff --git a/web/i18n/uk-UA/billing.ts b/web/i18n/uk-UA/billing.ts
+index e98b3e6091..d5967d0ff0 100644
+--- a/web/i18n/uk-UA/billing.ts
++++ b/web/i18n/uk-UA/billing.ts
+@@ -84,7 +84,7 @@ const translation = {
+     priceTip: 'за робочим простором/',
+     unlimitedApiRate: 'Немає обмеження на швидкість API',
+     freeTrialTipSuffix: 'Кредитна картка не потрібна',
+-    apiRateLimitUnit: '{{count,number}}/місяць',
++    apiRateLimitUnit: '{{count,number}}',
+     getStarted: 'Почати',
+     freeTrialTip: 'безкоштовна пробна версія з 200 запитів до OpenAI.',
+     documents: '{{count,number}} Документів знань',
+diff --git a/web/i18n/vi-VN/billing.ts b/web/i18n/vi-VN/billing.ts
+index c6a7458164..837dde499b 100644
+--- a/web/i18n/vi-VN/billing.ts
++++ b/web/i18n/vi-VN/billing.ts
+@@ -90,7 +90,7 @@ const translation = {
+     teamMember_other: '{{count,number}} thành viên trong nhóm',
+     documents: '{{count,number}} Tài liệu Kiến thức',
+     getStarted: 'Bắt đầu',
+-    apiRateLimitUnit: '{{count,number}}/tháng',
++    apiRateLimitUnit: '{{count,number}}',
+     freeTrialTipSuffix: 'Không cần thẻ tín dụng',
+     documentsRequestQuotaTooltip: 'Chỉ định tổng số hành động mà một không gian làm việc có thể thực hiện mỗi phút trong cơ sở tri thức, bao gồm tạo mới tập dữ liệu, xóa, cập nhật, tải tài liệu lên, thay đổi, lưu trữ và truy vấn cơ sở tri thức. Chỉ số này được sử dụng để đánh giá hiệu suất của các yêu cầu cơ sở tri thức. Ví dụ, nếu một người dùng Sandbox thực hiện 10 lần kiểm tra liên tiếp trong một phút, không gian làm việc của họ sẽ bị hạn chế tạm thời không thực hiện các hành động sau trong phút tiếp theo: tạo mới tập dữ liệu, xóa, cập nhật và tải tài liệu lên hoặc thay đổi.',
+     startBuilding: 'Bắt đầu xây dựng',
+diff --git a/web/i18n/zh-Hans/billing.ts b/web/i18n/zh-Hans/billing.ts
+index 3c50abd01f..b61ad835ee 100644
+--- a/web/i18n/zh-Hans/billing.ts
++++ b/web/i18n/zh-Hans/billing.ts
+@@ -7,8 +7,16 @@ const translation = {
+     documentsUploadQuota: '文档上传配额',
+     vectorSpace: '知识库数据存储空间',
+     vectorSpaceTooltip: '采用高质量索引模式的文档会消耗知识数据存储资源。当知识数据存储达到限制时，将不会上传新文档。',
+-    triggerEvents: '触发事件',
++    triggerEvents: '触发器事件数',
+     perMonth: '每月',
++    resetsIn: '{{count,number}} 天后重置',
++  },
++  triggerLimitModal: {
++    title: '升级以解锁每个工作流无限制的触发器',
++    description: '您已达到此计划上每个工作流最多 2 个触发器的限制。请升级后再发布此工作流。',
++    dismiss: '知道了',
++    upgrade: '升级',
++    usageTitle: '触发事件额度',
+   },
+   upgradeBtn: {
+     plain: '查看套餐',
+@@ -60,10 +68,10 @@ const translation = {
+     documentsTooltip: '从知识库的数据源导入的文档数量配额。',
+     vectorSpace: '{{size}} 知识库数据存储空间',
+     vectorSpaceTooltip: '采用高质量索引模式的文档会消耗知识数据存储资源。当知识数据存储达到限制时，将不会上传新文档。',
+-    documentsRequestQuota: '{{count,number}}/分钟 知识库请求频率限制',
++    documentsRequestQuota: '{{count,number}} 知识请求/分钟',
+     documentsRequestQuotaTooltip: '指每分钟内，一个空间在知识库中可执行的操作总数，包括数据集的创建、删除、更新，文档的上传、修改、归档，以及知识库查询等，用于评估知识库请求的性能。例如，Sandbox 用户在 1 分钟内连续执行 10 次命中测试，其工作区将在接下来的 1 分钟内无法继续执行以下操作：数据集的创建、删除、更新，文档的上传、修改等操作。',
+     apiRateLimit: 'API 请求频率限制',
+-    apiRateLimitUnit: '{{count,number}} 次/月',
++    apiRateLimitUnit: '{{count,number}} 次',
+     unlimitedApiRate: 'API 请求频率无限制',
+     apiRateLimitTooltip: 'API 请求频率限制涵盖所有通过 Dify API 发起的调用，例如文本生成、聊天对话、工作流执行和文档处理等。',
+     documentProcessingPriority: '文档处理',
+@@ -74,18 +82,20 @@ const translation = {
+       'top-priority': '最高优先级',
+     },
+     triggerEvents: {
+-      sandbox: '{{count,number}} 触发事件',
+-      professional: '{{count,number}} 触发事件/月',
+-      unlimited: '无限制触发事件',
++      sandbox: '{{count,number}} 触发器事件数',
++      professional: '{{count,number}} 触发器事件数/月',
++      unlimited: '无限触发器事件数',
++      tooltip: '通过插件、定时触发器、Webhook 等来自动触发工作流的事件数。',
+     },
+     workflowExecution: {
+-      standard: '标准工作流执行',
+-      faster: '更快的工作流执行',
+-      priority: '优先工作流执行',
++      standard: '标准工作流执行队列',
++      faster: '快速工作流执行队列',
++      priority: '高优先级工作流执行队列',
++      tooltip: '工作流的执行队列优先级与运行速度。',
+     },
+     startNodes: {
+-      limited: '每个工作流最多 {{count}} 个起始节点',
+-      unlimited: '每个工作流无限制起始节点',
++      limited: '最多 {{count}} 个触发器/工作流',
++      unlimited: '无限制的触发器/工作流',
+     },
+     logsHistory: '{{days}}日志历史',
+     customTools: '自定义工具',
+diff --git a/web/i18n/zh-Hans/workflow.ts b/web/i18n/zh-Hans/workflow.ts
+index 18e76caa64..792ffc7842 100644
+--- a/web/i18n/zh-Hans/workflow.ts
++++ b/web/i18n/zh-Hans/workflow.ts
+@@ -122,6 +122,11 @@ const translation = {
+     noHistory: '没有历史版本',
+     tagBound: '使用此标签的应用数量',
+   },
++  publishLimit: {
++    startNodeTitlePrefix: '升级以',
++    startNodeTitleSuffix: '解锁每个工作流无限制的触发器',
++    startNodeDesc: '您已达到此计划上每个工作流最多 2 个触发器的限制。请升级后再发布此工作流。',
++  },
+   env: {
+     envPanelTitle: '环境变量',
+     envDescription: '环境变量是一种存储敏感信息的方法，如 API 密钥、数据库密码等。它们被存储在工作流程中，而不是代码中，以便在不同环境中共享。',
+diff --git a/web/i18n/zh-Hant/billing.ts b/web/i18n/zh-Hant/billing.ts
+index 38589179e7..7f1be09008 100644
+--- a/web/i18n/zh-Hant/billing.ts
++++ b/web/i18n/zh-Hant/billing.ts
+@@ -74,7 +74,7 @@ const translation = {
+     receiptInfo: '只有團隊所有者和團隊管理員才能訂閱和檢視賬單資訊',
+     annotationQuota: '註釋配額',
+     self: '自我主持',
+-    apiRateLimitUnit: '{{count,number}}/月',
++    apiRateLimitUnit: '{{count,number}} 次',
+     freeTrialTipPrefix: '註冊並獲得一個',
+     annualBilling: '年度計費',
+     freeTrialTipSuffix: '無需信用卡',
+diff --git a/web/i18n/zh-Hant/workflow.ts b/web/i18n/zh-Hant/workflow.ts
+index ce053d6e5b..5917eb95ed 100644
+--- a/web/i18n/zh-Hant/workflow.ts
++++ b/web/i18n/zh-Hant/workflow.ts
+@@ -116,6 +116,11 @@ const translation = {
+     currentWorkflow: '當前工作流程',
+     moreActions: '更多動作',
+   },
++  publishLimit: {
++    startNodeTitlePrefix: '升級以',
++    startNodeTitleSuffix: '解鎖無限開始節點',
++    startNodeDesc: '目前方案最多允許 2 個開始節點，升級後才能發布此工作流程。',
++  },
+   env: {
+     envPanelTitle: '環境變數',
+     envDescription: '環境變數可用於存儲私人信息和憑證。它們是唯讀的，並且可以在導出時與 DSL 文件分開。',
+diff --git a/web/utils/time.ts b/web/utils/time.ts
+index ff2e38321f..daa54a5bf3 100644
+--- a/web/utils/time.ts
++++ b/web/utils/time.ts
+@@ -10,3 +10,10 @@ export const isAfter = (date: ConfigType, compare: ConfigType) => {
+ export const formatTime = ({ date, dateFormat }: { date: ConfigType; dateFormat: string }) => {
+   return dayjs(date).format(dateFormat)
+ }
++
++export const getDaysUntilEndOfMonth = (date: ConfigType = dayjs()) => {
++  const current = dayjs(date).startOf('day')
++  const endOfMonth = dayjs(date).endOf('month').startOf('day')
++  const diff = endOfMonth.diff(current, 'day')
++  return Math.max(diff, 0)
++}

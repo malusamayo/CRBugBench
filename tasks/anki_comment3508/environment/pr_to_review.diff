@@ -1,0 +1,344 @@
+diff --git a/ftl/core/card-stats.ftl b/ftl/core/card-stats.ftl
+index ece08b20a57..bd5b52a87fc 100644
+--- a/ftl/core/card-stats.ftl
++++ b/ftl/core/card-stats.ftl
+@@ -23,6 +23,7 @@ card-stats-review-log-type-review = Review
+ card-stats-review-log-type-relearn = Relearn
+ card-stats-review-log-type-filtered = Filtered
+ card-stats-review-log-type-manual = Manual
++card-stats-review-log-type-rescheduled = Rescheduled
+ card-stats-review-log-elapsed-time = Elapsed Time
+ card-stats-no-card = (No card to display.)
+ card-stats-custom-data = Custom Data
+diff --git a/proto/anki/stats.proto b/proto/anki/stats.proto
+index 4ef811df9ee..1ec39fcf790 100644
+--- a/proto/anki/stats.proto
++++ b/proto/anki/stats.proto
+@@ -205,6 +205,7 @@ message RevlogEntry {
+     RELEARNING = 2;
+     FILTERED = 3;
+     MANUAL = 4;
++    RESCHEDULED = 5;
+   }
+   int64 id = 1;
+   int64 cid = 2;
+diff --git a/rslib/src/revlog/mod.rs b/rslib/src/revlog/mod.rs
+index 128beab64a8..ad7f302612f 100644
+--- a/rslib/src/revlog/mod.rs
++++ b/rslib/src/revlog/mod.rs
+@@ -72,6 +72,7 @@ pub enum RevlogReviewKind {
+     /// disabled.
+     Filtered = 3,
+     Manual = 4,
++    Rescheduled = 5,
+ }
+ 
+ impl RevlogEntry {
+@@ -86,11 +87,32 @@ impl RevlogEntry {
+ }
+ 
+ impl Collection {
++    // set due date or reset
+     pub(crate) fn log_manually_scheduled_review(
+         &mut self,
+         card: &Card,
+         original_interval: u32,
+         usn: Usn,
++    ) -> Result<()> {
++        self.log_scheduled_review(card, original_interval, usn, RevlogReviewKind::Manual)
++    }
++
++    // reschedule cards on change
++    pub(crate) fn log_rescheduled_review(
++        &mut self,
++        card: &Card,
++        original_interval: u32,
++        usn: Usn,
++    ) -> Result<()> {
++        self.log_scheduled_review(card, original_interval, usn, RevlogReviewKind::Rescheduled)
++    }
++
++    fn log_scheduled_review(
++        &mut self,
++        card: &Card,
++        original_interval: u32,
++        usn: Usn,
++        review_kind: RevlogReviewKind,
+     ) -> Result<()> {
+         let ease_factor = u32::from(
+             card.memory_state
+@@ -106,7 +128,7 @@ impl Collection {
+             last_interval: i32::try_from(original_interval).unwrap_or(i32::MAX),
+             ease_factor,
+             taken_millis: 0,
+-            review_kind: RevlogReviewKind::Manual,
++            review_kind,
+         };
+         self.add_revlog_entry_undoable(entry)?;
+         Ok(())
+diff --git a/rslib/src/scheduler/fsrs/memory_state.rs b/rslib/src/scheduler/fsrs/memory_state.rs
+index 97736837935..8dec27ba881 100644
+--- a/rslib/src/scheduler/fsrs/memory_state.rs
++++ b/rslib/src/scheduler/fsrs/memory_state.rs
+@@ -119,9 +119,10 @@ impl Collection {
+                                         };
+                                         *due = (timing.days_elapsed as i32) - days_elapsed
+                                             + card.interval as i32;
+-                                        // Add a manual revlog entry if the last entry wasn't manual
+-                                        if !last_info.last_revlog_is_manual {
+-                                            self.log_manually_scheduled_review(
++                                        // Add a rescheduled revlog entry if the last entry wasn't
++                                        // rescheduled
++                                        if !last_info.last_revlog_is_rescheduled {
++                                            self.log_rescheduled_review(
+                                                 &card,
+                                                 original_interval,
+                                                 usn,
+@@ -237,7 +238,7 @@ struct LastRevlogInfo {
+     last_reviewed_at: Option<TimestampSecs>,
+     /// If true, the last action on this card was a reschedule, so we
+     /// can avoid writing an extra revlog entry on another reschedule.
+-    last_revlog_is_manual: bool,
++    last_revlog_is_rescheduled: bool,
+ }
+ 
+ /// Return a map of cards to info about last review/reschedule.
+@@ -249,18 +250,18 @@ fn get_last_revlog_info(revlogs: &[RevlogEntry]) -> HashMap<CardId, LastRevlogIn
+         .into_iter()
+         .for_each(|(card_id, group)| {
+             let mut last_reviewed_at = None;
+-            let mut last_revlog_is_manual = false;
++            let mut last_revlog_is_rescheduled = false;
+             for e in group.into_iter() {
+                 if e.button_chosen >= 1 {
+                     last_reviewed_at = Some(e.id.as_secs());
+                 }
+-                last_revlog_is_manual = e.review_kind == RevlogReviewKind::Manual;
++                last_revlog_is_rescheduled = e.review_kind == RevlogReviewKind::Rescheduled;
+             }
+             out.insert(
+                 card_id,
+                 LastRevlogInfo {
+                     last_reviewed_at,
+-                    last_revlog_is_manual,
++                    last_revlog_is_rescheduled,
+                 },
+             );
+         });
+@@ -321,7 +322,7 @@ pub(crate) fn single_card_revlog_to_item(
+                 }))
+             }
+         } else {
+-            // only manual rescheduling; treat like empty
++            // only manual and rescheduled revlogs; treat like empty
+             Ok(None)
+         }
+     } else {
+diff --git a/rslib/src/scheduler/fsrs/retention.rs b/rslib/src/scheduler/fsrs/retention.rs
+index f9716dde011..f2951f2dc7a 100644
+--- a/rslib/src/scheduler/fsrs/retention.rs
++++ b/rslib/src/scheduler/fsrs/retention.rs
+@@ -84,7 +84,8 @@ impl From<crate::revlog::RevlogReviewKind> for fsrs::RevlogReviewKind {
+             crate::revlog::RevlogReviewKind::Review => fsrs::RevlogReviewKind::Review,
+             crate::revlog::RevlogReviewKind::Relearning => fsrs::RevlogReviewKind::Relearning,
+             crate::revlog::RevlogReviewKind::Filtered => fsrs::RevlogReviewKind::Filtered,
+-            crate::revlog::RevlogReviewKind::Manual => fsrs::RevlogReviewKind::Manual,
++            crate::revlog::RevlogReviewKind::Manual
++            | crate::revlog::RevlogReviewKind::Rescheduled => fsrs::RevlogReviewKind::Manual,
+         }
+     }
+ }
+diff --git a/rslib/src/scheduler/fsrs/weights.rs b/rslib/src/scheduler/fsrs/weights.rs
+index 51bd7107d14..464859ec504 100644
+--- a/rslib/src/scheduler/fsrs/weights.rs
++++ b/rslib/src/scheduler/fsrs/weights.rs
+@@ -261,6 +261,9 @@ pub(crate) fn single_card_revlog_to_items(
+             Some(RevlogEntry {
+                 review_kind: RevlogReviewKind::Manual,
+                 ..
++            }) | Some(RevlogEntry {
++                review_kind: RevlogReviewKind::Rescheduled,
++                ..
+             })
+         );
+     }
+@@ -310,10 +313,12 @@ pub(crate) fn single_card_revlog_to_items(
+     // Filter out unwanted entries
+     entries.retain(|entry| {
+         !(
+-            // manually rescheduled
++            // set due date or reset
+             (entry.review_kind == RevlogReviewKind::Manual || entry.button_chosen == 0)
+             || // cram
+             (entry.review_kind == RevlogReviewKind::Filtered && entry.ease_factor == 0)
++            || // rescheduled
++            (entry.review_kind == RevlogReviewKind::Rescheduled)
+         )
+     });
+ 
+@@ -374,6 +379,7 @@ fn revlog_entry_to_proto(e: RevlogEntry) -> anki_proto::stats::RevlogEntry {
+             RevlogReviewKind::Relearning => revlog_entry::ReviewKind::Relearning,
+             RevlogReviewKind::Filtered => revlog_entry::ReviewKind::Filtered,
+             RevlogReviewKind::Manual => revlog_entry::ReviewKind::Manual,
++            RevlogReviewKind::Rescheduled => revlog_entry::ReviewKind::Rescheduled,
+         } as i32,
+     }
+ }
+diff --git a/rslib/src/stats/graphs/buttons.rs b/rslib/src/stats/graphs/buttons.rs
+index 1fa3de7597f..7c6fd03c828 100644
+--- a/rslib/src/stats/graphs/buttons.rs
++++ b/rslib/src/stats/graphs/buttons.rs
+@@ -79,7 +79,7 @@ fn interval_bucket(review: &RevlogEntry) -> Option<IntervalBucket> {
+         } else {
+             IntervalBucket::Mature
+         }),
+-        RevlogReviewKind::Manual => None,
++        RevlogReviewKind::Manual | RevlogReviewKind::Rescheduled => None,
+     }
+ }
+ 
+diff --git a/rslib/src/stats/graphs/hours.rs b/rslib/src/stats/graphs/hours.rs
+index b24e5082d1a..5fcd2ea2dff 100644
+--- a/rslib/src/stats/graphs/hours.rs
++++ b/rslib/src/stats/graphs/hours.rs
+@@ -32,7 +32,9 @@ impl GraphsContext {
+         'outer: for review in &self.revlog {
+             if matches!(
+                 review.review_kind,
+-                RevlogReviewKind::Filtered | RevlogReviewKind::Manual
++                RevlogReviewKind::Filtered
++                    | RevlogReviewKind::Manual
++                    | RevlogReviewKind::Rescheduled
+             ) {
+                 continue;
+             }
+diff --git a/rslib/src/stats/graphs/retention.rs b/rslib/src/stats/graphs/retention.rs
+index 886e42ae513..d8999a71968 100644
+--- a/rslib/src/stats/graphs/retention.rs
++++ b/rslib/src/stats/graphs/retention.rs
+@@ -53,7 +53,7 @@ impl GraphsContext {
+         self.revlog
+             .iter()
+             .filter(|review| {
+-                // not manually rescheduled
++                // not rescheduled/set due date/reset
+                 review.button_chosen > 0
+                     // not cramming
+                     && (review.review_kind != RevlogReviewKind::Filtered || review.ease_factor != 0)
+diff --git a/rslib/src/stats/graphs/reviews.rs b/rslib/src/stats/graphs/reviews.rs
+index 9db4b9e5d37..5a348d3b756 100644
+--- a/rslib/src/stats/graphs/reviews.rs
++++ b/rslib/src/stats/graphs/reviews.rs
+@@ -38,7 +38,7 @@ impl GraphsContext {
+                     count.filtered += 1;
+                     time.filtered += review.taken_millis;
+                 }
+-                RevlogReviewKind::Manual => unreachable!(),
++                RevlogReviewKind::Manual | RevlogReviewKind::Rescheduled => unreachable!(),
+             }
+         }
+         data
+diff --git a/rslib/src/stats/graphs/today.rs b/rslib/src/stats/graphs/today.rs
+index e2544509ad3..5ae4d29371e 100644
+--- a/rslib/src/stats/graphs/today.rs
++++ b/rslib/src/stats/graphs/today.rs
+@@ -14,7 +14,9 @@ impl GraphsContext {
+             if review.id.0 < start_of_today_ms {
+                 continue;
+             }
+-            if review.review_kind == RevlogReviewKind::Manual {
++            if review.review_kind == RevlogReviewKind::Manual
++                || review.review_kind == RevlogReviewKind::Rescheduled
++            {
+                 continue;
+             }
+             // total
+@@ -37,7 +39,7 @@ impl GraphsContext {
+                 RevlogReviewKind::Review => today.review_count += 1,
+                 RevlogReviewKind::Relearning => today.relearn_count += 1,
+                 RevlogReviewKind::Filtered => today.early_review_count += 1,
+-                RevlogReviewKind::Manual => unreachable!(),
++                RevlogReviewKind::Manual | RevlogReviewKind::Rescheduled => unreachable!(),
+             }
+         }
+         today
+diff --git a/rslib/src/stats/service.rs b/rslib/src/stats/service.rs
+index 2611ae0bff1..077fd38faf3 100644
+--- a/rslib/src/stats/service.rs
++++ b/rslib/src/stats/service.rs
+@@ -46,6 +46,9 @@ impl From<RevlogReviewKind> for i32 {
+             RevlogReviewKind::Relearning => anki_proto::stats::revlog_entry::ReviewKind::Relearning,
+             RevlogReviewKind::Filtered => anki_proto::stats::revlog_entry::ReviewKind::Filtered,
+             RevlogReviewKind::Manual => anki_proto::stats::revlog_entry::ReviewKind::Manual,
++            RevlogReviewKind::Rescheduled => {
++                anki_proto::stats::revlog_entry::ReviewKind::Rescheduled
++            }
+         }) as i32
+     }
+ }
+diff --git a/rslib/src/storage/revlog/mod.rs b/rslib/src/storage/revlog/mod.rs
+index 03b72b8b10b..84332b0d0e3 100644
+--- a/rslib/src/storage/revlog/mod.rs
++++ b/rslib/src/storage/revlog/mod.rs
+@@ -172,12 +172,19 @@ impl SqliteStorage {
+         let start = day_cutoff.adding_secs(-86_400).as_millis();
+         self.db
+             .prepare_cached(include_str!("studied_today.sql"))?
+-            .query_map([start.0, RevlogReviewKind::Manual as i64], |row| {
+-                Ok(StudiedToday {
+-                    cards: row.get(0)?,
+-                    seconds: row.get(1)?,
+-                })
+-            })?
++            .query_map(
++                [
++                    start.0,
++                    RevlogReviewKind::Manual as i64,
++                    RevlogReviewKind::Rescheduled as i64,
++                ],
++                |row| {
++                    Ok(StudiedToday {
++                        cards: row.get(0)?,
++                        seconds: row.get(1)?,
++                    })
++                },
++            )?
+             .next()
+             .unwrap()
+             .map_err(Into::into)
+diff --git a/rslib/src/storage/revlog/studied_today.sql b/rslib/src/storage/revlog/studied_today.sql
+index 2a341f63203..7772992d839 100644
+--- a/rslib/src/storage/revlog/studied_today.sql
++++ b/rslib/src/storage/revlog/studied_today.sql
+@@ -2,4 +2,5 @@ SELECT COUNT(),
+   coalesce(sum(time) / 1000.0, 0.0)
+ FROM revlog
+ WHERE id > ?
++  AND type != ?
+   AND type != ?
+\ No newline at end of file
+diff --git a/ts/routes/card-info/Revlog.svelte b/ts/routes/card-info/Revlog.svelte
+index 61f4a597848..dc410b4ab20 100644
+--- a/ts/routes/card-info/Revlog.svelte
++++ b/ts/routes/card-info/Revlog.svelte
+@@ -36,6 +36,8 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
+                 return tr2.cardStatsReviewLogTypeFiltered();
+             case ReviewKind.MANUAL:
+                 return tr2.cardStatsReviewLogTypeManual();
++            case ReviewKind.RESCHEDULED:
++                return tr2.cardStatsReviewLogTypeRescheduled();
+         }
+     }
+ 
+diff --git a/ts/routes/card-info/forgetting-curve.ts b/ts/routes/card-info/forgetting-curve.ts
+index 7331f7dc591..66d4ebb4fb4 100644
+--- a/ts/routes/card-info/forgetting-curve.ts
++++ b/ts/routes/card-info/forgetting-curve.ts
+@@ -48,6 +48,7 @@ function filterDataByTimeRange(data: DataPoint[], maxDays: number): DataPoint[]
+ export function filterRevlogEntryByReviewKind(entry: RevlogEntry): boolean {
+     return (
+         entry.reviewKind !== RevlogEntry_ReviewKind.MANUAL
++        && entry.reviewKind !== RevlogEntry_ReviewKind.RESCHEDULED
+         && (entry.reviewKind !== RevlogEntry_ReviewKind.FILTERED || entry.ease !== 0)
+     );
+ }

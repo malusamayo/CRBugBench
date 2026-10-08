@@ -1,0 +1,416 @@
+diff --git a/crates/polars-core/src/series/builder.rs b/crates/polars-core/src/series/builder.rs
+index c1736da7e3f0..c9cd26a022a2 100644
+--- a/crates/polars-core/src/series/builder.rs
++++ b/crates/polars-core/src/series/builder.rs
+@@ -174,4 +174,12 @@ impl SeriesBuilder {
+         assert!(chunks.len() == 1);
+         self.builder.opt_gather_extend(&*chunks[0], idxs, share);
+     }
++
++    pub fn push_any_value(&mut self, value: AnyValue<'static>) {
++        // @PERF
++        self.extend(
++            &Scalar::new(self.dtype.clone(), value).into_series(PlSmallStr::EMPTY),
++            ShareStrategy::Always,
++        );
++    }
+ }
+diff --git a/crates/polars-ops/src/series/ops/rle.rs b/crates/polars-ops/src/series/ops/rle.rs
+index 809989f7afd9..a7bcc0dbafdc 100644
+--- a/crates/polars-ops/src/series/ops/rle.rs
++++ b/crates/polars-ops/src/series/ops/rle.rs
+@@ -1,6 +1,9 @@
+ use polars_core::prelude::*;
+ use polars_core::series::IsSorted;
+ 
++pub static RLE_VALUE_COLUMN_NAME: &str = "value";
++pub static RLE_LENGTH_COLUMN_NAME: &str = "len";
++
+ /// Get the run-Lengths of values.
+ pub fn rle_lengths(s: &Column, lengths: &mut Vec<IdxSize>) -> PolarsResult<()> {
+     lengths.clear();
+@@ -55,9 +58,9 @@ pub fn rle(s: &Column) -> PolarsResult<Column> {
+     let vals = s
+         .take_slice(&idxs)
+         .unwrap()
+-        .with_name(PlSmallStr::from_static("value"));
++        .with_name(PlSmallStr::from_static(RLE_VALUE_COLUMN_NAME));
+     let outvals = vec![
+-        Series::from_vec(PlSmallStr::from_static("len"), lengths).into(),
++        Series::from_vec(PlSmallStr::from_static(RLE_LENGTH_COLUMN_NAME), lengths).into(),
+         vals,
+     ];
+     Ok(StructChunked::from_columns(s.name().clone(), idxs.len(), &outvals)?.into_column())
+diff --git a/crates/polars-stream/src/nodes/mod.rs b/crates/polars-stream/src/nodes/mod.rs
+index 0fea2cc2c2e9..3a65dca872a1 100644
+--- a/crates/polars-stream/src/nodes/mod.rs
++++ b/crates/polars-stream/src/nodes/mod.rs
+@@ -16,6 +16,7 @@ pub mod negative_slice;
+ pub mod ordered_union;
+ pub mod reduce;
+ pub mod repeat;
++pub mod rle;
+ pub mod rle_id;
+ pub mod select;
+ pub mod simple_projection;
+diff --git a/crates/polars-stream/src/nodes/rle.rs b/crates/polars-stream/src/nodes/rle.rs
+new file mode 100644
+index 000000000000..bc8d37bde8c3
+--- /dev/null
++++ b/crates/polars-stream/src/nodes/rle.rs
+@@ -0,0 +1,227 @@
++use arrow::array::builder::ShareStrategy;
++use polars_core::frame::DataFrame;
++use polars_core::prelude::{
++    AnyValue, DataType, Field, IDX_DTYPE, IntoColumn, NamedFrom, StructChunked,
++};
++use polars_core::scalar::Scalar;
++use polars_core::series::Series;
++use polars_core::series::builder::SeriesBuilder;
++use polars_error::PolarsResult;
++use polars_ops::series::{RLE_LENGTH_COLUMN_NAME, RLE_VALUE_COLUMN_NAME};
++use polars_utils::IdxSize;
++use polars_utils::pl_str::PlSmallStr;
++
++use super::ComputeNode;
++use crate::async_executor::{JoinHandle, TaskPriority, TaskScope};
++use crate::execute::StreamingExecutionState;
++use crate::graph::PortState;
++use crate::morsel::{Morsel, MorselSeq, SourceToken};
++use crate::pipe::{RecvPort, SendPort};
++
++pub struct RleNode {
++    name: PlSmallStr,
++    dtype: DataType,
++
++    seq: MorselSeq,
++
++    // Invariant: last == None <=> last_length == 0
++    last_length: IdxSize,
++    last: Option<AnyValue<'static>>,
++}
++
++impl RleNode {
++    pub fn new(name: PlSmallStr, dtype: DataType) -> Self {
++        Self {
++            name,
++            dtype,
++            seq: MorselSeq::default(),
++            last_length: 0,
++            last: None,
++        }
++    }
++}
++
++impl ComputeNode for RleNode {
++    fn name(&self) -> &str {
++        "rle"
++    }
++
++    fn update_state(
++        &mut self,
++        recv: &mut [PortState],
++        send: &mut [PortState],
++        _state: &StreamingExecutionState,
++    ) -> PolarsResult<()> {
++        assert!(recv.len() == 1 && send.len() == 1);
++
++        if send[0] == PortState::Done {
++            recv[0] = PortState::Done;
++            self.last_length = 0;
++            self.last.take();
++        } else if self.last.is_some() {
++            send[0] = PortState::Ready;
++        } else if recv[0] == PortState::Done {
++            send[0] = PortState::Done;
++        } else {
++            recv.swap_with_slice(send);
++        }
++
++        Ok(())
++    }
++
++    fn spawn<'env, 's>(
++        &'env mut self,
++        scope: &'s TaskScope<'s, 'env>,
++        recv_ports: &mut [Option<RecvPort<'_>>],
++        send_ports: &mut [Option<SendPort<'_>>],
++        _state: &'s StreamingExecutionState,
++        join_handles: &mut Vec<JoinHandle<PolarsResult<()>>>,
++    ) {
++        assert_eq!(recv_ports.len(), 1);
++        assert_eq!(send_ports.len(), 1);
++
++        let recv = recv_ports[0].take();
++        let mut send = send_ports[0].take().unwrap().serial();
++
++        let fields = vec![
++            Field::new(PlSmallStr::from_static(RLE_LENGTH_COLUMN_NAME), IDX_DTYPE),
++            Field::new(
++                PlSmallStr::from_static(RLE_VALUE_COLUMN_NAME),
++                self.dtype.clone(),
++            ),
++        ];
++        let output_dtype = DataType::Struct(fields.clone());
++
++        match recv {
++            None => {
++                // This happens when we have received out last morsel and we need to return one
++                // more value.
++                let last = self.last.take().unwrap();
++                if self.last_length > 0 {
++                    join_handles.push(scope.spawn_task(TaskPriority::High, async move {
++                        let column = Scalar::new(
++                            output_dtype,
++                            AnyValue::StructOwned(Box::new((
++                                vec![AnyValue::from(self.last_length), last],
++                                fields,
++                            ))),
++                        )
++                        .into_column(self.name.clone());
++
++                        let df = DataFrame::new(vec![column]).unwrap();
++                        _ = send
++                            .send(Morsel::new(df, self.seq.successor(), SourceToken::new()))
++                            .await;
++
++                        self.last_length = 0;
++                        Ok(())
++                    }));
++                }
++            },
++
++            Some(recv) => {
++                let mut recv = recv.serial();
++                join_handles.push(scope.spawn_task(TaskPriority::High, async move {
++                    let mut idxs = Vec::new();
++                    let mut lengths = Vec::new();
++                    while let Ok(mut m) = recv.recv().await {
++                        self.seq = m.seq();
++                        if m.df().height() == 0 {
++                            continue;
++                        }
++
++                        assert_eq!(m.df().width(), 1);
++                        let column = &m.df()[0];
++
++                        lengths.clear();
++                        polars_ops::series::rle_lengths(column, &mut lengths)?;
++
++                        let mut new_first_is_last = false;
++                        if let Some(last) = &self.last {
++                            let fst = Scalar::new(
++                                self.dtype.clone(),
++                                column.get(0).unwrap().into_static(),
++                            );
++                            let last = Scalar::new(self.dtype.clone(), last.clone());
++                            new_first_is_last = fst == last;
++                        }
++
++                        // If we have a morsel that is all the same value and we already know that
++                        // value. Just add it to the length and continue.
++                        if lengths.len() == 1 && new_first_is_last {
++                            self.last_length += lengths[0];
++                            continue;
++                        }
++
++                        let mut values = SeriesBuilder::new(self.dtype.clone());
++                        values.reserve(lengths.len());
++
++                        // Create the gather indices.
++                        idxs.clear();
++                        idxs.reserve(lengths.len() - 1);
++                        let mut idx = 0;
++                        for l in &lengths[0..lengths.len() - 1] {
++                            idxs.push(idx);
++                            idx += *l;
++                        }
++
++                        // Update the lengths to match what is being gathered and with the last
++                        // element.
++                        if new_first_is_last || self.last.is_none() {
++                            lengths[0] += self.last_length;
++                            self.last_length = lengths.pop().unwrap();
++                        } else {
++                            let mut prev = self.last_length;
++                            for l in lengths.iter_mut() {
++                                std::mem::swap(l, &mut prev);
++                            }
++                            self.last_length = prev;
++                        }
++                        let old_last = self
++                            .last
++                            .replace(column.get(column.len() - 1).unwrap().into_static());
++
++                        // If we have nothing to return, just continue.
++                        if lengths.is_empty() {
++                            continue;
++                        }
++
++                        // If the morsel starts with a new value. We need to make sure to push it
++                        // into the output values.
++                        if !new_first_is_last && let Some(last) = old_last {
++                            values.push_any_value(last);
++                        }
++
++                        // Actually gather the remaining values.
++                        unsafe {
++                            values.gather_extend(
++                                column.as_materialized_series(),
++                                &idxs,
++                                ShareStrategy::Always,
++                            )
++                        };
++
++                        let lengths = Series::new(
++                            PlSmallStr::from_static(RLE_LENGTH_COLUMN_NAME),
++                            std::mem::take(&mut lengths),
++                        );
++                        let series = values.freeze(PlSmallStr::from_static(RLE_VALUE_COLUMN_NAME));
++
++                        let rle_struct = StructChunked::from_series(
++                            self.name.clone(),
++                            lengths.len(),
++                            [&lengths, &series].into_iter(),
++                        )
++                        .unwrap();
++                        *m.df_mut() = DataFrame::new(vec![rle_struct.into_column()]).unwrap();
++
++                        if send.send(m).await.is_err() {
++                            break;
++                        }
++                    }
++                    Ok(())
++                }));
++            },
++        }
++    }
++}
+diff --git a/crates/polars-stream/src/physical_plan/fmt.rs b/crates/polars-stream/src/physical_plan/fmt.rs
+index 27b4066c3f74..cd6679f9c89f 100644
+--- a/crates/polars-stream/src/physical_plan/fmt.rs
++++ b/crates/polars-stream/src/physical_plan/fmt.rs
+@@ -318,6 +318,7 @@ fn visualize_plan_rec(
+             from_ref(input),
+         ),
+         PhysNodeKind::Repeat { value, repeats } => ("repeat".to_owned(), &[*value, *repeats][..]),
++        PhysNodeKind::Rle { input, .. } => ("rle".to_owned(), &[*input][..]),
+         PhysNodeKind::RleId { input, .. } => ("rle_id".to_owned(), &[*input][..]),
+         PhysNodeKind::OrderedUnion { inputs } => ("ordered-union".to_string(), inputs.as_slice()),
+         PhysNodeKind::Zip {
+diff --git a/crates/polars-stream/src/physical_plan/lower_expr.rs b/crates/polars-stream/src/physical_plan/lower_expr.rs
+index e9778e46463e..bb09cadef28f 100644
+--- a/crates/polars-stream/src/physical_plan/lower_expr.rs
++++ b/crates/polars-stream/src/physical_plan/lower_expr.rs
+@@ -8,6 +8,7 @@ use polars_error::PolarsResult;
+ use polars_expr::state::ExecutionState;
+ use polars_expr::{ExpressionConversionState, create_physical_expr};
+ use polars_ops::frame::{JoinArgs, JoinType};
++use polars_ops::series::{RLE_LENGTH_COLUMN_NAME, RLE_VALUE_COLUMN_NAME};
+ use polars_plan::plans::AExpr;
+ use polars_plan::plans::expr_ir::{ExprIR, OutputName};
+ use polars_plan::prelude::*;
+@@ -935,11 +936,48 @@ fn lower_exprs_with_ctx(
+                 transformed_exprs.push(left_col_expr);
+             },
+ 
++            AExpr::Function {
++                input: ref inner_exprs,
++                function: IRFunctionExpr::RLE,
++                options: _,
++            } => {
++                assert_eq!(inner_exprs.len(), 1);
++
++                let input_schema = &ctx.phys_sm[input.node].output_schema;
++
++                let value_key = unique_column_name();
++                let value_dtype = inner_exprs[0].dtype(input_schema, ctx.expr_arena)?;
++
++                let input = build_select_stream_with_ctx(input, inner_exprs, ctx)?;
++                let node_kind = PhysNodeKind::Rle {
++                    input,
++                    name: value_key.clone(),
++                };
++
++                let output_schema = Schema::from_iter([(
++                    value_key.clone(),
++                    DataType::Struct(vec![
++                        Field::new(
++                            PlSmallStr::from_static(RLE_VALUE_COLUMN_NAME),
++                            value_dtype.clone(),
++                        ),
++                        Field::new(PlSmallStr::from_static(RLE_LENGTH_COLUMN_NAME), IDX_DTYPE),
++                    ]),
++                )]);
++                let node_key = ctx
++                    .phys_sm
++                    .insert(PhysNode::new(Arc::new(output_schema), node_kind));
++                input_streams.insert(PhysStream::first(node_key));
++                transformed_exprs.push(ctx.expr_arena.add(AExpr::Column(value_key)));
++            },
++
+             AExpr::Function {
+                 input: ref inner_exprs,
+                 function: IRFunctionExpr::RLEID,
+                 options: _,
+             } => {
++                assert_eq!(inner_exprs.len(), 1);
++
+                 let value_key = unique_column_name();
+ 
+                 let input = build_select_stream_with_ctx(input, inner_exprs, ctx)?;
+@@ -948,7 +986,7 @@ fn lower_exprs_with_ctx(
+                     name: value_key.clone(),
+                 };
+ 
+-                let output_schema = Schema::from_iter([(value_key.clone(), DataType::UInt32)]);
++                let output_schema = Schema::from_iter([(value_key.clone(), IDX_DTYPE)]);
+                 let node_key = ctx
+                     .phys_sm
+                     .insert(PhysNode::new(Arc::new(output_schema), node_kind));
+diff --git a/crates/polars-stream/src/physical_plan/mod.rs b/crates/polars-stream/src/physical_plan/mod.rs
+index 88482a31768f..5ffe960fcbd7 100644
+--- a/crates/polars-stream/src/physical_plan/mod.rs
++++ b/crates/polars-stream/src/physical_plan/mod.rs
+@@ -198,6 +198,11 @@ pub enum PhysNodeKind {
+         repeats: PhysStream,
+     },
+ 
++    Rle {
++        input: PhysStream,
++        name: PlSmallStr,
++    },
++
+     RleId {
+         input: PhysStream,
+         name: PlSmallStr,
+@@ -340,6 +345,7 @@ fn visit_node_inputs_mut(
+             | PhysNodeKind::Map { input, .. }
+             | PhysNodeKind::Sort { input, .. }
+             | PhysNodeKind::Multiplexer { input }
++            | PhysNodeKind::Rle { input, .. }
+             | PhysNodeKind::RleId { input, .. }
+             | PhysNodeKind::GroupBy { input, .. } => {
+                 rec!(input.node);
+diff --git a/crates/polars-stream/src/physical_plan/to_graph.rs b/crates/polars-stream/src/physical_plan/to_graph.rs
+index f8e5b2edea38..d303bc0c8b70 100644
+--- a/crates/polars-stream/src/physical_plan/to_graph.rs
++++ b/crates/polars-stream/src/physical_plan/to_graph.rs
+@@ -498,6 +498,17 @@ fn to_graph_rec<'a>(
+             )
+         },
+ 
++        Rle { input, name } => {
++            let input_key = to_graph_rec(input.node, ctx)?;
++            let input_schema = &ctx.phys_sm[input.node].output_schema;
++            assert_eq!(input_schema.len(), 1);
++            let dtype = input_schema.get_at_index(0).unwrap().1.clone();
++            ctx.graph.add_node(
++                nodes::rle::RleNode::new(name.clone(), dtype),
++                [(input_key, input.port)],
++            )
++        },
++
+         RleId { input, name } => {
+             let input_key = to_graph_rec(input.node, ctx)?;
+             let input_schema = &ctx.phys_sm[input.node].output_schema;

@@ -1,0 +1,332 @@
+commit 351ad84eaf74af2680ed5394bb15ab5b88e1cad4
+Author: Amjith Ramanujam <amjith.r@gmail.com>
+Date:   Mon Oct 21 10:33:02 2024 -0700
+
+    Add support for system-level `uv.toml` configuration (#7851)
+    
+    ## Summary
+    
+    Look for a system level uv.toml config file under `/etc/uv/uv.toml` or
+    `C:\ProgramData`.
+    
+    This PR is to address #6742 and start a conversation.
+    
+    ## Test Plan
+    
+    This was tested locally manually on MacOS. I am happy to contribute
+    tests once we settle on the approach.
+    
+    cc @thatch
+    
+    ---------
+    
+    Co-authored-by: Charlie Marsh <charlie.r.marsh@gmail.com>
+
+diff --git a/crates/uv-settings/Cargo.toml b/crates/uv-settings/Cargo.toml
+index 683b9aae3..1aca3d09c 100644
+--- a/crates/uv-settings/Cargo.toml
++++ b/crates/uv-settings/Cargo.toml
+@@ -44,3 +44,7 @@ url = { workspace = true }
+ 
+ [package.metadata.cargo-shear]
+ ignored = ["uv-options-metadata", "clap"]
++
++[dev-dependencies]
++assert_fs = { version = "1.1.2" }
++indoc = { version = "2.0.5" }
+diff --git a/crates/uv-settings/src/lib.rs b/crates/uv-settings/src/lib.rs
+index 2ee366bf9..80ce9fd16 100644
+--- a/crates/uv-settings/src/lib.rs
++++ b/crates/uv-settings/src/lib.rs
+@@ -1,10 +1,10 @@
++use std::env;
+ use std::ops::Deref;
+ use std::path::{Path, PathBuf};
+ 
+ use tracing::debug;
+ 
+ use uv_fs::Simplified;
+-#[cfg(not(windows))]
+ use uv_static::EnvVars;
+ use uv_warnings::warn_user;
+ 
+@@ -36,7 +36,7 @@ impl Deref for FilesystemOptions {
+ impl FilesystemOptions {
+     /// Load the user [`FilesystemOptions`].
+     pub fn user() -> Result<Option<Self>, Error> {
+-        let Some(dir) = config_dir() else {
++        let Some(dir) = user_config_dir() else {
+             return Ok(None);
+         };
+         let root = dir.join("uv");
+@@ -61,6 +61,14 @@ impl FilesystemOptions {
+         }
+     }
+ 
++    pub fn system() -> Result<Option<Self>, Error> {
++        let Some(file) = system_config_file() else {
++            return Ok(None);
++        };
++        debug!("Found system configuration in: `{}`", file.display());
++        Ok(Some(Self(read_file(&file)?)))
++    }
++
+     /// Find the [`FilesystemOptions`] for the given path.
+     ///
+     /// The search starts at the given path and goes up the directory tree until a `uv.toml` file or
+@@ -171,22 +179,72 @@ impl From<Options> for FilesystemOptions {
+ /// This is similar to the `config_dir()` returned by the `dirs` crate, but it uses the
+ /// `XDG_CONFIG_HOME` environment variable on both Linux _and_ macOS, rather than the
+ /// `Application Support` directory on macOS.
+-fn config_dir() -> Option<PathBuf> {
+-    // On Windows, use, e.g., C:\Users\Alice\AppData\Roaming
++fn user_config_dir() -> Option<PathBuf> {
++    // On Windows, use, e.g., `C:\Users\Alice\AppData\Roaming`.
+     #[cfg(windows)]
+     {
+         dirs_sys::known_folder_roaming_app_data()
+     }
+ 
+-    // On Linux and macOS, use, e.g., /home/alice/.config.
++    // On Linux and macOS, use, e.g., `/home/alice/.config`.
+     #[cfg(not(windows))]
+     {
+-        std::env::var_os(EnvVars::XDG_CONFIG_HOME)
++        env::var_os(EnvVars::XDG_CONFIG_HOME)
+             .and_then(dirs_sys::is_absolute_path)
+             .or_else(|| dirs_sys::home_dir().map(|path| path.join(".config")))
+     }
+ }
+ 
++#[cfg(not(windows))]
++fn locate_system_config_xdg(value: Option<&str>) -> Option<PathBuf> {
++    // On Linux and macOS, read the `XDG_CONFIG_DIRS` environment variable.
++    let default = "/etc/xdg";
++    let config_dirs = value.filter(|s| !s.is_empty()).unwrap_or(default);
++
++    for dir in config_dirs.split(':').take_while(|s| !s.is_empty()) {
++        let uv_toml_path = Path::new(dir).join("uv").join("uv.toml");
++        if uv_toml_path.is_file() {
++            return Some(uv_toml_path);
++        }
++    }
++    None
++}
++
++#[cfg(windows)]
++fn locate_system_config_windows(system_drive: &std::ffi::OsStr) -> Option<PathBuf> {
++    // On Windows, use `%SYSTEMDRIVE%\ProgramData\uv\uv.toml` (e.g., `C:\ProgramData`).
++    let candidate = PathBuf::from(system_drive).join("ProgramData\\uv\\uv.toml");
++    candidate.as_path().is_file().then_some(candidate)
++}
++
++/// Returns the path to the system configuration file.
++///
++/// On Unix-like systems, uses the `XDG_CONFIG_DIRS` environment variable (falling back to
++/// `/etc/xdg/uv/uv.toml` if unset or empty) and then `/etc/uv/uv.toml`
++///
++/// On Windows, uses `%SYSTEMDRIVE%\ProgramData\uv\uv.toml`.
++fn system_config_file() -> Option<PathBuf> {
++    #[cfg(windows)]
++    {
++        env::var_os(EnvVars::SYSTEMDRIVE)
++            .and_then(|system_drive| locate_system_config_windows(&system_drive))
++    }
++
++    #[cfg(not(windows))]
++    {
++        if let Some(path) =
++            locate_system_config_xdg(env::var(EnvVars::XDG_CONFIG_DIRS).ok().as_deref())
++        {
++            return Some(path);
++        }
++
++        // Fallback to `/etc/uv/uv.toml` if `XDG_CONFIG_DIRS` is not set or no valid
++        // path is found.
++        let candidate = Path::new("/etc/uv/uv.toml");
++        candidate.is_file().then(|| candidate.to_path_buf())
++    }
++}
++
+ /// Load [`Options`] from a `uv.toml` file.
+ fn read_file(path: &Path) -> Result<Options, Error> {
+     let content = fs_err::read_to_string(path)?;
+@@ -206,3 +264,93 @@ pub enum Error {
+     #[error("Failed to parse: `{0}`")]
+     UvToml(String, #[source] toml::de::Error),
+ }
++
++#[cfg(test)]
++mod test {
++    #[cfg(windows)]
++    use crate::locate_system_config_windows;
++    #[cfg(not(windows))]
++    use crate::locate_system_config_xdg;
++
++    use assert_fs::fixture::FixtureError;
++    use assert_fs::prelude::*;
++    use indoc::indoc;
++
++    #[test]
++    #[cfg(not(windows))]
++    fn test_locate_system_config_xdg() -> Result<(), FixtureError> {
++        // Write a `uv.toml` to a temporary directory.
++        let context = assert_fs::TempDir::new()?;
++        context.child("uv").child("uv.toml").write_str(indoc! {
++            r#"
++            [pip]
++            index-url = "https://test.pypi.org/simple"
++        "#,
++        })?;
++
++        // None
++        assert_eq!(locate_system_config_xdg(None), None);
++
++        // Empty string
++        assert_eq!(locate_system_config_xdg(Some("")), None);
++
++        // Single colon
++        assert_eq!(locate_system_config_xdg(Some(":")), None);
++
++        // Assert that the `system_config_file` function returns the correct path.
++        assert_eq!(
++            locate_system_config_xdg(Some(context.to_str().unwrap())).unwrap(),
++            context.child("uv").child("uv.toml").path()
++        );
++
++        // Write a separate `uv.toml` to a different directory.
++        let first = context.child("first");
++        let first_config = first.child("uv").child("uv.toml");
++        first_config.write_str("")?;
++
++        assert_eq!(
++            locate_system_config_xdg(Some(
++                format!("{}:{}", first.to_string_lossy(), context.to_string_lossy()).as_str()
++            ))
++            .unwrap(),
++            first_config.path()
++        );
++
++        Ok(())
++    }
++
++    #[test]
++    #[cfg(windows)]
++    fn test_windows_config() -> Result<(), FixtureError> {
++        // Write a `uv.toml` to a temporary directory.
++        let context = assert_fs::TempDir::new()?;
++        context
++            .child("ProgramData")
++            .child("uv")
++            .child("uv.toml")
++            .write_str(indoc! { r#"
++            [pip]
++            index-url = "https://test.pypi.org/simple"
++        "#})?;
++
++        // This is typically only a drive (that is, letter and colon) but we
++        // allow anything, including a path to the test fixtures...
++        assert_eq!(
++            locate_system_config_windows(context.path().as_os_str()).unwrap(),
++            context
++                .child("ProgramData")
++                .child("uv")
++                .child("uv.toml")
++                .path()
++        );
++
++        // This does not have a `ProgramData` child, so contains no config.
++        let context = assert_fs::TempDir::new()?;
++        assert_eq!(
++            locate_system_config_windows(context.path().as_os_str()),
++            None
++        );
++
++        Ok(())
++    }
++}
+diff --git a/crates/uv-static/src/env_vars.rs b/crates/uv-static/src/env_vars.rs
+index 7137d895d..fa5eb8de4 100644
+--- a/crates/uv-static/src/env_vars.rs
++++ b/crates/uv-static/src/env_vars.rs
+@@ -199,6 +199,12 @@ impl EnvVars {
+     /// Used to set a temporary directory for some tests.
+     pub const UV_INTERNAL__TEST_DIR: &'static str = "UV_INTERNAL__TEST_DIR";
+ 
++    /// Path to system-level configuration directory on Unix systems.
++    pub const XDG_CONFIG_DIRS: &'static str = "XDG_CONFIG_DIRS";
++
++    /// Path to system-level configuration directory on Windows systems.
++    pub const SYSTEMDRIVE: &'static str = "SYSTEMDRIVE";
++
+     /// Path to user-level configuration directory on Unix systems.
+     pub const XDG_CONFIG_HOME: &'static str = "XDG_CONFIG_HOME";
+ 
+diff --git a/crates/uv/src/lib.rs b/crates/uv/src/lib.rs
+index 590051ce6..e9380b828 100644
+--- a/crates/uv/src/lib.rs
++++ b/crates/uv/src/lib.rs
+@@ -117,17 +117,19 @@ async fn run(mut cli: Cli) -> Result<ExitStatus> {
+         None
+     } else if matches!(&*cli.command, Commands::Tool(_)) {
+         // For commands that operate at the user-level, ignore local configuration.
+-        FilesystemOptions::user()?
++        FilesystemOptions::user()?.combine(FilesystemOptions::system()?)
+     } else if let Ok(workspace) =
+         Workspace::discover(&project_dir, &DiscoveryOptions::default()).await
+     {
+         let project = FilesystemOptions::find(workspace.install_path())?;
++        let system = FilesystemOptions::system()?;
+         let user = FilesystemOptions::user()?;
+-        project.combine(user)
++        project.combine(user).combine(system)
+     } else {
+         let project = FilesystemOptions::find(&project_dir)?;
++        let system = FilesystemOptions::system()?;
+         let user = FilesystemOptions::user()?;
+-        project.combine(user)
++        project.combine(user).combine(system)
+     };
+ 
+     // Parse the external command, if necessary.
+diff --git a/docs/configuration/files.md b/docs/configuration/files.md
+index 58c6dc995..640321e6b 100644
+--- a/docs/configuration/files.md
++++ b/docs/configuration/files.md
+@@ -9,7 +9,7 @@ in the nearest parent directory.
+ 
+     For `tool` commands, which operate at the user level, local configuration
+     files will be ignored. Instead, uv will exclusively read from user-level configuration
+-    (e.g., `~/.config/uv/uv.toml`).
++    (e.g., `~/.config/uv/uv.toml`) and system-level configuration (e.g., `/etc/uv/uv.toml`).
+ 
+ In workspaces, uv will begin its search at the workspace root, ignoring any configuration defined in
+ workspace members. Since the workspace is locked as a single unit, configuration is shared across
+@@ -40,13 +40,21 @@ index-url = "https://test.pypi.org/simple"
+     `[tool.uv]` section in the accompanying `pyproject.toml` will be ignored.
+ 
+ uv will also discover user-level configuration at `~/.config/uv/uv.toml` (or
+-`$XDG_CONFIG_HOME/uv/uv.toml`) on macOS and Linux, or `%APPDATA%\uv\uv.toml` on Windows. User-level
+-configuration must use the `uv.toml` format, rather than the `pyproject.toml` format, as a
+-`pyproject.toml` is intended to define a Python _project_.
++`$XDG_CONFIG_HOME/uv/uv.toml`) on macOS and Linux, or `%APPDATA%\uv\uv.toml` on Windows; and
++system-level configuration at `/etc/uv/uv.toml` (or `$XDG_CONFIG_DIRS/uv/uv.toml`) on macOS and
++Linux, or `%SYSTEMDRIVE%\ProgramData\uv\uv.toml` on Windows.
+ 
+-If both project- and user-level configuration are found, the settings will be merged, with the
+-project-level configuration taking precedence. Specifically, if a string, number, or boolean is
+-present in both tables, the project-level value will be used, and the user-level value will be
++User-and system-level configuration must use the `uv.toml` format, rather than the `pyproject.toml`
++format, as a `pyproject.toml` is intended to define a Python _project_.
++
++If project-, user-, and system-level configuration files are found, the settings will be merged,
++with project-level configuration taking precedence over the user-level configuration, and user-level
++configuration taking precedence over the system-level configuration. (If multiple system-level
++configuration files are found, e.g., at both `/etc/uv/uv.toml` and `$XDG_CONFIG_DIRS/uv/uv.toml`,
++only the first-discovered file will be used, with XDG taking priority.)
++
++For example, if a string, number, or boolean is present in both the project- and user-level
++configuration tables, the project-level value will be used, and the user-level value will be
+ ignored. If an array is present in both tables, the arrays will be concatenated, with the
+ project-level settings appearing earlier in the merged array.
+ 

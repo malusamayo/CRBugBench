@@ -1,0 +1,272 @@
+commit 2d34b2bfecf732cb4dd0b693b9c65fd874473dc4
+Author: jamesbt365 <jamesbt365@gmail.com>
+Date:   Fri May 31 21:18:31 2024 +0100
+
+    Add support for super reactions (#2882)
+    
+    Rough, very quick addition of super reactions, also known as burst reactions.
+    
+    Fixes #2866
+
+diff --git a/src/http/client.rs b/src/http/client.rs
+index be6e1ae2e..4157b804f 100644
+--- a/src/http/client.rs
++++ b/src/http/client.rs
+@@ -815,12 +815,12 @@ impl Http {
+         .await
+     }
+ 
+-    /// Reacts to a message.
+-    pub async fn create_reaction(
++    async fn _create_reaction(
+         &self,
+         channel_id: ChannelId,
+         message_id: MessageId,
+         reaction_type: &ReactionType,
++        burst: bool,
+     ) -> Result<()> {
+         self.wind(204, Request {
+             body: None,
+@@ -832,11 +832,31 @@ impl Http {
+                 message_id,
+                 reaction: &reaction_type.as_data(),
+             },
+-            params: None,
++            params: Some(vec![("burst", burst.to_string())]),
+         })
+         .await
+     }
+ 
++    /// Reacts to a message.
++    pub async fn create_reaction(
++        &self,
++        channel_id: ChannelId,
++        message_id: MessageId,
++        reaction_type: &ReactionType,
++    ) -> Result<()> {
++        self._create_reaction(channel_id, message_id, reaction_type, false).await
++    }
++
++    /// Super reacts to a message.
++    pub async fn create_super_reaction(
++        &self,
++        channel_id: ChannelId,
++        message_id: MessageId,
++        reaction_type: &ReactionType,
++    ) -> Result<()> {
++        self._create_reaction(channel_id, message_id, reaction_type, true).await
++    }
++
+     /// Creates a role.
+     pub async fn create_role(
+         &self,
+diff --git a/src/model/channel/message.rs b/src/model/channel/message.rs
+index 9a2f7d2e0..60a764590 100644
+--- a/src/model/channel/message.rs
++++ b/src/model/channel/message.rs
+@@ -539,13 +539,35 @@ impl Message {
+         cache_http: impl CacheHttp,
+         reaction_type: impl Into<ReactionType>,
+     ) -> Result<Reaction> {
+-        self._react(cache_http, reaction_type.into()).await
++        self._react(cache_http, reaction_type.into(), false).await
++    }
++
++    /// React to the message with a custom [`Emoji`] or unicode character.
++    ///
++    /// **Note**: Requires  [Add Reactions] and [Use External Emojis] permissions.
++    ///
++    /// # Errors
++    ///
++    /// If the `cache` is enabled, returns a [`ModelError::InvalidPermissions`] if the current user
++    /// does not have the required [permissions].
++    ///
++    /// [Add Reactions]: Permissions::ADD_REACTIONS
++    /// [Use External Emojis]: Permissions::USE_EXTERNAL_EMOJIS
++    /// [permissions]: crate::model::permissions
++    #[inline]
++    pub async fn super_react(
++        &self,
++        cache_http: impl CacheHttp,
++        reaction_type: impl Into<ReactionType>,
++    ) -> Result<Reaction> {
++        self._react(cache_http, reaction_type.into(), true).await
+     }
+ 
+     async fn _react(
+         &self,
+         cache_http: impl CacheHttp,
+         reaction_type: ReactionType,
++        burst: bool,
+     ) -> Result<Reaction> {
+         #[cfg_attr(not(feature = "cache"), allow(unused_mut))]
+         let mut user_id = None;
+@@ -559,13 +581,30 @@ impl Message {
+                         self.channel_id,
+                         Permissions::ADD_REACTIONS,
+                     )?;
++
++                    if burst {
++                        utils::user_has_perms_cache(
++                            cache,
++                            self.channel_id,
++                            Permissions::USE_EXTERNAL_EMOJIS,
++                        )?;
++                    }
+                 }
+ 
+                 user_id = Some(cache.current_user().id);
+             }
+         }
+ 
+-        cache_http.http().create_reaction(self.channel_id, self.id, &reaction_type).await?;
++        let reaction_types = if burst {
++            cache_http
++                .http()
++                .create_super_reaction(self.channel_id, self.id, &reaction_type)
++                .await?;
++            ReactionTypes::Burst
++        } else {
++            cache_http.http().create_reaction(self.channel_id, self.id, &reaction_type).await?;
++            ReactionTypes::Normal
++        };
+ 
+         Ok(Reaction {
+             channel_id: self.channel_id,
+@@ -574,6 +613,10 @@ impl Message {
+             user_id,
+             guild_id: self.guild_id,
+             member: self.member.as_deref().map(|member| member.clone().into()),
++            message_author_id: None,
++            burst,
++            burst_colours: None,
++            reaction_type: reaction_types,
+         })
+     }
+ 
+@@ -891,13 +934,31 @@ impl<'a> From<&'a Message> for MessageId {
+ #[derive(Clone, Debug, Deserialize, Serialize)]
+ #[non_exhaustive]
+ pub struct MessageReaction {
+-    /// The amount of the type of reaction that have been sent for the associated message.
++    /// The amount of the type of reaction that have been sent for the associated message
++    /// including super reactions.
+     pub count: u64,
+-    /// Indicator of whether the current user has sent the type of reaction.
++    /// A breakdown of what reactions were from regular reactions and super reactions.
++    pub count_details: CountDetails,
++    /// Indicator of whether the current user has sent this type of reaction.
+     pub me: bool,
++    /// Indicator of whether the current user has sent the type of super-reaction.
++    pub me_burst: bool,
+     /// The type of reaction.
+     #[serde(rename = "emoji")]
+     pub reaction_type: ReactionType,
++    // The colours used for super reactions.
++    pub burst_colours: Vec<Colour>,
++}
++
++/// A representation of reaction count details.
++///
++/// [Discord docs](https://discord.com/developers/docs/resources/channel#reaction-count-details-object).
++#[cfg_attr(feature = "typesize", derive(typesize::derive::TypeSize))]
++#[derive(Clone, Debug, Deserialize, Serialize)]
++#[non_exhaustive]
++pub struct CountDetails {
++    pub burst: u64,
++    pub normal: u64,
+ }
+ 
+ enum_number! {
+diff --git a/src/model/channel/reaction.rs b/src/model/channel/reaction.rs
+index 510c2b1e0..d63e1eb3a 100644
+--- a/src/model/channel/reaction.rs
++++ b/src/model/channel/reaction.rs
+@@ -8,6 +8,7 @@ use std::str::FromStr;
+ use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+ use serde::de::Error as DeError;
+ use serde::ser::{Serialize, SerializeMap, Serializer};
++use serde_cow::CowStr;
+ #[cfg(feature = "model")]
+ use tracing::warn;
+ 
+@@ -36,9 +37,38 @@ pub struct Reaction {
+     /// The optional Id of the [`Guild`] where the reaction was sent.
+     pub guild_id: Option<GuildId>,
+     /// The optional object of the member which added the reaction.
++    ///
++    /// Not present on the ReactionRemove gateway event.
+     pub member: Option<Member>,
+     /// The reactive emoji used.
+     pub emoji: ReactionType,
++    /// The Id of the user who sent the message which this reacted to.
++    ///
++    /// Only present on the ReactionAdd gateway event.
++    pub message_author_id: Option<UserId>,
++    /// Indicates if this was a super reaction.
++    pub burst: bool,
++    /// Colours used for the super reaction animation.
++    ///
++    /// Only present on the ReactionAdd gateway event.
++    #[serde(rename = "burst_colors", default, deserialize_with = "discord_colours")]
++    pub burst_colours: Option<Vec<Colour>>,
++    /// The type of reaction.
++    #[serde(rename = "type")]
++    pub reaction_type: ReactionTypes,
++}
++
++enum_number! {
++    /// A list of types a reaction can be.
++    #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
++    #[cfg_attr(feature = "typesize", derive(typesize::derive::TypeSize))]
++    #[serde(from = "u8", into = "u8")]
++    #[non_exhaustive]
++    pub enum ReactionTypes {
++        Normal = 0,
++        Burst = 1,
++        _ => Unknown(u8),
++    }
+ }
+ 
+ // Manual impl needed to insert guild_id into PartialMember
+@@ -58,6 +88,40 @@ impl Serialize for Reaction {
+     }
+ }
+ 
++fn discord_colours<'de, D>(deserializer: D) -> Result<Option<Vec<Colour>>, D::Error>
++where
++    D: Deserializer<'de>,
++{
++    let vec_str: Option<Vec<CowStr<'_>>> = Deserialize::deserialize(deserializer)?;
++
++    let Some(vec_str) = vec_str else { return Ok(None) };
++
++    if vec_str.is_empty() {
++        return Ok(None);
++    }
++
++    let colours: Result<Vec<_>, _> = vec_str
++        .iter()
++        .map(|s| {
++            let s = s.0.strip_prefix('#').ok_or_else(|| DeError::custom("Invalid colour data"))?;
++
++            if s.len() != 6 {
++                return Err(DeError::custom("Invalid colour data length"));
++            }
++
++            match u32::from_str_radix(s, 16) {
++                Ok(c) => Ok(Colour::new(c)),
++                Err(_) => Err(DeError::custom("Invalid colour data")),
++            }
++        })
++        .collect();
++
++    match colours {
++        Ok(colours) => Ok(Some(colours)),
++        Err(err) => Err(err),
++    }
++}
++
+ #[cfg(feature = "model")]
+ impl Reaction {
+     /// Retrieves the associated the reaction was made in.

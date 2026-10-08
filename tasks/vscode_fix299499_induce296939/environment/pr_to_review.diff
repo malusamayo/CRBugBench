@@ -1,0 +1,312 @@
+commit 6b820e7b5bed8110eeaa6fb176dfae9e98d2011e
+Author: Johannes Rieken <johannes.rieken@gmail.com>
+Date:   Mon Feb 23 11:44:40 2026 +0100
+
+    Add diagnostics support to inline chat and related actions (#296939)
+    
+    - Introduce `selectionHasDiagnostics` context key to track diagnostics in the editor selection.
+    - Implement `FixDiagnosticsAction` to allow users to fix diagnostics directly from inline chat.
+    - Enhance `InlineChatController` to optionally attach diagnostics to chat requests.
+    - Update inline chat configuration to include `FixDiagnostics` setting.
+    - Register new action in the inline chat affordance for fixing diagnostics.
+
+diff --git a/src/vs/editor/common/editorContextKeys.ts b/src/vs/editor/common/editorContextKeys.ts
+index d1e7c0dd95c..632f9005347 100644
+--- a/src/vs/editor/common/editorContextKeys.ts
++++ b/src/vs/editor/common/editorContextKeys.ts
+@@ -93,4 +93,5 @@ export namespace EditorContextKeys {
+ 	export const hasMultipleDocumentFormattingProvider = new RawContextKey<boolean>('editorHasMultipleDocumentFormattingProvider', false, nls.localize('editorHasMultipleDocumentFormattingProvider', "Whether the editor has multiple document formatting providers"));
+ 	export const hasMultipleDocumentSelectionFormattingProvider = new RawContextKey<boolean>('editorHasMultipleDocumentSelectionFormattingProvider', false, nls.localize('editorHasMultipleDocumentSelectionFormattingProvider', "Whether the editor has multiple document selection formatting providers"));
+ 
++	export const selectionHasDiagnostics = new RawContextKey<boolean>('editorSelectionHasDiagnostics', false, nls.localize('editorSelectionHasDiagnostics', "Whether any diagnostic is present in the current editor selection"));
+ }
+diff --git a/src/vs/editor/contrib/gotoError/browser/markerSelectionStatus.ts b/src/vs/editor/contrib/gotoError/browser/markerSelectionStatus.ts
+new file mode 100644
+index 00000000000..e13f8bd6018
+--- /dev/null
++++ b/src/vs/editor/contrib/gotoError/browser/markerSelectionStatus.ts
+@@ -0,0 +1,70 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import { Disposable } from '../../../../base/common/lifecycle.js';
++import { isEqual } from '../../../../base/common/resources.js';
++import { ICodeEditor } from '../../../browser/editorBrowser.js';
++import { EditorContributionInstantiation, registerEditorContribution } from '../../../browser/editorExtensions.js';
++import { Range } from '../../../common/core/range.js';
++import { IEditorContribution } from '../../../common/editorCommon.js';
++import { EditorContextKeys } from '../../../common/editorContextKeys.js';
++import { IContextKey, IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
++import { IMarkerService, MarkerSeverity } from '../../../../platform/markers/common/markers.js';
++
++class MarkerSelectionStatus extends Disposable implements IEditorContribution {
++
++	static readonly ID = 'editor.contrib.markerSelectionStatus';
++
++	private readonly _ctxHasDiagnostics: IContextKey<boolean>;
++
++	constructor(
++		private readonly _editor: ICodeEditor,
++		@IContextKeyService contextKeyService: IContextKeyService,
++		@IMarkerService private readonly _markerService: IMarkerService,
++	) {
++		super();
++
++		this._ctxHasDiagnostics = EditorContextKeys.selectionHasDiagnostics.bindTo(contextKeyService);
++
++		this._store.add(this._editor.onDidChangeCursorSelection(() => this._update()));
++		this._store.add(this._editor.onDidChangeModel(() => this._update()));
++		this._store.add(this._markerService.onMarkerChanged(e => {
++			const model = this._editor.getModel();
++			if (model && e.some(uri => isEqual(uri, model.uri))) {
++				this._update();
++			}
++		}));
++
++		this._update();
++	}
++
++	override dispose(): void {
++		this._ctxHasDiagnostics.reset();
++		super.dispose();
++	}
++
++	private _update(): void {
++		const model = this._editor.getModel();
++		const selection = this._editor.getSelection();
++		if (!model || !selection) {
++			this._ctxHasDiagnostics.reset();
++			return;
++		}
++
++		const markers = this._markerService.read({
++			resource: model.uri,
++			severities: MarkerSeverity.Error | MarkerSeverity.Warning | MarkerSeverity.Info
++		});
++
++		const hasIntersecting = markers.some(marker => Range.areIntersecting(
++			{ startLineNumber: marker.startLineNumber, startColumn: marker.startColumn, endLineNumber: marker.endLineNumber, endColumn: marker.endColumn },
++			selection
++		));
++
++		this._ctxHasDiagnostics.set(hasIntersecting);
++	}
++}
++
++registerEditorContribution(MarkerSelectionStatus.ID, MarkerSelectionStatus, EditorContributionInstantiation.AfterFirstRender);
+diff --git a/src/vs/editor/editor.all.ts b/src/vs/editor/editor.all.ts
+index 916cc40a980..4802aeb185a 100644
+--- a/src/vs/editor/editor.all.ts
++++ b/src/vs/editor/editor.all.ts
+@@ -30,6 +30,7 @@ import './contrib/inlineProgress/browser/inlineProgress.js';
+ import './contrib/gotoSymbol/browser/goToCommands.js';
+ import './contrib/gotoSymbol/browser/link/goToDefinitionAtPosition.js';
+ import './contrib/gotoError/browser/gotoError.js';
++import './contrib/gotoError/browser/markerSelectionStatus.js';
+ import './contrib/gpu/browser/gpuActions.js';
+ import './contrib/hover/browser/hoverContribution.js';
+ import './contrib/indentation/browser/indentation.js';
+@@ -70,4 +71,3 @@ import './contrib/floatingMenu/browser/floatingMenu.contribution.js';
+ import './common/standaloneStrings.js';
+ 
+ import '../base/browser/ui/codicons/codiconStyles.js'; // The codicons are defined here and must be loaded
+-
+diff --git a/src/vs/workbench/contrib/inlineChat/browser/inlineChat.contribution.ts b/src/vs/workbench/contrib/inlineChat/browser/inlineChat.contribution.ts
+index 2e6c7a6474b..def506dfd1a 100644
+--- a/src/vs/workbench/contrib/inlineChat/browser/inlineChat.contribution.ts
++++ b/src/vs/workbench/contrib/inlineChat/browser/inlineChat.contribution.ts
+@@ -94,6 +94,7 @@ registerAction2(InlineChatActions.FocusInlineChat);
+ registerAction2(InlineChatActions.SubmitInlineChatInputAction);
+ registerAction2(InlineChatActions.QueueInChatAction);
+ registerAction2(InlineChatActions.HideInlineChatInputAction);
++registerAction2(InlineChatActions.FixDiagnosticsAction);
+ 
+ 
+ const workbenchContributionsRegistry = Registry.as<IWorkbenchContributionsRegistry>(WorkbenchExtensions.Workbench);
+diff --git a/src/vs/workbench/contrib/inlineChat/browser/inlineChatActions.ts b/src/vs/workbench/contrib/inlineChat/browser/inlineChatActions.ts
+index 92789d87d0f..882525d9900 100644
+--- a/src/vs/workbench/contrib/inlineChat/browser/inlineChatActions.ts
++++ b/src/vs/workbench/contrib/inlineChat/browser/inlineChatActions.ts
+@@ -11,7 +11,7 @@ import { EmbeddedDiffEditorWidget } from '../../../../editor/browser/widget/diff
+ import { EmbeddedCodeEditorWidget } from '../../../../editor/browser/widget/codeEditor/embeddedCodeEditorWidget.js';
+ import { EditorContextKeys } from '../../../../editor/common/editorContextKeys.js';
+ import { InlineChatController, InlineChatRunOptions } from './inlineChatController.js';
+-import { ACTION_ACCEPT_CHANGES, ACTION_ASK_IN_CHAT, CTX_INLINE_CHAT_FOCUSED, CTX_INLINE_CHAT_VISIBLE, CTX_INLINE_CHAT_OUTER_CURSOR_POSITION, CTX_INLINE_CHAT_POSSIBLE, ACTION_START, CTX_INLINE_CHAT_V2_ENABLED, CTX_INLINE_CHAT_V1_ENABLED, CTX_HOVER_MODE, CTX_INLINE_CHAT_INPUT_HAS_TEXT, CTX_INLINE_CHAT_FILE_BELONGS_TO_CHAT, CTX_INLINE_CHAT_INPUT_WIDGET_FOCUSED, InlineChatConfigKeys } from '../common/inlineChat.js';
++import { ACTION_ACCEPT_CHANGES, ACTION_ASK_IN_CHAT, CTX_INLINE_CHAT_FOCUSED, CTX_INLINE_CHAT_VISIBLE, CTX_INLINE_CHAT_OUTER_CURSOR_POSITION, CTX_INLINE_CHAT_POSSIBLE, ACTION_START, CTX_INLINE_CHAT_V2_ENABLED, CTX_INLINE_CHAT_V1_ENABLED, CTX_HOVER_MODE, CTX_INLINE_CHAT_INPUT_HAS_TEXT, CTX_INLINE_CHAT_FILE_BELONGS_TO_CHAT, CTX_INLINE_CHAT_INPUT_WIDGET_FOCUSED, InlineChatConfigKeys, CTX_FIX_DIAGNOSTICS_ENABLED } from '../common/inlineChat.js';
+ import { ctxHasEditorModification, ctxHasRequestInProgress } from '../../chat/browser/chatEditing/chatEditingEditorContextKeys.js';
+ import { localize, localize2 } from '../../../../nls.js';
+ import { Action2, IAction2Options, MenuId, MenuRegistry } from '../../../../platform/actions/common/actions.js';
+@@ -246,6 +246,33 @@ export abstract class AbstractInlineChatAction extends EditorAction2 {
+ 	abstract runInlineChatCommand(accessor: ServicesAccessor, ctrl: InlineChatController, editor: ICodeEditor, ...args: unknown[]): void;
+ }
+ 
++export class FixDiagnosticsAction extends AbstractInlineChatAction {
++
++	constructor() {
++		super({
++			id: 'inlineChat.fixDiagnostics',
++			title: localize2('fix', 'Fix'),
++			icon: Codicon.editSparkle,
++			precondition: ContextKeyExpr.and(inlineChatContextKey, CTX_FIX_DIAGNOSTICS_ENABLED, EditorContextKeys.selectionHasDiagnostics, CTX_INLINE_CHAT_FILE_BELONGS_TO_CHAT.negate()),
++			menu: [{
++				id: MenuId.InlineChatEditorAffordance,
++				group: '1_quickfix',
++				order: 100,
++				when: ContextKeyExpr.and(CTX_FIX_DIAGNOSTICS_ENABLED, EditorContextKeys.selectionHasDiagnostics, CTX_INLINE_CHAT_FILE_BELONGS_TO_CHAT.negate()),
++			}, {
++				id: MenuId.ChatEditorInlineMenu,
++				group: '2_chat',
++				order: 1,
++				when: ContextKeyExpr.and(CTX_FIX_DIAGNOSTICS_ENABLED, EditorContextKeys.selectionHasDiagnostics, CTX_INLINE_CHAT_FILE_BELONGS_TO_CHAT.negate()),
++			}]
++		});
++	}
++
++	override runInlineChatCommand(_accessor: ServicesAccessor, ctrl: InlineChatController, _editor: ICodeEditor, ..._args: unknown[]): void {
++		ctrl.run({ autoSend: true, attachDiagnostics: true });
++	}
++}
++
+ class KeepOrUndoSessionAction extends AbstractInlineChatAction {
+ 
+ 	constructor(private readonly _keep: boolean, desc: IAction2Options) {
+diff --git a/src/vs/workbench/contrib/inlineChat/browser/inlineChatController.ts b/src/vs/workbench/contrib/inlineChat/browser/inlineChatController.ts
+index 7efaea3ee5d..5b9416ce49d 100644
+--- a/src/vs/workbench/contrib/inlineChat/browser/inlineChatController.ts
++++ b/src/vs/workbench/contrib/inlineChat/browser/inlineChatController.ts
+@@ -68,6 +68,7 @@ export abstract class InlineChatRunOptions {
+ 	position?: IPosition;
+ 	modelSelector?: ILanguageModelChatSelector;
+ 	resolveOnResponse?: boolean;
++	attachDiagnostics?: boolean;
+ 
+ 	static isInlineChatRunOptions(options: unknown): options is InlineChatRunOptions {
+ 
+@@ -75,7 +76,7 @@ export abstract class InlineChatRunOptions {
+ 			return false;
+ 		}
+ 
+-		const { initialSelection, initialRange, message, autoSend, position, attachments, modelSelector, resolveOnResponse } = <InlineChatRunOptions>options;
++		const { initialSelection, initialRange, message, autoSend, position, attachments, modelSelector, resolveOnResponse, attachDiagnostics } = <InlineChatRunOptions>options;
+ 		if (
+ 			typeof message !== 'undefined' && typeof message !== 'string'
+ 			|| typeof autoSend !== 'undefined' && typeof autoSend !== 'boolean'
+@@ -85,6 +86,7 @@ export abstract class InlineChatRunOptions {
+ 			|| typeof attachments !== 'undefined' && (!Array.isArray(attachments) || !attachments.every(item => item instanceof URI))
+ 			|| typeof modelSelector !== 'undefined' && !isILanguageModelChatSelector(modelSelector)
+ 			|| typeof resolveOnResponse !== 'undefined' && typeof resolveOnResponse !== 'boolean'
++			|| typeof attachDiagnostics !== 'undefined' && typeof attachDiagnostics !== 'boolean'
+ 		) {
+ 			return false;
+ 		}
+@@ -506,22 +508,24 @@ export class InlineChatController implements IEditorContribution {
+ 		try {
+ 			await this._applyModelDefaults(session, sessionStore);
+ 
+-			// ADD diagnostics
+-			const entries: IChatRequestVariableEntry[] = [];
+-			for (const [range, marker] of this._markerDecorationsService.getLiveMarkers(uri)) {
+-				if (range.intersectRanges(this._editor.getSelection())) {
+-					const filter = IDiagnosticVariableEntryFilterData.fromMarker(marker);
+-					entries.push(IDiagnosticVariableEntryFilterData.toEntry(filter));
++			// ADD diagnostics (only when explicitly requested)
++			if (arg?.attachDiagnostics) {
++				const entries: IChatRequestVariableEntry[] = [];
++				for (const [range, marker] of this._markerDecorationsService.getLiveMarkers(uri)) {
++					if (range.intersectRanges(this._editor.getSelection())) {
++						const filter = IDiagnosticVariableEntryFilterData.fromMarker(marker);
++						entries.push(IDiagnosticVariableEntryFilterData.toEntry(filter));
++					}
++				}
++				if (entries.length > 0) {
++					this._zone.value.widget.chatWidget.attachmentModel.addContext(...entries);
++					const msg = entries.length > 1
++						? localize('fixN', "Fix the attached problems")
++						: localize('fix1', "Fix the attached problem");
++					this._zone.value.widget.chatWidget.input.setValue(msg, true);
++					arg.message = msg;
++					this._zone.value.widget.chatWidget.inputEditor.setSelection(new Selection(1, 1, Number.MAX_SAFE_INTEGER, 1));
+ 				}
+-			}
+-			if (entries.length > 0) {
+-				this._zone.value.widget.chatWidget.attachmentModel.addContext(...entries);
+-				this._zone.value.widget.chatWidget.input.setValue(entries.length > 1
+-					? localize('fixN', "Fix the attached problems")
+-					: localize('fix1', "Fix the attached problem"),
+-					true
+-				);
+-				this._zone.value.widget.chatWidget.inputEditor.setSelection(new Selection(1, 1, Number.MAX_SAFE_INTEGER, 1));
+ 			}
+ 
+ 			// Check args
+diff --git a/src/vs/workbench/contrib/inlineChat/browser/inlineChatEditorAffordance.ts b/src/vs/workbench/contrib/inlineChat/browser/inlineChatEditorAffordance.ts
+index 1123978c2e8..e7773395fce 100644
+--- a/src/vs/workbench/contrib/inlineChat/browser/inlineChatEditorAffordance.ts
++++ b/src/vs/workbench/contrib/inlineChat/browser/inlineChatEditorAffordance.ts
+@@ -173,7 +173,7 @@ export class InlineChatEditorAffordance extends Disposable implements IContentWi
+ 				if (action instanceof MenuItemAction && action.id === quickFixCommandId) {
+ 					return instantiationService.createInstance(QuickFixActionViewItem, action, this._editor);
+ 				}
+-				if (action instanceof MenuItemAction && (action.id === ACTION_START || action.id === ACTION_ASK_IN_CHAT)) {
++				if (action instanceof MenuItemAction && (action.id === ACTION_START || action.id === ACTION_ASK_IN_CHAT || action.id === 'inlineChat.fixDiagnostics')) {
+ 					return instantiationService.createInstance(LabelWithKeybindingActionViewItem, action);
+ 				}
+ 				return undefined;
+diff --git a/src/vs/workbench/contrib/inlineChat/browser/inlineChatOverlayWidget.ts b/src/vs/workbench/contrib/inlineChat/browser/inlineChatOverlayWidget.ts
+index 1d27ddb7da5..2a997e1555f 100644
+--- a/src/vs/workbench/contrib/inlineChat/browser/inlineChatOverlayWidget.ts
++++ b/src/vs/workbench/contrib/inlineChat/browser/inlineChatOverlayWidget.ts
+@@ -225,9 +225,14 @@ export class InlineChatInputWidget extends Disposable {
+ 		}));
+ 
+ 		// ArrowUp on first action bar item moves focus back to input editor
++		// Escape on action bar hides the widget
+ 		this._store.add(dom.addDisposableListener(actionBar.domNode, 'keydown', (e: KeyboardEvent) => {
+ 			const event = new StandardKeyboardEvent(e);
+-			if (event.keyCode === KeyCode.UpArrow) {
++			if (event.keyCode === KeyCode.Escape) {
++				event.preventDefault();
++				event.stopPropagation();
++				this.hide();
++			} else if (event.keyCode === KeyCode.UpArrow) {
+ 				const firstItem = actionBar.viewItems[0] as BaseActionViewItem | undefined;
+ 				if (firstItem?.element && dom.isAncestorOfActiveElement(firstItem.element)) {
+ 					event.preventDefault();
+diff --git a/src/vs/workbench/contrib/inlineChat/common/inlineChat.ts b/src/vs/workbench/contrib/inlineChat/common/inlineChat.ts
+index 28c824b62be..5eb1312bd5a 100644
+--- a/src/vs/workbench/contrib/inlineChat/common/inlineChat.ts
++++ b/src/vs/workbench/contrib/inlineChat/common/inlineChat.ts
+@@ -22,6 +22,7 @@ export const enum InlineChatConfigKeys {
+ 	DefaultModel = 'inlineChat.defaultModel',
+ 	Affordance = 'inlineChat.affordance',
+ 	RenderMode = 'inlineChat.renderMode',
++	FixDiagnostics = 'inlineChat.fixDiagnostics',
+ }
+ 
+ Registry.as<IConfigurationRegistry>(Extensions.Configuration).registerConfiguration({
+@@ -83,6 +84,15 @@ Registry.as<IConfigurationRegistry>(Extensions.Configuration).registerConfigurat
+ 				mode: 'auto'
+ 			},
+ 			tags: ['experimental']
++		},
++		[InlineChatConfigKeys.FixDiagnostics]: {
++			description: localize('fixDiagnostics', "Controls whether the Fix action is shown for diagnostics in the editor."),
++			default: false,
++			type: 'boolean',
++			experiment: {
++				mode: 'auto'
++			},
++			tags: ['experimental']
+ 		}
+ 	}
+ });
+@@ -130,6 +140,7 @@ export const CTX_INLINE_CHAT_V2_ENABLED = ContextKeyExpr.or(
+ );
+ 
+ export const CTX_HOVER_MODE = ContextKeyExpr.equals('config.inlineChat.renderMode', 'hover');
++export const CTX_FIX_DIAGNOSTICS_ENABLED = ContextKeyExpr.equals('config.inlineChat.fixDiagnostics', true);
+ 
+ // --- (selected) action identifier
+ 

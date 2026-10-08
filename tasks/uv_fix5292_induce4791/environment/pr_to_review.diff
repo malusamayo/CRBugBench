@@ -1,0 +1,692 @@
+commit 12dd450a8e0f61ab503f9b93ecae2ccb049bcd06
+Author: Ibraheem Ahmed <ibraheem@ibraheem.ca>
+Date:   Fri Jul 19 11:11:48 2024 -0400
+
+    Implement `uv init` (#4791)
+    
+    ## Summary
+    
+    Implements the `uv init` command, which initializes a project
+    (`pyproject.toml`, `README.md`, `src/__init__.py`) in the current
+    directory, or in the given path. `uv init` also does workspace
+    discovery.
+    
+    Resolves https://github.com/astral-sh/uv/issues/1360.
+    
+    ---------
+    
+    Co-authored-by: Zanie Blue <contact@zanie.dev>
+
+diff --git a/crates/uv-cli/src/lib.rs b/crates/uv-cli/src/lib.rs
+index 552631362..b57e93650 100644
+--- a/crates/uv-cli/src/lib.rs
++++ b/crates/uv-cli/src/lib.rs
+@@ -358,6 +358,9 @@ pub enum PipCommand {
+ 
+ #[derive(Subcommand)]
+ pub enum ProjectCommand {
++    /// Initialize a project.
++    #[clap(hide = true)]
++    Init(InitArgs),
+     /// Run a command in the project environment.
+     #[clap(hide = true)]
+     #[command(
+@@ -1781,6 +1784,21 @@ impl ExternalCommand {
+     }
+ }
+ 
++#[derive(Args)]
++#[allow(clippy::struct_excessive_bools)]
++pub struct InitArgs {
++    /// The path of the project.
++    pub path: Option<String>,
++
++    /// The name of the project, defaults to the name of the directory.
++    #[arg(long)]
++    pub name: Option<PackageName>,
++
++    /// Do not create a readme file.
++    #[arg(long)]
++    pub no_readme: bool,
++}
++
+ #[derive(Args)]
+ #[allow(clippy::struct_excessive_bools)]
+ pub struct RunArgs {
+diff --git a/crates/uv-distribution/Cargo.toml b/crates/uv-distribution/Cargo.toml
+index 7a0f9c203..1d4fd1fe5 100644
+--- a/crates/uv-distribution/Cargo.toml
++++ b/crates/uv-distribution/Cargo.toml
+@@ -40,6 +40,7 @@ glob = { workspace = true }
+ nanoid = { workspace = true }
+ once_cell = { workspace = true }
+ path-absolutize = { workspace = true }
++path-slash = { workspace = true }
+ reqwest = { workspace = true }
+ reqwest-middleware = { workspace = true }
+ rmp-serde = { workspace = true }
+diff --git a/crates/uv-distribution/src/pyproject_mut.rs b/crates/uv-distribution/src/pyproject_mut.rs
+index 005853a21..40c8be738 100644
+--- a/crates/uv-distribution/src/pyproject_mut.rs
++++ b/crates/uv-distribution/src/pyproject_mut.rs
+@@ -1,6 +1,8 @@
++use std::path::Path;
+ use std::str::FromStr;
+ use std::{fmt, mem};
+ 
++use path_slash::PathExt;
+ use thiserror::Error;
+ use toml_edit::{Array, DocumentMut, Item, RawString, Table, TomlError, Value};
+ 
+@@ -26,6 +28,8 @@ pub enum Error {
+     MalformedDependencies,
+     #[error("Sources in `pyproject.toml` are malformed")]
+     MalformedSources,
++    #[error("Workspace in `pyproject.toml` is malformed")]
++    MalformedWorkspace,
+     #[error("Cannot perform ambiguous update; found multiple entries with matching package names")]
+     Ambiguous,
+ }
+@@ -38,6 +42,35 @@ impl PyProjectTomlMut {
+         })
+     }
+ 
++    /// Adds a project to the workspace.
++    pub fn add_workspace(&mut self, path: impl AsRef<Path>) -> Result<(), Error> {
++        // Get or create `tool.uv.workspace.members`.
++        let members = self
++            .doc
++            .entry("tool")
++            .or_insert(implicit())
++            .as_table_mut()
++            .ok_or(Error::MalformedWorkspace)?
++            .entry("uv")
++            .or_insert(implicit())
++            .as_table_mut()
++            .ok_or(Error::MalformedWorkspace)?
++            .entry("workspace")
++            .or_insert(Item::Table(Table::new()))
++            .as_table_mut()
++            .ok_or(Error::MalformedWorkspace)?
++            .entry("members")
++            .or_insert(Item::Value(Value::Array(Array::new())))
++            .as_array_mut()
++            .ok_or(Error::MalformedWorkspace)?;
++
++        // Add the path to the workspace.
++        // Use cross-platform slashes so the toml string type does not change
++        members.push(path.as_ref().to_slash_lossy().to_string());
++
++        Ok(())
++    }
++
+     /// Adds a dependency to `project.dependencies`.
+     pub fn add_dependency(
+         &mut self,
+diff --git a/crates/uv/Cargo.toml b/crates/uv/Cargo.toml
+index c7eda3747..86c7179de 100644
+--- a/crates/uv/Cargo.toml
++++ b/crates/uv/Cargo.toml
+@@ -53,6 +53,7 @@ fs-err = { workspace = true, features = ["tokio"] }
+ futures = { workspace = true }
+ indexmap = { workspace = true }
+ indicatif = { workspace = true }
++indoc = { workspace = true }
+ itertools = { workspace = true }
+ miette = { workspace = true, features = ["fancy"] }
+ owo-colors = { workspace = true }
+diff --git a/crates/uv/src/commands/mod.rs b/crates/uv/src/commands/mod.rs
+index 9deb21c6d..3ab3f20a1 100644
+--- a/crates/uv/src/commands/mod.rs
++++ b/crates/uv/src/commands/mod.rs
+@@ -19,6 +19,7 @@ pub(crate) use pip::sync::pip_sync;
+ pub(crate) use pip::tree::pip_tree;
+ pub(crate) use pip::uninstall::pip_uninstall;
+ pub(crate) use project::add::add;
++pub(crate) use project::init::init;
+ pub(crate) use project::lock::lock;
+ pub(crate) use project::remove::remove;
+ pub(crate) use project::run::run;
+diff --git a/crates/uv/src/commands/project/init.rs b/crates/uv/src/commands/project/init.rs
+new file mode 100644
+index 000000000..4946799d1
+--- /dev/null
++++ b/crates/uv/src/commands/project/init.rs
+@@ -0,0 +1,155 @@
++use std::fmt::Write;
++use std::path::PathBuf;
++
++use anyhow::Result;
++
++use owo_colors::OwoColorize;
++use pep508_rs::PackageName;
++use uv_configuration::PreviewMode;
++use uv_distribution::pyproject_mut::PyProjectTomlMut;
++use uv_distribution::{ProjectWorkspace, WorkspaceError};
++use uv_fs::Simplified;
++use uv_warnings::warn_user_once;
++
++use crate::commands::ExitStatus;
++use crate::printer::Printer;
++
++/// Add one or more packages to the project requirements.
++#[allow(clippy::single_match_else)]
++pub(crate) async fn init(
++    explicit_path: Option<String>,
++    name: Option<PackageName>,
++    no_readme: bool,
++    preview: PreviewMode,
++    printer: Printer,
++) -> Result<ExitStatus> {
++    if preview.is_disabled() {
++        warn_user_once!("`uv init` is experimental and may change without warning");
++    }
++
++    // Discover the current workspace, if it exists.
++    let current_dir = std::env::current_dir()?.canonicalize()?;
++    let workspace = match ProjectWorkspace::discover(&current_dir, None).await {
++        Ok(project) => Some(project),
++        Err(WorkspaceError::MissingPyprojectToml) => None,
++        Err(err) => return Err(err.into()),
++    };
++
++    // Default to the current directory if a path was not provided.
++    let path = match explicit_path {
++        None => current_dir.clone(),
++        Some(ref path) => PathBuf::from(path),
++    };
++
++    // Default to the directory name if a name was not provided.
++    let name = match name {
++        Some(name) => name,
++        None => {
++            let name = path
++                .file_name()
++                .and_then(|path| path.to_str())
++                .expect("Invalid package name");
++
++            PackageName::new(name.to_string())?
++        }
++    };
++
++    // Make sure a project does not already exist in the given directory.
++    if path.join("pyproject.toml").exists() {
++        let path = path
++            .simple_canonicalize()
++            .unwrap_or_else(|_| path.simplified().to_path_buf());
++
++        anyhow::bail!(
++            "Project is already initialized in {}",
++            path.display().cyan()
++        );
++    }
++
++    // Create the directory for the project.
++    let src_dir = path.join("src").join(name.as_ref());
++    fs_err::create_dir_all(&src_dir)?;
++
++    // Create the `pyproject.toml`.
++    let pyproject = indoc::formatdoc! {r#"
++        [project]
++        name = "{name}"
++        version = "0.1.0"
++        description = "Add your description here"{readme}
++        dependencies = []
++
++        [tool.uv]
++        dev-dependencies = []
++        "#,
++        readme = if no_readme { "" } else { "\nreadme = \"README.md\"" },
++    };
++
++    fs_err::write(path.join("pyproject.toml"), pyproject)?;
++
++    // Create `src/{name}/__init__.py` if it does not already exist.
++    let init_py = src_dir.join("__init__.py");
++    if !init_py.try_exists()? {
++        fs_err::write(
++            init_py,
++            indoc::formatdoc! {r#"
++            def hello() -> str:
++                return "Hello from {name}!"
++            "#},
++        )?;
++    }
++
++    // Create the `README.md` if it does not already exist.
++    if !no_readme {
++        let readme = path.join("README.md");
++        if !readme.exists() {
++            fs_err::write(readme, String::new())?;
++        }
++    }
++
++    if let Some(workspace) = workspace {
++        // Add the package to the workspace.
++        let mut pyproject =
++            PyProjectTomlMut::from_toml(workspace.current_project().pyproject_toml())?;
++        pyproject.add_workspace(path.strip_prefix(workspace.project_root())?)?;
++
++        // Save the modified `pyproject.toml`.
++        fs_err::write(
++            workspace.current_project().root().join("pyproject.toml"),
++            pyproject.to_string(),
++        )?;
++
++        writeln!(
++            printer.stderr(),
++            "Adding {} as member of workspace {}",
++            name.cyan(),
++            workspace
++                .workspace()
++                .install_path()
++                .simplified_display()
++                .cyan()
++        )?;
++    }
++
++    match explicit_path {
++        // Initialized a project in the current directory.
++        None => {
++            writeln!(printer.stderr(), "Initialized project {}", name.cyan())?;
++        }
++
++        // Initialized a project in the given directory.
++        Some(path) => {
++            let path = path
++                .simple_canonicalize()
++                .unwrap_or_else(|_| path.simplified().to_path_buf());
++
++            writeln!(
++                printer.stderr(),
++                "Initialized project {} in {}",
++                name.cyan(),
++                path.display().cyan()
++            )?;
++        }
++    }
++
++    Ok(ExitStatus::Success)
++}
+diff --git a/crates/uv/src/commands/project/mod.rs b/crates/uv/src/commands/project/mod.rs
+index a56ca68b3..ed84dc6b8 100644
+--- a/crates/uv/src/commands/project/mod.rs
++++ b/crates/uv/src/commands/project/mod.rs
+@@ -35,6 +35,7 @@ use crate::settings::{InstallerSettingsRef, ResolverInstallerSettings, ResolverS
+ 
+ pub(crate) mod add;
+ pub(crate) mod environment;
++pub(crate) mod init;
+ pub(crate) mod lock;
+ pub(crate) mod remove;
+ pub(crate) mod run;
+diff --git a/crates/uv/src/lib.rs b/crates/uv/src/lib.rs
+index 43ced139d..f1be81a55 100644
+--- a/crates/uv/src/lib.rs
++++ b/crates/uv/src/lib.rs
+@@ -821,6 +821,20 @@ async fn run_project(
+     }
+ 
+     match *project_command {
++        ProjectCommand::Init(args) => {
++            // Resolve the settings from the command-line arguments and workspace configuration.
++            let args = settings::InitSettings::resolve(args, filesystem);
++            show_settings!(args);
++
++            commands::init(
++                args.path,
++                args.name,
++                args.no_readme,
++                globals.preview,
++                printer,
++            )
++            .await
++        }
+         ProjectCommand::Run(args) => {
+             // Resolve the settings from the command-line arguments and workspace configuration.
+             let args = settings::RunSettings::resolve(args, filesystem);
+diff --git a/crates/uv/src/settings.rs b/crates/uv/src/settings.rs
+index cbcebd1bf..2e64b4b68 100644
+--- a/crates/uv/src/settings.rs
++++ b/crates/uv/src/settings.rs
+@@ -11,8 +11,8 @@ use pypi_types::Requirement;
+ use uv_cache::{CacheArgs, Refresh};
+ use uv_cli::options::{flag, resolver_installer_options, resolver_options};
+ use uv_cli::{
+-    AddArgs, ColorChoice, Commands, ExternalCommand, GlobalArgs, ListFormat, LockArgs, Maybe,
+-    PipCheckArgs, PipCompileArgs, PipFreezeArgs, PipInstallArgs, PipListArgs, PipShowArgs,
++    AddArgs, ColorChoice, Commands, ExternalCommand, GlobalArgs, InitArgs, ListFormat, LockArgs,
++    Maybe, PipCheckArgs, PipCompileArgs, PipFreezeArgs, PipInstallArgs, PipListArgs, PipShowArgs,
+     PipSyncArgs, PipTreeArgs, PipUninstallArgs, PythonFindArgs, PythonInstallArgs, PythonListArgs,
+     PythonPinArgs, PythonUninstallArgs, RemoveArgs, RunArgs, SyncArgs, ToolDirArgs,
+     ToolInstallArgs, ToolListArgs, ToolRunArgs, ToolUninstallArgs, TreeArgs, VenvArgs,
+@@ -147,6 +147,33 @@ impl CacheSettings {
+     }
+ }
+ 
++/// The resolved settings to use for a `init` invocation.
++#[allow(clippy::struct_excessive_bools)]
++#[derive(Debug, Clone)]
++pub(crate) struct InitSettings {
++    pub(crate) path: Option<String>,
++    pub(crate) name: Option<PackageName>,
++    pub(crate) no_readme: bool,
++}
++
++impl InitSettings {
++    /// Resolve the [`InitSettings`] from the CLI and filesystem configuration.
++    #[allow(clippy::needless_pass_by_value)]
++    pub(crate) fn resolve(args: InitArgs, _filesystem: Option<FilesystemOptions>) -> Self {
++        let InitArgs {
++            path,
++            name,
++            no_readme,
++        } = args;
++
++        Self {
++            path,
++            name,
++            no_readme,
++        }
++    }
++}
++
+ /// The resolved settings to use for a `run` invocation.
+ #[allow(clippy::struct_excessive_bools)]
+ #[derive(Debug, Clone)]
+diff --git a/crates/uv/tests/common/mod.rs b/crates/uv/tests/common/mod.rs
+index 7559b8ddc..fac8bb072 100644
+--- a/crates/uv/tests/common/mod.rs
++++ b/crates/uv/tests/common/mod.rs
+@@ -406,6 +406,14 @@ impl TestContext {
+         command
+     }
+ 
++    /// Create a `uv init` command with options shared across scenarios.
++    pub fn init(&self) -> Command {
++        let mut command = Command::new(get_bin());
++        command.arg("init");
++        self.add_shared_args(&mut command);
++        command
++    }
++
+     /// Create a `uv sync` command with options shared across scenarios.
+     pub fn sync(&self) -> Command {
+         let mut command = Command::new(get_bin());
+diff --git a/crates/uv/tests/init.rs b/crates/uv/tests/init.rs
+new file mode 100644
+index 000000000..172b5fb6f
+--- /dev/null
++++ b/crates/uv/tests/init.rs
+@@ -0,0 +1,271 @@
++#![cfg(all(feature = "python", feature = "pypi"))]
++
++use anyhow::Result;
++use assert_fs::prelude::*;
++use indoc::indoc;
++use insta::assert_snapshot;
++
++use common::{uv_snapshot, TestContext};
++
++mod common;
++
++#[test]
++fn init() -> Result<()> {
++    let context = TestContext::new("3.12");
++
++    uv_snapshot!(context.filters(), context.init().arg("foo"), @r###"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++
++    ----- stderr -----
++    warning: `uv init` is experimental and may change without warning
++    Initialized project foo in [TEMP_DIR]/foo
++    "###);
++
++    let pyproject = fs_err::read_to_string(context.temp_dir.join("foo/pyproject.toml"))?;
++    let init_py = fs_err::read_to_string(context.temp_dir.join("foo/src/foo/__init__.py"))?;
++    let _ = fs_err::read_to_string(context.temp_dir.join("foo/README.md")).unwrap();
++
++    insta::with_settings!({
++        filters => context.filters(),
++    }, {
++        assert_snapshot!(
++            pyproject, @r###"
++        [project]
++        name = "foo"
++        version = "0.1.0"
++        description = "Add your description here"
++        readme = "README.md"
++        dependencies = []
++
++        [tool.uv]
++        dev-dependencies = []
++        "###
++        );
++    });
++
++    insta::with_settings!({
++        filters => context.filters(),
++    }, {
++        assert_snapshot!(
++            init_py, @r###"
++        def hello() -> str:
++            return "Hello from foo!"
++        "###
++        );
++    });
++
++    // Run `uv lock` in the new project.
++    uv_snapshot!(context.filters(), context.lock().current_dir(context.temp_dir.join("foo")), @r###"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++
++    ----- stderr -----
++    warning: `uv lock` is experimental and may change without warning
++    Using Python 3.12.[X] interpreter at: [PYTHON-3.12]
++    warning: No `requires-python` field found in the workspace. Defaulting to `>=3.12`.
++    Resolved 1 package in [TIME]
++    "###);
++
++    Ok(())
++}
++
++#[test]
++fn init_no_readme() -> Result<()> {
++    let context = TestContext::new("3.12");
++
++    uv_snapshot!(context.filters(), context.init().arg("foo").arg("--no-readme"), @r###"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++
++    ----- stderr -----
++    warning: `uv init` is experimental and may change without warning
++    Initialized project foo in [TEMP_DIR]/foo
++    "###);
++
++    let pyproject = fs_err::read_to_string(context.temp_dir.join("foo/pyproject.toml"))?;
++    let _ = fs_err::read_to_string(context.temp_dir.join("foo/README.md")).unwrap_err();
++
++    insta::with_settings!({
++        filters => context.filters(),
++    }, {
++        assert_snapshot!(
++            pyproject, @r###"
++        [project]
++        name = "foo"
++        version = "0.1.0"
++        description = "Add your description here"
++        dependencies = []
++
++        [tool.uv]
++        dev-dependencies = []
++        "###
++        );
++    });
++
++    Ok(())
++}
++
++#[test]
++fn current_dir() -> Result<()> {
++    let context = TestContext::new("3.12");
++
++    let dir = context.temp_dir.join("foo");
++    fs_err::create_dir(&dir)?;
++
++    uv_snapshot!(context.filters(), context.init().current_dir(&dir), @r###"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++
++    ----- stderr -----
++    warning: `uv init` is experimental and may change without warning
++    Initialized project foo
++    "###);
++
++    let pyproject = fs_err::read_to_string(dir.join("pyproject.toml"))?;
++    let init_py = fs_err::read_to_string(dir.join("src/foo/__init__.py"))?;
++    let _ = fs_err::read_to_string(dir.join("README.md")).unwrap();
++
++    insta::with_settings!({
++        filters => context.filters(),
++    }, {
++        assert_snapshot!(
++            pyproject, @r###"
++        [project]
++        name = "foo"
++        version = "0.1.0"
++        description = "Add your description here"
++        readme = "README.md"
++        dependencies = []
++
++        [tool.uv]
++        dev-dependencies = []
++        "###
++        );
++    });
++
++    insta::with_settings!({
++        filters => context.filters(),
++    }, {
++        assert_snapshot!(
++            init_py, @r###"
++        def hello() -> str:
++            return "Hello from foo!"
++        "###
++        );
++    });
++
++    // Run `uv lock` in the new project.
++    uv_snapshot!(context.filters(), context.lock().current_dir(&dir), @r###"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++
++    ----- stderr -----
++    warning: `uv lock` is experimental and may change without warning
++    Using Python 3.12.[X] interpreter at: [PYTHON-3.12]
++    warning: No `requires-python` field found in the workspace. Defaulting to `>=3.12`.
++    Resolved 1 package in [TIME]
++    "###);
++
++    Ok(())
++}
++
++#[test]
++fn init_workspace() -> Result<()> {
++    let context = TestContext::new("3.12");
++
++    let pyproject_toml = context.temp_dir.child("pyproject.toml");
++    pyproject_toml.write_str(indoc! {
++        r#"
++        [project]
++        name = "project"
++        version = "0.1.0"
++        requires-python = ">=3.12"
++        dependencies = ["anyio==3.7.0"]
++        "#,
++    })?;
++
++    let child = context.temp_dir.join("foo");
++    fs_err::create_dir(&child)?;
++
++    uv_snapshot!(context.filters(), context.init().current_dir(&child), @r###"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++
++    ----- stderr -----
++    warning: `uv init` is experimental and may change without warning
++    Adding foo as member of workspace [TEMP_DIR]/
++    Initialized project foo
++    "###);
++
++    let pyproject = fs_err::read_to_string(child.join("pyproject.toml"))?;
++    let init_py = fs_err::read_to_string(child.join("src/foo/__init__.py"))?;
++
++    let _ = fs_err::read_to_string(child.join("README.md")).unwrap();
++
++    insta::with_settings!({
++        filters => context.filters(),
++    }, {
++        assert_snapshot!(
++            pyproject, @r###"
++        [project]
++        name = "foo"
++        version = "0.1.0"
++        description = "Add your description here"
++        readme = "README.md"
++        dependencies = []
++
++        [tool.uv]
++        dev-dependencies = []
++        "###
++        );
++    });
++
++    insta::with_settings!({
++        filters => context.filters(),
++    }, {
++        assert_snapshot!(
++            init_py, @r###"
++        def hello() -> str:
++            return "Hello from foo!"
++        "###
++        );
++    });
++
++    let workspace = fs_err::read_to_string(context.temp_dir.join("pyproject.toml"))?;
++    insta::with_settings!({
++        filters => context.filters(),
++    }, {
++        assert_snapshot!(
++            workspace, @r###"
++        [project]
++        name = "project"
++        version = "0.1.0"
++        requires-python = ">=3.12"
++        dependencies = ["anyio==3.7.0"]
++
++        [tool.uv.workspace]
++        members = ["foo"]
++        "###
++        );
++    });
++
++    // Run `uv lock` in the workspace.
++    uv_snapshot!(context.filters(), context.lock(), @r###"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++
++    ----- stderr -----
++    warning: `uv lock` is experimental and may change without warning
++    Resolved 5 packages in [TIME]
++    "###);
++
++    Ok(())
++}

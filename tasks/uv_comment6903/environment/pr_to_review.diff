@@ -1,0 +1,2215 @@
+diff --git a/crates/uv-build/src/lib.rs b/crates/uv-build/src/lib.rs
+index 479a4b35d5f..2915256abb4 100644
+--- a/crates/uv-build/src/lib.rs
++++ b/crates/uv-build/src/lib.rs
+@@ -13,16 +13,17 @@ use std::ffi::OsString;
+ use std::fmt::{Display, Formatter};
+ use std::io;
+ use std::path::{Path, PathBuf};
+-use std::process::{ExitStatus, Output};
++use std::process::ExitStatus;
+ use std::rc::Rc;
+ use std::str::FromStr;
+ use std::sync::LazyLock;
+ use std::{env, iter};
+ use tempfile::{tempdir_in, TempDir};
+ use thiserror::Error;
++use tokio::io::AsyncBufReadExt;
+ use tokio::process::Command;
+ use tokio::sync::{Mutex, Semaphore};
+-use tracing::{debug, info_span, instrument, Instrument};
++use tracing::{debug, error, info_span, instrument, Instrument};
+ 
+ use distribution_types::Resolution;
+ use pep440_rs::Version;
+@@ -79,8 +80,8 @@ static DEFAULT_BACKEND: LazyLock<Pep517Backend> = LazyLock::new(|| Pep517Backend
+ pub enum Error {
+     #[error(transparent)]
+     Io(#[from] io::Error),
+-    #[error("Invalid source distribution: {0}")]
+-    InvalidSourceDist(String),
++    #[error("{} does not appear to be a Python project, as neither `pyproject.toml` nor `setup.py` is present in the directory", _0.simplified_display())]
++    InvalidSourceDist(PathBuf),
+     #[error("Invalid `pyproject.toml`")]
+     InvalidPyprojectToml(#[from] toml::de::Error),
+     #[error("Editable installs with setup.py legacy builds are unsupported, please specify a build backend in pyproject.toml")]
+@@ -89,7 +90,7 @@ pub enum Error {
+     RequirementsInstall(&'static str, #[source] anyhow::Error),
+     #[error("Failed to create temporary virtualenv")]
+     Virtualenv(#[from] uv_virtualenv::Error),
+-    #[error("Failed to run {0}")]
++    #[error("Failed to run `{0}`")]
+     CommandFailed(PathBuf, #[source] io::Error),
+     #[error("{message} with {exit_code}\n--- stdout:\n{stdout}\n--- stderr:\n{stderr}\n---")]
+     BuildBackend {
+@@ -159,14 +160,11 @@ impl Display for MissingHeaderCause {
+ impl Error {
+     fn from_command_output(
+         message: String,
+-        output: &Output,
++        output: &PythonRunnerOutput,
+         version_id: impl Into<String>,
+     ) -> Self {
+-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+-
+-        // In the cases i've seen it was the 5th and 3rd last line (see test case), 10 seems like a reasonable cutoff
+-        let missing_library = stderr.lines().rev().take(10).find_map(|line| {
++        // In the cases I've seen it was the 5th and 3rd last line (see test case), 10 seems like a reasonable cutoff.
++        let missing_library = output.stderr.iter().rev().take(10).find_map(|line| {
+             if let Some((_, [header])) = MISSING_HEADER_RE_GCC
+                 .captures(line.trim())
+                 .or(MISSING_HEADER_RE_CLANG.captures(line.trim()))
+@@ -191,8 +189,8 @@ impl Error {
+             return Self::MissingHeader {
+                 message,
+                 exit_code: output.status,
+-                stdout,
+-                stderr,
++                stdout: output.stdout.iter().join("\n"),
++                stderr: output.stderr.iter().join("\n"),
+                 missing_header_cause: MissingHeaderCause {
+                     missing_library,
+                     version_id: version_id.into(),
+@@ -203,8 +201,8 @@ impl Error {
+         Self::BuildBackend {
+             message,
+             exit_code: output.status,
+-            stdout,
+-            stderr,
++            stdout: output.stdout.iter().join("\n"),
++            stderr: output.stderr.iter().join("\n"),
+         }
+     }
+ }
+@@ -353,7 +351,7 @@ pub struct SourceBuildContext {
+     default_resolution: Rc<Mutex<Option<Resolution>>>,
+ }
+ 
+-/// Holds the state through a series of PEP 517 frontend to backend calls or a single setup.py
++/// Holds the state through a series of PEP 517 frontend to backend calls or a single `setup.py`
+ /// invocation.
+ ///
+ /// This keeps both the temp dir and the result of a potential `prepare_metadata_for_build_wheel`
+@@ -454,7 +452,7 @@ impl SourceBuild {
+                 .install(&resolved_requirements, &venv)
+                 .await
+                 .map_err(|err| {
+-                    Error::RequirementsInstall("build-system.requires (install)", err)
++                    Error::RequirementsInstall("`build-system.requires` (install)", err)
+                 })?;
+         }
+ 
+@@ -540,7 +538,7 @@ impl SourceBuild {
+                         .resolve(&default_backend.requirements)
+                         .await
+                         .map_err(|err| {
+-                            Error::RequirementsInstall("setup.py build (resolve)", err)
++                            Error::RequirementsInstall("`setup.py` build (resolve)", err)
+                         })?;
+                     *resolution = Some(resolved_requirements.clone());
+                     resolved_requirements
+@@ -550,7 +548,7 @@ impl SourceBuild {
+                     .resolve(&pep517_backend.requirements)
+                     .await
+                     .map_err(|err| {
+-                        Error::RequirementsInstall("build-system.requires (resolve)", err)
++                        Error::RequirementsInstall("`build-system.requires` (resolve)", err)
+                     })?
+             },
+         )
+@@ -595,8 +593,7 @@ impl SourceBuild {
+                 // We require either a `pyproject.toml` or a `setup.py` file at the top level.
+                 if !source_tree.join("setup.py").is_file() {
+                     return Err(Box::new(Error::InvalidSourceDist(
+-                        "The archive contains neither a `pyproject.toml` nor a `setup.py` file at the top level"
+-                            .to_string(),
++                        source_tree.to_path_buf(),
+                     )));
+                 }
+ 
+@@ -683,8 +680,8 @@ impl SourceBuild {
+         };
+         let span = info_span!(
+             "run_python_script",
+-            script=format!("prepare_metadata_for_build_{}", self.build_kind),
+-            python_version = %self.venv.interpreter().python_version()
++            version_id = &self.version_id,
++            script = format!("prepare_metadata_for_build_{}", self.build_kind),
+         );
+         let output = self
+             .runner
+@@ -713,19 +710,19 @@ impl SourceBuild {
+         Ok(self.metadata_directory.clone())
+     }
+ 
+-    /// Build a source distribution from an archive (`.zip` or `.tar.gz`), return the location of the
+-    /// built wheel.
++    /// Build a distribution from an archive (`.zip` or `.tar.gz`) or source tree, and return the
++    /// location of the built distribution.
+     ///
+-    /// The location will be inside `temp_dir`, i.e. you must use the wheel before dropping the temp
+-    /// dir.
++    /// The location will be inside `temp_dir`, i.e., you must use the distribution before dropping
++    /// the temporary directory.
+     ///
+     /// <https://packaging.python.org/en/latest/specifications/source-distribution-format/>
+     #[instrument(skip_all, fields(version_id = self.version_id))]
+-    pub async fn build_wheel(&self, wheel_dir: &Path) -> Result<String, Error> {
++    pub async fn build(&self, wheel_dir: &Path) -> Result<String, Error> {
+         // The build scripts run with the extracted root as cwd, so they need the absolute path.
+-        let wheel_dir = fs::canonicalize(wheel_dir)?;
++        let wheel_dir = std::path::absolute(wheel_dir)?;
+ 
+-        // Prevent clashes from two uv processes building wheels in parallel.
++        // Prevent clashes from two uv processes building distributions in parallel.
+         let tmp_dir = tempdir_in(&wheel_dir)?;
+         let filename = self
+             .pep517_build(tmp_dir.path(), &self.pep517_backend)
+@@ -737,86 +734,159 @@ impl SourceBuild {
+         Ok(filename)
+     }
+ 
++    /// Perform a PEP 517 build for a wheel or source distribution (sdist).
+     async fn pep517_build(
+         &self,
+-        wheel_dir: &Path,
++        output_dir: &Path,
+         pep517_backend: &Pep517Backend,
+     ) -> Result<String, Error> {
+-        let metadata_directory = self
+-            .metadata_directory
+-            .as_deref()
+-            .map_or("None".to_string(), |path| {
+-                format!(r#""{}""#, path.escape_for_python())
+-            });
+-
+-        // Write the hook output to a file so that we can read it back reliably.
+-        let outfile = self
+-            .temp_dir
+-            .path()
+-            .join(format!("build_{}.txt", self.build_kind));
+-
+-        debug!(
+-            r#"Calling `{}.build_{}("{}", {}, {})`"#,
+-            pep517_backend.backend,
+-            self.build_kind,
+-            wheel_dir.escape_for_python(),
+-            self.config_settings.escape_for_python(),
+-            metadata_directory,
+-        );
+-        let script = formatdoc! {
+-            r#"
+-            {}
++        match self.build_kind {
++            BuildKind::Sdist => {
++                // Write the hook output to a file so that we can read it back reliably.
++                let outfile = self
++                    .temp_dir
++                    .path()
++                    .join(format!("build_{}.txt", self.build_kind));
++
++                debug!(
++                    r#"Calling `{}.build_{}("{}", {})`"#,
++                    pep517_backend.backend,
++                    self.build_kind,
++                    output_dir.escape_for_python(),
++                    self.config_settings.escape_for_python(),
++                );
++                let script = formatdoc! {
++                    r#"
++                    {}
++
++                    sdist_filename = backend.build_{}("{}", {})
++                    with open("{}", "w") as fp:
++                        fp.write(sdist_filename)
++                    "#,
++                    pep517_backend.backend_import(),
++                    self.build_kind,
++                    output_dir.escape_for_python(),
++                    self.config_settings.escape_for_python(),
++                    outfile.escape_for_python()
++                };
++                let span = info_span!(
++                    "run_python_script",
++                    version_id = &self.version_id,
++                    script = format!("build_{}", self.build_kind),
++                );
++                let output = self
++                    .runner
++                    .run_script(
++                        &self.venv,
++                        &script,
++                        &self.source_tree,
++                        &self.environment_variables,
++                        &self.modified_path,
++                    )
++                    .instrument(span)
++                    .await?;
++                if !output.status.success() {
++                    return Err(Error::from_command_output(
++                        format!(
++                            "Build backend failed to build sdist through `build_{}()`",
++                            self.build_kind
++                        ),
++                        &output,
++                        &self.version_id,
++                    ));
++                }
+ 
+-            wheel_filename = backend.build_{}("{}", {}, {})
+-            with open("{}", "w") as fp:
+-                fp.write(wheel_filename)
+-            "#,
+-            pep517_backend.backend_import(),
+-            self.build_kind,
+-            wheel_dir.escape_for_python(),
+-            self.config_settings.escape_for_python(),
+-            metadata_directory,
+-            outfile.escape_for_python()
+-        };
+-        let span = info_span!(
+-            "run_python_script",
+-            script=format!("build_{}", self.build_kind),
+-            python_version = %self.venv.interpreter().python_version()
+-        );
+-        let output = self
+-            .runner
+-            .run_script(
+-                &self.venv,
+-                &script,
+-                &self.source_tree,
+-                &self.environment_variables,
+-                &self.modified_path,
+-            )
+-            .instrument(span)
+-            .await?;
+-        if !output.status.success() {
+-            return Err(Error::from_command_output(
+-                format!(
+-                    "Build backend failed to build wheel through `build_{}()`",
+-                    self.build_kind
+-                ),
+-                &output,
+-                &self.version_id,
+-            ));
+-        }
++                let distribution_filename = fs::read_to_string(&outfile)?;
++                if !output_dir.join(&distribution_filename).is_file() {
++                    return Err(Error::from_command_output(
++                        format!(
++                            "Build backend failed to produce sdist through `build_{}()`: `{distribution_filename}` not found",
++                            self.build_kind
++                        ),
++                        &output,
++                        &self.version_id,
++                    ));
++                }
++                Ok(distribution_filename)
++            }
++            BuildKind::Wheel | BuildKind::Editable => {
++                let metadata_directory = self
++                    .metadata_directory
++                    .as_deref()
++                    .map_or("None".to_string(), |path| {
++                        format!(r#""{}""#, path.escape_for_python())
++                    });
++
++                // Write the hook output to a file so that we can read it back reliably.
++                let outfile = self
++                    .temp_dir
++                    .path()
++                    .join(format!("build_{}.txt", self.build_kind));
++
++                debug!(
++                    r#"Calling `{}.build_{}("{}", {}, {})`"#,
++                    pep517_backend.backend,
++                    self.build_kind,
++                    output_dir.escape_for_python(),
++                    self.config_settings.escape_for_python(),
++                    metadata_directory,
++                );
++                let script = formatdoc! {
++                    r#"
++                    {}
++
++                    wheel_filename = backend.build_{}("{}", {}, {})
++                    with open("{}", "w") as fp:
++                        fp.write(wheel_filename)
++                    "#,
++                    pep517_backend.backend_import(),
++                    self.build_kind,
++                    output_dir.escape_for_python(),
++                    self.config_settings.escape_for_python(),
++                    metadata_directory,
++                    outfile.escape_for_python()
++                };
++                let span = info_span!(
++                    "run_python_script",
++                    version_id = &self.version_id,
++                    script = format!("build_{}", self.build_kind),
++                );
++                let output = self
++                    .runner
++                    .run_script(
++                        &self.venv,
++                        &script,
++                        &self.source_tree,
++                        &self.environment_variables,
++                        &self.modified_path,
++                    )
++                    .instrument(span)
++                    .await?;
++                if !output.status.success() {
++                    return Err(Error::from_command_output(
++                        format!(
++                            "Build backend failed to build wheel through `build_{}()`",
++                            self.build_kind
++                        ),
++                        &output,
++                        &self.version_id,
++                    ));
++                }
+ 
+-        let distribution_filename = fs::read_to_string(&outfile)?;
+-        if !wheel_dir.join(&distribution_filename).is_file() {
+-            return Err(Error::from_command_output(
+-                format!(
+-                    "Build backend failed to produce wheel through `build_{}()`: `{distribution_filename}` not found",
+-                    self.build_kind
+-                ),
+-                &output,
+-                &self.version_id,
+-            ));
++                let distribution_filename = fs::read_to_string(&outfile)?;
++                if !output_dir.join(&distribution_filename).is_file() {
++                    return Err(Error::from_command_output(
++                        format!(
++                            "Build backend failed to produce through `build_{}()`: `{distribution_filename}` not found",
++                            self.build_kind
++                        ),
++                        &output,
++                        &self.version_id,
++                    ));
++                }
++                Ok(distribution_filename)
++            }
+         }
+-        Ok(distribution_filename)
+     }
+ }
+ 
+@@ -826,7 +896,7 @@ impl SourceBuildTrait for SourceBuild {
+     }
+ 
+     async fn wheel<'a>(&'a self, wheel_dir: &'a Path) -> anyhow::Result<String> {
+-        Ok(self.build_wheel(wheel_dir).await?)
++        Ok(self.build(wheel_dir).await?)
+     }
+ }
+ 
+@@ -943,12 +1013,12 @@ async fn create_pep517_build_environment(
+         let resolution = build_context
+             .resolve(&requirements)
+             .await
+-            .map_err(|err| Error::RequirementsInstall("build-system.requires (resolve)", err))?;
++            .map_err(|err| Error::RequirementsInstall("`build-system.requires` (resolve)", err))?;
+ 
+         build_context
+             .install(&resolution, venv)
+             .await
+-            .map_err(|err| Error::RequirementsInstall("build-system.requires (install)", err))?;
++            .map_err(|err| Error::RequirementsInstall("`build-system.requires` (install)", err))?;
+     }
+ 
+     Ok(())
+@@ -956,10 +1026,18 @@ async fn create_pep517_build_environment(
+ 
+ /// A runner that manages the execution of external python processes with a
+ /// concurrency limit.
++#[derive(Debug)]
+ struct PythonRunner {
+     control: Semaphore,
+ }
+ 
++#[derive(Debug)]
++struct PythonRunnerOutput {
++    stdout: Vec<String>,
++    stderr: Vec<String>,
++    status: ExitStatus,
++}
++
+ impl PythonRunner {
+     /// Create a `PythonRunner` with the provided concurrency limit.
+     fn new(concurrency: usize) -> PythonRunner {
+@@ -981,36 +1059,79 @@ impl PythonRunner {
+         source_tree: &Path,
+         environment_variables: &FxHashMap<OsString, OsString>,
+         modified_path: &OsString,
+-    ) -> Result<Output, Error> {
++    ) -> Result<PythonRunnerOutput, Error> {
+         let _permit = self.control.acquire().await.unwrap();
+ 
+-        Command::new(venv.python_executable())
++        let mut child = Command::new(venv.python_executable())
+             .args(["-c", script])
+             .current_dir(source_tree.simplified())
+-            // Pass in remaining environment variables
+             .envs(environment_variables)
+-            // Set the modified PATH
+             .env("PATH", modified_path)
+-            // Activate the venv
+             .env("VIRTUAL_ENV", venv.root())
+             .env("CLICOLOR_FORCE", "1")
+-            .output()
++            .stdout(std::process::Stdio::piped())
++            .stderr(std::process::Stdio::piped())
++            .spawn()
++            .expect("Failed to spawn Python script");
++
++        // Create buffers to capture `stdout` and `stderr`.
++        let mut stdout_buf = Vec::new();
++        let mut stderr_buf = Vec::new();
++
++        // Create separate readers for `stdout` and `stderr`.
++        let mut stdout_reader = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
++        let mut stderr_reader = tokio::io::BufReader::new(child.stderr.take().unwrap()).lines();
++
++        loop {
++            tokio::select! {
++                line = stdout_reader.next_line() => {
++                    match line {
++                        Ok(Some(line)) => {
++                            debug!("{line}");
++                            stdout_buf.push(line);
++                        },
++                        Ok(None) => break,
++                        Err(err) => return Err(Error::CommandFailed(venv.python_executable().to_path_buf(), err)),
++                    }
++                },
++                line = stderr_reader.next_line() => {
++                    match line {
++                        Ok(Some(line)) => {
++                            debug!("{line}");
++                            stderr_buf.push(line);
++                        },
++                        Ok(None) => break,
++                        Err(err) => return Err(Error::CommandFailed(venv.python_executable().to_path_buf(), err)),
++                    }
++                },
++            }
++        }
++
++        // Wait for the child process to finish.
++        let status = child
++            .wait()
+             .await
+-            .map_err(|err| Error::CommandFailed(venv.python_executable().to_path_buf(), err))
++            .map_err(|err| Error::CommandFailed(venv.python_executable().to_path_buf(), err))?;
++
++        Ok(PythonRunnerOutput {
++            stdout: stdout_buf,
++            stderr: stderr_buf,
++            status,
++        })
+     }
+ }
+ 
+ #[cfg(test)]
+ mod test {
+-    use std::process::{ExitStatus, Output};
++    use std::process::ExitStatus;
+ 
+     use indoc::indoc;
+ 
+-    use crate::Error;
++    use crate::{Error, PythonRunnerOutput};
+ 
+     #[test]
+     fn missing_header() {
+-        let output = Output {
++        let output = PythonRunnerOutput {
+             status: ExitStatus::default(), // This is wrong but `from_raw` is platform-gated.
+             stdout: indoc!(r"
+                 running bdist_wheel
+@@ -1019,7 +1140,7 @@ mod test {
+                 creating build/temp.linux-x86_64-cpython-39/pygraphviz
+                 gcc -Wno-unused-result -Wsign-compare -DNDEBUG -g -fwrapv -O3 -Wall -DOPENSSL_NO_SSL3 -fPIC -DSWIG_PYTHON_STRICT_BYTE_CHAR -I/tmp/.tmpy6vVes/.venv/include -I/home/konsti/.pyenv/versions/3.9.18/include/python3.9 -c pygraphviz/graphviz_wrap.c -o build/temp.linux-x86_64-cpython-39/pygraphviz/graphviz_wrap.o
+                 "
+-            ).as_bytes().to_vec(),
++            ).lines().map(ToString::to_string).collect(),
+             stderr: indoc!(r#"
+                 warning: no files found matching '*.png' under directory 'doc'
+                 warning: no files found matching '*.txt' under directory 'doc'
+@@ -1031,7 +1152,7 @@ mod test {
+                 compilation terminated.
+                 error: command '/usr/bin/gcc' failed with exit code 1
+                 "#
+-            ).as_bytes().to_vec(),
++            ).lines().map(ToString::to_string).collect(),
+         };
+ 
+         let err = Error::from_command_output(
+@@ -1070,20 +1191,20 @@ mod test {
+ 
+     #[test]
+     fn missing_linker_library() {
+-        let output = Output {
++        let output = PythonRunnerOutput {
+             status: ExitStatus::default(), // This is wrong but `from_raw` is platform-gated.
+             stdout: Vec::new(),
+             stderr: indoc!(
+                 r"
+-                1099 |     n = strlen(p);
+-                     |         ^~~~~~~~~
++               1099 |     n = strlen(p);
++                    |         ^~~~~~~~~
+                /usr/bin/ld: cannot find -lncurses: No such file or directory
+                collect2: error: ld returned 1 exit status
+-               error: command '/usr/bin/x86_64-linux-gnu-gcc' failed with exit code 1
+-                "
++               error: command '/usr/bin/x86_64-linux-gnu-gcc' failed with exit code 1"
+             )
+-            .as_bytes()
+-            .to_vec(),
++            .lines()
++            .map(ToString::to_string)
++            .collect(),
+         };
+ 
+         let err = Error::from_command_output(
+@@ -1100,7 +1221,7 @@ mod test {
+ 
+         --- stderr:
+         1099 |     n = strlen(p);
+-              |         ^~~~~~~~~
++             |         ^~~~~~~~~
+         /usr/bin/ld: cannot find -lncurses: No such file or directory
+         collect2: error: ld returned 1 exit status
+         error: command '/usr/bin/x86_64-linux-gnu-gcc' failed with exit code 1
+@@ -1114,7 +1235,7 @@ mod test {
+ 
+     #[test]
+     fn missing_wheel_package() {
+-        let output = Output {
++        let output = PythonRunnerOutput {
+             status: ExitStatus::default(), // This is wrong but `from_raw` is platform-gated.
+             stdout: Vec::new(),
+             stderr: indoc!(
+@@ -1124,11 +1245,11 @@ mod test {
+                or: setup.py --help-commands
+                or: setup.py cmd --help
+ 
+-            error: invalid command 'bdist_wheel'
+-                "
++            error: invalid command 'bdist_wheel'"
+             )
+-            .as_bytes()
+-            .to_vec(),
++            .lines()
++            .map(ToString::to_string)
++            .collect(),
+         };
+ 
+         let err = Error::from_command_output(
+diff --git a/crates/uv-cli/src/lib.rs b/crates/uv-cli/src/lib.rs
+index c6131cc8eae..487d1954a8d 100644
+--- a/crates/uv-cli/src/lib.rs
++++ b/crates/uv-cli/src/lib.rs
+@@ -335,6 +335,27 @@ pub enum Commands {
+         after_long_help = ""
+     )]
+     Venv(VenvArgs),
++    /// Build Python packages into source distributions and wheels.
++    ///
++    /// `uv build` accepts a path to a directory or source distribution,
++    /// which defaults to the current working directory.
++    ///
++    /// By default, if passed a directory, `uv build` will build a source
++    /// distribution ("sdist") from the source directory, and a binary
++    /// distribution ("wheel") from  the source distribution.
++    ///
++    /// `uv build --sdist` can be used to build only the source distribution,
++    /// `uv build --wheel` can be used to build only the binary distribution,
++    /// and `uv build --sdist --wheel` can be used to build both distributions
++    /// from source.
++    ///
++    /// If passed a source distribution, `uv build --wheel` will build a wheel
++    /// from  the source distribution.
++    #[command(
++        after_help = "Use `uv help build` for more details.",
++        after_long_help = ""
++    )]
++    Build(BuildArgs),
+     /// Manage uv's cache.
+     #[command(
+         after_help = "Use `uv help cache` for more details.",
+@@ -1125,7 +1146,7 @@ pub struct PipSyncArgs {
+ 
+     /// The Python interpreter into which packages should be installed.
+     ///
+-    /// By default, syncing requires a virtual environment. An path to an
++    /// By default, syncing requires a virtual environment. A path to an
+     /// alternative Python can be provided, but it is only recommended in
+     /// continuous integration (CI) environments and should be used with
+     /// caution, as it can modify the system Python installation.
+@@ -1407,7 +1428,7 @@ pub struct PipInstallArgs {
+ 
+     /// The Python interpreter into which packages should be installed.
+     ///
+-    /// By default, installation requires a virtual environment. An path to an
++    /// By default, installation requires a virtual environment. A path to an
+     /// alternative Python can be provided, but it is only recommended in
+     /// continuous integration (CI) environments and should be used with
+     /// caution, as it can modify the system Python installation.
+@@ -1572,7 +1593,7 @@ pub struct PipUninstallArgs {
+ 
+     /// The Python interpreter from which packages should be uninstalled.
+     ///
+-    /// By default, uninstallation requires a virtual environment. An path to an
++    /// By default, uninstallation requires a virtual environment. A path to an
+     /// alternative Python can be provided, but it is only recommended in
+     /// continuous integration (CI) environments and should be used with
+     /// caution, as it can modify the system Python installation.
+@@ -1923,6 +1944,50 @@ pub struct PipTreeArgs {
+     pub compat_args: compat::PipGlobalCompatArgs,
+ }
+ 
++#[derive(Args)]
++#[allow(clippy::struct_excessive_bools)]
++pub struct BuildArgs {
++    /// The directory from which source distributions and/or wheels should be built, or a source
++    /// distribution archive to build into a wheel.
++    ///
++    /// Defaults to the current working directory.
++    #[arg(value_parser = parse_file_path)]
++    pub src_dir: Option<PathBuf>,
++
++    /// Build a source distribution ("sdist") from the given directory.
++    #[arg(long)]
++    pub sdist: bool,
++
++    /// Build a binary distribution ("wheel") from the given directory.
++    #[arg(long)]
++    pub wheel: bool,
++
++    /// The Python interpreter to use for the build environment.
++    ///
++    /// By default, builds are executed in isolated virtual environments. The
++    /// discovered interpreter will be used to create those environments, and
++    /// will be symlinked or copied in depending on the platform.
++    ///
++    /// See `uv help python` to view supported request formats.
++    #[arg(
++        long,
++        short,
++        env = "UV_PYTHON",
++        verbatim_doc_comment,
++        help_heading = "Python options"
++    )]
++    pub python: Option<String>,
++
++    #[command(flatten)]
++    pub resolver: ResolverArgs,
++
++    #[command(flatten)]
++    pub build: BuildOptionsArgs,
++
++    #[command(flatten)]
++    pub refresh: RefreshArgs,
++}
++
+ #[derive(Args)]
+ #[allow(clippy::struct_excessive_bools)]
+ pub struct VenvArgs {
+@@ -2298,7 +2363,7 @@ pub struct RunArgs {
+     pub installer: ResolverInstallerArgs,
+ 
+     #[command(flatten)]
+-    pub build: BuildArgs,
++    pub build: BuildOptionsArgs,
+ 
+     #[command(flatten)]
+     pub refresh: RefreshArgs,
+@@ -2426,7 +2491,7 @@ pub struct SyncArgs {
+     pub installer: ResolverInstallerArgs,
+ 
+     #[command(flatten)]
+-    pub build: BuildArgs,
++    pub build: BuildOptionsArgs,
+ 
+     #[command(flatten)]
+     pub refresh: RefreshArgs,
+@@ -2479,7 +2544,7 @@ pub struct LockArgs {
+     pub resolver: ResolverArgs,
+ 
+     #[command(flatten)]
+-    pub build: BuildArgs,
++    pub build: BuildOptionsArgs,
+ 
+     #[command(flatten)]
+     pub refresh: RefreshArgs,
+@@ -2593,7 +2658,7 @@ pub struct AddArgs {
+     pub installer: ResolverInstallerArgs,
+ 
+     #[command(flatten)]
+-    pub build: BuildArgs,
++    pub build: BuildOptionsArgs,
+ 
+     #[command(flatten)]
+     pub refresh: RefreshArgs,
+@@ -2662,7 +2727,7 @@ pub struct RemoveArgs {
+     pub installer: ResolverInstallerArgs,
+ 
+     #[command(flatten)]
+-    pub build: BuildArgs,
++    pub build: BuildOptionsArgs,
+ 
+     #[command(flatten)]
+     pub refresh: RefreshArgs,
+@@ -2722,7 +2787,7 @@ pub struct TreeArgs {
+     pub frozen: bool,
+ 
+     #[command(flatten)]
+-    pub build: BuildArgs,
++    pub build: BuildOptionsArgs,
+ 
+     #[command(flatten)]
+     pub resolver: ResolverArgs,
+@@ -2819,7 +2884,7 @@ pub struct ExportArgs {
+     pub resolver: ResolverArgs,
+ 
+     #[command(flatten)]
+-    pub build: BuildArgs,
++    pub build: BuildOptionsArgs,
+ 
+     #[command(flatten)]
+     pub refresh: RefreshArgs,
+@@ -2844,6 +2909,38 @@ pub struct ExportArgs {
+     pub python: Option<String>,
+ }
+ 
++#[derive(Args)]
++#[allow(clippy::struct_excessive_bools)]
++pub struct BuildNamespace {
++    #[command(subcommand)]
++    pub command: BuildCommand,
++}
++
++#[derive(Subcommand)]
++pub enum BuildCommand {
++    /// Run a command provided by a Python package.
++    ///
++    /// By default, the package to install is assumed to match the command name.
++    ///
++    /// The name of the command can include an exact version in the format
++    /// `<package>@<version>`, e.g., `uv tool run ruff@0.3.0`. If more complex
++    /// version specification is desired or if the command is provided by a
++    /// different package, use `--from`.
++    ///
++    /// If the tool was previously installed, i.e., via `uv tool install`, the
++    /// installed version will be used unless a version is requested or the
++    /// `--isolated` flag is used.
++    ///
++    /// `uvx` is provided as a convenient alias for `uv tool run`, their
++    /// behavior is identical.
++    ///
++    /// If no command is provided, the installed tools are displayed.
++    ///
++    /// Packages are installed into an ephemeral virtual environment in the uv
++    /// cache directory.
++    Run(BuildOptionsArgs),
++}
++
+ #[derive(Args)]
+ #[allow(clippy::struct_excessive_bools)]
+ pub struct ToolNamespace {
+@@ -2966,7 +3063,7 @@ pub struct ToolRunArgs {
+     pub installer: ResolverInstallerArgs,
+ 
+     #[command(flatten)]
+-    pub build: BuildArgs,
++    pub build: BuildOptionsArgs,
+ 
+     #[command(flatten)]
+     pub refresh: RefreshArgs,
+@@ -3018,7 +3115,7 @@ pub struct ToolInstallArgs {
+     pub installer: ResolverInstallerArgs,
+ 
+     #[command(flatten)]
+-    pub build: BuildArgs,
++    pub build: BuildOptionsArgs,
+ 
+     #[command(flatten)]
+     pub refresh: RefreshArgs,
+@@ -3103,7 +3200,7 @@ pub struct ToolUpgradeArgs {
+     pub installer: ResolverInstallerArgs,
+ 
+     #[command(flatten)]
+-    pub build: BuildArgs,
++    pub build: BuildOptionsArgs,
+ }
+ 
+ #[derive(Args)]
+@@ -3407,7 +3504,7 @@ pub struct RefreshArgs {
+ 
+ #[derive(Args)]
+ #[allow(clippy::struct_excessive_bools)]
+-pub struct BuildArgs {
++pub struct BuildOptionsArgs {
+     /// Don't build source distributions.
+     ///
+     /// When enabled, resolving will not run arbitrary Python code. The cached wheels of
+diff --git a/crates/uv-cli/src/options.rs b/crates/uv-cli/src/options.rs
+index 6fb230b2349..dc66217124c 100644
+--- a/crates/uv-cli/src/options.rs
++++ b/crates/uv-cli/src/options.rs
+@@ -4,7 +4,8 @@ use uv_resolver::PrereleaseMode;
+ use uv_settings::{PipOptions, ResolverInstallerOptions, ResolverOptions};
+ 
+ use crate::{
+-    BuildArgs, IndexArgs, InstallerArgs, Maybe, RefreshArgs, ResolverArgs, ResolverInstallerArgs,
++    BuildOptionsArgs, IndexArgs, InstallerArgs, Maybe, RefreshArgs, ResolverArgs,
++    ResolverInstallerArgs,
+ };
+ 
+ /// Given a boolean flag pair (like `--upgrade` and `--no-upgrade`), resolve the value of the flag.
+@@ -206,8 +207,11 @@ impl From<IndexArgs> for PipOptions {
+     }
+ }
+ 
+-/// Construct the [`ResolverOptions`] from the [`ResolverArgs`] and [`BuildArgs`].
+-pub fn resolver_options(resolver_args: ResolverArgs, build_args: BuildArgs) -> ResolverOptions {
++/// Construct the [`ResolverOptions`] from the [`ResolverArgs`] and [`BuildOptionsArgs`].
++pub fn resolver_options(
++    resolver_args: ResolverArgs,
++    build_args: BuildOptionsArgs,
++) -> ResolverOptions {
+     let ResolverArgs {
+         index_args,
+         upgrade,
+@@ -228,7 +232,7 @@ pub fn resolver_options(resolver_args: ResolverArgs, build_args: BuildArgs) -> R
+         no_sources,
+     } = resolver_args;
+ 
+-    let BuildArgs {
++    let BuildOptionsArgs {
+         no_build,
+         build,
+         no_build_package,
+@@ -281,10 +285,10 @@ pub fn resolver_options(resolver_args: ResolverArgs, build_args: BuildArgs) -> R
+     }
+ }
+ 
+-/// Construct the [`ResolverInstallerOptions`] from the [`ResolverInstallerArgs`] and [`BuildArgs`].
++/// Construct the [`ResolverInstallerOptions`] from the [`ResolverInstallerArgs`] and [`BuildOptionsArgs`].
+ pub fn resolver_installer_options(
+     resolver_installer_args: ResolverInstallerArgs,
+-    build_args: BuildArgs,
++    build_args: BuildOptionsArgs,
+ ) -> ResolverInstallerOptions {
+     let ResolverInstallerArgs {
+         index_args,
+@@ -311,7 +315,7 @@ pub fn resolver_installer_options(
+         no_sources,
+     } = resolver_installer_args;
+ 
+-    let BuildArgs {
++    let BuildOptionsArgs {
+         no_build,
+         build,
+         no_build_package,
+diff --git a/crates/uv-client/src/base_client.rs b/crates/uv-client/src/base_client.rs
+index 4edbea7aede..189d960ce7e 100644
+--- a/crates/uv-client/src/base_client.rs
++++ b/crates/uv-client/src/base_client.rs
+@@ -191,6 +191,7 @@ impl<'a> BaseClientBuilder<'a> {
+     ) -> Client {
+         // Configure the builder.
+         let client_builder = ClientBuilder::new()
++            .http1_title_case_headers()
+             .user_agent(user_agent)
+             .pool_max_idle_per_host(20)
+             .read_timeout(std::time::Duration::from_secs(timeout))
+diff --git a/crates/uv-configuration/src/build_options.rs b/crates/uv-configuration/src/build_options.rs
+index ee7a0c5c1d0..360f130911b 100644
+--- a/crates/uv-configuration/src/build_options.rs
++++ b/crates/uv-configuration/src/build_options.rs
+@@ -6,10 +6,12 @@ use crate::{PackageNameSpecifier, PackageNameSpecifiers};
+ 
+ #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+ pub enum BuildKind {
+-    /// A regular PEP 517 wheel build
++    /// A PEP 517 wheel build.
+     #[default]
+     Wheel,
+-    /// A PEP 660 editable installation wheel build
++    /// A PEP 517 source distribution build.
++    Sdist,
++    /// A PEP 660 editable installation wheel build.
+     Editable,
+ }
+ 
+@@ -17,6 +19,7 @@ impl Display for BuildKind {
+     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+         match self {
+             Self::Wheel => f.write_str("wheel"),
++            Self::Sdist => f.write_str("sdist"),
+             Self::Editable => f.write_str("editable"),
+         }
+     }
+diff --git a/crates/uv-dev/Cargo.toml b/crates/uv-dev/Cargo.toml
+index a7a740a6de6..d7cef9f7823 100644
+--- a/crates/uv-dev/Cargo.toml
++++ b/crates/uv-dev/Cargo.toml
+@@ -18,23 +18,16 @@ workspace = true
+ [dependencies]
+ distribution-filename = { workspace = true }
+ distribution-types = { workspace = true }
+-install-wheel-rs = { workspace = true }
+ pep508_rs = { workspace = true }
+ pypi-types = { workspace = true }
+-uv-build = { workspace = true }
+ uv-cache = { workspace = true, features = ["clap"] }
+ uv-cli = { workspace = true }
+ uv-client = { workspace = true }
+-uv-configuration = { workspace = true }
+-uv-dispatch = { workspace = true }
+-uv-git = { workspace = true }
+ uv-installer = { workspace = true }
+ uv-macros = { workspace = true }
+ uv-options-metadata = { workspace = true }
+ uv-python = { workspace = true }
+-uv-resolver = { workspace = true }
+ uv-settings = { workspace = true, features = ["schemars"] }
+-uv-types = { workspace = true }
+ uv-workspace = { workspace = true, features = ["schemars"] }
+ 
+ # Any dependencies that are exclusively used in `uv-dev` should be listed as non-workspace
+@@ -44,12 +37,11 @@ anyhow = { workspace = true }
+ clap = { workspace = true, features = ["derive", "wrap_help"] }
+ fs-err = { workspace = true, features = ["tokio"] }
+ itertools = { workspace = true }
+-markdown = "0.3.0"
++markdown = { version = "0.3.0" }
+ owo-colors = { workspace = true }
+ poloto = { version = "19.1.2", optional = true }
+ pretty_assertions = { version = "1.4.0" }
+ resvg = { version = "0.29.0", optional = true }
+-rustc-hash = { workspace = true }
+ schemars = { workspace = true }
+ serde = { workspace = true }
+ serde_json = { workspace = true }
+diff --git a/crates/uv-dev/src/build.rs b/crates/uv-dev/src/build.rs
+deleted file mode 100644
+index 8170c2080d9..00000000000
+--- a/crates/uv-dev/src/build.rs
++++ /dev/null
+@@ -1,114 +0,0 @@
+-use std::env;
+-use std::path::PathBuf;
+-
+-use anyhow::{Context, Result};
+-use clap::Parser;
+-use fs_err as fs;
+-use rustc_hash::FxHashMap;
+-
+-use distribution_types::IndexLocations;
+-use uv_build::{SourceBuild, SourceBuildContext};
+-use uv_cache::{Cache, CacheArgs};
+-use uv_client::RegistryClientBuilder;
+-use uv_configuration::{
+-    BuildKind, BuildOptions, Concurrency, ConfigSettings, IndexStrategy, SourceStrategy,
+-};
+-use uv_dispatch::BuildDispatch;
+-use uv_git::GitResolver;
+-use uv_python::{EnvironmentPreference, PythonEnvironment, PythonRequest};
+-use uv_resolver::{FlatIndex, InMemoryIndex};
+-use uv_types::{BuildIsolation, InFlight};
+-
+-#[derive(Parser)]
+-pub(crate) struct BuildArgs {
+-    /// Base python in a way that can be found with `which`
+-    /// TODO(konstin): Also use proper python parsing here
+-    #[clap(short, long)]
+-    python: Option<PathBuf>,
+-    /// Directory to story the built wheel in
+-    #[clap(short, long)]
+-    wheels: Option<PathBuf>,
+-    /// The source distribution to build, as a directory.
+-    sdist: PathBuf,
+-    /// The subdirectory to build within the source distribution.
+-    subdirectory: Option<PathBuf>,
+-    /// You can edit the python sources of an editable install and the changes will be used without
+-    /// the need to reinstall it.
+-    #[clap(short, long)]
+-    editable: bool,
+-    #[command(flatten)]
+-    cache_args: CacheArgs,
+-}
+-
+-/// Build a source distribution to a wheel
+-pub(crate) async fn build(args: BuildArgs) -> Result<PathBuf> {
+-    let wheel_dir = if let Some(wheel_dir) = args.wheels {
+-        fs::create_dir_all(&wheel_dir).context("Invalid wheel directory")?;
+-        wheel_dir
+-    } else {
+-        env::current_dir()?
+-    };
+-    let build_kind = if args.editable {
+-        BuildKind::Editable
+-    } else {
+-        BuildKind::Wheel
+-    };
+-
+-    let cache = Cache::try_from(args.cache_args)?.init()?;
+-
+-    let client = RegistryClientBuilder::new(cache.clone()).build();
+-    let concurrency = Concurrency::default();
+-    let config_settings = ConfigSettings::default();
+-    let exclude_newer = None;
+-    let flat_index = FlatIndex::default();
+-    let git = GitResolver::default();
+-    let in_flight = InFlight::default();
+-    let index = InMemoryIndex::default();
+-    let index_urls = IndexLocations::default();
+-    let index_strategy = IndexStrategy::default();
+-    let sources = SourceStrategy::default();
+-    let python = PythonEnvironment::find(
+-        &PythonRequest::default(),
+-        EnvironmentPreference::OnlyVirtual,
+-        &cache,
+-    )?;
+-    let build_options = BuildOptions::default();
+-    let build_constraints = [];
+-
+-    let build_dispatch = BuildDispatch::new(
+-        &client,
+-        &cache,
+-        &build_constraints,
+-        python.interpreter(),
+-        &index_urls,
+-        &flat_index,
+-        &index,
+-        &git,
+-        &in_flight,
+-        index_strategy,
+-        &config_settings,
+-        BuildIsolation::Isolated,
+-        install_wheel_rs::linker::LinkMode::default(),
+-        &build_options,
+-        exclude_newer,
+-        sources,
+-        concurrency,
+-    );
+-
+-    let builder = SourceBuild::setup(
+-        &args.sdist,
+-        args.subdirectory.as_deref(),
+-        None,
+-        python.interpreter(),
+-        &build_dispatch,
+-        SourceBuildContext::default(),
+-        args.sdist.display().to_string(),
+-        config_settings.clone(),
+-        BuildIsolation::Isolated,
+-        build_kind,
+-        FxHashMap::default(),
+-        concurrency.builds,
+-    )
+-    .await?;
+-    Ok(wheel_dir.join(builder.build_wheel(&wheel_dir).await?))
+-}
+diff --git a/crates/uv-dev/src/main.rs b/crates/uv-dev/src/main.rs
+index 7530167bee7..4ee22e75725 100644
+--- a/crates/uv-dev/src/main.rs
++++ b/crates/uv-dev/src/main.rs
+@@ -4,7 +4,7 @@ use std::process::ExitCode;
+ use std::str::FromStr;
+ use std::time::Instant;
+ 
+-use anstream::{eprintln, println};
++use anstream::eprintln;
+ use anyhow::Result;
+ use clap::Parser;
+ use owo_colors::OwoColorize;
+@@ -16,7 +16,6 @@ use tracing_subscriber::layer::SubscriberExt;
+ use tracing_subscriber::util::SubscriberInitExt;
+ use tracing_subscriber::{EnvFilter, Layer};
+ 
+-use crate::build::{build, BuildArgs};
+ use crate::clear_compile::ClearCompileArgs;
+ use crate::compile::CompileArgs;
+ use crate::generate_all::Args as GenerateAllArgs;
+@@ -43,7 +42,6 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+ #[global_allocator]
+ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+ 
+-mod build;
+ mod clear_compile;
+ mod compile;
+ mod generate_all;
+@@ -57,8 +55,6 @@ const ROOT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../");
+ 
+ #[derive(Parser)]
+ enum Cli {
+-    /// Build a source distribution into a wheel.
+-    Build(BuildArgs),
+     /// Display the metadata for a `.whl` at a given URL.
+     WheelMetadata(WheelMetadataArgs),
+     /// Compile all `.py` to `.pyc` files in the tree.
+@@ -82,10 +78,6 @@ enum Cli {
+ async fn run() -> Result<()> {
+     let cli = Cli::parse();
+     match cli {
+-        Cli::Build(args) => {
+-            let target = build(args).await?;
+-            println!("Wheel built to {}", target.display());
+-        }
+         Cli::WheelMetadata(args) => wheel_metadata::wheel_metadata(args).await?,
+         Cli::Compile(args) => compile::compile(args).await?,
+         Cli::ClearCompile(args) => clear_compile::clear_compile(&args)?,
+diff --git a/crates/uv-virtualenv/src/virtualenv.rs b/crates/uv-virtualenv/src/virtualenv.rs
+index 08d09b61996..5b6a1e950ba 100644
+--- a/crates/uv-virtualenv/src/virtualenv.rs
++++ b/crates/uv-virtualenv/src/virtualenv.rs
+@@ -8,7 +8,7 @@ use std::path::Path;
+ use fs_err as fs;
+ use fs_err::File;
+ use itertools::Itertools;
+-use tracing::info;
++use tracing::debug;
+ 
+ use pypi_types::Scheme;
+ use uv_fs::{cachedir, Simplified, CWD};
+@@ -92,16 +92,16 @@ pub(crate) fn create(
+                 )));
+             } else if metadata.is_dir() {
+                 if allow_existing {
+-                    info!("Allowing existing directory");
++                    debug!("Allowing existing directory");
+                 } else if location.join("pyvenv.cfg").is_file() {
+-                    info!("Removing existing directory");
++                    debug!("Removing existing directory");
+                     fs::remove_dir_all(location)?;
+                     fs::create_dir_all(location)?;
+                 } else if location
+                     .read_dir()
+                     .is_ok_and(|mut dir| dir.next().is_none())
+                 {
+-                    info!("Ignoring empty directory");
++                    debug!("Ignoring empty directory");
+                 } else {
+                     return Err(Error::Io(io::Error::new(
+                         io::ErrorKind::AlreadyExists,
+diff --git a/crates/uv/Cargo.toml b/crates/uv/Cargo.toml
+index 5e5a520d371..a11e1953d46 100644
+--- a/crates/uv/Cargo.toml
++++ b/crates/uv/Cargo.toml
+@@ -15,6 +15,7 @@ workspace = true
+ 
+ [dependencies]
+ cache-key = { workspace = true }
++distribution-filename = { workspace = true }
+ distribution-types = { workspace = true }
+ install-wheel-rs = { workspace = true, default-features = false }
+ pep440_rs = { workspace = true }
+@@ -28,6 +29,7 @@ uv-client = { workspace = true }
+ uv-configuration = { workspace = true }
+ uv-dispatch = { workspace = true }
+ uv-distribution = { workspace = true }
++uv-extract = { workspace = true }
+ uv-fs = { workspace = true }
+ uv-git = { workspace = true }
+ uv-installer = { workspace = true }
+@@ -63,6 +65,7 @@ regex = { workspace = true }
+ rustc-hash = { workspace = true }
+ serde = { workspace = true }
+ serde_json = { workspace = true }
++tempfile = { workspace = true }
+ textwrap = { workspace = true }
+ thiserror = { workspace = true }
+ tokio = { workspace = true }
+diff --git a/crates/uv/src/commands/build.rs b/crates/uv/src/commands/build.rs
+new file mode 100644
+index 00000000000..bdd7459275d
+--- /dev/null
++++ b/crates/uv/src/commands/build.rs
+@@ -0,0 +1,408 @@
++use crate::commands::project::find_requires_python;
++use crate::commands::reporters::PythonDownloadReporter;
++use crate::commands::{ExitStatus, SharedState};
++use crate::printer::Printer;
++use crate::settings::{ResolverSettings, ResolverSettingsRef};
++
++use anyhow::Result;
++use distribution_filename::SourceDistExtension;
++use owo_colors::OwoColorize;
++use std::path::{Path, PathBuf};
++use uv_auth::store_credentials_from_url;
++use uv_cache::Cache;
++use uv_client::{BaseClientBuilder, Connectivity, FlatIndexClient, RegistryClientBuilder};
++use uv_configuration::{BuildKind, Concurrency};
++use uv_dispatch::BuildDispatch;
++use uv_fs::{Simplified, CWD};
++use uv_python::{
++    EnvironmentPreference, PythonDownloads, PythonEnvironment, PythonInstallation,
++    PythonPreference, PythonRequest, PythonVersionFile, VersionRequest,
++};
++use uv_resolver::{FlatIndex, RequiresPython};
++use uv_types::{BuildContext, BuildIsolation, HashStrategy};
++use uv_warnings::warn_user_once;
++use uv_workspace::{DiscoveryOptions, VirtualProject, WorkspaceError};
++
++/// Build source distributions and wheels.
++#[allow(clippy::fn_params_excessive_bools)]
++pub(crate) async fn build(
++    path: Option<PathBuf>,
++    sdist: bool,
++    wheel: bool,
++    python: Option<String>,
++    settings: ResolverSettings,
++    no_config: bool,
++    python_preference: PythonPreference,
++    python_downloads: PythonDownloads,
++    connectivity: Connectivity,
++    concurrency: Concurrency,
++    native_tls: bool,
++    cache: &Cache,
++    printer: Printer,
++) -> Result<ExitStatus> {
++    let assets = build_impl(
++        path.as_deref(),
++        sdist,
++        wheel,
++        python.as_deref(),
++        settings.as_ref(),
++        no_config,
++        python_preference,
++        python_downloads,
++        connectivity,
++        concurrency,
++        native_tls,
++        cache,
++        printer,
++    )
++    .await?;
++
++    match assets {
++        BuiltDistributions::Wheel(wheel) => {
++            anstream::eprintln!("Successfully built {}", wheel.bold().cyan());
++        }
++        BuiltDistributions::Sdist(sdist) => {
++            anstream::eprintln!("Successfully built {}", sdist.bold().cyan());
++        }
++        BuiltDistributions::Both(sdist, wheel) => {
++            anstream::eprintln!(
++                "Successfully built {} and {}",
++                sdist.bold().cyan(),
++                wheel.bold().cyan()
++            );
++        }
++    }
++
++    Ok(ExitStatus::Success)
++}
++
++#[allow(clippy::fn_params_excessive_bools)]
++async fn build_impl(
++    path: Option<&Path>,
++    sdist: bool,
++    wheel: bool,
++    python_request: Option<&str>,
++    settings: ResolverSettingsRef<'_>,
++    no_config: bool,
++    python_preference: PythonPreference,
++    python_downloads: PythonDownloads,
++    connectivity: Connectivity,
++    concurrency: Concurrency,
++    native_tls: bool,
++    cache: &Cache,
++    printer: Printer,
++) -> Result<BuiltDistributions> {
++    // Extract the resolver settings.
++    let ResolverSettingsRef {
++        index_locations,
++        index_strategy,
++        keyring_provider,
++        allow_insecure_host,
++        resolution: _,
++        prerelease: _,
++        config_setting,
++        no_build_isolation,
++        no_build_isolation_package,
++        exclude_newer,
++        link_mode,
++        upgrade: _,
++        build_options,
++        sources,
++    } = settings;
++
++    let client_builder = BaseClientBuilder::default()
++        .connectivity(connectivity)
++        .native_tls(native_tls);
++
++    // (1) Explicit request from user
++    let mut interpreter_request = python_request.map(PythonRequest::parse);
++
++    // (2) Request from `.python-version`
++    if interpreter_request.is_none() {
++        interpreter_request = PythonVersionFile::discover(&*CWD, no_config, false)
++            .await?
++            .and_then(PythonVersionFile::into_version);
++    }
++
++    // (3) `Requires-Python` in `pyproject.toml`
++    if interpreter_request.is_none() {
++        let project = match VirtualProject::discover(&CWD, &DiscoveryOptions::default()).await {
++            Ok(project) => Some(project),
++            Err(WorkspaceError::MissingProject(_)) => None,
++            Err(WorkspaceError::MissingPyprojectToml) => None,
++            Err(WorkspaceError::NonWorkspace(_)) => None,
++            Err(err) => {
++                warn_user_once!("{err}");
++                None
++            }
++        };
++
++        if let Some(project) = project {
++            interpreter_request = find_requires_python(project.workspace())?
++                .as_ref()
++                .map(RequiresPython::specifiers)
++                .map(|specifiers| {
++                    PythonRequest::Version(VersionRequest::Range(specifiers.clone()))
++                });
++        }
++    }
++
++    // Locate the Python interpreter to use in the environment.
++    let interpreter = PythonInstallation::find_or_download(
++        interpreter_request.as_ref(),
++        EnvironmentPreference::Any,
++        python_preference,
++        python_downloads,
++        &client_builder,
++        cache,
++        Some(&PythonDownloadReporter::single(printer)),
++    )
++    .await?
++    .into_interpreter();
++
++    // Add all authenticated sources to the cache.
++    for url in index_locations.urls() {
++        store_credentials_from_url(url);
++    }
++
++    // Initialize the registry client.
++    let client = RegistryClientBuilder::new(cache.clone())
++        .native_tls(native_tls)
++        .connectivity(connectivity)
++        .index_urls(index_locations.index_urls())
++        .index_strategy(index_strategy)
++        .keyring(keyring_provider)
++        .allow_insecure_host(allow_insecure_host.to_vec())
++        .markers(interpreter.markers())
++        .platform(interpreter.platform())
++        .build();
++
++    // Determine whether to enable build isolation.
++    let environment;
++    let build_isolation = if no_build_isolation {
++        environment = PythonEnvironment::from_interpreter(interpreter.clone());
++        BuildIsolation::Shared(&environment)
++    } else if no_build_isolation_package.is_empty() {
++        BuildIsolation::Isolated
++    } else {
++        environment = PythonEnvironment::from_interpreter(interpreter.clone());
++        BuildIsolation::SharedPackage(&environment, no_build_isolation_package)
++    };
++
++    // TODO(charlie): These are all default values. We should consider whether we want to make them
++    // optional on the downstream APIs.
++    let build_constraints = [];
++    let hasher = HashStrategy::None;
++
++    // Resolve the flat indexes from `--find-links`.
++    let flat_index = {
++        let client = FlatIndexClient::new(&client, cache);
++        let entries = client.fetch(index_locations.flat_index()).await?;
++        FlatIndex::from_entries(entries, None, &hasher, build_options)
++    };
++
++    // Initialize any shared state.
++    let state = SharedState::default();
++
++    // Create a build dispatch.
++    let build_dispatch = BuildDispatch::new(
++        &client,
++        cache,
++        &build_constraints,
++        &interpreter,
++        index_locations,
++        &flat_index,
++        &state.index,
++        &state.git,
++        &state.in_flight,
++        index_strategy,
++        config_setting,
++        build_isolation,
++        link_mode,
++        build_options,
++        exclude_newer,
++        sources,
++        concurrency,
++    );
++
++    // Determine the build plan from the command-line arguments.
++    let path = path.unwrap_or_else(|| &*CWD);
++    let metadata = match fs_err::tokio::metadata(path).await {
++        Ok(metadata) => metadata,
++        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
++            return Err(anyhow::anyhow!(
++                "Source `{}` does not exist",
++                path.simplified_display()
++            ));
++        }
++        Err(err) => return Err(err.into()),
++    };
++
++    // Create the output directory.
++    let output_dir = if metadata.is_dir() {
++        path.join("dist")
++    } else {
++        path.parent().unwrap().to_path_buf()
++    };
++    fs_err::tokio::create_dir_all(&output_dir).await?;
++
++    // Determine the build plan.
++    let plan = if metadata.is_dir() {
++        // We're building from a directory.
++        match (sdist, wheel) {
++            (false, false) => BuildPlan::SdistToWheel,
++            (false, true) => BuildPlan::Wheel,
++            (true, false) => BuildPlan::Sdist,
++            (true, true) => BuildPlan::SdistAndWheel,
++        }
++    } else {
++        // We're building from a file, which must be a source distribution.
++        match (sdist, wheel) {
++            (false, true) => BuildPlan::WheelFromSdist,
++            (false, false) => {
++                return Err(anyhow::anyhow!(
++                    "Pass `--wheel` explicitly to build a wheel from a source distribution"
++                ));
++            }
++            (true, _) => {
++                return Err(anyhow::anyhow!(
++                    "Building an `--sdist` from a source distribution is not supported"
++                ));
++            }
++        }
++    };
++
++    // Prepare some common arguments for the build.
++    let subdirectory = None;
++    let version_id = path.file_name().unwrap().to_str().unwrap().to_string();
++    let dist = None;
++
++    let assets = match plan {
++        BuildPlan::SdistToWheel => {
++            // Build the sdist.
++            let builder = build_dispatch
++                .setup_build(path, subdirectory, &version_id, dist, BuildKind::Sdist)
++                .await?;
++            let sdist = builder.build(&output_dir).await?;
++
++            // Extract the source distribution into a temporary directory.
++            let path = output_dir.join(&sdist);
++            let reader = fs_err::tokio::File::open(&path).await?;
++            let ext = SourceDistExtension::from_path(path.as_path()).map_err(|err| {
++                anyhow::anyhow!("`{}` is not a valid source distribution, as it ends with an unsupported extension. Expected one of: {err}.", path.simplified_display())
++            })?;
++            let temp_dir = tempfile::tempdir_in(&output_dir)?;
++            uv_extract::stream::archive(reader, ext, temp_dir.path()).await?;
++
++            // Extract the top-level directory from the archive.
++            let extracted = match uv_extract::strip_component(temp_dir.path()) {
++                Ok(top_level) => top_level,
++                Err(uv_extract::Error::NonSingularArchive(_)) => temp_dir.path().to_path_buf(),
++                Err(err) => return Err(err.into()),
++            };
++
++            // Build a wheel from the source distribution.
++            let builder = build_dispatch
++                .setup_build(
++                    &extracted,
++                    subdirectory,
++                    &version_id,
++                    dist,
++                    BuildKind::Wheel,
++                )
++                .await?;
++            let wheel = builder.build(&output_dir).await?;
++
++            BuiltDistributions::Both(sdist, wheel)
++        }
++        BuildPlan::Sdist => {
++            let builder = build_dispatch
++                .setup_build(path, subdirectory, &version_id, dist, BuildKind::Sdist)
++                .await?;
++            let sdist = builder.build(&output_dir).await?;
++
++            BuiltDistributions::Sdist(sdist)
++        }
++        BuildPlan::Wheel => {
++            let builder = build_dispatch
++                .setup_build(path, subdirectory, &version_id, dist, BuildKind::Wheel)
++                .await?;
++            let wheel = builder.build(&output_dir).await?;
++
++            BuiltDistributions::Wheel(wheel)
++        }
++        BuildPlan::SdistAndWheel => {
++            let builder = build_dispatch
++                .setup_build(path, subdirectory, &version_id, dist, BuildKind::Sdist)
++                .await?;
++            let sdist = builder.build(&output_dir).await?;
++
++            let builder = build_dispatch
++                .setup_build(path, subdirectory, &version_id, dist, BuildKind::Wheel)
++                .await?;
++            let wheel = builder.build(&output_dir).await?;
++
++            BuiltDistributions::Both(sdist, wheel)
++        }
++        BuildPlan::WheelFromSdist => {
++            // Extract the source distribution into a temporary directory.
++            let reader = fs_err::tokio::File::open(path).await?;
++            let ext = SourceDistExtension::from_path(path).map_err(|err| {
++                anyhow::anyhow!("`{}` is not a valid build source. Expected to receive a source directory, or a source distribution ending in one of: {err}.", path.simplified_display())
++            })?;
++            let temp_dir = tempfile::tempdir_in(&output_dir)?;
++            uv_extract::stream::archive(reader, ext, temp_dir.path()).await?;
++
++            // Extract the top-level directory from the archive.
++            let extracted = match uv_extract::strip_component(temp_dir.path()) {
++                Ok(top_level) => top_level,
++                Err(uv_extract::Error::NonSingularArchive(_)) => temp_dir.path().to_path_buf(),
++                Err(err) => return Err(err.into()),
++            };
++
++            // Build a wheel from the source distribution.
++            let builder = build_dispatch
++                .setup_build(
++                    &extracted,
++                    subdirectory,
++                    &version_id,
++                    dist,
++                    BuildKind::Wheel,
++                )
++                .await?;
++            let wheel = builder.build(&output_dir).await?;
++
++            BuiltDistributions::Wheel(wheel)
++        }
++    };
++
++    Ok(assets)
++}
++
++#[derive(Debug, Clone, PartialEq)]
++enum BuiltDistributions {
++    /// A built wheel.
++    Wheel(String),
++    /// A built source distribution.
++    Sdist(String),
++    /// A built source distribution and wheel.
++    Both(String, String),
++}
++
++#[derive(Debug, Copy, Clone, PartialEq, Eq)]
++enum BuildPlan {
++    /// Build a source distribution from source, then build the wheel from the source distribution.
++    SdistToWheel,
++
++    /// Build a source distribution from source.
++    Sdist,
++
++    /// Build a wheel from source.
++    Wheel,
++
++    /// Build a source distribution and a wheel from source.
++    SdistAndWheel,
++
++    /// Build a wheel from a source distribution.
++    WheelFromSdist,
++}
+diff --git a/crates/uv/src/commands/mod.rs b/crates/uv/src/commands/mod.rs
+index d013d48b5e6..f228e644dee 100644
+--- a/crates/uv/src/commands/mod.rs
++++ b/crates/uv/src/commands/mod.rs
+@@ -4,6 +4,7 @@ use std::{fmt::Display, fmt::Write, process::ExitCode};
+ use anyhow::Context;
+ use owo_colors::OwoColorize;
+ 
++pub(crate) use build::build;
+ pub(crate) use cache_clean::cache_clean;
+ pub(crate) use cache_dir::cache_dir;
+ pub(crate) use cache_prune::cache_prune;
+@@ -65,6 +66,7 @@ mod python;
+ pub(crate) mod reporters;
+ mod tool;
+ 
++mod build;
+ #[cfg(feature = "self-update")]
+ mod self_update;
+ mod venv;
+diff --git a/crates/uv/src/lib.rs b/crates/uv/src/lib.rs
+index e9535db71d3..934c985c27e 100644
+--- a/crates/uv/src/lib.rs
++++ b/crates/uv/src/lib.rs
+@@ -660,6 +660,34 @@ async fn run(cli: Cli) -> Result<ExitStatus> {
+             commands::cache_dir(&cache);
+             Ok(ExitStatus::Success)
+         }
++        Commands::Build(args) => {
++            // Resolve the settings from the command-line arguments and workspace configuration.
++            let args = settings::BuildSettings::resolve(args, filesystem);
++            show_settings!(args);
++
++            // Initialize the cache.
++            let cache = cache.init()?.with_refresh(
++                args.refresh
++                    .combine(Refresh::from(args.settings.upgrade.clone())),
++            );
++
++            commands::build(
++                args.src_dir,
++                args.sdist,
++                args.wheel,
++                args.python,
++                args.settings,
++                cli.no_config,
++                globals.python_preference,
++                globals.python_downloads,
++                globals.connectivity,
++                globals.concurrency,
++                globals.native_tls,
++                &cache,
++                printer,
++            )
++            .await
++        }
+         Commands::Venv(args) => {
+             args.compat_args.validate()?;
+ 
+@@ -1133,7 +1161,10 @@ async fn run_project(
+             show_settings!(args);
+ 
+             // Initialize the cache.
+-            let cache = cache.init()?;
++            let cache = cache.init()?.with_refresh(
++                args.refresh
++                    .combine(Refresh::from(args.settings.upgrade.clone())),
++            );
+ 
+             commands::lock(
+                 args.locked,
+diff --git a/crates/uv/src/settings.rs b/crates/uv/src/settings.rs
+index 1534de957cd..b6ec91a504a 100644
+--- a/crates/uv/src/settings.rs
++++ b/crates/uv/src/settings.rs
+@@ -11,7 +11,7 @@ use pypi_types::{Requirement, SupportedEnvironments};
+ use uv_cache::{CacheArgs, Refresh};
+ use uv_cli::{
+     options::{flag, resolver_installer_options, resolver_options},
+-    ExportArgs, ToolUpgradeArgs,
++    BuildArgs, ExportArgs, ToolUpgradeArgs,
+ };
+ use uv_cli::{
+     AddArgs, ColorChoice, ExternalCommand, GlobalArgs, InitArgs, ListFormat, LockArgs, Maybe,
+@@ -1604,7 +1604,43 @@ impl PipCheckSettings {
+     }
+ }
+ 
+-/// The resolved settings to use for a `pip check` invocation.
++/// The resolved settings to use for a `build` invocation.
++#[allow(clippy::struct_excessive_bools)]
++#[derive(Debug, Clone)]
++pub(crate) struct BuildSettings {
++    pub(crate) src_dir: Option<PathBuf>,
++    pub(crate) sdist: bool,
++    pub(crate) wheel: bool,
++    pub(crate) python: Option<String>,
++    pub(crate) refresh: Refresh,
++    pub(crate) settings: ResolverSettings,
++}
++
++impl BuildSettings {
++    /// Resolve the [`BuildSettings`] from the CLI and filesystem configuration.
++    pub(crate) fn resolve(args: BuildArgs, filesystem: Option<FilesystemOptions>) -> Self {
++        let BuildArgs {
++            src_dir,
++            sdist,
++            wheel,
++            python,
++            build,
++            refresh,
++            resolver,
++        } = args;
++
++        Self {
++            src_dir,
++            sdist,
++            wheel,
++            python,
++            refresh: Refresh::from(refresh),
++            settings: ResolverSettings::combine(resolver_options(resolver, build), filesystem),
++        }
++    }
++}
++
++/// The resolved settings to use for a `venv` invocation.
+ #[allow(clippy::struct_excessive_bools)]
+ #[derive(Debug, Clone)]
+ pub(crate) struct VenvSettings {
+diff --git a/crates/uv/tests/build.rs b/crates/uv/tests/build.rs
+new file mode 100644
+index 00000000000..3ec02a88452
+--- /dev/null
++++ b/crates/uv/tests/build.rs
+@@ -0,0 +1,316 @@
++#![cfg(all(feature = "python", feature = "pypi"))]
++#![allow(clippy::disallowed_types)]
++
++use anyhow::Result;
++use assert_fs::prelude::*;
++use common::{uv_snapshot, TestContext};
++use predicates::prelude::predicate;
++
++mod common;
++
++#[test]
++fn build() -> Result<()> {
++    let context = TestContext::new("3.12");
++
++    let project = context.temp_dir.child("project");
++
++    let pyproject_toml = project.child("pyproject.toml");
++    pyproject_toml.write_str(
++        r#"
++        [project]
++        name = "project"
++        version = "0.1.0"
++        requires-python = ">=3.12"
++        dependencies = ["anyio==3.7.0"]
++
++        [build-system]
++        requires = ["setuptools>=42"]
++        build-backend = "setuptools.build_meta"
++        "#,
++    )?;
++
++    project.child("src").child("__init__.py").touch()?;
++
++    // Build the specified path.
++    uv_snapshot!(context.filters(), context.build().arg("project"), @r###"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++
++    ----- stderr -----
++    Successfully built project-0.1.0.tar.gz and project-0.1.0-py3-none-any.whl
++    "###);
++
++    project
++        .child("dist")
++        .child("project-0.1.0.tar.gz")
++        .assert(predicate::path::is_file());
++    project
++        .child("dist")
++        .child("project-0.1.0-py3-none-any.whl")
++        .assert(predicate::path::is_file());
++
++    fs_err::remove_dir_all(project.child("dist"))?;
++
++    // Build the current working directory.
++    uv_snapshot!(context.filters(), context.build().current_dir(project.path()), @r###"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++
++    ----- stderr -----
++    Successfully built project-0.1.0.tar.gz and project-0.1.0-py3-none-any.whl
++    "###);
++
++    project
++        .child("dist")
++        .child("project-0.1.0.tar.gz")
++        .assert(predicate::path::is_file());
++    project
++        .child("dist")
++        .child("project-0.1.0-py3-none-any.whl")
++        .assert(predicate::path::is_file());
++
++    fs_err::remove_dir_all(project.child("dist"))?;
++
++    // Error if there's nothing to build.
++    uv_snapshot!(context.filters(), context.build(), @r###"
++    success: false
++    exit_code: 2
++    ----- stdout -----
++
++    ----- stderr -----
++    error: [TEMP_DIR]/ does not appear to be a Python project, as neither `pyproject.toml` nor `setup.py` is present in the directory
++    "###);
++
++    Ok(())
++}
++
++#[test]
++fn sdist() -> Result<()> {
++    let context = TestContext::new("3.12");
++
++    let project = context.temp_dir.child("project");
++
++    let pyproject_toml = project.child("pyproject.toml");
++    pyproject_toml.write_str(
++        r#"
++        [project]
++        name = "project"
++        version = "0.1.0"
++        requires-python = ">=3.12"
++        dependencies = ["anyio==3.7.0"]
++
++        [build-system]
++        requires = ["setuptools>=42"]
++        build-backend = "setuptools.build_meta"
++        "#,
++    )?;
++
++    project.child("src").child("__init__.py").touch()?;
++
++    // Build the specified path.
++    uv_snapshot!(context.filters(), context.build().arg("--sdist").current_dir(&project), @r###"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++
++    ----- stderr -----
++    Successfully built project-0.1.0.tar.gz
++    "###);
++
++    project
++        .child("dist")
++        .child("project-0.1.0.tar.gz")
++        .assert(predicate::path::is_file());
++    project
++        .child("dist")
++        .child("project-0.1.0-py3-none-any.whl")
++        .assert(predicate::path::missing());
++
++    Ok(())
++}
++
++#[test]
++fn wheel() -> Result<()> {
++    let context = TestContext::new("3.12");
++
++    let project = context.temp_dir.child("project");
++
++    let pyproject_toml = project.child("pyproject.toml");
++    pyproject_toml.write_str(
++        r#"
++        [project]
++        name = "project"
++        version = "0.1.0"
++        requires-python = ">=3.12"
++        dependencies = ["anyio==3.7.0"]
++
++        [build-system]
++        requires = ["setuptools>=42"]
++        build-backend = "setuptools.build_meta"
++        "#,
++    )?;
++
++    project.child("src").child("__init__.py").touch()?;
++
++    // Build the specified path.
++    uv_snapshot!(context.filters(), context.build().arg("--wheel").current_dir(&project), @r###"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++
++    ----- stderr -----
++    Successfully built project-0.1.0-py3-none-any.whl
++    "###);
++
++    project
++        .child("dist")
++        .child("project-0.1.0.tar.gz")
++        .assert(predicate::path::missing());
++    project
++        .child("dist")
++        .child("project-0.1.0-py3-none-any.whl")
++        .assert(predicate::path::is_file());
++
++    Ok(())
++}
++
++#[test]
++fn sdist_wheel() -> Result<()> {
++    let context = TestContext::new("3.12");
++
++    let project = context.temp_dir.child("project");
++
++    let pyproject_toml = project.child("pyproject.toml");
++    pyproject_toml.write_str(
++        r#"
++        [project]
++        name = "project"
++        version = "0.1.0"
++        requires-python = ">=3.12"
++        dependencies = ["anyio==3.7.0"]
++
++        [build-system]
++        requires = ["setuptools>=42"]
++        build-backend = "setuptools.build_meta"
++        "#,
++    )?;
++
++    project.child("src").child("__init__.py").touch()?;
++
++    // Build the specified path.
++    uv_snapshot!(context.filters(), context.build().arg("--sdist").arg("--wheel").current_dir(&project), @r###"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++
++    ----- stderr -----
++    Successfully built project-0.1.0.tar.gz and project-0.1.0-py3-none-any.whl
++    "###);
++
++    project
++        .child("dist")
++        .child("project-0.1.0.tar.gz")
++        .assert(predicate::path::is_file());
++    project
++        .child("dist")
++        .child("project-0.1.0-py3-none-any.whl")
++        .assert(predicate::path::is_file());
++
++    Ok(())
++}
++
++#[test]
++fn wheel_from_sdist() -> Result<()> {
++    let context = TestContext::new("3.12");
++
++    let project = context.temp_dir.child("project");
++
++    let pyproject_toml = project.child("pyproject.toml");
++    pyproject_toml.write_str(
++        r#"
++        [project]
++        name = "project"
++        version = "0.1.0"
++        requires-python = ">=3.12"
++        dependencies = ["anyio==3.7.0"]
++
++        [build-system]
++        requires = ["setuptools>=42"]
++        build-backend = "setuptools.build_meta"
++        "#,
++    )?;
++
++    project.child("src").child("__init__.py").touch()?;
++
++    // Build the sdist.
++    uv_snapshot!(context.filters(), context.build().arg("--sdist").current_dir(&project), @r###"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++
++    ----- stderr -----
++    Successfully built project-0.1.0.tar.gz
++    "###);
++
++    project
++        .child("dist")
++        .child("project-0.1.0.tar.gz")
++        .assert(predicate::path::is_file());
++    project
++        .child("dist")
++        .child("project-0.1.0-py3-none-any.whl")
++        .assert(predicate::path::missing());
++
++    // Error if `--wheel` is not specified.
++    uv_snapshot!(context.filters(), context.build().arg("./dist/project-0.1.0.tar.gz").current_dir(&project), @r###"
++    success: false
++    exit_code: 2
++    ----- stdout -----
++
++    ----- stderr -----
++    error: Pass `--wheel` explicitly to build a wheel from a source distribution
++    "###);
++
++    // Error if `--sdist` is not specified.
++    uv_snapshot!(context.filters(), context.build().arg("./dist/project-0.1.0.tar.gz").arg("--sdist").current_dir(&project), @r###"
++    success: false
++    exit_code: 2
++    ----- stdout -----
++
++    ----- stderr -----
++    error: Building an `--sdist` from a source distribution is not supported
++    "###);
++
++    // Build the wheel from the sdist.
++    uv_snapshot!(context.filters(), context.build().arg("./dist/project-0.1.0.tar.gz").arg("--wheel").current_dir(&project), @r###"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++
++    ----- stderr -----
++    Successfully built project-0.1.0-py3-none-any.whl
++    "###);
++
++    project
++        .child("dist")
++        .child("project-0.1.0.tar.gz")
++        .assert(predicate::path::is_file());
++    project
++        .child("dist")
++        .child("project-0.1.0-py3-none-any.whl")
++        .assert(predicate::path::is_file());
++
++    // Passing a wheel is an error.
++    uv_snapshot!(context.filters(), context.build().arg("./dist/project-0.1.0-py3-none-any.whl").arg("--wheel").current_dir(&project), @r###"
++    success: false
++    exit_code: 2
++    ----- stdout -----
++
++    ----- stderr -----
++    error: `./dist/project-0.1.0-py3-none-any.whl` is not a valid build source. Expected to receive a source directory, or a source distribution ending in one of: `.zip`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, or `.tar.zst`.
++    "###);
++
++    Ok(())
++}
+diff --git a/crates/uv/tests/common/mod.rs b/crates/uv/tests/common/mod.rs
+index d255a7c2629..842590dcd6c 100644
+--- a/crates/uv/tests/common/mod.rs
++++ b/crates/uv/tests/common/mod.rs
+@@ -500,6 +500,14 @@ impl TestContext {
+         command
+     }
+ 
++    /// Create a `uv build` command with options shared across scenarios.
++    pub fn build(&self) -> Command {
++        let mut command = Command::new(get_bin());
++        command.arg("build");
++        self.add_shared_args(&mut command);
++        command
++    }
++
+     /// Create a `uv python find` command with options shared across scenarios.
+     pub fn python_find(&self) -> Command {
+         let mut command = Command::new(get_bin());
+diff --git a/crates/uv/tests/help.rs b/crates/uv/tests/help.rs
+index 87ed0b56087..516408dcdad 100644
+--- a/crates/uv/tests/help.rs
++++ b/crates/uv/tests/help.rs
+@@ -28,6 +28,7 @@ fn help() {
+       python                     Manage Python versions and installations
+       pip                        Manage Python packages with a pip-compatible interface
+       venv                       Create a virtual environment
++      build                      Build Python packages into source distributions and wheels
+       cache                      Manage uv's cache
+       version                    Display uv's version
+       generate-shell-completion  Generate shell completion
+@@ -92,6 +93,7 @@ fn help_flag() {
+       python   Manage Python versions and installations
+       pip      Manage Python packages with a pip-compatible interface
+       venv     Create a virtual environment
++      build    Build Python packages into source distributions and wheels
+       cache    Manage uv's cache
+       version  Display uv's version
+       help     Display documentation for a command
+@@ -154,6 +156,7 @@ fn help_short_flag() {
+       python   Manage Python versions and installations
+       pip      Manage Python packages with a pip-compatible interface
+       venv     Create a virtual environment
++      build    Build Python packages into source distributions and wheels
+       cache    Manage uv's cache
+       version  Display uv's version
+       help     Display documentation for a command
+@@ -633,6 +636,7 @@ fn help_unknown_subcommand() {
+         python
+         pip
+         venv
++        build
+         cache
+         version
+         generate-shell-completion
+@@ -657,6 +661,7 @@ fn help_unknown_subcommand() {
+         python
+         pip
+         venv
++        build
+         cache
+         version
+         generate-shell-completion
+@@ -708,6 +713,7 @@ fn help_with_global_option() {
+       python                     Manage Python versions and installations
+       pip                        Manage Python packages with a pip-compatible interface
+       venv                       Create a virtual environment
++      build                      Build Python packages into source distributions and wheels
+       cache                      Manage uv's cache
+       version                    Display uv's version
+       generate-shell-completion  Generate shell completion
+@@ -808,6 +814,7 @@ fn help_with_no_pager() {
+       python                     Manage Python versions and installations
+       pip                        Manage Python packages with a pip-compatible interface
+       venv                       Create a virtual environment
++      build                      Build Python packages into source distributions and wheels
+       cache                      Manage uv's cache
+       version                    Display uv's version
+       generate-shell-completion  Generate shell completion
+diff --git a/crates/uv/tests/pip_compile.rs b/crates/uv/tests/pip_compile.rs
+index 1d92e28b02e..f019aae79da 100644
+--- a/crates/uv/tests/pip_compile.rs
++++ b/crates/uv/tests/pip_compile.rs
+@@ -11779,7 +11779,7 @@ fn incompatible_build_constraint() -> Result<()> {
+ 
+     ----- stderr -----
+     error: Failed to download and build `requests==1.2.0`
+-      Caused by: Failed to install requirements from setup.py build (resolve)
++      Caused by: Failed to install requirements from `setup.py` build (resolve)
+       Caused by: No solution found when resolving: setuptools>=40.8.0
+       Caused by: Because you require setuptools>=40.8.0 and setuptools==1, we can conclude that your requirements are unsatisfiable.
+     "###
+diff --git a/crates/uv/tests/pip_install.rs b/crates/uv/tests/pip_install.rs
+index 71b1a9ad9bf..d3c0c9be5b8 100644
+--- a/crates/uv/tests/pip_install.rs
++++ b/crates/uv/tests/pip_install.rs
+@@ -6171,7 +6171,7 @@ fn incompatible_build_constraint() -> Result<()> {
+ 
+     ----- stderr -----
+     error: Failed to download and build `requests==1.2.0`
+-      Caused by: Failed to install requirements from setup.py build (resolve)
++      Caused by: Failed to install requirements from `setup.py` build (resolve)
+       Caused by: No solution found when resolving: setuptools>=40.8.0
+       Caused by: Because you require setuptools>=40.8.0 and setuptools==1, we can conclude that your requirements are unsatisfiable.
+     "###
+diff --git a/crates/uv/tests/pip_sync.rs b/crates/uv/tests/pip_sync.rs
+index 2af46d84b6d..e343174a26b 100644
+--- a/crates/uv/tests/pip_sync.rs
++++ b/crates/uv/tests/pip_sync.rs
+@@ -5473,7 +5473,7 @@ fn incompatible_build_constraint() -> Result<()> {
+ 
+     ----- stderr -----
+     error: Failed to download and build `requests==1.2.0`
+-      Caused by: Failed to install requirements from setup.py build (resolve)
++      Caused by: Failed to install requirements from `setup.py` build (resolve)
+       Caused by: No solution found when resolving: setuptools>=40.8.0
+       Caused by: Because you require setuptools>=40.8.0 and setuptools==1, we can conclude that your requirements are unsatisfiable.
+     "###

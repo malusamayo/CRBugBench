@@ -1,0 +1,4001 @@
+diff --git a/src/Admin/Tools/Jobs/DeleteSendsJob.cs b/src/Admin/Tools/Jobs/DeleteSendsJob.cs
+index dafce0399436..7449d2ea0112 100644
+--- a/src/Admin/Tools/Jobs/DeleteSendsJob.cs
++++ b/src/Admin/Tools/Jobs/DeleteSendsJob.cs
+@@ -2,7 +2,7 @@
+ using Bit.Core;
+ using Bit.Core.Jobs;
+ using Bit.Core.Tools.Repositories;
+-using Bit.Core.Tools.Services;
++using Bit.Core.Tools.SendFeatures.Commands.Interfaces;
+ using Quartz;
+ 
+ namespace Bit.Admin.Tools.Jobs;
+@@ -32,10 +32,10 @@ protected async override Task ExecuteJobAsync(IJobExecutionContext context)
+         }
+         using (var scope = _serviceProvider.CreateScope())
+         {
+-            var sendService = scope.ServiceProvider.GetRequiredService<ISendService>();
++            var nonAnonymousSendCommand = scope.ServiceProvider.GetRequiredService<INonAnonymousSendCommand>();
+             foreach (var send in sends)
+             {
+-                await sendService.DeleteSendAsync(send);
++                await nonAnonymousSendCommand.DeleteSendAsync(send);
+             }
+         }
+     }
+diff --git a/src/Api/KeyManagement/Validators/SendRotationValidator.cs b/src/Api/KeyManagement/Validators/SendRotationValidator.cs
+index c39f563b516a..10a5d996b7ff 100644
+--- a/src/Api/KeyManagement/Validators/SendRotationValidator.cs
++++ b/src/Api/KeyManagement/Validators/SendRotationValidator.cs
+@@ -12,17 +12,17 @@ namespace Bit.Api.KeyManagement.Validators;
+ /// </summary>
+ public class SendRotationValidator : IRotationValidator<IEnumerable<SendWithIdRequestModel>, IReadOnlyList<Send>>
+ {
+-    private readonly ISendService _sendService;
++    private readonly ISendAuthorizationService _sendAuthorizationService;
+     private readonly ISendRepository _sendRepository;
+ 
+     /// <summary>
+     /// Instantiates a new <see cref="SendRotationValidator"/>
+     /// </summary>
+-    /// <param name="sendService">Enables conversion of <see cref="SendWithIdRequestModel"/> to <see cref="Send"/></param>
++    /// <param name="sendAuthorizationService">Enables conversion of <see cref="SendWithIdRequestModel"/> to <see cref="Send"/></param>
+     /// <param name="sendRepository">Retrieves all user <see cref="Send"/>s</param>
+-    public SendRotationValidator(ISendService sendService, ISendRepository sendRepository)
++    public SendRotationValidator(ISendAuthorizationService sendAuthorizationService, ISendRepository sendRepository)
+     {
+-        _sendService = sendService;
++        _sendAuthorizationService = sendAuthorizationService;
+         _sendRepository = sendRepository;
+     }
+ 
+@@ -44,7 +44,7 @@ public async Task<IReadOnlyList<Send>> ValidateAsync(User user, IEnumerable<Send
+                 throw new BadRequestException("All existing sends must be included in the rotation.");
+             }
+ 
+-            result.Add(send.ToSend(existing, _sendService));
++            result.Add(send.ToSend(existing, _sendAuthorizationService));
+         }
+ 
+         return result;
+diff --git a/src/Api/Tools/Controllers/SendsController.cs b/src/Api/Tools/Controllers/SendsController.cs
+index 3b5534bed04a..a6f58e56f428 100644
+--- a/src/Api/Tools/Controllers/SendsController.cs
++++ b/src/Api/Tools/Controllers/SendsController.cs
+@@ -12,6 +12,7 @@
+ using Bit.Core.Tools.Enums;
+ using Bit.Core.Tools.Models.Data;
+ using Bit.Core.Tools.Repositories;
++using Bit.Core.Tools.SendFeatures.Commands.Interfaces;
+ using Bit.Core.Tools.Services;
+ using Bit.Core.Utilities;
+ using Microsoft.AspNetCore.Authorization;
+@@ -25,8 +26,11 @@ public class SendsController : Controller
+ {
+     private readonly ISendRepository _sendRepository;
+     private readonly IUserService _userService;
+-    private readonly ISendService _sendService;
++    private readonly ISendValidationService _sendValidationService;
++    private readonly ISendAuthorizationService _sendAuthorizationService;
+     private readonly ISendFileStorageService _sendFileStorageService;
++    private readonly IAnonymousSendCommand _anonymousSendCommand;
++    private readonly INonAnonymousSendCommand _nonAnonymousSendCommand;
+     private readonly ILogger<SendsController> _logger;
+     private readonly GlobalSettings _globalSettings;
+     private readonly ICurrentContext _currentContext;
+@@ -34,7 +38,10 @@ public class SendsController : Controller
+     public SendsController(
+         ISendRepository sendRepository,
+         IUserService userService,
+-        ISendService sendService,
++        ISendValidationService sendValidationService,
++        ISendAuthorizationService sendAuthorizationService,
++        IAnonymousSendCommand anonymousSendCommand,
++        INonAnonymousSendCommand nonAnonymousSendCommand,
+         ISendFileStorageService sendFileStorageService,
+         ILogger<SendsController> logger,
+         GlobalSettings globalSettings,
+@@ -42,13 +49,17 @@ public SendsController(
+     {
+         _sendRepository = sendRepository;
+         _userService = userService;
+-        _sendService = sendService;
++        _sendValidationService = sendValidationService;
++        _sendAuthorizationService = sendAuthorizationService;
++        _anonymousSendCommand = anonymousSendCommand;
++        _nonAnonymousSendCommand = nonAnonymousSendCommand;
+         _sendFileStorageService = sendFileStorageService;
+         _logger = logger;
+         _globalSettings = globalSettings;
+         _currentContext = currentContext;
+     }
+ 
++    #region Anonymous endpoints
+     [AllowAnonymous]
+     [HttpPost("access/{id}")]
+     public async Task<IActionResult> Access(string id, [FromBody] SendAccessRequestModel model)
+@@ -62,7 +73,7 @@ public async Task<IActionResult> Access(string id, [FromBody] SendAccessRequestM
+ 
+         var guid = new Guid(CoreHelpers.Base64UrlDecode(id));
+         var (send, passwordRequired, passwordInvalid) =
+-            await _sendService.AccessAsync(guid, model.Password);
++            await _sendAuthorizationService.AccessAsync(guid, model.Password);
+         if (passwordRequired)
+         {
+             return new UnauthorizedResult();
+@@ -106,7 +117,7 @@ public async Task<IActionResult> GetSendFileDownloadData(string encodedSendId,
+             throw new BadRequestException("Could not locate send");
+         }
+ 
+-        var (url, passwordRequired, passwordInvalid) = await _sendService.GetSendFileDownloadUrlAsync(send, fileId,
++        var (url, passwordRequired, passwordInvalid) = await _anonymousSendCommand.GetSendFileDownloadUrlAsync(send, fileId,
+             model.Password);
+ 
+         if (passwordRequired)
+@@ -130,6 +141,44 @@ public async Task<IActionResult> GetSendFileDownloadData(string encodedSendId,
+         });
+     }
+ 
++    [AllowAnonymous]
++    [HttpPost("file/validate/azure")]
++    public async Task<ObjectResult> AzureValidateFile()
++    {
++        return await ApiHelpers.HandleAzureEvents(Request, new Dictionary<string, Func<EventGridEvent, Task>>
++        {
++            {
++                "Microsoft.Storage.BlobCreated", async (eventGridEvent) =>
++                {
++                    try
++                    {
++                        var blobName = eventGridEvent.Subject.Split($"{AzureSendFileStorageService.FilesContainerName}/blobs/")[1];
++                        var sendId = AzureSendFileStorageService.SendIdFromBlobName(blobName);
++                        var send = await _sendRepository.GetByIdAsync(new Guid(sendId));
++                        if (send == null)
++                        {
++                            if (_sendFileStorageService is AzureSendFileStorageService azureSendFileStorageService)
++                            {
++                                await azureSendFileStorageService.DeleteBlobAsync(blobName);
++                            }
++                            return;
++                        }
++                        await _sendValidationService.ValidateSendFile(send);
++                    }
++                    catch (Exception e)
++                    {
++                        _logger.LogError(e, $"Uncaught exception occurred while handling event grid event: {JsonSerializer.Serialize(eventGridEvent)}");
++                        return;
++                    }
++                }
++            }
++        });
++    }
++
++    #endregion
++
++    #region Non-anonymous endpoints
++
+     [HttpGet("{id}")]
+     public async Task<SendResponseModel> Get(string id)
+     {
+@@ -157,8 +206,8 @@ public async Task<SendResponseModel> Post([FromBody] SendRequestModel model)
+     {
+         model.ValidateCreation();
+         var userId = _userService.GetProperUserId(User).Value;
+-        var send = model.ToSend(userId, _sendService);
+-        await _sendService.SaveSendAsync(send);
++        var send = model.ToSend(userId, _sendAuthorizationService);
++        await _nonAnonymousSendCommand.SaveSendAsync(send);
+         return new SendResponseModel(send, _globalSettings);
+     }
+ 
+@@ -175,15 +224,15 @@ public async Task<SendFileUploadDataResponseModel> PostFile([FromBody] SendReque
+             throw new BadRequestException("Invalid content. File size hint is required.");
+         }
+ 
+-        if (model.FileLength.Value > SendService.MAX_FILE_SIZE)
++        if (model.FileLength.Value > Constants.FileSize501mb)
+         {
+-            throw new BadRequestException($"Max file size is {SendService.MAX_FILE_SIZE_READABLE}.");
++            throw new BadRequestException($"Max file size is {_sendValidationService.GetMaxFileSizeReadable()}.");
+         }
+ 
+         model.ValidateCreation();
+         var userId = _userService.GetProperUserId(User).Value;
+-        var (send, data) = model.ToSend(userId, model.File.FileName, _sendService);
+-        var uploadUrl = await _sendService.SaveFileSendAsync(send, data, model.FileLength.Value);
++        var (send, data) = model.ToSend(userId, model.File.FileName, _sendAuthorizationService);
++        var uploadUrl = await _nonAnonymousSendCommand.SaveFileSendAsync(send, data, model.FileLength.Value);
+         return new SendFileUploadDataResponseModel
+         {
+             Url = uploadUrl,
+@@ -230,41 +279,7 @@ public async Task PostFileForExistingSend(string id, string fileId)
+         var send = await _sendRepository.GetByIdAsync(new Guid(id));
+         await Request.GetFileAsync(async (stream) =>
+         {
+-            await _sendService.UploadFileToExistingSendAsync(stream, send);
+-        });
+-    }
+-
+-    [AllowAnonymous]
+-    [HttpPost("file/validate/azure")]
+-    public async Task<ObjectResult> AzureValidateFile()
+-    {
+-        return await ApiHelpers.HandleAzureEvents(Request, new Dictionary<string, Func<EventGridEvent, Task>>
+-        {
+-            {
+-                "Microsoft.Storage.BlobCreated", async (eventGridEvent) =>
+-                {
+-                    try
+-                    {
+-                        var blobName = eventGridEvent.Subject.Split($"{AzureSendFileStorageService.FilesContainerName}/blobs/")[1];
+-                        var sendId = AzureSendFileStorageService.SendIdFromBlobName(blobName);
+-                        var send = await _sendRepository.GetByIdAsync(new Guid(sendId));
+-                        if (send == null)
+-                        {
+-                            if (_sendFileStorageService is AzureSendFileStorageService azureSendFileStorageService)
+-                            {
+-                                await azureSendFileStorageService.DeleteBlobAsync(blobName);
+-                            }
+-                            return;
+-                        }
+-                        await _sendService.ValidateSendFile(send);
+-                    }
+-                    catch (Exception e)
+-                    {
+-                        _logger.LogError(e, $"Uncaught exception occurred while handling event grid event: {JsonSerializer.Serialize(eventGridEvent)}");
+-                        return;
+-                    }
+-                }
+-            }
++            await _nonAnonymousSendCommand.UploadFileToExistingSendAsync(stream, send);
+         });
+     }
+ 
+@@ -279,7 +294,7 @@ public async Task<SendResponseModel> Put(string id, [FromBody] SendRequestModel
+             throw new NotFoundException();
+         }
+ 
+-        await _sendService.SaveSendAsync(model.ToSend(send, _sendService));
++        await _nonAnonymousSendCommand.SaveSendAsync(model.ToSend(send, _sendAuthorizationService));
+         return new SendResponseModel(send, _globalSettings);
+     }
+ 
+@@ -294,7 +309,7 @@ public async Task<SendResponseModel> PutRemovePassword(string id)
+         }
+ 
+         send.Password = null;
+-        await _sendService.SaveSendAsync(send);
++        await _nonAnonymousSendCommand.SaveSendAsync(send);
+         return new SendResponseModel(send, _globalSettings);
+     }
+ 
+@@ -308,6 +323,8 @@ public async Task Delete(string id)
+             throw new NotFoundException();
+         }
+ 
+-        await _sendService.DeleteSendAsync(send);
++        await _nonAnonymousSendCommand.DeleteSendAsync(send);
+     }
++
++    #endregion
+ }
+diff --git a/src/Api/Tools/Models/Request/SendRequestModel.cs b/src/Api/Tools/Models/Request/SendRequestModel.cs
+index 660ff41e3a67..5b3fd7ba3111 100644
+--- a/src/Api/Tools/Models/Request/SendRequestModel.cs
++++ b/src/Api/Tools/Models/Request/SendRequestModel.cs
+@@ -36,31 +36,31 @@ public class SendRequestModel
+     public bool? Disabled { get; set; }
+     public bool? HideEmail { get; set; }
+ 
+-    public Send ToSend(Guid userId, ISendService sendService)
++    public Send ToSend(Guid userId, ISendAuthorizationService sendAuthorizationService)
+     {
+         var send = new Send
+         {
+             Type = Type,
+             UserId = (Guid?)userId
+         };
+-        ToSend(send, sendService);
++        ToSend(send, sendAuthorizationService);
+         return send;
+     }
+ 
+-    public (Send, SendFileData) ToSend(Guid userId, string fileName, ISendService sendService)
++    public (Send, SendFileData) ToSend(Guid userId, string fileName, ISendAuthorizationService sendAuthorizationService)
+     {
+         var send = ToSendBase(new Send
+         {
+             Type = Type,
+             UserId = (Guid?)userId
+-        }, sendService);
++        }, sendAuthorizationService);
+         var data = new SendFileData(Name, Notes, fileName);
+         return (send, data);
+     }
+ 
+-    public Send ToSend(Send existingSend, ISendService sendService)
++    public Send ToSend(Send existingSend, ISendAuthorizationService sendAuthorizationService)
+     {
+-        existingSend = ToSendBase(existingSend, sendService);
++        existingSend = ToSendBase(existingSend, sendAuthorizationService);
+         switch (existingSend.Type)
+         {
+             case SendType.File:
+@@ -125,7 +125,7 @@ public void ValidateEdit()
+         }
+     }
+ 
+-    private Send ToSendBase(Send existingSend, ISendService sendService)
++    private Send ToSendBase(Send existingSend, ISendAuthorizationService authorizationService)
+     {
+         existingSend.Key = Key;
+         existingSend.ExpirationDate = ExpirationDate;
+@@ -133,7 +133,7 @@ private Send ToSendBase(Send existingSend, ISendService sendService)
+         existingSend.MaxAccessCount = MaxAccessCount;
+         if (!string.IsNullOrWhiteSpace(Password))
+         {
+-            existingSend.Password = sendService.HashPassword(Password);
++            existingSend.Password = authorizationService.HashPassword(Password);
+         }
+         existingSend.Disabled = Disabled.GetValueOrDefault();
+         existingSend.HideEmail = HideEmail.GetValueOrDefault();
+diff --git a/src/Core/Tools/SendFeatures/Commands/AnonymousSendCommand.cs b/src/Core/Tools/SendFeatures/Commands/AnonymousSendCommand.cs
+new file mode 100644
+index 000000000000..25d9f316ec3a
+--- /dev/null
++++ b/src/Core/Tools/SendFeatures/Commands/AnonymousSendCommand.cs
+@@ -0,0 +1,51 @@
++﻿using Bit.Core.Exceptions;
++using Bit.Core.Platform.Push;
++using Bit.Core.Tools.Entities;
++using Bit.Core.Tools.Enums;
++using Bit.Core.Tools.Repositories;
++using Bit.Core.Tools.SendFeatures.Commands.Interfaces;
++using Bit.Core.Tools.Services;
++
++namespace Bit.Core.Tools.SendFeatures.Commands;
++
++public class AnonymousSendCommand : IAnonymousSendCommand
++{
++    private readonly ISendRepository _sendRepository;
++    private readonly ISendFileStorageService _sendFileStorageService;
++    private readonly IPushNotificationService _pushNotificationService;
++    private readonly ISendAuthorizationService _sendAuthorizationService;
++
++    public AnonymousSendCommand(
++        ISendRepository sendRepository,
++        ISendFileStorageService sendFileStorageService,
++        IPushNotificationService pushNotificationService,
++        ISendAuthorizationService sendAuthorizationService
++        )
++    {
++        _sendRepository = sendRepository;
++        _sendFileStorageService = sendFileStorageService;
++        _pushNotificationService = pushNotificationService;
++        _sendAuthorizationService = sendAuthorizationService;
++    }
++
++    // Response: Send, password required, password invalid
++    public async Task<(string, bool, bool)> GetSendFileDownloadUrlAsync(Send send, string fileId, string password)
++    {
++        if (send.Type != SendType.File)
++        {
++            throw new BadRequestException("Can only get a download URL for a file type of Send");
++        }
++
++        var (grantAccess, passwordRequired, passwordInvalid) = _sendAuthorizationService.SendCanBeAccessed(send, password);
++
++        if (!grantAccess)
++        {
++            return (null, passwordRequired, passwordInvalid);
++        }
++
++        send.AccessCount++;
++        await _sendRepository.ReplaceAsync(send);
++        await _pushNotificationService.PushSyncSendUpdateAsync(send);
++        return (await _sendFileStorageService.GetSendFileDownloadUrlAsync(send, fileId), false, false);
++    }
++}
+diff --git a/src/Core/Tools/SendFeatures/Commands/Interfaces/IAnonymousSendCommand.cs b/src/Core/Tools/SendFeatures/Commands/Interfaces/IAnonymousSendCommand.cs
+new file mode 100644
+index 000000000000..03283870521a
+--- /dev/null
++++ b/src/Core/Tools/SendFeatures/Commands/Interfaces/IAnonymousSendCommand.cs
+@@ -0,0 +1,20 @@
++﻿using Bit.Core.Tools.Entities;
++
++namespace Bit.Core.Tools.SendFeatures.Commands.Interfaces;
++
++/// <summary>
++/// AnonymousSendCommand interface provides methods for managing anonymous Sends.
++/// </summary>
++public interface IAnonymousSendCommand
++{
++    /// <summary>
++    /// Gets the Send file download URL for a Send object.
++    /// </summary>
++    /// <param name="send">Send object to help get file download url and validate file</param>
++    /// <param name="fileId">FileId get file download url</param>
++    /// <param name="password">Password will be validated and used to determine access</param>
++    /// <returns>Async Task object with Tuple containing the string of download url, boolean that identifies if
++    /// passwordRequiredError occurred, and another boolean that identifies if passwordInvalidError occurred.
++    /// </returns>
++    Task<(string, bool, bool)> GetSendFileDownloadUrlAsync(Send send, string fileId, string password);
++}
+diff --git a/src/Core/Tools/SendFeatures/Commands/Interfaces/INonAnonymousSendCommand.cs b/src/Core/Tools/SendFeatures/Commands/Interfaces/INonAnonymousSendCommand.cs
+new file mode 100644
+index 000000000000..97f1a7d4dd12
+--- /dev/null
++++ b/src/Core/Tools/SendFeatures/Commands/Interfaces/INonAnonymousSendCommand.cs
+@@ -0,0 +1,40 @@
++﻿using Bit.Core.Tools.Entities;
++using Bit.Core.Tools.Models.Data;
++
++namespace Bit.Core.Tools.SendFeatures.Commands.Interfaces;
++
++/// <summary>
++/// NonAnonymousSendCommand interface provides methods for managing non-anonymous Sends.
++/// </summary>
++public interface INonAnonymousSendCommand
++{
++    /// <summary>
++    /// Saves a Send to the database.
++    /// </summary>
++    /// <param name="send">Send object that is to be saved to database</param>
++    /// <returns>Task object for async operations</returns>
++    Task SaveSendAsync(Send send);
++
++    /// <summary>
++    /// Save File to the database.
++    /// </summary>
++    /// <param name="send">Send object that is to be saved to database</param>
++    /// <param name="data">SendFileData to be saved to database</param>
++    /// <param name="fileLength">Length of file help with saving to database</param>
++    /// <returns>Task object for async operations with file upload url</returns>
++    Task<string> SaveFileSendAsync(Send send, SendFileData data, long fileLength);
++    /// <summary>
++    /// Upload a file to an existing Send.
++    /// </summary>
++    /// <param name="stream">Stream of file to be uploaded</param>
++    /// <param name="send">Send object to help with uploading file</param>
++    /// <returns>Task object for async operations</returns>
++    Task UploadFileToExistingSendAsync(Stream stream, Send send);
++
++    /// <summary>
++    /// Deletes a Send from the database.
++    /// </summary>
++    /// <param name="send">Send object to be used to delete from database</param>
++    /// <returns>Task object for async operations</returns>
++    Task DeleteSendAsync(Send send);
++}
+diff --git a/src/Core/Tools/SendFeatures/Commands/NonAnonymousSendCommand.cs b/src/Core/Tools/SendFeatures/Commands/NonAnonymousSendCommand.cs
+new file mode 100644
+index 000000000000..b2cc7b7f3a39
+--- /dev/null
++++ b/src/Core/Tools/SendFeatures/Commands/NonAnonymousSendCommand.cs
+@@ -0,0 +1,154 @@
++﻿using System.Text.Json;
++using Bit.Core.Context;
++using Bit.Core.Exceptions;
++using Bit.Core.Platform.Push;
++using Bit.Core.Tools.Entities;
++using Bit.Core.Tools.Enums;
++using Bit.Core.Tools.Models.Business;
++using Bit.Core.Tools.Models.Data;
++using Bit.Core.Tools.Repositories;
++using Bit.Core.Tools.SendFeatures.Commands.Interfaces;
++using Bit.Core.Tools.Services;
++using Bit.Core.Utilities;
++
++namespace Bit.Core.Tools.SendFeatures.Commands;
++
++public class NonAnonymousSendCommand : INonAnonymousSendCommand
++{
++    private readonly ISendRepository _sendRepository;
++    private readonly ISendFileStorageService _sendFileStorageService;
++    private readonly IPushNotificationService _pushNotificationService;
++    private readonly ISendAuthorizationService _sendAuthorizationService;
++    private readonly ISendValidationService _sendValidationService;
++    private readonly IReferenceEventService _referenceEventService;
++    private readonly ICurrentContext _currentContext;
++    private readonly ISendCoreHelperService _sendCoreHelperService;
++
++    public NonAnonymousSendCommand(
++        ISendRepository sendRepository,
++        ISendFileStorageService sendFileStorageService,
++        IPushNotificationService pushNotificationService,
++        ISendAuthorizationService sendAuthorizationService,
++        ISendValidationService sendValidationService,
++        IReferenceEventService referenceEventService,
++        ICurrentContext currentContext,
++        ISendCoreHelperService sendCoreHelperService
++        )
++    {
++        _sendRepository = sendRepository;
++        _sendFileStorageService = sendFileStorageService;
++        _pushNotificationService = pushNotificationService;
++        _sendAuthorizationService = sendAuthorizationService;
++        _sendValidationService = sendValidationService;
++        _referenceEventService = referenceEventService;
++        _currentContext = currentContext;
++        _sendCoreHelperService = sendCoreHelperService;
++    }
++
++    public async Task SaveSendAsync(Send send)
++    {
++        // Make sure user can save Sends
++        await _sendValidationService.ValidateUserCanSaveAsync(send.UserId, send);
++
++        if (send.Id == default(Guid))
++        {
++            await _sendRepository.CreateAsync(send);
++            await _pushNotificationService.PushSyncSendCreateAsync(send);
++            await _referenceEventService.RaiseEventAsync(new ReferenceEvent
++            {
++                Id = send.UserId ?? default,
++                Type = ReferenceEventType.SendCreated,
++                Source = ReferenceEventSource.User,
++                SendType = send.Type,
++                MaxAccessCount = send.MaxAccessCount,
++                HasPassword = !string.IsNullOrWhiteSpace(send.Password),
++                SendHasNotes = send.Data?.Contains("Notes"),
++                ClientId = _currentContext.ClientId,
++                ClientVersion = _currentContext.ClientVersion
++            });
++        }
++        else
++        {
++            send.RevisionDate = DateTime.UtcNow;
++            await _sendRepository.UpsertAsync(send);
++            await _pushNotificationService.PushSyncSendUpdateAsync(send);
++        }
++    }
++
++    public async Task<string> SaveFileSendAsync(Send send, SendFileData data, long fileLength)
++    {
++        if (send.Type != SendType.File)
++        {
++            throw new BadRequestException("Send is not of type \"file\".");
++        }
++
++        if (fileLength < 1)
++        {
++            throw new BadRequestException("No file data.");
++        }
++
++        var storageBytesRemaining = await _sendValidationService.StorageRemainingForSendAsync(send);
++
++        if (storageBytesRemaining < fileLength)
++        {
++            throw new BadRequestException("Not enough storage available.");
++        }
++
++        var fileId = _sendCoreHelperService.SecureRandomString(32, useUpperCase: false, useSpecial: false);
++
++        try
++        {
++            data.Id = fileId;
++            data.Size = fileLength;
++            data.Validated = false;
++            send.Data = JsonSerializer.Serialize(data,
++                JsonHelpers.IgnoreWritingNull);
++            await SaveSendAsync(send);
++            return await _sendFileStorageService.GetSendFileUploadUrlAsync(send, fileId);
++        }
++        catch
++        {
++            // Clean up since this is not transactional
++            await _sendFileStorageService.DeleteFileAsync(send, fileId);
++            throw;
++        }
++    }
++
++    public async Task UploadFileToExistingSendAsync(Stream stream, Send send)
++    {
++        if (send?.Data == null)
++        {
++            throw new BadRequestException("Send does not have file data");
++        }
++
++        if (send.Type != SendType.File)
++        {
++            throw new BadRequestException("Not a File Type Send.");
++        }
++
++        var data = JsonSerializer.Deserialize<SendFileData>(send.Data);
++
++        if (data.Validated)
++        {
++            throw new BadRequestException("File has already been uploaded.");
++        }
++
++        await _sendFileStorageService.UploadNewFileAsync(stream, send, data.Id);
++
++        if (!await _sendValidationService.ValidateSendFile(send))
++        {
++            throw new BadRequestException("File received does not match expected file length.");
++        }
++    }
++    public async Task DeleteSendAsync(Send send)
++    {
++        await _sendRepository.DeleteAsync(send);
++        if (send.Type == Enums.SendType.File)
++        {
++            var data = JsonSerializer.Deserialize<SendFileData>(send.Data);
++            await _sendFileStorageService.DeleteFileAsync(send, data.Id);
++        }
++        await _pushNotificationService.PushSyncSendDeleteAsync(send);
++    }
++
++}
+diff --git a/src/Core/Tools/Services/Implementations/AzureSendFileStorageService.cs b/src/Core/Tools/SendFeatures/Services/AzureSendFileStorageService.cs
+similarity index 100%
+rename from src/Core/Tools/Services/Implementations/AzureSendFileStorageService.cs
+rename to src/Core/Tools/SendFeatures/Services/AzureSendFileStorageService.cs
+diff --git a/src/Core/Tools/SendFeatures/Services/Interfaces/ISendAuthorizationService.cs b/src/Core/Tools/SendFeatures/Services/Interfaces/ISendAuthorizationService.cs
+new file mode 100644
+index 000000000000..61173bdac5bd
+--- /dev/null
++++ b/src/Core/Tools/SendFeatures/Services/Interfaces/ISendAuthorizationService.cs
+@@ -0,0 +1,27 @@
++﻿using Bit.Core.Tools.Entities;
++
++namespace Bit.Core.Tools.Services;
++
++/// <summary>
++/// Send Authorization service is responsible for checking if a Send can be accessed.
++/// </summary>
++public interface ISendAuthorizationService
++{
++    /// <summary>
++    /// Checks if a Send can be accessed while updating the Send, pushing a notification, and sending a reference event.
++    /// </summary>
++    /// <param name="sendId">Guid of the Send needing to be accessed</param>
++    /// <param name="password">Password will be validated and used to determine access</param>
++    /// <returns>Async Task object with Tuple containing the Send object, boolean that identifies if
++    /// passwordRequiredError occurred, and another boolean that identifies if passwordInvalidError occurred.
++    /// </returns>
++    Task<(Send, bool, bool)> AccessAsync(Guid sendId, string password);
++    (bool grant, bool passwordRequiredError, bool passwordInvalidError) SendCanBeAccessed(Send send,
++        string password);
++    /// <summary>
++    /// Hashes the password using the password hasher.
++    /// </summary>
++    /// <param name="password">Password to be hashed</param>
++    /// <returns>Hashed password of the password given</returns>
++    string HashPassword(string password);
++}
+diff --git a/src/Core/Tools/SendFeatures/Services/Interfaces/ISendCoreHelperService.cs b/src/Core/Tools/SendFeatures/Services/Interfaces/ISendCoreHelperService.cs
+new file mode 100644
+index 000000000000..a09d7c3c6031
+--- /dev/null
++++ b/src/Core/Tools/SendFeatures/Services/Interfaces/ISendCoreHelperService.cs
+@@ -0,0 +1,17 @@
++﻿namespace Bit.Core.Tools.Services;
++
++/// <summary>
++/// This interface provides helper methods for generating secure random strings. Making
++/// it easier to mock the service in unit tests.
++/// </summary>
++public interface ISendCoreHelperService
++{
++    /// <summary>
++    /// Securely generates a random string of the specified length.
++    /// </summary>
++    /// <param name="length">Desired string length to be returned</param>
++    /// <param name="useUpperCase">Desired casing for the string</param>
++    /// <param name="useSpecial">Determines if special characters will be used in string</param>
++    /// <returns>A secure random string with the desired parameters</returns>
++    string SecureRandomString(int length, bool useUpperCase, bool useSpecial);
++}
+diff --git a/src/Core/Tools/SendFeatures/Services/Interfaces/ISendStorageService.cs b/src/Core/Tools/SendFeatures/Services/Interfaces/ISendStorageService.cs
+new file mode 100644
+index 000000000000..c37a4d3c98f7
+--- /dev/null
++++ b/src/Core/Tools/SendFeatures/Services/Interfaces/ISendStorageService.cs
+@@ -0,0 +1,65 @@
++﻿using Bit.Core.Enums;
++using Bit.Core.Tools.Entities;
++
++namespace Bit.Core.Tools.Services;
++
++/// <summary>
++/// Send File Storage Service is responsible for uploading, deleting, and validating files
++/// whether they are in local storage or in cloud storage.
++/// </summary>
++public interface ISendFileStorageService
++{
++    FileUploadType FileUploadType { get; }
++    /// <summary>
++    ///  Uploads a new file to the storage.
++    /// </summary>
++    /// <param name="stream">Stream of the file</param>
++    /// <param name="send">Send object for the file</param>
++    /// <param name="fileId">File id</param>
++    /// <returns>Task object for async operations</returns>
++    Task UploadNewFileAsync(Stream stream, Send send, string fileId);
++    /// <summary>
++    /// Deletes a file from the storage.
++    /// </summary>
++    /// <param name="send">Send object for file to be deleted</param>
++    /// <param name="fileId">File id of file to be deleted</param>
++    /// <returns>Task object for async operations</returns>
++    Task DeleteFileAsync(Send send, string fileId);
++    /// <summary>
++    /// Deletes all files for a specific organization.
++    /// </summary>
++    /// <param name="organizationId">OrganizationId to delete all files pertaining to organization</param>
++    /// <returns>Task object for async operations</returns>
++    Task DeleteFilesForOrganizationAsync(Guid organizationId);
++    /// <summary>
++    /// Deletes all files for a specific user.
++    /// </summary>
++    /// <param name="userId">UserId to delete all files pertaining to user</param>
++    /// <returns>Task object for async operations</returns>
++    Task DeleteFilesForUserAsync(Guid userId);
++    /// <summary>
++    /// Gets the download URL for a file.
++    /// </summary>
++    /// <param name="send">Send object help get download url for file</param>
++    /// <param name="fileId">File id to help get download url for file</param>
++    /// <returns>Task object for async operations with download url as a string</returns>
++    Task<string> GetSendFileDownloadUrlAsync(Send send, string fileId);
++    /// <summary>
++    /// Gets the upload URL for a file.
++    /// </summary>
++    /// <param name="send">Send object help get upload url for file </param>
++    /// <param name="fileId">File id to help get upload url for file</param>
++    /// <returns>Task object for async operations with file upload url as string</returns>
++    Task<string> GetSendFileUploadUrlAsync(Send send, string fileId);
++    /// <summary>
++    /// Validates the file size of a file in the storage.
++    /// </summary>
++    /// <param name="send">Send object help validate file</param>
++    /// <param name="fileId">File id to identify which file to validate</param>
++    /// <param name="expectedFileSize">Expected file size of the file</param>
++    /// <param name="leeway">Leeway will be used as tolerance range when validating the file size</param>
++    /// <returns>Task object for async operations with Tuple of boolean that determines if file was valid and long that
++    /// the actual file size of the file.
++    /// </returns>
++    Task<(bool, long?)> ValidateFileAsync(Send send, string fileId, long expectedFileSize, long leeway);
++}
+diff --git a/src/Core/Tools/SendFeatures/Services/Interfaces/ISendValidationService.cs b/src/Core/Tools/SendFeatures/Services/Interfaces/ISendValidationService.cs
+new file mode 100644
+index 000000000000..6ac70c8f0175
+--- /dev/null
++++ b/src/Core/Tools/SendFeatures/Services/Interfaces/ISendValidationService.cs
+@@ -0,0 +1,48 @@
++﻿using Bit.Core.Tools.Entities;
++
++namespace Bit.Core.Tools.Services;
++
++public interface ISendValidationService
++{
++    /// <summary>
++    /// Gets the maximum file size for a Send.
++    /// </summary>
++    /// <returns>Max file size for a Send</returns>
++    long GetMaxFileSize();
++
++    /// <summary>
++    /// Gets the maximum file size for a Send in a human-readable format.
++    /// </summary>
++    /// <returns>Max file size for a Send in human-readable format</returns>
++    string GetMaxFileSizeReadable();
++
++    /// <summary>
++    /// Validates the Send file.
++    /// </summary>
++    /// <param name="send">Send object needed to validate file</param>
++    /// <returns>Boolean whether the file was valid or not</returns>
++    Task<bool> ValidateSendFile(Send send);
++
++    /// <summary>
++    /// Validates a file can be saved by specified user.
++    /// </summary>
++    /// <param name="userId">UserId needed to validate file for specific user</param>
++    /// <param name="send">Send object needed to help validate file</param>
++    /// <returns>Task object for async operations</returns>
++    Task ValidateUserCanSaveAsync(Guid? userId, Send send);
++
++    /// <summary>
++    /// Validates a file can be saved by specified user with different policy based on feature flag
++    /// </summary>
++    /// <param name="userId">UserId needed to validate file for specific user</param>
++    /// <param name="send">Send object needed to help validate file</param>
++    /// <returns>Task object for async operations</returns>
++    Task ValidateUserCanSaveAsync_vNext(Guid? userId, Send send);
++
++    /// <summary>
++    /// Calculates the remaining storage for a Send.
++    /// </summary>
++    /// <param name="send"></param>
++    /// <returns>Task object for async operations</returns>
++    Task<long> StorageRemainingForSendAsync(Send send);
++}
+diff --git a/src/Core/Tools/Services/Implementations/LocalSendStorageService.cs b/src/Core/Tools/SendFeatures/Services/LocalSendStorageService.cs
+similarity index 100%
+rename from src/Core/Tools/Services/Implementations/LocalSendStorageService.cs
+rename to src/Core/Tools/SendFeatures/Services/LocalSendStorageService.cs
+diff --git a/src/Core/Tools/SendFeatures/Services/SendAuthorizationService.cs b/src/Core/Tools/SendFeatures/Services/SendAuthorizationService.cs
+new file mode 100644
+index 000000000000..b8eb9d74ab85
+--- /dev/null
++++ b/src/Core/Tools/SendFeatures/Services/SendAuthorizationService.cs
+@@ -0,0 +1,103 @@
++﻿using Bit.Core.Context;
++using Bit.Core.Entities;
++using Bit.Core.Platform.Push;
++using Bit.Core.Tools.Entities;
++using Bit.Core.Tools.Enums;
++using Bit.Core.Tools.Models.Business;
++using Bit.Core.Tools.Repositories;
++using Microsoft.AspNetCore.Identity;
++
++namespace Bit.Core.Tools.Services;
++
++public class SendAuthorizationService : ISendAuthorizationService
++{
++    private readonly ISendRepository _sendRepository;
++    private readonly IPasswordHasher<User> _passwordHasher;
++    private readonly IPushNotificationService _pushNotificationService;
++    private readonly IReferenceEventService _referenceEventService;
++    private readonly ICurrentContext _currentContext;
++
++    public SendAuthorizationService(
++        ISendRepository sendRepository,
++        IPasswordHasher<User> passwordHasher,
++        IPushNotificationService pushNotificationService,
++        IReferenceEventService referenceEventService,
++        ICurrentContext currentContext)
++    {
++        _sendRepository = sendRepository;
++        _passwordHasher = passwordHasher;
++        _pushNotificationService = pushNotificationService;
++        _referenceEventService = referenceEventService;
++        _currentContext = currentContext;
++    }
++
++    public (bool grant, bool passwordRequiredError, bool passwordInvalidError) SendCanBeAccessed(Send send,
++        string password)
++    {
++        var now = DateTime.UtcNow;
++        if (send == null || send.MaxAccessCount.GetValueOrDefault(int.MaxValue) <= send.AccessCount ||
++            send.ExpirationDate.GetValueOrDefault(DateTime.MaxValue) < now || send.Disabled ||
++            send.DeletionDate < now)
++        {
++            return (false, false, false);
++        }
++        if (!string.IsNullOrWhiteSpace(send.Password))
++        {
++            if (string.IsNullOrWhiteSpace(password))
++            {
++                return (false, true, false);
++            }
++            var passwordResult = _passwordHasher.VerifyHashedPassword(new User(), send.Password, password);
++            if (passwordResult == PasswordVerificationResult.SuccessRehashNeeded)
++            {
++                send.Password = HashPassword(password);
++            }
++            if (passwordResult == PasswordVerificationResult.Failed)
++            {
++                return (false, false, true);
++            }
++        }
++
++        return (true, false, false);
++    }
++
++    // Response: Send, password required, password invalid
++    public async Task<(Send, bool, bool)> AccessAsync(Guid sendId, string password)
++    {
++        var send = await _sendRepository.GetByIdAsync(sendId);
++        var (grantAccess, passwordRequired, passwordInvalid) = SendCanBeAccessed(send, password);
++
++        if (!grantAccess)
++        {
++            return (null, passwordRequired, passwordInvalid);
++        }
++
++        // TODO: maybe move this to a simple ++ sproc?
++        if (send.Type != SendType.File)
++        {
++            // File sends are incremented during file download
++            send.AccessCount++;
++        }
++
++        await _sendRepository.ReplaceAsync(send);
++        await _pushNotificationService.PushSyncSendUpdateAsync(send);
++        await _referenceEventService.RaiseEventAsync(new ReferenceEvent
++        {
++            Id = send.UserId ?? default,
++            Type = ReferenceEventType.SendAccessed,
++            Source = ReferenceEventSource.User,
++            SendType = send.Type,
++            MaxAccessCount = send.MaxAccessCount,
++            HasPassword = !string.IsNullOrWhiteSpace(send.Password),
++            SendHasNotes = send.Data?.Contains("Notes"),
++            ClientId = _currentContext.ClientId,
++            ClientVersion = _currentContext.ClientVersion
++        });
++        return (send, false, false);
++    }
++
++    public string HashPassword(string password)
++    {
++        return _passwordHasher.HashPassword(new User(), password);
++    }
++}
+diff --git a/src/Core/Tools/SendFeatures/Services/SendCoreHelperService.cs b/src/Core/Tools/SendFeatures/Services/SendCoreHelperService.cs
+new file mode 100644
+index 000000000000..122759f8f011
+--- /dev/null
++++ b/src/Core/Tools/SendFeatures/Services/SendCoreHelperService.cs
+@@ -0,0 +1,12 @@
++﻿using Bit.Core.Utilities;
++
++namespace Bit.Core.Tools.Services;
++
++public class SendCoreHelperService : ISendCoreHelperService
++{
++    public string SecureRandomString(int length, bool useUpperCase, bool useSpecial)
++    {
++        return CoreHelpers.SecureRandomString(length, upper: useUpperCase, special: useSpecial);
++    }
++
++}
+diff --git a/src/Core/Tools/SendFeatures/Services/SendValidationService.cs b/src/Core/Tools/SendFeatures/Services/SendValidationService.cs
+new file mode 100644
+index 000000000000..fd027b4c47ca
+--- /dev/null
++++ b/src/Core/Tools/SendFeatures/Services/SendValidationService.cs
+@@ -0,0 +1,186 @@
++﻿using System.Text.Json;
++using Bit.Core.AdminConsole.Enums;
++using Bit.Core.AdminConsole.Models.Data.Organizations.Policies;
++using Bit.Core.AdminConsole.OrganizationFeatures.Policies;
++using Bit.Core.AdminConsole.OrganizationFeatures.Policies.PolicyRequirements;
++using Bit.Core.AdminConsole.Services;
++using Bit.Core.Context;
++using Bit.Core.Exceptions;
++using Bit.Core.Repositories;
++using Bit.Core.Services;
++using Bit.Core.Settings;
++using Bit.Core.Tools.Entities;
++using Bit.Core.Tools.Models.Data;
++using Bit.Core.Tools.SendFeatures.Commands.Interfaces;
++using Bit.Core.Utilities;
++
++namespace Bit.Core.Tools.Services;
++
++public class SendValidationService : ISendValidationService
++{
++    private readonly long MAX_FILE_SIZE = Constants.FileSize501mb;
++    private readonly string MAX_FILE_SIZE_READABLE = "500 MB";
++    private readonly IUserRepository _userRepository;
++    private readonly IOrganizationRepository _organizationRepository;
++    private readonly INonAnonymousSendCommand _nonAnonymousSendCommand;
++    private readonly ISendFileStorageService _sendFileStorageService;
++    private readonly IPolicyService _policyService;
++    private readonly IFeatureService _featureService;
++    private readonly IUserService _userService;
++    private readonly GlobalSettings _globalSettings;
++    private readonly ICurrentContext _currentContext;
++    private readonly IPolicyRequirementQuery _policyRequirementQuery;
++
++    private readonly long _fileSizeLeeway = 1024L * 1024L; // 1MB
++
++    public SendValidationService(
++        IUserRepository userRepository,
++        IOrganizationRepository organizationRepository,
++        INonAnonymousSendCommand nonAnonymousSendCommand,
++        ISendFileStorageService sendFileStorageService,
++        IPolicyService policyService,
++        IFeatureService featureService,
++        IUserService userService,
++        IPolicyRequirementQuery policyRequirementQuery,
++        GlobalSettings globalSettings,
++        ICurrentContext currentContext)
++    {
++        _userRepository = userRepository;
++        _organizationRepository = organizationRepository;
++        _nonAnonymousSendCommand = nonAnonymousSendCommand;
++        _sendFileStorageService = sendFileStorageService;
++        _policyService = policyService;
++        _featureService = featureService;
++        _userService = userService;
++        _policyRequirementQuery = policyRequirementQuery;
++        _globalSettings = globalSettings;
++        _currentContext = currentContext;
++    }
++
++    public long GetMaxFileSize()
++    {
++        return MAX_FILE_SIZE;
++    }
++
++    public string GetMaxFileSizeReadable()
++    {
++        return MAX_FILE_SIZE_READABLE;
++    }
++
++    public async Task<bool> ValidateSendFile(Send send)
++    {
++        var fileData = JsonSerializer.Deserialize<SendFileData>(send.Data);
++
++        var (valid, realSize) = await _sendFileStorageService.ValidateFileAsync(send, fileData.Id, fileData.Size, _fileSizeLeeway);
++
++        if (!valid || realSize > GetMaxFileSize())
++        {
++            // File reported differs in size from that promised. Must be a rogue client. Delete Send
++            await _nonAnonymousSendCommand.DeleteSendAsync(send);
++            return false;
++        }
++
++        // Update Send data if necessary
++        if (realSize != fileData.Size)
++        {
++            fileData.Size = realSize.Value;
++        }
++        fileData.Validated = true;
++        send.Data = JsonSerializer.Serialize(fileData,
++            JsonHelpers.IgnoreWritingNull);
++        await _nonAnonymousSendCommand.SaveSendAsync(send);
++
++        return valid;
++    }
++    public async Task ValidateUserCanSaveAsync(Guid? userId, Send send)
++    {
++        if (_featureService.IsEnabled(FeatureFlagKeys.PolicyRequirements))
++        {
++            await ValidateUserCanSaveAsync_vNext(userId, send);
++            return;
++        }
++
++        if (!userId.HasValue || (!_currentContext.Organizations?.Any() ?? true))
++        {
++            return;
++        }
++
++        var anyDisableSendPolicies = await _policyService.AnyPoliciesApplicableToUserAsync(userId.Value,
++            PolicyType.DisableSend);
++        if (anyDisableSendPolicies)
++        {
++            throw new BadRequestException("Due to an Enterprise Policy, you are only able to delete an existing Send.");
++        }
++
++        if (send.HideEmail.GetValueOrDefault())
++        {
++            var sendOptionsPolicies = await _policyService.GetPoliciesApplicableToUserAsync(userId.Value, PolicyType.SendOptions);
++            if (sendOptionsPolicies.Any(p => CoreHelpers.LoadClassFromJsonData<SendOptionsPolicyData>(p.PolicyData)?.DisableHideEmail ?? false))
++            {
++                throw new BadRequestException("Due to an Enterprise Policy, you are not allowed to hide your email address from recipients when creating or editing a Send.");
++            }
++        }
++    }
++
++    public async Task ValidateUserCanSaveAsync_vNext(Guid? userId, Send send)
++    {
++        if (!userId.HasValue)
++        {
++            return;
++        }
++
++        var disableSendRequirement = await _policyRequirementQuery.GetAsync<DisableSendPolicyRequirement>(userId.Value);
++        if (disableSendRequirement.DisableSend)
++        {
++            throw new BadRequestException("Due to an Enterprise Policy, you are only able to delete an existing Send.");
++        }
++
++        var sendOptionsRequirement = await _policyRequirementQuery.GetAsync<SendOptionsPolicyRequirement>(userId.Value);
++        if (sendOptionsRequirement.DisableHideEmail && send.HideEmail.GetValueOrDefault())
++        {
++            throw new BadRequestException("Due to an Enterprise Policy, you are not allowed to hide your email address from recipients when creating or editing a Send.");
++        }
++    }
++
++    public async Task<long> StorageRemainingForSendAsync(Send send)
++    {
++        var storageBytesRemaining = 0L;
++        if (send.UserId.HasValue)
++        {
++            var user = await _userRepository.GetByIdAsync(send.UserId.Value);
++            if (!await _userService.CanAccessPremium(user))
++            {
++                throw new BadRequestException("You must have premium status to use file Sends.");
++            }
++
++            if (!user.EmailVerified)
++            {
++                throw new BadRequestException("You must confirm your email to use file Sends.");
++            }
++
++            if (user.Premium)
++            {
++                storageBytesRemaining = user.StorageBytesRemaining();
++            }
++            else
++            {
++                // Users that get access to file storage/premium from their organization get the default
++                // 1 GB max storage.
++                short limit = _globalSettings.SelfHosted ? (short)10240 : (short)1;
++                storageBytesRemaining = user.StorageBytesRemaining(limit);
++            }
++        }
++        else if (send.OrganizationId.HasValue)
++        {
++            var org = await _organizationRepository.GetByIdAsync(send.OrganizationId.Value);
++            if (!org.MaxStorageGb.HasValue)
++            {
++                throw new BadRequestException("This organization cannot use file sends.");
++            }
++
++            storageBytesRemaining = org.StorageBytesRemaining();
++        }
++
++        return storageBytesRemaining;
++    }
++}
+diff --git a/src/Core/Tools/Services/ISendService.cs b/src/Core/Tools/Services/ISendService.cs
+deleted file mode 100644
+index 2c20851ce809..000000000000
+--- a/src/Core/Tools/Services/ISendService.cs
++++ /dev/null
+@@ -1,16 +0,0 @@
+-﻿using Bit.Core.Tools.Entities;
+-using Bit.Core.Tools.Models.Data;
+-
+-namespace Bit.Core.Tools.Services;
+-
+-public interface ISendService
+-{
+-    Task DeleteSendAsync(Send send);
+-    Task SaveSendAsync(Send send);
+-    Task<string> SaveFileSendAsync(Send send, SendFileData data, long fileLength);
+-    Task UploadFileToExistingSendAsync(Stream stream, Send send);
+-    Task<(Send, bool, bool)> AccessAsync(Guid sendId, string password);
+-    string HashPassword(string password);
+-    Task<(string, bool, bool)> GetSendFileDownloadUrlAsync(Send send, string fileId, string password);
+-    Task<bool> ValidateSendFile(Send send);
+-}
+diff --git a/src/Core/Tools/Services/ISendStorageService.cs b/src/Core/Tools/Services/ISendStorageService.cs
+deleted file mode 100644
+index 4bf2aa38929f..000000000000
+--- a/src/Core/Tools/Services/ISendStorageService.cs
++++ /dev/null
+@@ -1,16 +0,0 @@
+-﻿using Bit.Core.Enums;
+-using Bit.Core.Tools.Entities;
+-
+-namespace Bit.Core.Tools.Services;
+-
+-public interface ISendFileStorageService
+-{
+-    FileUploadType FileUploadType { get; }
+-    Task UploadNewFileAsync(Stream stream, Send send, string fileId);
+-    Task DeleteFileAsync(Send send, string fileId);
+-    Task DeleteFilesForOrganizationAsync(Guid organizationId);
+-    Task DeleteFilesForUserAsync(Guid userId);
+-    Task<string> GetSendFileDownloadUrlAsync(Send send, string fileId);
+-    Task<string> GetSendFileUploadUrlAsync(Send send, string fileId);
+-    Task<(bool, long?)> ValidateFileAsync(Send send, string fileId, long expectedFileSize, long leeway);
+-}
+diff --git a/src/Core/Tools/Services/Implementations/SendService.cs b/src/Core/Tools/Services/Implementations/SendService.cs
+deleted file mode 100644
+index e09787d7eb20..000000000000
+--- a/src/Core/Tools/Services/Implementations/SendService.cs
++++ /dev/null
+@@ -1,383 +0,0 @@
+-﻿using System.Text.Json;
+-using Bit.Core.AdminConsole.Enums;
+-using Bit.Core.AdminConsole.Models.Data.Organizations.Policies;
+-using Bit.Core.AdminConsole.OrganizationFeatures.Policies;
+-using Bit.Core.AdminConsole.OrganizationFeatures.Policies.PolicyRequirements;
+-using Bit.Core.AdminConsole.Services;
+-using Bit.Core.Context;
+-using Bit.Core.Entities;
+-using Bit.Core.Exceptions;
+-using Bit.Core.Platform.Push;
+-using Bit.Core.Repositories;
+-using Bit.Core.Services;
+-using Bit.Core.Settings;
+-using Bit.Core.Tools.Entities;
+-using Bit.Core.Tools.Enums;
+-using Bit.Core.Tools.Models.Business;
+-using Bit.Core.Tools.Models.Data;
+-using Bit.Core.Tools.Repositories;
+-using Bit.Core.Utilities;
+-using Microsoft.AspNetCore.Identity;
+-
+-namespace Bit.Core.Tools.Services;
+-
+-public class SendService : ISendService
+-{
+-    public const long MAX_FILE_SIZE = Constants.FileSize501mb;
+-    public const string MAX_FILE_SIZE_READABLE = "500 MB";
+-    private readonly ISendRepository _sendRepository;
+-    private readonly IUserRepository _userRepository;
+-    private readonly IPolicyService _policyService;
+-    private readonly IUserService _userService;
+-    private readonly IOrganizationRepository _organizationRepository;
+-    private readonly ISendFileStorageService _sendFileStorageService;
+-    private readonly IPasswordHasher<User> _passwordHasher;
+-    private readonly IPushNotificationService _pushService;
+-    private readonly IReferenceEventService _referenceEventService;
+-    private readonly GlobalSettings _globalSettings;
+-    private readonly ICurrentContext _currentContext;
+-    private readonly IPolicyRequirementQuery _policyRequirementQuery;
+-    private readonly IFeatureService _featureService;
+-
+-    private const long _fileSizeLeeway = 1024L * 1024L; // 1MB
+-
+-    public SendService(
+-        ISendRepository sendRepository,
+-        IUserRepository userRepository,
+-        IUserService userService,
+-        IOrganizationRepository organizationRepository,
+-        ISendFileStorageService sendFileStorageService,
+-        IPasswordHasher<User> passwordHasher,
+-        IPushNotificationService pushService,
+-        IReferenceEventService referenceEventService,
+-        GlobalSettings globalSettings,
+-        IPolicyService policyService,
+-        ICurrentContext currentContext,
+-        IPolicyRequirementQuery policyRequirementQuery,
+-        IFeatureService featureService)
+-    {
+-        _sendRepository = sendRepository;
+-        _userRepository = userRepository;
+-        _userService = userService;
+-        _policyService = policyService;
+-        _organizationRepository = organizationRepository;
+-        _sendFileStorageService = sendFileStorageService;
+-        _passwordHasher = passwordHasher;
+-        _pushService = pushService;
+-        _referenceEventService = referenceEventService;
+-        _globalSettings = globalSettings;
+-        _currentContext = currentContext;
+-        _policyRequirementQuery = policyRequirementQuery;
+-        _featureService = featureService;
+-    }
+-
+-    public async Task SaveSendAsync(Send send)
+-    {
+-        // Make sure user can save Sends
+-        await ValidateUserCanSaveAsync(send.UserId, send);
+-
+-        if (send.Id == default(Guid))
+-        {
+-            await _sendRepository.CreateAsync(send);
+-            await _pushService.PushSyncSendCreateAsync(send);
+-            await RaiseReferenceEventAsync(send, ReferenceEventType.SendCreated);
+-        }
+-        else
+-        {
+-            send.RevisionDate = DateTime.UtcNow;
+-            await _sendRepository.UpsertAsync(send);
+-            await _pushService.PushSyncSendUpdateAsync(send);
+-        }
+-    }
+-
+-    public async Task<string> SaveFileSendAsync(Send send, SendFileData data, long fileLength)
+-    {
+-        if (send.Type != SendType.File)
+-        {
+-            throw new BadRequestException("Send is not of type \"file\".");
+-        }
+-
+-        if (fileLength < 1)
+-        {
+-            throw new BadRequestException("No file data.");
+-        }
+-
+-        var storageBytesRemaining = await StorageRemainingForSendAsync(send);
+-
+-        if (storageBytesRemaining < fileLength)
+-        {
+-            throw new BadRequestException("Not enough storage available.");
+-        }
+-
+-        var fileId = Utilities.CoreHelpers.SecureRandomString(32, upper: false, special: false);
+-
+-        try
+-        {
+-            data.Id = fileId;
+-            data.Size = fileLength;
+-            data.Validated = false;
+-            send.Data = JsonSerializer.Serialize(data,
+-                JsonHelpers.IgnoreWritingNull);
+-            await SaveSendAsync(send);
+-            return await _sendFileStorageService.GetSendFileUploadUrlAsync(send, fileId);
+-        }
+-        catch
+-        {
+-            // Clean up since this is not transactional
+-            await _sendFileStorageService.DeleteFileAsync(send, fileId);
+-            throw;
+-        }
+-    }
+-
+-    public async Task UploadFileToExistingSendAsync(Stream stream, Send send)
+-    {
+-        if (send?.Data == null)
+-        {
+-            throw new BadRequestException("Send does not have file data");
+-        }
+-
+-        if (send.Type != SendType.File)
+-        {
+-            throw new BadRequestException("Not a File Type Send.");
+-        }
+-
+-        var data = JsonSerializer.Deserialize<SendFileData>(send.Data);
+-
+-        if (data.Validated)
+-        {
+-            throw new BadRequestException("File has already been uploaded.");
+-        }
+-
+-        await _sendFileStorageService.UploadNewFileAsync(stream, send, data.Id);
+-
+-        if (!await ValidateSendFile(send))
+-        {
+-            throw new BadRequestException("File received does not match expected file length.");
+-        }
+-    }
+-
+-    public async Task<bool> ValidateSendFile(Send send)
+-    {
+-        var fileData = JsonSerializer.Deserialize<SendFileData>(send.Data);
+-
+-        var (valid, realSize) = await _sendFileStorageService.ValidateFileAsync(send, fileData.Id, fileData.Size, _fileSizeLeeway);
+-
+-        if (!valid || realSize > MAX_FILE_SIZE)
+-        {
+-            // File reported differs in size from that promised. Must be a rogue client. Delete Send
+-            await DeleteSendAsync(send);
+-            return false;
+-        }
+-
+-        // Update Send data if necessary
+-        if (realSize != fileData.Size)
+-        {
+-            fileData.Size = realSize.Value;
+-        }
+-        fileData.Validated = true;
+-        send.Data = JsonSerializer.Serialize(fileData,
+-            JsonHelpers.IgnoreWritingNull);
+-        await SaveSendAsync(send);
+-
+-        return valid;
+-    }
+-
+-    public async Task DeleteSendAsync(Send send)
+-    {
+-        await _sendRepository.DeleteAsync(send);
+-        if (send.Type == Enums.SendType.File)
+-        {
+-            var data = JsonSerializer.Deserialize<SendFileData>(send.Data);
+-            await _sendFileStorageService.DeleteFileAsync(send, data.Id);
+-        }
+-        await _pushService.PushSyncSendDeleteAsync(send);
+-    }
+-
+-    public (bool grant, bool passwordRequiredError, bool passwordInvalidError) SendCanBeAccessed(Send send,
+-        string password)
+-    {
+-        var now = DateTime.UtcNow;
+-        if (send == null || send.MaxAccessCount.GetValueOrDefault(int.MaxValue) <= send.AccessCount ||
+-            send.ExpirationDate.GetValueOrDefault(DateTime.MaxValue) < now || send.Disabled ||
+-            send.DeletionDate < now)
+-        {
+-            return (false, false, false);
+-        }
+-        if (!string.IsNullOrWhiteSpace(send.Password))
+-        {
+-            if (string.IsNullOrWhiteSpace(password))
+-            {
+-                return (false, true, false);
+-            }
+-            var passwordResult = _passwordHasher.VerifyHashedPassword(new User(), send.Password, password);
+-            if (passwordResult == PasswordVerificationResult.SuccessRehashNeeded)
+-            {
+-                send.Password = HashPassword(password);
+-            }
+-            if (passwordResult == PasswordVerificationResult.Failed)
+-            {
+-                return (false, false, true);
+-            }
+-        }
+-
+-        return (true, false, false);
+-    }
+-
+-    // Response: Send, password required, password invalid
+-    public async Task<(string, bool, bool)> GetSendFileDownloadUrlAsync(Send send, string fileId, string password)
+-    {
+-        if (send.Type != SendType.File)
+-        {
+-            throw new BadRequestException("Can only get a download URL for a file type of Send");
+-        }
+-
+-        var (grantAccess, passwordRequired, passwordInvalid) = SendCanBeAccessed(send, password);
+-
+-        if (!grantAccess)
+-        {
+-            return (null, passwordRequired, passwordInvalid);
+-        }
+-
+-        send.AccessCount++;
+-        await _sendRepository.ReplaceAsync(send);
+-        await _pushService.PushSyncSendUpdateAsync(send);
+-        return (await _sendFileStorageService.GetSendFileDownloadUrlAsync(send, fileId), false, false);
+-    }
+-
+-    // Response: Send, password required, password invalid
+-    public async Task<(Send, bool, bool)> AccessAsync(Guid sendId, string password)
+-    {
+-        var send = await _sendRepository.GetByIdAsync(sendId);
+-        var (grantAccess, passwordRequired, passwordInvalid) = SendCanBeAccessed(send, password);
+-
+-        if (!grantAccess)
+-        {
+-            return (null, passwordRequired, passwordInvalid);
+-        }
+-
+-        // TODO: maybe move this to a simple ++ sproc?
+-        if (send.Type != SendType.File)
+-        {
+-            // File sends are incremented during file download
+-            send.AccessCount++;
+-        }
+-
+-        await _sendRepository.ReplaceAsync(send);
+-        await _pushService.PushSyncSendUpdateAsync(send);
+-        await RaiseReferenceEventAsync(send, ReferenceEventType.SendAccessed);
+-        return (send, false, false);
+-    }
+-
+-    private async Task RaiseReferenceEventAsync(Send send, ReferenceEventType eventType)
+-    {
+-        await _referenceEventService.RaiseEventAsync(new ReferenceEvent
+-        {
+-            Id = send.UserId ?? default,
+-            Type = eventType,
+-            Source = ReferenceEventSource.User,
+-            SendType = send.Type,
+-            MaxAccessCount = send.MaxAccessCount,
+-            HasPassword = !string.IsNullOrWhiteSpace(send.Password),
+-            SendHasNotes = send.Data?.Contains("Notes"),
+-            ClientId = _currentContext.ClientId,
+-            ClientVersion = _currentContext.ClientVersion
+-        });
+-    }
+-
+-    public string HashPassword(string password)
+-    {
+-        return _passwordHasher.HashPassword(new User(), password);
+-    }
+-
+-    private async Task ValidateUserCanSaveAsync(Guid? userId, Send send)
+-    {
+-        if (_featureService.IsEnabled(FeatureFlagKeys.PolicyRequirements))
+-        {
+-            await ValidateUserCanSaveAsync_vNext(userId, send);
+-            return;
+-        }
+-
+-        if (!userId.HasValue || (!_currentContext.Organizations?.Any() ?? true))
+-        {
+-            return;
+-        }
+-
+-        var anyDisableSendPolicies = await _policyService.AnyPoliciesApplicableToUserAsync(userId.Value,
+-            PolicyType.DisableSend);
+-        if (anyDisableSendPolicies)
+-        {
+-            throw new BadRequestException("Due to an Enterprise Policy, you are only able to delete an existing Send.");
+-        }
+-
+-        if (send.HideEmail.GetValueOrDefault())
+-        {
+-            var sendOptionsPolicies = await _policyService.GetPoliciesApplicableToUserAsync(userId.Value, PolicyType.SendOptions);
+-            if (sendOptionsPolicies.Any(p => CoreHelpers.LoadClassFromJsonData<SendOptionsPolicyData>(p.PolicyData)?.DisableHideEmail ?? false))
+-            {
+-                throw new BadRequestException("Due to an Enterprise Policy, you are not allowed to hide your email address from recipients when creating or editing a Send.");
+-            }
+-        }
+-    }
+-
+-    private async Task ValidateUserCanSaveAsync_vNext(Guid? userId, Send send)
+-    {
+-        if (!userId.HasValue)
+-        {
+-            return;
+-        }
+-
+-        var disableSendRequirement = await _policyRequirementQuery.GetAsync<DisableSendPolicyRequirement>(userId.Value);
+-        if (disableSendRequirement.DisableSend)
+-        {
+-            throw new BadRequestException("Due to an Enterprise Policy, you are only able to delete an existing Send.");
+-        }
+-
+-        var sendOptionsRequirement = await _policyRequirementQuery.GetAsync<SendOptionsPolicyRequirement>(userId.Value);
+-        if (sendOptionsRequirement.DisableHideEmail && send.HideEmail.GetValueOrDefault())
+-        {
+-            throw new BadRequestException("Due to an Enterprise Policy, you are not allowed to hide your email address from recipients when creating or editing a Send.");
+-        }
+-    }
+-
+-    private async Task<long> StorageRemainingForSendAsync(Send send)
+-    {
+-        var storageBytesRemaining = 0L;
+-        if (send.UserId.HasValue)
+-        {
+-            var user = await _userRepository.GetByIdAsync(send.UserId.Value);
+-            if (!await _userService.CanAccessPremium(user))
+-            {
+-                throw new BadRequestException("You must have premium status to use file Sends.");
+-            }
+-
+-            if (!user.EmailVerified)
+-            {
+-                throw new BadRequestException("You must confirm your email to use file Sends.");
+-            }
+-
+-            if (user.Premium)
+-            {
+-                storageBytesRemaining = user.StorageBytesRemaining();
+-            }
+-            else
+-            {
+-                // Users that get access to file storage/premium from their organization get the default
+-                // 1 GB max storage.
+-                storageBytesRemaining = user.StorageBytesRemaining(
+-                    _globalSettings.SelfHosted ? (short)10240 : (short)1);
+-            }
+-        }
+-        else if (send.OrganizationId.HasValue)
+-        {
+-            var org = await _organizationRepository.GetByIdAsync(send.OrganizationId.Value);
+-            if (!org.MaxStorageGb.HasValue)
+-            {
+-                throw new BadRequestException("This organization cannot use file sends.");
+-            }
+-
+-            storageBytesRemaining = org.StorageBytesRemaining();
+-        }
+-
+-        return storageBytesRemaining;
+-    }
+-}
+diff --git a/src/SharedWeb/Utilities/ServiceCollectionExtensions.cs b/src/SharedWeb/Utilities/ServiceCollectionExtensions.cs
+index 8d48fc86ef11..ab8c62622833 100644
+--- a/src/SharedWeb/Utilities/ServiceCollectionExtensions.cs
++++ b/src/SharedWeb/Utilities/ServiceCollectionExtensions.cs
+@@ -123,7 +123,7 @@ public static void AddBaseServices(this IServiceCollection services, IGlobalSett
+         services.AddScoped<ISsoConfigService, SsoConfigService>();
+         services.AddScoped<IAuthRequestService, AuthRequestService>();
+         services.AddScoped<IDuoUniversalTokenService, DuoUniversalTokenService>();
+-        services.AddScoped<ISendService, SendService>();
++        services.AddScoped<ISendAuthorizationService, SendAuthorizationService>();
+         services.AddLoginServices();
+         services.AddScoped<IOrganizationDomainService, OrganizationDomainService>();
+         services.AddVaultServices();
+diff --git a/test/Api.Test/KeyManagement/Validators/SendRotationValidatorTests.cs b/test/Api.Test/KeyManagement/Validators/SendRotationValidatorTests.cs
+index 842343ba33d1..7bab587cf0c2 100644
+--- a/test/Api.Test/KeyManagement/Validators/SendRotationValidatorTests.cs
++++ b/test/Api.Test/KeyManagement/Validators/SendRotationValidatorTests.cs
+@@ -23,11 +23,11 @@ public class SendRotationValidatorTests
+     public async Task ValidateAsync_Success()
+     {
+         // Arrange
+-        var sendService = Substitute.For<ISendService>();
++        var sendAuthorizationService = Substitute.For<ISendAuthorizationService>();
+         var sendRepository = Substitute.For<ISendRepository>();
+ 
+         var sut = new SendRotationValidator(
+-            sendService,
++            sendAuthorizationService,
+             sendRepository
+         );
+ 
+@@ -52,11 +52,11 @@ public async Task ValidateAsync_Success()
+     public async Task ValidateAsync_SendNotReturnedFromRepository_NotIncludedInOutput()
+     {
+         // Arrange
+-        var sendService = Substitute.For<ISendService>();
++        var sendAuthorizationService = Substitute.For<ISendAuthorizationService>();
+         var sendRepository = Substitute.For<ISendRepository>();
+ 
+         var sut = new SendRotationValidator(
+-            sendService,
++            sendAuthorizationService,
+             sendRepository
+         );
+ 
+@@ -76,11 +76,11 @@ public async Task ValidateAsync_SendNotReturnedFromRepository_NotIncludedInOutpu
+     public async Task ValidateAsync_InputMissingUserSend_Throws()
+     {
+         // Arrange
+-        var sendService = Substitute.For<ISendService>();
++        var sendAuthorizationService = Substitute.For<ISendAuthorizationService>();
+         var sendRepository = Substitute.For<ISendRepository>();
+ 
+         var sut = new SendRotationValidator(
+-            sendService,
++            sendAuthorizationService,
+             sendRepository
+         );
+ 
+diff --git a/test/Api.Test/Tools/Controllers/SendsControllerTests.cs b/test/Api.Test/Tools/Controllers/SendsControllerTests.cs
+index f784448e50a6..28528b5b21ec 100644
+--- a/test/Api.Test/Tools/Controllers/SendsControllerTests.cs
++++ b/test/Api.Test/Tools/Controllers/SendsControllerTests.cs
+@@ -11,6 +11,7 @@
+ using Bit.Core.Tools.Entities;
+ using Bit.Core.Tools.Enums;
+ using Bit.Core.Tools.Repositories;
++using Bit.Core.Tools.SendFeatures.Commands.Interfaces;
+ using Bit.Core.Tools.Services;
+ using Bit.Core.Utilities;
+ using Microsoft.AspNetCore.Mvc;
+@@ -26,7 +27,10 @@ public class SendsControllerTests : IDisposable
+     private readonly GlobalSettings _globalSettings;
+     private readonly IUserService _userService;
+     private readonly ISendRepository _sendRepository;
+-    private readonly ISendService _sendService;
++    private readonly INonAnonymousSendCommand _nonAnonymousSendCommand;
++    private readonly IAnonymousSendCommand _anonymousSendCommand;
++    private readonly ISendAuthorizationService _sendAuthorizationService;
++    private readonly ISendValidationService _sendValidationService;
+     private readonly ISendFileStorageService _sendFileStorageService;
+     private readonly ILogger<SendsController> _logger;
+     private readonly ICurrentContext _currentContext;
+@@ -35,7 +39,10 @@ public SendsControllerTests()
+     {
+         _userService = Substitute.For<IUserService>();
+         _sendRepository = Substitute.For<ISendRepository>();
+-        _sendService = Substitute.For<ISendService>();
++        _nonAnonymousSendCommand = Substitute.For<INonAnonymousSendCommand>();
++        _anonymousSendCommand = Substitute.For<IAnonymousSendCommand>();
++        _sendAuthorizationService = Substitute.For<ISendAuthorizationService>();
++        _sendValidationService = Substitute.For<ISendValidationService>();
+         _sendFileStorageService = Substitute.For<ISendFileStorageService>();
+         _globalSettings = new GlobalSettings();
+         _logger = Substitute.For<ILogger<SendsController>>();
+@@ -44,7 +51,10 @@ public SendsControllerTests()
+         _sut = new SendsController(
+             _sendRepository,
+             _userService,
+-            _sendService,
++            _sendValidationService,
++            _sendAuthorizationService,
++            _anonymousSendCommand,
++            _nonAnonymousSendCommand,
+             _sendFileStorageService,
+             _logger,
+             _globalSettings,
+@@ -68,7 +78,7 @@ public async Task SendsController_WhenSendHidesEmail_CreatorIdentifierShouldBeNu
+         send.Data = JsonSerializer.Serialize(new Dictionary<string, string>());
+         send.HideEmail = true;
+ 
+-        _sendService.AccessAsync(id, null).Returns((send, false, false));
++        _sendAuthorizationService.AccessAsync(id, null).Returns((send, false, false));
+         _userService.GetUserByIdAsync(Arg.Any<Guid>()).Returns(user);
+ 
+         var request = new SendAccessRequestModel();
+diff --git a/test/Api.Test/Tools/Models/Request/SendRequestModelTests.cs b/test/Api.Test/Tools/Models/Request/SendRequestModelTests.cs
+index 59fb35d32ed2..804966701122 100644
+--- a/test/Api.Test/Tools/Models/Request/SendRequestModelTests.cs
++++ b/test/Api.Test/Tools/Models/Request/SendRequestModelTests.cs
+@@ -34,11 +34,11 @@ public void ToSend_Text_Success()
+             Type = SendType.Text,
+         };
+ 
+-        var sendService = Substitute.For<ISendService>();
+-        sendService.HashPassword(Arg.Any<string>())
++        var sendAuthorizationService = Substitute.For<ISendAuthorizationService>();
++        sendAuthorizationService.HashPassword(Arg.Any<string>())
+             .Returns((info) => $"hashed_{(string)info[0]}");
+ 
+-        var send = sendRequest.ToSend(Guid.NewGuid(), sendService);
++        var send = sendRequest.ToSend(Guid.NewGuid(), sendAuthorizationService);
+ 
+         Assert.Equal(deletionDate, send.DeletionDate);
+         Assert.False(send.Disabled);
+diff --git a/test/Core.Test/Tools/Services/AnonymousSendCommandTests.cs b/test/Core.Test/Tools/Services/AnonymousSendCommandTests.cs
+new file mode 100644
+index 000000000000..79409b622a2c
+--- /dev/null
++++ b/test/Core.Test/Tools/Services/AnonymousSendCommandTests.cs
+@@ -0,0 +1,120 @@
++﻿using System.Text.Json;
++using Bit.Core.Exceptions;
++using Bit.Core.Platform.Push;
++using Bit.Core.Tools.Entities;
++using Bit.Core.Tools.Enums;
++using Bit.Core.Tools.Repositories;
++using Bit.Core.Tools.SendFeatures.Commands;
++using Bit.Core.Tools.Services;
++using NSubstitute;
++using Xunit;
++
++namespace Bit.Core.Test.Tools.Services;
++
++public class AnonymousSendCommandTests
++{
++    private readonly ISendRepository _sendRepository;
++    private readonly ISendFileStorageService _sendFileStorageService;
++    private readonly IPushNotificationService _pushNotificationService;
++    private readonly ISendAuthorizationService _sendAuthorizationService;
++    private readonly AnonymousSendCommand _anonymousSendCommand;
++
++    public AnonymousSendCommandTests()
++    {
++        _sendRepository = Substitute.For<ISendRepository>();
++        _sendFileStorageService = Substitute.For<ISendFileStorageService>();
++        _pushNotificationService = Substitute.For<IPushNotificationService>();
++        _sendAuthorizationService = Substitute.For<ISendAuthorizationService>();
++
++        _anonymousSendCommand = new AnonymousSendCommand(
++            _sendRepository,
++            _sendFileStorageService,
++            _pushNotificationService,
++            _sendAuthorizationService);
++    }
++
++    [Fact]
++    public async Task GetSendFileDownloadUrlAsync_Success_ReturnsDownloadUrl()
++    {
++        // Arrange
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            Type = SendType.File,
++            AccessCount = 0,
++            Data = JsonSerializer.Serialize(new { Id = "fileId123" })
++        };
++        var fileId = "fileId123";
++        var password = "testPassword";
++        var expectedUrl = "https://example.com/download";
++
++        _sendAuthorizationService
++            .SendCanBeAccessed(send, password)
++            .Returns((true, false, false));
++
++        _sendFileStorageService
++            .GetSendFileDownloadUrlAsync(send, fileId)
++            .Returns(expectedUrl);
++
++        // Act
++        var (url, passwordRequired, passwordInvalid) =
++            await _anonymousSendCommand.GetSendFileDownloadUrlAsync(send, fileId, password);
++
++        // Assert
++        Assert.Equal(expectedUrl, url);
++        Assert.False(passwordRequired);
++        Assert.False(passwordInvalid);
++        Assert.Equal(1, send.AccessCount);
++
++        await _sendRepository.Received(1).ReplaceAsync(send);
++        await _pushNotificationService.Received(1).PushSyncSendUpdateAsync(send);
++    }
++
++    [Fact]
++    public async Task GetSendFileDownloadUrlAsync_AccessDenied_ReturnsNullWithReasons()
++    {
++        // Arrange
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            Type = SendType.File,
++            AccessCount = 0
++        };
++        var fileId = "fileId123";
++        var password = "wrongPassword";
++
++        _sendAuthorizationService
++            .SendCanBeAccessed(send, password)
++            .Returns((false, true, true));
++
++        // Act
++        var (url, passwordRequired, passwordInvalid) =
++            await _anonymousSendCommand.GetSendFileDownloadUrlAsync(send, fileId, password);
++
++        // Assert
++        Assert.Null(url);
++        Assert.True(passwordRequired);
++        Assert.True(passwordInvalid);
++        Assert.Equal(0, send.AccessCount);
++
++        await _sendRepository.DidNotReceiveWithAnyArgs().ReplaceAsync(default);
++        await _pushNotificationService.DidNotReceiveWithAnyArgs().PushSyncSendUpdateAsync(default);
++    }
++
++    [Fact]
++    public async Task GetSendFileDownloadUrlAsync_NotFileSend_ThrowsBadRequestException()
++    {
++        // Arrange
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            Type = SendType.Text
++        };
++        var fileId = "fileId123";
++        var password = "testPassword";
++
++        // Act & Assert
++        await Assert.ThrowsAsync<BadRequestException>(() =>
++            _anonymousSendCommand.GetSendFileDownloadUrlAsync(send, fileId, password));
++    }
++}
+diff --git a/test/Core.Test/Tools/Services/NonAnonymousSendCommandTests.cs b/test/Core.Test/Tools/Services/NonAnonymousSendCommandTests.cs
+new file mode 100644
+index 000000000000..3ef7bd241cb7
+--- /dev/null
++++ b/test/Core.Test/Tools/Services/NonAnonymousSendCommandTests.cs
+@@ -0,0 +1,1098 @@
++﻿using System.Text.Json;
++using Bit.Core.Context;
++using Bit.Core.Entities;
++using Bit.Core.Exceptions;
++using Bit.Core.Platform.Push;
++using Bit.Core.Services;
++using Bit.Core.Test.AutoFixture.CurrentContextFixtures;
++using Bit.Core.Test.Tools.AutoFixture.SendFixtures;
++using Bit.Core.Tools.Entities;
++using Bit.Core.Tools.Enums;
++using Bit.Core.Tools.Models.Business;
++using Bit.Core.Tools.Models.Data;
++using Bit.Core.Tools.Repositories;
++using Bit.Core.Tools.SendFeatures.Commands;
++using Bit.Core.Tools.Services;
++using Bit.Test.Common.AutoFixture.Attributes;
++using NSubstitute;
++using NSubstitute.ExceptionExtensions;
++using Xunit;
++
++namespace Bit.Core.Test.Tools.Services;
++
++[SutProviderCustomize]
++[CurrentContextCustomize]
++[UserSendCustomize]
++public class NonAnonymousSendCommandTests
++{
++    private readonly ISendRepository _sendRepository;
++    private readonly ISendFileStorageService _sendFileStorageService;
++    private readonly IPushNotificationService _pushNotificationService;
++    private readonly ISendAuthorizationService _sendAuthorizationService;
++    private readonly ISendValidationService _sendValidationService;
++    private readonly IFeatureService _featureService;
++    private readonly IReferenceEventService _referenceEventService;
++    private readonly ICurrentContext _currentContext;
++    private readonly ISendCoreHelperService _sendCoreHelperService;
++    private readonly NonAnonymousSendCommand _nonAnonymousSendCommand;
++
++    public NonAnonymousSendCommandTests()
++    {
++        _sendRepository = Substitute.For<ISendRepository>();
++        _sendFileStorageService = Substitute.For<ISendFileStorageService>();
++        _pushNotificationService = Substitute.For<IPushNotificationService>();
++        _sendAuthorizationService = Substitute.For<ISendAuthorizationService>();
++        _featureService = Substitute.For<IFeatureService>();
++        _sendValidationService = Substitute.For<ISendValidationService>();
++        _referenceEventService = Substitute.For<IReferenceEventService>();
++        _currentContext = Substitute.For<ICurrentContext>();
++        _sendCoreHelperService = Substitute.For<ISendCoreHelperService>();
++
++        _nonAnonymousSendCommand = new NonAnonymousSendCommand(
++            _sendRepository,
++            _sendFileStorageService,
++            _pushNotificationService,
++            _sendAuthorizationService,
++            _sendValidationService,
++            _referenceEventService,
++            _currentContext,
++            _sendCoreHelperService
++        );
++    }
++
++    // Disable Send policy check
++    [Theory]
++    [InlineData(SendType.File)]
++    [InlineData(SendType.Text)]
++    public async Task SaveSendAsync_DisableSend_Applies_throws(SendType sendType)
++    {
++        // Arrange
++        var send = new Send
++        {
++            Id = default,
++            Type = sendType,
++            UserId = Guid.NewGuid()
++        };
++
++        var user = new User
++        {
++            Id = send.UserId.Value,
++            Email = "test@example.com"
++        };
++
++        // Configure validation service to throw when DisableSend policy applies
++        _sendValidationService.ValidateUserCanSaveAsync(send.UserId.Value, send)
++            .Throws(new BadRequestException("Due to an Enterprise Policy, you are only able to delete an existing Send."));
++
++        // Act & Assert
++        var exception = await Assert.ThrowsAsync<BadRequestException>(() =>
++            _nonAnonymousSendCommand.SaveSendAsync(send));
++
++        Assert.Contains("Enterprise Policy", exception.Message);
++
++        // Verify the validation service was called
++        await _sendValidationService.Received(1).ValidateUserCanSaveAsync(send.UserId.Value, send);
++
++        // Verify repository was not called since exception was thrown
++        await _sendRepository.DidNotReceive().CreateAsync(Arg.Any<Send>());
++    }
++
++    [Theory]
++    [InlineData(true)]  // New Send (Id is default)
++    [InlineData(false)] // Existing Send (Id is not default)
++    public async Task SaveSendAsync_DisableSend_DoesntApply_success(bool isNewSend)
++    {
++        // Arrange
++        var userId = Guid.NewGuid();
++        var send = new Send
++        {
++            Id = isNewSend ? default : Guid.NewGuid(),
++            Type = SendType.Text,
++            UserId = userId,
++            Data = "Text with Notes"
++        };
++
++        var initialDate = DateTime.UtcNow.AddMinutes(-5);
++        send.RevisionDate = initialDate;
++
++        // Configure validation service to NOT throw (policy doesn't apply)
++        _sendValidationService.ValidateUserCanSaveAsync(userId, send).Returns(Task.CompletedTask);
++
++        // Set up context for reference event
++        _currentContext.ClientId.Returns("test-client");
++        _currentContext.ClientVersion.Returns(Version.Parse("1.0.0"));
++
++        // Act
++        await _nonAnonymousSendCommand.SaveSendAsync(send);
++
++        // Assert
++        // Verify validation was checked
++        await _sendValidationService.Received(1).ValidateUserCanSaveAsync(userId, send);
++
++        if (isNewSend)
++        {
++            // For new Sends
++            await _sendRepository.Received(1).CreateAsync(send);
++            await _pushNotificationService.Received(1).PushSyncSendCreateAsync(send);
++            await _referenceEventService.Received(1).RaiseEventAsync(Arg.Is<ReferenceEvent>(e =>
++                e.Id == userId &&
++                e.Type == ReferenceEventType.SendCreated &&
++                e.Source == ReferenceEventSource.User &&
++                e.SendType == send.Type &&
++                e.SendHasNotes == true &&
++                e.ClientId == "test-client" &&
++                e.ClientVersion == Version.Parse("1.0.0")));
++        }
++        else
++        {
++            // For existing Sends
++            await _sendRepository.Received(1).UpsertAsync(send);
++            Assert.NotEqual(initialDate, send.RevisionDate);
++            await _pushNotificationService.Received(1).PushSyncSendUpdateAsync(send);
++            await _referenceEventService.DidNotReceive().RaiseEventAsync(Arg.Any<ReferenceEvent>());
++        }
++    }
++
++    [Theory]
++    [InlineData(true)]  // New Send (Id is default)
++    [InlineData(false)] // Existing Send (Id is not default)
++    public async Task SaveSendAsync_DisableHideEmail_Applies_throws(bool isNewSend)
++    {
++        // Arrange
++        var userId = Guid.NewGuid();
++        var send = new Send
++        {
++            Id = isNewSend ? default : Guid.NewGuid(),
++            Type = SendType.Text,
++            UserId = userId,
++            HideEmail = true
++        };
++
++        // Configure validation service to throw when HideEmail policy applies
++        _sendValidationService.ValidateUserCanSaveAsync(userId, send)
++            .Throws(new BadRequestException("Due to an Enterprise Policy, you are not allowed to hide your email address from recipients when creating or editing a Send."));
++
++        // Act & Assert
++        var exception = await Assert.ThrowsAsync<BadRequestException>(() =>
++            _nonAnonymousSendCommand.SaveSendAsync(send));
++
++        Assert.Contains("hide your email address", exception.Message);
++
++        // Verify validation was called
++        await _sendValidationService.Received(1).ValidateUserCanSaveAsync(userId, send);
++
++        // Verify repository was not called (exception prevented save)
++        if (isNewSend)
++        {
++            await _sendRepository.DidNotReceive().CreateAsync(Arg.Any<Send>());
++        }
++        else
++        {
++            await _sendRepository.DidNotReceive().UpsertAsync(Arg.Any<Send>());
++        }
++
++        // Verify push notification wasn't sent
++        await _pushNotificationService.DidNotReceive().PushSyncSendCreateAsync(Arg.Any<Send>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendUpdateAsync(Arg.Any<Send>());
++    }
++
++    [Theory]
++    [InlineData(true)]  // New Send (Id is default)
++    [InlineData(false)] // Existing Send (Id is not default)
++    public async Task SaveSendAsync_DisableHideEmail_DoesntApply_success(bool isNewSend)
++    {
++        // Arrange
++        var userId = Guid.NewGuid();
++        var send = new Send
++        {
++            Id = isNewSend ? default : Guid.NewGuid(),
++            Type = SendType.Text,
++            UserId = userId,
++            HideEmail = true  // Setting HideEmail to true
++        };
++
++        var initialDate = DateTime.UtcNow.AddMinutes(-5);
++        send.RevisionDate = initialDate;
++
++        // Configure validation service to NOT throw (policy doesn't apply)
++        _sendValidationService.ValidateUserCanSaveAsync(userId, send).Returns(Task.CompletedTask);
++
++        // Set up context for reference event
++        _currentContext.ClientId.Returns("test-client");
++        _currentContext.ClientVersion.Returns(Version.Parse("1.0.0"));
++
++        // Act
++        await _nonAnonymousSendCommand.SaveSendAsync(send);
++
++        // Assert
++        // Verify validation was checked
++        await _sendValidationService.Received(1).ValidateUserCanSaveAsync(userId, send);
++
++        if (isNewSend)
++        {
++            // For new Sends
++            await _sendRepository.Received(1).CreateAsync(send);
++            await _pushNotificationService.Received(1).PushSyncSendCreateAsync(send);
++            await _referenceEventService.Received(1).RaiseEventAsync(Arg.Is<ReferenceEvent>(e =>
++                e.Id == userId &&
++                e.Type == ReferenceEventType.SendCreated &&
++                e.Source == ReferenceEventSource.User &&
++                e.SendType == send.Type &&
++                e.HasPassword == false &&
++                e.ClientId == "test-client" &&
++                e.ClientVersion == Version.Parse("1.0.0")));
++        }
++        else
++        {
++            // For existing Sends
++            await _sendRepository.Received(1).UpsertAsync(send);
++            Assert.NotEqual(initialDate, send.RevisionDate);
++            await _pushNotificationService.Received(1).PushSyncSendUpdateAsync(send);
++            await _referenceEventService.DidNotReceive().RaiseEventAsync(Arg.Any<ReferenceEvent>());
++        }
++    }
++
++    [Theory]
++    [InlineData(SendType.File)]
++    [InlineData(SendType.Text)]
++    public async Task SaveSendAsync_DisableSend_Applies_Throws_vNext(SendType sendType)
++    {
++        // Arrange
++        var userId = Guid.NewGuid();
++        var send = new Send
++        {
++            Id = default,
++            Type = sendType,
++            UserId = userId
++        };
++
++        // Configure validation service to throw when DisableSend policy applies in vNext implementation
++        _sendValidationService.ValidateUserCanSaveAsync(userId, send)
++            .Returns(Task.FromException(new BadRequestException("Due to an Enterprise Policy, you are only able to delete an existing Send.")));
++
++        // Act & Assert
++        var exception = await Assert.ThrowsAsync<BadRequestException>(() =>
++            _nonAnonymousSendCommand.SaveSendAsync(send));
++
++        Assert.Contains("Enterprise Policy", exception.Message);
++
++        // Verify validation service was called
++        await _sendValidationService.Received(1).ValidateUserCanSaveAsync(userId, send);
++
++        // Verify repository and notification methods were not called
++        await _sendRepository.DidNotReceive().CreateAsync(Arg.Any<Send>());
++        await _sendRepository.DidNotReceive().UpsertAsync(Arg.Any<Send>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendCreateAsync(Arg.Any<Send>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendUpdateAsync(Arg.Any<Send>());
++        await _referenceEventService.DidNotReceive().RaiseEventAsync(Arg.Any<ReferenceEvent>());
++    }
++
++    [Theory]
++    [InlineData(true)]  // New Send (Id is default)
++    [InlineData(false)] // Existing Send (Id is not default)
++    public async Task SaveSendAsync_DisableSend_DoesntApply_Success_vNext(bool isNewSend)
++    {
++        // Arrange
++        var userId = Guid.NewGuid();
++        var send = new Send
++        {
++            Id = isNewSend ? default : Guid.NewGuid(),
++            Type = SendType.Text,
++            UserId = userId,
++            Data = "Text with Notes"
++        };
++
++        var initialDate = DateTime.UtcNow.AddMinutes(-5);
++        send.RevisionDate = initialDate;
++
++        // Configure validation service to return success for vNext implementation
++        _sendValidationService.ValidateUserCanSaveAsync(userId, send).Returns(Task.CompletedTask);
++
++        // Set up context for reference event
++        _currentContext.ClientId.Returns("test-client");
++        _currentContext.ClientVersion.Returns(Version.Parse("1.0.0"));
++
++        // Enable feature flag for policy requirements (vNext path)
++        _featureService.IsEnabled(FeatureFlagKeys.PolicyRequirements).Returns(true);
++
++        // Act
++        await _nonAnonymousSendCommand.SaveSendAsync(send);
++
++        // Assert
++        // Verify validation was checked with vNext path
++        await _sendValidationService.Received(1).ValidateUserCanSaveAsync(userId, send);
++
++        if (isNewSend)
++        {
++            // For new Sends
++            await _sendRepository.Received(1).CreateAsync(send);
++            await _pushNotificationService.Received(1).PushSyncSendCreateAsync(send);
++            await _referenceEventService.Received(1).RaiseEventAsync(Arg.Is<ReferenceEvent>(e =>
++                e.Id == userId &&
++                e.Type == ReferenceEventType.SendCreated &&
++                e.Source == ReferenceEventSource.User &&
++                e.SendType == send.Type &&
++                e.SendHasNotes == true &&
++                e.ClientId == "test-client" &&
++                e.ClientVersion == Version.Parse("1.0.0")));
++        }
++        else
++        {
++            // For existing Sends
++            await _sendRepository.Received(1).UpsertAsync(send);
++            Assert.NotEqual(initialDate, send.RevisionDate);
++            await _pushNotificationService.Received(1).PushSyncSendUpdateAsync(send);
++            await _referenceEventService.DidNotReceive().RaiseEventAsync(Arg.Any<ReferenceEvent>());
++        }
++    }
++
++    // Send Options Policy - Disable Hide Email check
++    [Theory]
++    [InlineData(true)]  // New Send (Id is default)
++    [InlineData(false)] // Existing Send (Id is not default)
++    public async Task SaveSendAsync_DisableHideEmail_Applies_Throws_vNext(bool isNewSend)
++    {
++        // Arrange
++        var userId = Guid.NewGuid();
++        var send = new Send
++        {
++            Id = isNewSend ? default : Guid.NewGuid(),
++            Type = SendType.Text,
++            UserId = userId,
++            HideEmail = true
++        };
++
++        // Enable feature flag for policy requirements (vNext path)
++        _featureService.IsEnabled(FeatureFlagKeys.PolicyRequirements).Returns(true);
++
++        // Configure validation service to throw when DisableHideEmail policy applies in vNext implementation
++        _sendValidationService.ValidateUserCanSaveAsync(userId, send)
++            .Throws(new BadRequestException("Due to an Enterprise Policy, you are not allowed to hide your email address from recipients when creating or editing a Send."));
++
++        // Act & Assert
++        var exception = await Assert.ThrowsAsync<BadRequestException>(() =>
++            _nonAnonymousSendCommand.SaveSendAsync(send));
++
++        Assert.Contains("hide your email address", exception.Message);
++
++        // Verify validation was called
++        await _sendValidationService.Received(1).ValidateUserCanSaveAsync(userId, send);
++
++        // Verify repository was not called (exception prevented save)
++        await _sendRepository.DidNotReceive().CreateAsync(Arg.Any<Send>());
++        await _sendRepository.DidNotReceive().UpsertAsync(Arg.Any<Send>());
++
++        // Verify push notification wasn't sent
++        await _pushNotificationService.DidNotReceive().PushSyncSendCreateAsync(Arg.Any<Send>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendUpdateAsync(Arg.Any<Send>());
++
++        // Verify reference event service wasn't called
++        await _referenceEventService.DidNotReceive().RaiseEventAsync(Arg.Any<ReferenceEvent>());
++    }
++
++    [Theory]
++    [InlineData(true)]  // New Send (Id is default)
++    [InlineData(false)] // Existing Send (Id is not default)
++    public async Task SaveSendAsync_DisableHideEmail_Applies_ButEmailNotHidden_Success_vNext(bool isNewSend)
++    {
++        // Arrange
++        var userId = Guid.NewGuid();
++        var send = new Send
++        {
++            Id = isNewSend ? default : Guid.NewGuid(),
++            Type = SendType.Text,
++            UserId = userId,
++            HideEmail = false  // Email is not hidden, so policy doesn't block
++        };
++
++        var initialDate = DateTime.UtcNow.AddMinutes(-5);
++        send.RevisionDate = initialDate;
++
++        // Enable feature flag for policy requirements (vNext path)
++        _featureService.IsEnabled(FeatureFlagKeys.PolicyRequirements).Returns(true);
++
++        // Configure validation service to allow saves when HideEmail is false
++        _sendValidationService.ValidateUserCanSaveAsync(userId, send).Returns(Task.CompletedTask);
++
++        // Set up context for reference event
++        _currentContext.ClientId.Returns("test-client");
++        _currentContext.ClientVersion.Returns(Version.Parse("1.0.0"));
++
++        // Act
++        await _nonAnonymousSendCommand.SaveSendAsync(send);
++
++        // Assert
++        // Verify validation was called with vNext path
++        await _sendValidationService.Received(1).ValidateUserCanSaveAsync(userId, send);
++
++        if (isNewSend)
++        {
++            // For new Sends
++            await _sendRepository.Received(1).CreateAsync(send);
++            await _pushNotificationService.Received(1).PushSyncSendCreateAsync(send);
++            await _referenceEventService.Received(1).RaiseEventAsync(Arg.Is<ReferenceEvent>(e =>
++                e.Id == userId &&
++                e.Type == ReferenceEventType.SendCreated &&
++                e.Source == ReferenceEventSource.User &&
++                e.SendType == send.Type &&
++                e.ClientId == "test-client" &&
++                e.ClientVersion == Version.Parse("1.0.0")));
++        }
++        else
++        {
++            // For existing Sends
++            await _sendRepository.Received(1).UpsertAsync(send);
++            Assert.NotEqual(initialDate, send.RevisionDate);
++            await _pushNotificationService.Received(1).PushSyncSendUpdateAsync(send);
++            await _referenceEventService.DidNotReceive().RaiseEventAsync(Arg.Any<ReferenceEvent>());
++        }
++    }
++
++    [Fact]
++    public async Task SaveSendAsync_ExistingSend_Updates()
++    {
++        // Arrange
++        var userId = Guid.NewGuid();
++        var sendId = Guid.NewGuid();
++        var send = new Send
++        {
++            Id = sendId,
++            Type = SendType.Text,
++            UserId = userId,
++            Data = "Some text data"
++        };
++
++        var initialDate = DateTime.UtcNow.AddMinutes(-5);
++        send.RevisionDate = initialDate;
++
++        // Act
++        await _nonAnonymousSendCommand.SaveSendAsync(send);
++
++        // Assert
++        // Verify validation was called
++        await _sendValidationService.Received(1).ValidateUserCanSaveAsync(userId, send);
++
++        // Verify repository was called with updated send
++        await _sendRepository.Received(1).UpsertAsync(send);
++
++        // Check that the revision date was updated
++        Assert.NotEqual(initialDate, send.RevisionDate);
++
++        // Verify push notification was sent for the update
++        await _pushNotificationService.Received(1).PushSyncSendUpdateAsync(send);
++
++        // Verify no reference event was raised (only happens for new sends)
++        await _referenceEventService.DidNotReceive().RaiseEventAsync(Arg.Any<ReferenceEvent>());
++    }
++
++    [Fact]
++    public async Task SaveFileSendAsync_TextType_ThrowsBadRequest()
++    {
++        // Arrange
++        var userId = Guid.NewGuid();
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            Type = SendType.Text, // Text type instead of File
++            UserId = userId
++        };
++        var fileData = new SendFileData();
++        var fileLength = 1024L; // 1KB
++
++        // Act & Assert
++        var exception = await Assert.ThrowsAsync<BadRequestException>(() =>
++            _nonAnonymousSendCommand.SaveFileSendAsync(send, fileData, fileLength));
++
++        Assert.Contains("not of type \"file\"", exception.Message);
++
++        // Verify no further methods were called
++        await _sendValidationService.DidNotReceive().StorageRemainingForSendAsync(Arg.Any<Send>());
++        await _sendRepository.DidNotReceive().CreateAsync(Arg.Any<Send>());
++        await _sendRepository.DidNotReceive().UpsertAsync(Arg.Any<Send>());
++        await _sendFileStorageService.DidNotReceive().GetSendFileUploadUrlAsync(Arg.Any<Send>(), Arg.Any<string>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendCreateAsync(Arg.Any<Send>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendUpdateAsync(Arg.Any<Send>());
++    }
++
++    [Fact]
++    public async Task SaveFileSendAsync_EmptyFile_ThrowsBadRequest()
++    {
++        // Arrange
++        var userId = Guid.NewGuid();
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            Type = SendType.File,
++            UserId = userId
++        };
++        var fileData = new SendFileData();
++        var fileLength = 0L; // Empty file
++
++        // Act & Assert
++        var exception = await Assert.ThrowsAsync<BadRequestException>(() =>
++            _nonAnonymousSendCommand.SaveFileSendAsync(send, fileData, fileLength));
++
++        Assert.Contains("No file data", exception.Message);
++
++        // Verify no methods were called after validation failed
++        await _sendValidationService.DidNotReceive().StorageRemainingForSendAsync(Arg.Any<Send>());
++        await _sendRepository.DidNotReceive().CreateAsync(Arg.Any<Send>());
++        await _sendRepository.DidNotReceive().UpsertAsync(Arg.Any<Send>());
++        await _sendFileStorageService.DidNotReceive().GetSendFileUploadUrlAsync(Arg.Any<Send>(), Arg.Any<string>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendCreateAsync(Arg.Any<Send>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendUpdateAsync(Arg.Any<Send>());
++    }
++
++    [Fact]
++    public async Task SaveFileSendAsync_UserCannotAccessPremium_ThrowsBadRequest()
++    {
++        // Arrange
++        var userId = Guid.NewGuid();
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            Type = SendType.File,
++            UserId = userId
++        };
++        var fileData = new SendFileData();
++        var fileLength = 1024L; // 1KB
++
++        // Configure validation service to throw when checking storage
++        _sendValidationService.StorageRemainingForSendAsync(send)
++            .Throws(new BadRequestException("You must have premium status to use file Sends."));
++
++        // Act & Assert
++        var exception = await Assert.ThrowsAsync<BadRequestException>(() =>
++            _nonAnonymousSendCommand.SaveFileSendAsync(send, fileData, fileLength));
++
++        Assert.Contains("premium status", exception.Message);
++
++        // Verify storage validation was called
++        await _sendValidationService.Received(1).StorageRemainingForSendAsync(send);
++
++        // Verify no further methods were called
++        await _sendRepository.DidNotReceive().CreateAsync(Arg.Any<Send>());
++        await _sendRepository.DidNotReceive().UpsertAsync(Arg.Any<Send>());
++        await _sendFileStorageService.DidNotReceive().GetSendFileUploadUrlAsync(Arg.Any<Send>(), Arg.Any<string>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendCreateAsync(Arg.Any<Send>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendUpdateAsync(Arg.Any<Send>());
++    }
++
++    [Fact]
++    public async Task SaveFileSendAsync_UserHasUnconfirmedEmail_ThrowsBadRequest()
++    {
++        // Arrange
++        var userId = Guid.NewGuid();
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            Type = SendType.File,
++            UserId = userId
++        };
++        var fileData = new SendFileData();
++        var fileLength = 1024L; // 1KB
++
++        // Configure validation service to pass storage check
++        _sendValidationService.StorageRemainingForSendAsync(send).Returns(10240L); // 10KB remaining
++
++        // Configure validation service to throw when checking user can save
++        _sendValidationService.When(x => x.ValidateUserCanSaveAsync(userId, send))
++            .Throw(new BadRequestException("You must confirm your email before creating a Send."));
++
++        // Act & Assert
++        var exception = await Assert.ThrowsAsync<BadRequestException>(() =>
++            _nonAnonymousSendCommand.SaveFileSendAsync(send, fileData, fileLength));
++
++        Assert.Contains("confirm your email", exception.Message);
++
++        // Verify storage validation was called
++        await _sendValidationService.Received(1).StorageRemainingForSendAsync(send);
++
++        // Verify SaveSendAsync attempted to be called, triggering email validation
++        await _sendValidationService.Received(1).ValidateUserCanSaveAsync(userId, send);
++
++        // Verify no repository or notification methods were called after validation failed
++        await _sendRepository.DidNotReceive().CreateAsync(Arg.Any<Send>());
++        await _sendRepository.DidNotReceive().UpsertAsync(Arg.Any<Send>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendCreateAsync(Arg.Any<Send>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendUpdateAsync(Arg.Any<Send>());
++    }
++
++    [Fact]
++    public async Task SaveFileSendAsync_UserCanAccessPremium_HasNoStorage_ThrowsBadRequest()
++    {
++        // Arrange
++        var userId = Guid.NewGuid();
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            Type = SendType.File,
++            UserId = userId
++        };
++        var fileData = new SendFileData();
++        var fileLength = 1024L; // 1KB
++
++        // Configure validation service to return 0 storage remaining
++        _sendValidationService.StorageRemainingForSendAsync(send).Returns(0L);
++
++        // Act & Assert
++        var exception = await Assert.ThrowsAsync<BadRequestException>(() =>
++            _nonAnonymousSendCommand.SaveFileSendAsync(send, fileData, fileLength));
++
++        Assert.Contains("Not enough storage available", exception.Message);
++
++        // Verify storage validation was called
++        await _sendValidationService.Received(1).StorageRemainingForSendAsync(send);
++
++        // Verify no further methods were called
++        await _sendRepository.DidNotReceive().CreateAsync(Arg.Any<Send>());
++        await _sendRepository.DidNotReceive().UpsertAsync(Arg.Any<Send>());
++        await _sendFileStorageService.DidNotReceive().GetSendFileUploadUrlAsync(Arg.Any<Send>(), Arg.Any<string>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendCreateAsync(Arg.Any<Send>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendUpdateAsync(Arg.Any<Send>());
++    }
++
++    [Fact]
++    public async Task SaveFileSendAsync_UserCanAccessPremium_StorageFull_ThrowsBadRequest()
++    {
++        // Arrange
++        var userId = Guid.NewGuid();
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            Type = SendType.File,
++            UserId = userId
++        };
++        var fileData = new SendFileData();
++        var fileLength = 1024L; // 1KB
++
++        // Configure validation service to return less storage remaining than needed
++        _sendValidationService.StorageRemainingForSendAsync(send).Returns(512L); // Only 512 bytes available
++
++        // Act & Assert
++        var exception = await Assert.ThrowsAsync<BadRequestException>(() =>
++            _nonAnonymousSendCommand.SaveFileSendAsync(send, fileData, fileLength));
++
++        Assert.Contains("Not enough storage available", exception.Message);
++
++        // Verify storage validation was called
++        await _sendValidationService.Received(1).StorageRemainingForSendAsync(send);
++
++        // Verify no further methods were called
++        await _sendRepository.DidNotReceive().CreateAsync(Arg.Any<Send>());
++        await _sendRepository.DidNotReceive().UpsertAsync(Arg.Any<Send>());
++        await _sendFileStorageService.DidNotReceive().GetSendFileUploadUrlAsync(Arg.Any<Send>(), Arg.Any<string>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendCreateAsync(Arg.Any<Send>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendUpdateAsync(Arg.Any<Send>());
++    }
++
++    [Fact]
++    public async Task SaveFileSendAsync_UserCanAccessPremium_IsNotPremium_IsSelfHosted_GiantFile_ThrowsBadRequest()
++    {
++        // Arrange
++        var userId = Guid.NewGuid();
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            Type = SendType.File,
++            UserId = userId
++        };
++        var fileData = new SendFileData();
++        var fileLength = 15L * 1024L * 1024L * 1024L; // 15GB
++
++        // Configure validation service to return large but insufficient storage (10GB for self-hosted non-premium)
++        _sendValidationService.StorageRemainingForSendAsync(send)
++            .Returns(10L * 1024L * 1024L * 1024L); // 10GB remaining (self-hosted default)
++
++        // Act & Assert
++        var exception = await Assert.ThrowsAsync<BadRequestException>(() =>
++            _nonAnonymousSendCommand.SaveFileSendAsync(send, fileData, fileLength));
++
++        Assert.Contains("Not enough storage available", exception.Message);
++
++        // Verify storage validation was called
++        await _sendValidationService.Received(1).StorageRemainingForSendAsync(send);
++
++        // Verify no further methods were called
++        await _sendRepository.DidNotReceive().CreateAsync(Arg.Any<Send>());
++        await _sendRepository.DidNotReceive().UpsertAsync(Arg.Any<Send>());
++        await _sendFileStorageService.DidNotReceive().GetSendFileUploadUrlAsync(Arg.Any<Send>(), Arg.Any<string>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendCreateAsync(Arg.Any<Send>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendUpdateAsync(Arg.Any<Send>());
++    }
++
++    [Fact]
++    public async Task SaveFileSendAsync_UserCanAccessPremium_IsNotPremium_IsNotSelfHosted_TwoGigabyteFile_ThrowsBadRequest()
++    {
++        // Arrange
++        var userId = Guid.NewGuid();
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            Type = SendType.File,
++            UserId = userId
++        };
++        var fileData = new SendFileData();
++        var fileLength = 2L * 1024L * 1024L * 1024L; // 2GB
++
++        // Configure validation service to return 1GB storage (cloud non-premium default)
++        _sendValidationService.StorageRemainingForSendAsync(send)
++            .Returns(1L * 1024L * 1024L * 1024L); // 1GB remaining (cloud default)
++
++        // Act & Assert
++        var exception = await Assert.ThrowsAsync<BadRequestException>(() =>
++            _nonAnonymousSendCommand.SaveFileSendAsync(send, fileData, fileLength));
++
++        Assert.Contains("Not enough storage available", exception.Message);
++
++        // Verify storage validation was called
++        await _sendValidationService.Received(1).StorageRemainingForSendAsync(send);
++
++        // Verify no further methods were called
++        await _sendRepository.DidNotReceive().CreateAsync(Arg.Any<Send>());
++        await _sendRepository.DidNotReceive().UpsertAsync(Arg.Any<Send>());
++        await _sendFileStorageService.DidNotReceive().GetSendFileUploadUrlAsync(Arg.Any<Send>(), Arg.Any<string>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendCreateAsync(Arg.Any<Send>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendUpdateAsync(Arg.Any<Send>());
++    }
++
++    [Fact]
++    public async Task SaveFileSendAsync_ThroughOrg_MaxStorageIsNull_ThrowsBadRequest()
++    {
++        // Arrange
++        var organizationId = Guid.NewGuid();
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            Type = SendType.File,
++            OrganizationId = organizationId
++        };
++
++        var fileData = new SendFileData
++        {
++            FileName = "test.txt"
++        };
++
++        const long fileLength = 1000;
++
++        // Set up validation service to return 0 storage remaining
++        // This simulates the case when an organization's max storage is null
++        _sendValidationService.StorageRemainingForSendAsync(send).Returns(0L);
++
++        // Act & Assert
++        var exception = await Assert.ThrowsAsync<BadRequestException>(() =>
++            _nonAnonymousSendCommand.SaveFileSendAsync(send, fileData, fileLength));
++
++        Assert.Equal("Not enough storage available.", exception.Message);
++
++        // Verify the method was called exactly once
++        await _sendValidationService.Received(1).StorageRemainingForSendAsync(send);
++    }
++
++    [Fact]
++    public async Task SaveFileSendAsync_ThroughOrg_MaxStorageIsNull_TwoGBFile_ThrowsBadRequest()
++    {
++        // Arrange
++        var orgId = Guid.NewGuid();
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            Type = SendType.File,
++            OrganizationId = orgId,
++            UserId = null
++        };
++        var fileData = new SendFileData();
++        var fileLength = 2L * 1024L * 1024L * 1024L; // 2GB
++
++        // Configure validation service to throw BadRequest when checking storage for org without storage
++        _sendValidationService.StorageRemainingForSendAsync(send)
++            .Throws(new BadRequestException("This organization cannot use file sends."));
++
++        // Act & Assert
++        var exception = await Assert.ThrowsAsync<BadRequestException>(() =>
++            _nonAnonymousSendCommand.SaveFileSendAsync(send, fileData, fileLength));
++
++        Assert.Contains("This organization cannot use file sends", exception.Message);
++
++        // Verify storage validation was called
++        await _sendValidationService.Received(1).StorageRemainingForSendAsync(send);
++
++        // Verify no further methods were called
++        await _sendRepository.DidNotReceive().CreateAsync(Arg.Any<Send>());
++        await _sendRepository.DidNotReceive().UpsertAsync(Arg.Any<Send>());
++        await _sendFileStorageService.DidNotReceive().GetSendFileUploadUrlAsync(Arg.Any<Send>(), Arg.Any<string>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendCreateAsync(Arg.Any<Send>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendUpdateAsync(Arg.Any<Send>());
++    }
++
++    [Fact]
++    public async Task SaveFileSendAsync_ThroughOrg_MaxStorageIsOneGB_TwoGBFile_ThrowsBadRequest()
++    {
++        // Arrange
++        var orgId = Guid.NewGuid();
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            Type = SendType.File,
++            OrganizationId = orgId,
++            UserId = null
++        };
++        var fileData = new SendFileData();
++        var fileLength = 2L * 1024L * 1024L * 1024L; // 2GB
++
++        // Configure validation service to return 1GB storage (org's max storage limit)
++        _sendValidationService.StorageRemainingForSendAsync(send)
++            .Returns(1L * 1024L * 1024L * 1024L); // 1GB remaining
++
++        // Act & Assert
++        var exception = await Assert.ThrowsAsync<BadRequestException>(() =>
++            _nonAnonymousSendCommand.SaveFileSendAsync(send, fileData, fileLength));
++
++        Assert.Contains("Not enough storage available", exception.Message);
++
++        // Verify storage validation was called
++        await _sendValidationService.Received(1).StorageRemainingForSendAsync(send);
++
++        // Verify no further methods were called
++        await _sendRepository.DidNotReceive().CreateAsync(Arg.Any<Send>());
++        await _sendRepository.DidNotReceive().UpsertAsync(Arg.Any<Send>());
++        await _sendFileStorageService.DidNotReceive().GetSendFileUploadUrlAsync(Arg.Any<Send>(), Arg.Any<string>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendCreateAsync(Arg.Any<Send>());
++        await _pushNotificationService.DidNotReceive().PushSyncSendUpdateAsync(Arg.Any<Send>());
++    }
++
++    [Fact]
++    public async Task SaveFileSendAsync_HasEnoughStorage_Success()
++    {
++        // Arrange
++        var userId = Guid.NewGuid();
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            Type = SendType.File,
++            UserId = userId
++        };
++        var fileData = new SendFileData();
++        var fileLength = 500L * 1024L; // 500KB
++        var expectedFileId = "generatedfileid";
++        var expectedUploadUrl = "https://upload.example.com/url";
++
++        // Configure storage validation to return more storage than needed
++        _sendValidationService.StorageRemainingForSendAsync(send)
++            .Returns(1024L * 1024L); // 1MB remaining
++
++        // Configure file storage service to return upload URL
++        _sendFileStorageService.GetSendFileUploadUrlAsync(Arg.Any<Send>(), Arg.Any<string>())
++            .Returns(expectedUploadUrl);
++
++        // Set up string generator to return predictable file ID
++        _sendCoreHelperService.SecureRandomString(32, false, false)
++            .Returns(expectedFileId);
++
++        // Act
++        var result = await _nonAnonymousSendCommand.SaveFileSendAsync(send, fileData, fileLength);
++
++        // Assert
++        Assert.Equal(expectedUploadUrl, result);
++
++        // Verify storage validation was called
++        await _sendValidationService.Received(1).StorageRemainingForSendAsync(send);
++
++        // Verify upload URL was requested
++        await _sendFileStorageService.Received(1).GetSendFileUploadUrlAsync(send, expectedFileId);
++    }
++
++    [Fact]
++    public async Task SaveFileSendAsync_HasEnoughStorage_SendFileThrows_CleansUp()
++    {
++        // Arrange
++        var userId = Guid.NewGuid();
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            Type = SendType.File,
++            UserId = userId
++        };
++        var fileData = new SendFileData();
++        var fileLength = 500L * 1024L; // 500KB
++        var expectedFileId = "generatedfileid";
++
++        // Configure storage validation to return more storage than needed
++        _sendValidationService.StorageRemainingForSendAsync(send)
++            .Returns(1024L * 1024L); // 1MB remaining
++
++        // Set up string generator to return predictable file ID
++        _sendCoreHelperService.SecureRandomString(32, false, false)
++            .Returns(expectedFileId);
++
++        // Configure file storage service to throw exception when getting upload URL
++        _sendFileStorageService.GetSendFileUploadUrlAsync(Arg.Any<Send>(), Arg.Any<string>())
++            .Throws(new Exception("Storage service unavailable"));
++
++        // Act & Assert
++        await Assert.ThrowsAsync<Exception>(() =>
++            _nonAnonymousSendCommand.SaveFileSendAsync(send, fileData, fileLength));
++
++        // Verify storage validation was called
++        await _sendValidationService.Received(1).StorageRemainingForSendAsync(send);
++
++        // Verify file was cleaned up after failure
++        await _sendFileStorageService.Received(1).DeleteFileAsync(send, expectedFileId);
++    }
++
++    [Fact]
++    public async Task UpdateFileToExistingSendAsync_SendNull_ThrowsBadRequest()
++    {
++        // Arrange
++        Stream stream = new MemoryStream();
++        Send send = null;
++
++        // Act & Assert
++        var exception = await Assert.ThrowsAsync<BadRequestException>(() =>
++            _nonAnonymousSendCommand.UploadFileToExistingSendAsync(stream, send));
++
++        Assert.Equal("Send does not have file data", exception.Message);
++
++        // Verify no interactions with storage service
++        await _sendFileStorageService.DidNotReceiveWithAnyArgs().UploadNewFileAsync(
++            Arg.Any<Stream>(), Arg.Any<Send>(), Arg.Any<string>());
++
++        // Verify validation service was not called
++        await _sendValidationService.DidNotReceiveWithAnyArgs().ValidateSendFile(Arg.Any<Send>());
++    }
++
++    [Fact]
++    public async Task UpdateFileToExistingSendAsync_SendDataNull_ThrowsBadRequest()
++    {
++        // Arrange
++        Stream stream = new MemoryStream();
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            Type = SendType.File,
++            UserId = Guid.NewGuid(),
++            Data = null // Send exists but has null Data property
++        };
++
++        // Act & Assert
++        var exception = await Assert.ThrowsAsync<BadRequestException>(() =>
++            _nonAnonymousSendCommand.UploadFileToExistingSendAsync(stream, send));
++
++        Assert.Equal("Send does not have file data", exception.Message);
++
++        // Verify no interactions with storage service
++        await _sendFileStorageService.DidNotReceiveWithAnyArgs().UploadNewFileAsync(
++            Arg.Any<Stream>(), Arg.Any<Send>(), Arg.Any<string>());
++
++        // Verify validation service was not called
++        await _sendValidationService.DidNotReceiveWithAnyArgs().ValidateSendFile(Arg.Any<Send>());
++    }
++
++    [Fact]
++    public async Task UpdateFileToExistingSendAsync_NotFileType_ThrowsBadRequest()
++    {
++        // Arrange
++        Stream stream = new MemoryStream();
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            Type = SendType.Text, // Not a file type
++            UserId = Guid.NewGuid(),
++            Data = "{\"someData\":\"value\"}" // Has data, but not file data
++        };
++
++        // Act & Assert
++        var exception = await Assert.ThrowsAsync<BadRequestException>(() =>
++            _nonAnonymousSendCommand.UploadFileToExistingSendAsync(stream, send));
++
++        Assert.Equal("Not a File Type Send.", exception.Message);
++
++        // Verify no interactions with storage service
++        await _sendFileStorageService.DidNotReceiveWithAnyArgs().UploadNewFileAsync(
++            Arg.Any<Stream>(), Arg.Any<Send>(), Arg.Any<string>());
++
++        // Verify validation service was not called
++        await _sendValidationService.DidNotReceiveWithAnyArgs().ValidateSendFile(Arg.Any<Send>());
++    }
++
++    [Fact]
++    public async Task UpdateFileToExistingSendAsync_Success()
++    {
++        // Arrange
++        var stream = new MemoryStream(new byte[] { 1, 2, 3, 4, 5 });
++        var sendId = Guid.NewGuid();
++        var userId = Guid.NewGuid();
++        var fileId = "existingfileid123";
++
++        var sendFileData = new SendFileData { Id = fileId, Size = 1000, Validated = false };
++        var send = new Send
++        {
++            Id = sendId,
++            UserId = userId,
++            Type = SendType.File,
++            Data = JsonSerializer.Serialize(sendFileData)
++        };
++
++        // Setup validation to succeed
++        _sendValidationService.ValidateSendFile(send)
++            .Returns(true);
++
++        // Act
++        await _nonAnonymousSendCommand.UploadFileToExistingSendAsync(stream, send);
++
++        // Assert
++        // Verify file was uploaded with correct parameters
++        await _sendFileStorageService.Received(1).UploadNewFileAsync(
++            Arg.Is<Stream>(s => s == stream),
++            Arg.Is<Send>(s => s.Id == sendId && s.UserId == userId),
++            Arg.Is<string>(id => id == fileId)
++        );
++
++        // Verify validation was called
++        await _sendValidationService.Received(1).ValidateSendFile(send);
++    }
++
++    [Fact]
++    public async Task UpdateFileToExistingSendAsync_InvalidSize_ThrowsBadRequest()
++    {
++        // Arrange
++        var stream = new MemoryStream(new byte[] { 1, 2, 3, 4, 5 });
++        var sendId = Guid.NewGuid();
++        var userId = Guid.NewGuid();
++        var fileId = "existingfileid123";
++
++        var sendFileData = new SendFileData { Id = fileId, Size = 1000, Validated = false };
++        var send = new Send
++        {
++            Id = sendId,
++            UserId = userId,
++            Type = SendType.File,
++            Data = JsonSerializer.Serialize(sendFileData)
++        };
++
++        // Configure storage service to upload successfully
++        _sendFileStorageService.UploadNewFileAsync(
++                Arg.Any<Stream>(), Arg.Any<Send>(), Arg.Any<string>())
++            .Returns(Task.CompletedTask);
++
++        // Configure validation to fail due to file size mismatch
++        _sendValidationService.ValidateSendFile(send)
++            .Returns(false);
++
++        // Act & Assert
++        var exception = await Assert.ThrowsAsync<BadRequestException>(() =>
++            _nonAnonymousSendCommand.UploadFileToExistingSendAsync(stream, send));
++
++        Assert.Equal("File received does not match expected file length.", exception.Message);
++
++        // Verify upload was attempted
++        await _sendFileStorageService.Received(1).UploadNewFileAsync(
++            Arg.Is<Stream>(s => s == stream),
++            Arg.Is<Send>(s => s.Id == sendId),
++            Arg.Is<string>(s => s == fileId)
++        );
++
++        // Verify validation was called
++        await _sendValidationService.Received(1).ValidateSendFile(send);
++    }
++}
+diff --git a/test/Core.Test/Tools/Services/SendAuthorizationServiceTests.cs b/test/Core.Test/Tools/Services/SendAuthorizationServiceTests.cs
+new file mode 100644
+index 000000000000..d4625c0e466e
+--- /dev/null
++++ b/test/Core.Test/Tools/Services/SendAuthorizationServiceTests.cs
+@@ -0,0 +1,185 @@
++﻿using Bit.Core.Context;
++using Bit.Core.Platform.Push;
++using Bit.Core.Tools.Entities;
++using Bit.Core.Tools.Repositories;
++using Bit.Core.Tools.Services;
++using Microsoft.AspNetCore.Identity;
++using NSubstitute;
++using Xunit;
++
++namespace Bit.Core.Test.Tools.Services;
++
++public class SendAuthorizationServiceTests
++{
++    private readonly ISendRepository _sendRepository;
++    private readonly IPasswordHasher<Bit.Core.Entities.User> _passwordHasher;
++    private readonly IPushNotificationService _pushNotificationService;
++    private readonly IReferenceEventService _referenceEventService;
++    private readonly ICurrentContext _currentContext;
++    private readonly SendAuthorizationService _sendAuthorizationService;
++
++    public SendAuthorizationServiceTests()
++    {
++        _sendRepository = Substitute.For<ISendRepository>();
++        _passwordHasher = Substitute.For<IPasswordHasher<Bit.Core.Entities.User>>();
++        _pushNotificationService = Substitute.For<IPushNotificationService>();
++        _referenceEventService = Substitute.For<IReferenceEventService>();
++        _currentContext = Substitute.For<ICurrentContext>();
++
++        _sendAuthorizationService = new SendAuthorizationService(
++            _sendRepository,
++            _passwordHasher,
++            _pushNotificationService,
++            _referenceEventService,
++            _currentContext);
++    }
++
++
++    [Fact]
++    public void SendCanBeAccessed_Success_ReturnsTrue()
++    {
++        // Arrange
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            UserId = Guid.NewGuid(),
++            MaxAccessCount = 10,
++            AccessCount = 5,
++            ExpirationDate = DateTime.UtcNow.AddYears(1),
++            DeletionDate = DateTime.UtcNow.AddYears(1),
++            Disabled = false,
++            Password = "hashedPassword123"
++        };
++
++        const string password = "TEST";
++
++        _passwordHasher
++            .VerifyHashedPassword(Arg.Any<Bit.Core.Entities.User>(), send.Password, password)
++            .Returns(PasswordVerificationResult.Success);
++
++        // Act
++        var (grant, passwordRequiredError, passwordInvalidError) =
++            _sendAuthorizationService.SendCanBeAccessed(send, password);
++
++        // Assert
++        Assert.True(grant);
++        Assert.False(passwordRequiredError);
++        Assert.False(passwordInvalidError);
++    }
++
++    [Fact]
++    public void SendCanBeAccessed_NullMaxAccess_Success()
++    {
++        // Arrange
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            UserId = Guid.NewGuid(),
++            MaxAccessCount = null,
++            AccessCount = 5,
++            ExpirationDate = DateTime.UtcNow.AddYears(1),
++            DeletionDate = DateTime.UtcNow.AddYears(1),
++            Disabled = false,
++            Password = "hashedPassword123"
++        };
++
++        const string password = "TEST";
++
++        _passwordHasher
++            .VerifyHashedPassword(Arg.Any<Bit.Core.Entities.User>(), send.Password, password)
++            .Returns(PasswordVerificationResult.Success);
++
++        // Act
++        var (grant, passwordRequiredError, passwordInvalidError) =
++            _sendAuthorizationService.SendCanBeAccessed(send, password);
++
++        // Assert
++        Assert.True(grant);
++        Assert.False(passwordRequiredError);
++        Assert.False(passwordInvalidError);
++    }
++
++    [Fact]
++    public void SendCanBeAccessed_NullSend_DoesNotGrantAccess()
++    {
++        // Arrange
++        _passwordHasher
++            .VerifyHashedPassword(Arg.Any<Bit.Core.Entities.User>(), "TEST", "TEST")
++            .Returns(PasswordVerificationResult.Success);
++
++        // Act
++        var (grant, passwordRequiredError, passwordInvalidError) =
++            _sendAuthorizationService.SendCanBeAccessed(null, "TEST");
++
++        // Assert
++        Assert.False(grant);
++        Assert.False(passwordRequiredError);
++        Assert.False(passwordInvalidError);
++    }
++
++    [Fact]
++    public void SendCanBeAccessed_RehashNeeded_RehashesPassword()
++    {
++        // Arrange
++        var now = DateTime.UtcNow;
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            UserId = Guid.NewGuid(),
++            MaxAccessCount = null,
++            AccessCount = 5,
++            ExpirationDate = now.AddYears(1),
++            DeletionDate = now.AddYears(1),
++            Disabled = false,
++            Password = "TEST"
++        };
++
++        _passwordHasher
++            .VerifyHashedPassword(Arg.Any<Bit.Core.Entities.User>(), "TEST", "TEST")
++            .Returns(PasswordVerificationResult.SuccessRehashNeeded);
++
++        // Act
++        var (grant, passwordRequiredError, passwordInvalidError) =
++            _sendAuthorizationService.SendCanBeAccessed(send, "TEST");
++
++        // Assert
++        _passwordHasher
++            .Received(1)
++            .HashPassword(Arg.Any<Bit.Core.Entities.User>(), "TEST");
++
++        Assert.True(grant);
++        Assert.False(passwordRequiredError);
++        Assert.False(passwordInvalidError);
++    }
++
++    [Fact]
++    public void SendCanBeAccessed_VerifyFailed_PasswordInvalidReturnsTrue()
++    {
++        // Arrange
++        var now = DateTime.UtcNow;
++        var send = new Send
++        {
++            Id = Guid.NewGuid(),
++            UserId = Guid.NewGuid(),
++            MaxAccessCount = null,
++            AccessCount = 5,
++            ExpirationDate = now.AddYears(1),
++            DeletionDate = now.AddYears(1),
++            Disabled = false,
++            Password = "TEST"
++        };
++
++        _passwordHasher
++            .VerifyHashedPassword(Arg.Any<Bit.Core.Entities.User>(), "TEST", "TEST")
++            .Returns(PasswordVerificationResult.Failed);
++
++        // Act
++        var (grant, passwordRequiredError, passwordInvalidError) =
++            _sendAuthorizationService.SendCanBeAccessed(send, "TEST");
++
++        // Assert
++        Assert.False(grant);
++        Assert.False(passwordRequiredError);
++        Assert.True(passwordInvalidError);
++    }
++}
+diff --git a/test/Core.Test/Tools/Services/SendServiceTests.cs b/test/Core.Test/Tools/Services/SendServiceTests.cs
+deleted file mode 100644
+index 86d476340d0d..000000000000
+--- a/test/Core.Test/Tools/Services/SendServiceTests.cs
++++ /dev/null
+@@ -1,867 +0,0 @@
+-﻿using System.Text;
+-using System.Text.Json;
+-using Bit.Core.AdminConsole.Entities;
+-using Bit.Core.AdminConsole.Enums;
+-using Bit.Core.AdminConsole.Models.Data.Organizations.Policies;
+-using Bit.Core.AdminConsole.OrganizationFeatures.Policies;
+-using Bit.Core.AdminConsole.OrganizationFeatures.Policies.PolicyRequirements;
+-using Bit.Core.AdminConsole.Services;
+-using Bit.Core.Entities;
+-using Bit.Core.Exceptions;
+-using Bit.Core.Models.Data.Organizations.OrganizationUsers;
+-using Bit.Core.Platform.Push;
+-using Bit.Core.Repositories;
+-using Bit.Core.Services;
+-using Bit.Core.Test.AutoFixture.CurrentContextFixtures;
+-using Bit.Core.Test.Entities;
+-using Bit.Core.Test.Tools.AutoFixture.SendFixtures;
+-using Bit.Core.Tools.Entities;
+-using Bit.Core.Tools.Enums;
+-using Bit.Core.Tools.Models.Data;
+-using Bit.Core.Tools.Repositories;
+-using Bit.Core.Tools.Services;
+-using Bit.Test.Common.AutoFixture;
+-using Bit.Test.Common.AutoFixture.Attributes;
+-using Microsoft.AspNetCore.Identity;
+-using NSubstitute;
+-using NSubstitute.ExceptionExtensions;
+-using Xunit;
+-
+-using GlobalSettings = Bit.Core.Settings.GlobalSettings;
+-
+-namespace Bit.Core.Test.Tools.Services;
+-
+-[SutProviderCustomize]
+-[CurrentContextCustomize]
+-[UserSendCustomize]
+-public class SendServiceTests
+-{
+-    private void SaveSendAsync_Setup(SendType sendType, bool disableSendPolicyAppliesToUser,
+-        SutProvider<SendService> sutProvider, Send send)
+-    {
+-        send.Id = default;
+-        send.Type = sendType;
+-
+-        sutProvider.GetDependency<IPolicyService>().AnyPoliciesApplicableToUserAsync(
+-            Arg.Any<Guid>(), PolicyType.DisableSend).Returns(disableSendPolicyAppliesToUser);
+-    }
+-
+-    // Disable Send policy check
+-
+-    [Theory]
+-    [BitAutoData(SendType.File)]
+-    [BitAutoData(SendType.Text)]
+-    public async Task SaveSendAsync_DisableSend_Applies_throws(SendType sendType,
+-        SutProvider<SendService> sutProvider, Send send)
+-    {
+-        SaveSendAsync_Setup(sendType, disableSendPolicyAppliesToUser: true, sutProvider, send);
+-
+-        await Assert.ThrowsAsync<BadRequestException>(() => sutProvider.Sut.SaveSendAsync(send));
+-    }
+-
+-    [Theory]
+-    [BitAutoData(SendType.File)]
+-    [BitAutoData(SendType.Text)]
+-    public async Task SaveSendAsync_DisableSend_DoesntApply_success(SendType sendType,
+-        SutProvider<SendService> sutProvider, Send send)
+-    {
+-        SaveSendAsync_Setup(sendType, disableSendPolicyAppliesToUser: false, sutProvider, send);
+-
+-        await sutProvider.Sut.SaveSendAsync(send);
+-
+-        await sutProvider.GetDependency<ISendRepository>().Received(1).CreateAsync(send);
+-    }
+-
+-    // Send Options Policy - Disable Hide Email check
+-
+-    private void SaveSendAsync_HideEmail_Setup(bool disableHideEmailAppliesToUser,
+-        SutProvider<SendService> sutProvider, Send send, Policy policy)
+-    {
+-        send.HideEmail = true;
+-
+-        var sendOptions = new SendOptionsPolicyData
+-        {
+-            DisableHideEmail = disableHideEmailAppliesToUser
+-        };
+-        policy.Data = JsonSerializer.Serialize(sendOptions, new JsonSerializerOptions
+-        {
+-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+-        });
+-
+-        sutProvider.GetDependency<IPolicyService>().GetPoliciesApplicableToUserAsync(
+-            Arg.Any<Guid>(), PolicyType.SendOptions).Returns(new List<OrganizationUserPolicyDetails>()
+-            {
+-                new() { PolicyType = policy.Type, PolicyData = policy.Data, OrganizationId = policy.OrganizationId, PolicyEnabled = policy.Enabled }
+-            });
+-    }
+-
+-    [Theory]
+-    [BitAutoData(SendType.File)]
+-    [BitAutoData(SendType.Text)]
+-    public async Task SaveSendAsync_DisableHideEmail_Applies_throws(SendType sendType,
+-        SutProvider<SendService> sutProvider, Send send, Policy policy)
+-    {
+-        SaveSendAsync_Setup(sendType, false, sutProvider, send);
+-        SaveSendAsync_HideEmail_Setup(true, sutProvider, send, policy);
+-
+-        await Assert.ThrowsAsync<BadRequestException>(() => sutProvider.Sut.SaveSendAsync(send));
+-    }
+-
+-    [Theory]
+-    [BitAutoData(SendType.File)]
+-    [BitAutoData(SendType.Text)]
+-    public async Task SaveSendAsync_DisableHideEmail_DoesntApply_success(SendType sendType,
+-        SutProvider<SendService> sutProvider, Send send, Policy policy)
+-    {
+-        SaveSendAsync_Setup(sendType, false, sutProvider, send);
+-        SaveSendAsync_HideEmail_Setup(false, sutProvider, send, policy);
+-
+-        await sutProvider.Sut.SaveSendAsync(send);
+-
+-        await sutProvider.GetDependency<ISendRepository>().Received(1).CreateAsync(send);
+-    }
+-
+-    // Disable Send policy check - vNext
+-    private void SaveSendAsync_Setup_vNext(SutProvider<SendService> sutProvider, Send send,
+-        DisableSendPolicyRequirement disableSendPolicyRequirement, SendOptionsPolicyRequirement sendOptionsPolicyRequirement)
+-    {
+-        sutProvider.GetDependency<IPolicyRequirementQuery>().GetAsync<DisableSendPolicyRequirement>(send.UserId!.Value)
+-            .Returns(disableSendPolicyRequirement);
+-        sutProvider.GetDependency<IPolicyRequirementQuery>().GetAsync<SendOptionsPolicyRequirement>(send.UserId!.Value)
+-            .Returns(sendOptionsPolicyRequirement);
+-        sutProvider.GetDependency<IFeatureService>().IsEnabled(FeatureFlagKeys.PolicyRequirements).Returns(true);
+-
+-        // Should not be called in these tests
+-        sutProvider.GetDependency<IPolicyService>().AnyPoliciesApplicableToUserAsync(
+-            Arg.Any<Guid>(), Arg.Any<PolicyType>()).ThrowsAsync<Exception>();
+-    }
+-
+-    [Theory]
+-    [BitAutoData(SendType.File)]
+-    [BitAutoData(SendType.Text)]
+-    public async Task SaveSendAsync_DisableSend_Applies_Throws_vNext(SendType sendType,
+-        SutProvider<SendService> sutProvider, [NewUserSendCustomize] Send send)
+-    {
+-        send.Type = sendType;
+-        SaveSendAsync_Setup_vNext(sutProvider, send, new DisableSendPolicyRequirement { DisableSend = true }, new SendOptionsPolicyRequirement());
+-
+-        var exception = await Assert.ThrowsAsync<BadRequestException>(() => sutProvider.Sut.SaveSendAsync(send));
+-        Assert.Contains("Due to an Enterprise Policy, you are only able to delete an existing Send.",
+-            exception.Message);
+-    }
+-
+-    [Theory]
+-    [BitAutoData(SendType.File)]
+-    [BitAutoData(SendType.Text)]
+-    public async Task SaveSendAsync_DisableSend_DoesntApply_Success_vNext(SendType sendType,
+-        SutProvider<SendService> sutProvider, [NewUserSendCustomize] Send send)
+-    {
+-        send.Type = sendType;
+-        SaveSendAsync_Setup_vNext(sutProvider, send, new DisableSendPolicyRequirement(), new SendOptionsPolicyRequirement());
+-
+-        await sutProvider.Sut.SaveSendAsync(send);
+-
+-        await sutProvider.GetDependency<ISendRepository>().Received(1).CreateAsync(send);
+-    }
+-
+-    // Send Options Policy - Disable Hide Email check
+-
+-    [Theory]
+-    [BitAutoData(SendType.File)]
+-    [BitAutoData(SendType.Text)]
+-    public async Task SaveSendAsync_DisableHideEmail_Applies_Throws_vNext(SendType sendType,
+-        SutProvider<SendService> sutProvider, [NewUserSendCustomize] Send send)
+-    {
+-        send.Type = sendType;
+-        SaveSendAsync_Setup_vNext(sutProvider, send, new DisableSendPolicyRequirement(), new SendOptionsPolicyRequirement { DisableHideEmail = true });
+-        send.HideEmail = true;
+-
+-        var exception = await Assert.ThrowsAsync<BadRequestException>(() => sutProvider.Sut.SaveSendAsync(send));
+-        Assert.Contains("Due to an Enterprise Policy, you are not allowed to hide your email address from recipients when creating or editing a Send.", exception.Message);
+-    }
+-
+-    [Theory]
+-    [BitAutoData(SendType.File)]
+-    [BitAutoData(SendType.Text)]
+-    public async Task SaveSendAsync_DisableHideEmail_Applies_ButEmailNotHidden_Success_vNext(SendType sendType,
+-        SutProvider<SendService> sutProvider, [NewUserSendCustomize] Send send)
+-    {
+-        send.Type = sendType;
+-        SaveSendAsync_Setup_vNext(sutProvider, send, new DisableSendPolicyRequirement(), new SendOptionsPolicyRequirement { DisableHideEmail = true });
+-        send.HideEmail = false;
+-
+-        await sutProvider.Sut.SaveSendAsync(send);
+-
+-        await sutProvider.GetDependency<ISendRepository>().Received(1).CreateAsync(send);
+-    }
+-
+-    [Theory]
+-    [BitAutoData(SendType.File)]
+-    [BitAutoData(SendType.Text)]
+-    public async Task SaveSendAsync_DisableHideEmail_DoesntApply_Success_vNext(SendType sendType,
+-        SutProvider<SendService> sutProvider, [NewUserSendCustomize] Send send)
+-    {
+-        send.Type = sendType;
+-        SaveSendAsync_Setup_vNext(sutProvider, send, new DisableSendPolicyRequirement(), new SendOptionsPolicyRequirement());
+-        send.HideEmail = true;
+-
+-        await sutProvider.Sut.SaveSendAsync(send);
+-
+-        await sutProvider.GetDependency<ISendRepository>().Received(1).CreateAsync(send);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public async Task SaveSendAsync_ExistingSend_Updates(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        send.Id = Guid.NewGuid();
+-
+-        var now = DateTime.UtcNow;
+-        await sutProvider.Sut.SaveSendAsync(send);
+-
+-        Assert.True(send.RevisionDate - now < TimeSpan.FromSeconds(1));
+-
+-        await sutProvider.GetDependency<ISendRepository>()
+-            .Received(1)
+-            .UpsertAsync(send);
+-
+-        await sutProvider.GetDependency<IPushNotificationService>()
+-            .Received(1)
+-            .PushSyncSendUpdateAsync(send);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public async Task SaveFileSendAsync_TextType_ThrowsBadRequest(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        send.Type = SendType.Text;
+-
+-        var badRequest = await Assert.ThrowsAsync<BadRequestException>(() =>
+-            sutProvider.Sut.SaveFileSendAsync(send, null, 0)
+-        );
+-
+-        Assert.Contains("not of type \"file\"", badRequest.Message, StringComparison.InvariantCultureIgnoreCase);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public async Task SaveFileSendAsync_EmptyFile_ThrowsBadRequest(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        send.Type = SendType.File;
+-
+-        var badRequest = await Assert.ThrowsAsync<BadRequestException>(() =>
+-            sutProvider.Sut.SaveFileSendAsync(send, null, 0)
+-        );
+-
+-        Assert.Contains("no file data", badRequest.Message, StringComparison.InvariantCultureIgnoreCase);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public async Task SaveFileSendAsync_UserCannotAccessPremium_ThrowsBadRequest(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        var user = new User
+-        {
+-            Id = Guid.NewGuid(),
+-        };
+-
+-        send.UserId = user.Id;
+-        send.Type = SendType.File;
+-
+-        sutProvider.GetDependency<IUserRepository>()
+-            .GetByIdAsync(user.Id)
+-            .Returns(user);
+-
+-        sutProvider.GetDependency<IUserService>()
+-            .CanAccessPremium(user)
+-            .Returns(false);
+-
+-        var badRequest = await Assert.ThrowsAsync<BadRequestException>(() =>
+-            sutProvider.Sut.SaveFileSendAsync(send, null, 1)
+-        );
+-
+-        Assert.Contains("must have premium", badRequest.Message, StringComparison.InvariantCultureIgnoreCase);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public async Task SaveFileSendAsync_UserHasUnconfirmedEmail_ThrowsBadRequest(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        var user = new User
+-        {
+-            Id = Guid.NewGuid(),
+-            EmailVerified = false,
+-        };
+-
+-        send.UserId = user.Id;
+-        send.Type = SendType.File;
+-
+-        sutProvider.GetDependency<IUserRepository>()
+-            .GetByIdAsync(user.Id)
+-            .Returns(user);
+-
+-        sutProvider.GetDependency<IUserService>()
+-            .CanAccessPremium(user)
+-            .Returns(true);
+-
+-        var badRequest = await Assert.ThrowsAsync<BadRequestException>(() =>
+-            sutProvider.Sut.SaveFileSendAsync(send, null, 1)
+-        );
+-
+-        Assert.Contains("must confirm your email", badRequest.Message, StringComparison.InvariantCultureIgnoreCase);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public async Task SaveFileSendAsync_UserCanAccessPremium_HasNoStorage_ThrowsBadRequest(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        var user = new User
+-        {
+-            Id = Guid.NewGuid(),
+-            EmailVerified = true,
+-            Premium = true,
+-            MaxStorageGb = null,
+-            Storage = 0,
+-        };
+-
+-        send.UserId = user.Id;
+-        send.Type = SendType.File;
+-
+-        sutProvider.GetDependency<IUserRepository>()
+-            .GetByIdAsync(user.Id)
+-            .Returns(user);
+-
+-        sutProvider.GetDependency<IUserService>()
+-            .CanAccessPremium(user)
+-            .Returns(true);
+-
+-        var badRequest = await Assert.ThrowsAsync<BadRequestException>(() =>
+-            sutProvider.Sut.SaveFileSendAsync(send, null, 1)
+-        );
+-
+-        Assert.Contains("not enough storage", badRequest.Message, StringComparison.InvariantCultureIgnoreCase);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public async Task SaveFileSendAsync_UserCanAccessPremium_StorageFull_ThrowsBadRequest(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        var user = new User
+-        {
+-            Id = Guid.NewGuid(),
+-            EmailVerified = true,
+-            Premium = true,
+-            MaxStorageGb = 2,
+-            Storage = 2 * UserTests.Multiplier,
+-        };
+-
+-        send.UserId = user.Id;
+-        send.Type = SendType.File;
+-
+-        sutProvider.GetDependency<IUserRepository>()
+-            .GetByIdAsync(user.Id)
+-            .Returns(user);
+-
+-        sutProvider.GetDependency<IUserService>()
+-            .CanAccessPremium(user)
+-            .Returns(true);
+-
+-        var badRequest = await Assert.ThrowsAsync<BadRequestException>(() =>
+-            sutProvider.Sut.SaveFileSendAsync(send, null, 1)
+-        );
+-
+-        Assert.Contains("not enough storage", badRequest.Message, StringComparison.InvariantCultureIgnoreCase);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public async Task SaveFileSendAsync_UserCanAccessPremium_IsNotPremium_IsSelfHosted_GiantFile_ThrowsBadRequest(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        var user = new User
+-        {
+-            Id = Guid.NewGuid(),
+-            EmailVerified = true,
+-            Premium = false,
+-        };
+-
+-        send.UserId = user.Id;
+-        send.Type = SendType.File;
+-
+-        sutProvider.GetDependency<IUserRepository>()
+-            .GetByIdAsync(user.Id)
+-            .Returns(user);
+-
+-        sutProvider.GetDependency<IUserService>()
+-            .CanAccessPremium(user)
+-            .Returns(true);
+-
+-        sutProvider.GetDependency<GlobalSettings>()
+-            .SelfHosted = true;
+-
+-        var badRequest = await Assert.ThrowsAsync<BadRequestException>(() =>
+-            sutProvider.Sut.SaveFileSendAsync(send, null, 11000 * UserTests.Multiplier)
+-        );
+-
+-        Assert.Contains("not enough storage", badRequest.Message, StringComparison.InvariantCultureIgnoreCase);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public async Task SaveFileSendAsync_UserCanAccessPremium_IsNotPremium_IsNotSelfHosted_TwoGigabyteFile_ThrowsBadRequest(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        var user = new User
+-        {
+-            Id = Guid.NewGuid(),
+-            EmailVerified = true,
+-            Premium = false,
+-        };
+-
+-        send.UserId = user.Id;
+-        send.Type = SendType.File;
+-
+-        sutProvider.GetDependency<IUserRepository>()
+-            .GetByIdAsync(user.Id)
+-            .Returns(user);
+-
+-        sutProvider.GetDependency<IUserService>()
+-            .CanAccessPremium(user)
+-            .Returns(true);
+-
+-        sutProvider.GetDependency<GlobalSettings>()
+-            .SelfHosted = false;
+-
+-        var badRequest = await Assert.ThrowsAsync<BadRequestException>(() =>
+-            sutProvider.Sut.SaveFileSendAsync(send, null, 2 * UserTests.Multiplier)
+-        );
+-
+-        Assert.Contains("not enough storage", badRequest.Message, StringComparison.InvariantCultureIgnoreCase);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public async Task SaveFileSendAsync_ThroughOrg_MaxStorageIsNull_ThrowsBadRequest(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        var org = new Organization
+-        {
+-            Id = Guid.NewGuid(),
+-            MaxStorageGb = null,
+-        };
+-
+-        send.UserId = null;
+-        send.OrganizationId = org.Id;
+-        send.Type = SendType.File;
+-
+-        sutProvider.GetDependency<IOrganizationRepository>()
+-            .GetByIdAsync(org.Id)
+-            .Returns(org);
+-
+-        var badRequest = await Assert.ThrowsAsync<BadRequestException>(() =>
+-            sutProvider.Sut.SaveFileSendAsync(send, null, 1)
+-        );
+-
+-        Assert.Contains("organization cannot use file sends", badRequest.Message, StringComparison.InvariantCultureIgnoreCase);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public async Task SaveFileSendAsync_ThroughOrg_MaxStorageIsNull_TwoGBFile_ThrowsBadRequest(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        var org = new Organization
+-        {
+-            Id = Guid.NewGuid(),
+-            MaxStorageGb = null,
+-        };
+-
+-        send.UserId = null;
+-        send.OrganizationId = org.Id;
+-        send.Type = SendType.File;
+-
+-        sutProvider.GetDependency<IOrganizationRepository>()
+-            .GetByIdAsync(org.Id)
+-            .Returns(org);
+-
+-        var badRequest = await Assert.ThrowsAsync<BadRequestException>(() =>
+-            sutProvider.Sut.SaveFileSendAsync(send, null, 1)
+-        );
+-
+-        Assert.Contains("organization cannot use file sends", badRequest.Message, StringComparison.InvariantCultureIgnoreCase);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public async Task SaveFileSendAsync_ThroughOrg_MaxStorageIsOneGB_TwoGBFile_ThrowsBadRequest(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        var org = new Organization
+-        {
+-            Id = Guid.NewGuid(),
+-            MaxStorageGb = 1,
+-        };
+-
+-        send.UserId = null;
+-        send.OrganizationId = org.Id;
+-        send.Type = SendType.File;
+-
+-        sutProvider.GetDependency<IOrganizationRepository>()
+-            .GetByIdAsync(org.Id)
+-            .Returns(org);
+-
+-        var badRequest = await Assert.ThrowsAsync<BadRequestException>(() =>
+-            sutProvider.Sut.SaveFileSendAsync(send, null, 2 * UserTests.Multiplier)
+-        );
+-
+-        Assert.Contains("not enough storage", badRequest.Message, StringComparison.InvariantCultureIgnoreCase);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public async Task SaveFileSendAsync_HasEnoughStorage_Success(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        var user = new User
+-        {
+-            Id = Guid.NewGuid(),
+-            EmailVerified = true,
+-            MaxStorageGb = 10,
+-        };
+-
+-        var data = new SendFileData
+-        {
+-
+-        };
+-
+-        send.UserId = user.Id;
+-        send.Type = SendType.File;
+-
+-        var testUrl = "https://test.com/";
+-
+-        sutProvider.GetDependency<IUserRepository>()
+-            .GetByIdAsync(user.Id)
+-            .Returns(user);
+-
+-        sutProvider.GetDependency<IUserService>()
+-            .CanAccessPremium(user)
+-            .Returns(true);
+-
+-        sutProvider.GetDependency<ISendFileStorageService>()
+-            .GetSendFileUploadUrlAsync(send, Arg.Any<string>())
+-            .Returns(testUrl);
+-
+-        var utcNow = DateTime.UtcNow;
+-
+-        var url = await sutProvider.Sut.SaveFileSendAsync(send, data, 1 * UserTests.Multiplier);
+-
+-        Assert.Equal(testUrl, url);
+-        Assert.True(send.RevisionDate - utcNow < TimeSpan.FromSeconds(1));
+-
+-        await sutProvider.GetDependency<ISendFileStorageService>()
+-            .Received(1)
+-            .GetSendFileUploadUrlAsync(send, Arg.Any<string>());
+-
+-        await sutProvider.GetDependency<ISendRepository>()
+-            .Received(1)
+-            .UpsertAsync(send);
+-
+-        await sutProvider.GetDependency<IPushNotificationService>()
+-            .Received(1)
+-            .PushSyncSendUpdateAsync(send);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public async Task SaveFileSendAsync_HasEnoughStorage_SendFileThrows_CleansUp(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        var user = new User
+-        {
+-            Id = Guid.NewGuid(),
+-            EmailVerified = true,
+-            MaxStorageGb = 10,
+-        };
+-
+-        var data = new SendFileData
+-        {
+-
+-        };
+-
+-        send.UserId = user.Id;
+-        send.Type = SendType.File;
+-
+-        sutProvider.GetDependency<IUserRepository>()
+-            .GetByIdAsync(user.Id)
+-            .Returns(user);
+-
+-        sutProvider.GetDependency<IUserService>()
+-            .CanAccessPremium(user)
+-            .Returns(true);
+-
+-        sutProvider.GetDependency<ISendFileStorageService>()
+-            .GetSendFileUploadUrlAsync(send, Arg.Any<string>())
+-            .Returns<string>(callInfo => throw new Exception("Problem"));
+-
+-        var utcNow = DateTime.UtcNow;
+-
+-        var exception = await Assert.ThrowsAsync<Exception>(() =>
+-            sutProvider.Sut.SaveFileSendAsync(send, data, 1 * UserTests.Multiplier)
+-        );
+-
+-        Assert.True(send.RevisionDate - utcNow < TimeSpan.FromSeconds(1));
+-        Assert.Equal("Problem", exception.Message);
+-
+-        await sutProvider.GetDependency<ISendFileStorageService>()
+-            .Received(1)
+-            .GetSendFileUploadUrlAsync(send, Arg.Any<string>());
+-
+-        await sutProvider.GetDependency<ISendRepository>()
+-            .Received(1)
+-            .UpsertAsync(send);
+-
+-        await sutProvider.GetDependency<IPushNotificationService>()
+-            .Received(1)
+-            .PushSyncSendUpdateAsync(send);
+-
+-        await sutProvider.GetDependency<ISendFileStorageService>()
+-            .Received(1)
+-            .DeleteFileAsync(send, Arg.Any<string>());
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public async Task UpdateFileToExistingSendAsync_SendNull_ThrowsBadRequest(SutProvider<SendService> sutProvider)
+-    {
+-
+-        var badRequest = await Assert.ThrowsAsync<BadRequestException>(() =>
+-            sutProvider.Sut.UploadFileToExistingSendAsync(new MemoryStream(), null)
+-        );
+-
+-        Assert.Contains("does not have file data", badRequest.Message, StringComparison.InvariantCultureIgnoreCase);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public async Task UpdateFileToExistingSendAsync_SendDataNull_ThrowsBadRequest(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        send.Data = null;
+-
+-        var badRequest = await Assert.ThrowsAsync<BadRequestException>(() =>
+-            sutProvider.Sut.UploadFileToExistingSendAsync(new MemoryStream(), send)
+-        );
+-
+-        Assert.Contains("does not have file data", badRequest.Message, StringComparison.InvariantCultureIgnoreCase);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public async Task UpdateFileToExistingSendAsync_NotFileType_ThrowsBadRequest(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        var badRequest = await Assert.ThrowsAsync<BadRequestException>(() =>
+-            sutProvider.Sut.UploadFileToExistingSendAsync(new MemoryStream(), send)
+-        );
+-
+-        Assert.Contains("not a file type send", badRequest.Message, StringComparison.InvariantCultureIgnoreCase);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public async Task UpdateFileToExistingSendAsync_Success(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        var fileContents = "Test file content";
+-
+-        var sendFileData = new SendFileData
+-        {
+-            Id = "TEST",
+-            Size = fileContents.Length,
+-            Validated = false,
+-        };
+-
+-        send.Type = SendType.File;
+-        send.Data = JsonSerializer.Serialize(sendFileData);
+-
+-        sutProvider.GetDependency<ISendFileStorageService>()
+-            .ValidateFileAsync(send, sendFileData.Id, sendFileData.Size, Arg.Any<long>())
+-            .Returns((true, sendFileData.Size));
+-
+-        await sutProvider.Sut.UploadFileToExistingSendAsync(new MemoryStream(Encoding.UTF8.GetBytes(fileContents)), send);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public async Task UpdateFileToExistingSendAsync_InvalidSize(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        var fileContents = "Test file content";
+-
+-        var sendFileData = new SendFileData
+-        {
+-            Id = "TEST",
+-            Size = fileContents.Length,
+-        };
+-
+-        send.Type = SendType.File;
+-        send.Data = JsonSerializer.Serialize(sendFileData);
+-
+-        sutProvider.GetDependency<ISendFileStorageService>()
+-            .ValidateFileAsync(send, sendFileData.Id, sendFileData.Size, Arg.Any<long>())
+-            .Returns((false, sendFileData.Size));
+-
+-        var badRequest = await Assert.ThrowsAsync<BadRequestException>(() =>
+-            sutProvider.Sut.UploadFileToExistingSendAsync(new MemoryStream(Encoding.UTF8.GetBytes(fileContents)), send)
+-        );
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public void SendCanBeAccessed_Success(SutProvider<SendService> sutProvider, Send send)
+-    {
+-        var now = DateTime.UtcNow;
+-        send.MaxAccessCount = 10;
+-        send.AccessCount = 5;
+-        send.ExpirationDate = now.AddYears(1);
+-        send.DeletionDate = now.AddYears(1);
+-        send.Disabled = false;
+-
+-        sutProvider.GetDependency<IPasswordHasher<User>>()
+-            .VerifyHashedPassword(Arg.Any<User>(), send.Password, "TEST")
+-            .Returns(PasswordVerificationResult.Success);
+-
+-        var (grant, passwordRequiredError, passwordInvalidError)
+-            = sutProvider.Sut.SendCanBeAccessed(send, "TEST");
+-
+-        Assert.True(grant);
+-        Assert.False(passwordRequiredError);
+-        Assert.False(passwordInvalidError);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public void SendCanBeAccessed_NullMaxAccess_Success(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        var now = DateTime.UtcNow;
+-        send.MaxAccessCount = null;
+-        send.AccessCount = 5;
+-        send.ExpirationDate = now.AddYears(1);
+-        send.DeletionDate = now.AddYears(1);
+-        send.Disabled = false;
+-
+-        sutProvider.GetDependency<IPasswordHasher<User>>()
+-            .VerifyHashedPassword(Arg.Any<User>(), send.Password, "TEST")
+-            .Returns(PasswordVerificationResult.Success);
+-
+-        var (grant, passwordRequiredError, passwordInvalidError)
+-            = sutProvider.Sut.SendCanBeAccessed(send, "TEST");
+-
+-        Assert.True(grant);
+-        Assert.False(passwordRequiredError);
+-        Assert.False(passwordInvalidError);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public void SendCanBeAccessed_NullSend_DoesNotGrantAccess(SutProvider<SendService> sutProvider)
+-    {
+-        sutProvider.GetDependency<IPasswordHasher<User>>()
+-            .VerifyHashedPassword(Arg.Any<User>(), "TEST", "TEST")
+-            .Returns(PasswordVerificationResult.Success);
+-
+-        var (grant, passwordRequiredError, passwordInvalidError)
+-            = sutProvider.Sut.SendCanBeAccessed(null, "TEST");
+-
+-        Assert.False(grant);
+-        Assert.False(passwordRequiredError);
+-        Assert.False(passwordInvalidError);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public void SendCanBeAccessed_NullPassword_PasswordRequiredErrorReturnsTrue(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        var now = DateTime.UtcNow;
+-        send.MaxAccessCount = null;
+-        send.AccessCount = 5;
+-        send.ExpirationDate = now.AddYears(1);
+-        send.DeletionDate = now.AddYears(1);
+-        send.Disabled = false;
+-        send.Password = "HASH";
+-
+-        sutProvider.GetDependency<IPasswordHasher<User>>()
+-            .VerifyHashedPassword(Arg.Any<User>(), "TEST", "TEST")
+-            .Returns(PasswordVerificationResult.Success);
+-
+-        var (grant, passwordRequiredError, passwordInvalidError)
+-            = sutProvider.Sut.SendCanBeAccessed(send, null);
+-
+-        Assert.False(grant);
+-        Assert.True(passwordRequiredError);
+-        Assert.False(passwordInvalidError);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public void SendCanBeAccessed_RehashNeeded_RehashesPassword(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        var now = DateTime.UtcNow;
+-        send.MaxAccessCount = null;
+-        send.AccessCount = 5;
+-        send.ExpirationDate = now.AddYears(1);
+-        send.DeletionDate = now.AddYears(1);
+-        send.Disabled = false;
+-        send.Password = "TEST";
+-
+-        sutProvider.GetDependency<IPasswordHasher<User>>()
+-            .VerifyHashedPassword(Arg.Any<User>(), "TEST", "TEST")
+-            .Returns(PasswordVerificationResult.SuccessRehashNeeded);
+-
+-        var (grant, passwordRequiredError, passwordInvalidError)
+-            = sutProvider.Sut.SendCanBeAccessed(send, "TEST");
+-
+-        sutProvider.GetDependency<IPasswordHasher<User>>()
+-            .Received(1)
+-            .HashPassword(Arg.Any<User>(), "TEST");
+-
+-        Assert.True(grant);
+-        Assert.False(passwordRequiredError);
+-        Assert.False(passwordInvalidError);
+-    }
+-
+-    [Theory]
+-    [BitAutoData]
+-    public void SendCanBeAccessed_VerifyFailed_PasswordInvalidReturnsTrue(SutProvider<SendService> sutProvider,
+-        Send send)
+-    {
+-        var now = DateTime.UtcNow;
+-        send.MaxAccessCount = null;
+-        send.AccessCount = 5;
+-        send.ExpirationDate = now.AddYears(1);
+-        send.DeletionDate = now.AddYears(1);
+-        send.Disabled = false;
+-        send.Password = "TEST";
+-
+-        sutProvider.GetDependency<IPasswordHasher<User>>()
+-            .VerifyHashedPassword(Arg.Any<User>(), "TEST", "TEST")
+-            .Returns(PasswordVerificationResult.Failed);
+-
+-        var (grant, passwordRequiredError, passwordInvalidError)
+-            = sutProvider.Sut.SendCanBeAccessed(send, "TEST");
+-
+-        Assert.False(grant);
+-        Assert.False(passwordRequiredError);
+-        Assert.True(passwordInvalidError);
+-    }
+-}

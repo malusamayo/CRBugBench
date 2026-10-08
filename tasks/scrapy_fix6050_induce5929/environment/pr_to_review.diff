@@ -1,0 +1,260 @@
+commit 777a6ea4128cf00d53fa71dc48385bf036cb64fc
+Author: Serhii A <aserhii@protonmail.com>
+Date:   Fri Jun 16 16:46:06 2023 +0300
+
+    Make the retry middleware exception list configurable (#5929)
+
+diff --git a/docs/topics/downloader-middleware.rst b/docs/topics/downloader-middleware.rst
+index 7665a901a..a8e5b23bf 100644
+--- a/docs/topics/downloader-middleware.rst
++++ b/docs/topics/downloader-middleware.rst
+@@ -915,6 +915,7 @@ settings (see the settings documentation for more info):
+ * :setting:`RETRY_ENABLED`
+ * :setting:`RETRY_TIMES`
+ * :setting:`RETRY_HTTP_CODES`
++* :setting:`RETRY_EXCEPTIONS`
+ 
+ .. reqmeta:: dont_retry
+ 
+@@ -966,6 +967,37 @@ In some cases you may want to add 400 to :setting:`RETRY_HTTP_CODES` because
+ it is a common code used to indicate server overload. It is not included by
+ default because HTTP specs say so.
+ 
++.. setting:: RETRY_EXCEPTIONS
++
++RETRY_EXCEPTIONS
++^^^^^^^^^^^^^^^^
++
++Default::
++
++    [
++        'twisted.internet.defer.TimeoutError',
++        'twisted.internet.error.TimeoutError',
++        'twisted.internet.error.DNSLookupError',
++        'twisted.internet.error.ConnectionRefusedError',
++        'twisted.internet.error.ConnectionDone',
++        'twisted.internet.error.ConnectError',
++        'twisted.internet.error.ConnectionLost',
++        'twisted.internet.error.TCPTimedOutError',
++        'twisted.web.client.ResponseFailed',
++        IOError,
++        'scrapy.core.downloader.handlers.http11.TunnelError',
++    ]
++
++List of exceptions to retry.
++
++Each list entry may be an exception type or its import path as a string.
++
++An exception will not be caught when the exception type is not in
++:setting:`RETRY_EXCEPTIONS` or when the maximum number of retries for a request
++has been exceeded (see :setting:`RETRY_TIMES`). To learn about uncaught
++exception propagation, see
++:meth:`~scrapy.downloadermiddlewares.DownloaderMiddleware.process_exception`.
++
+ .. setting:: RETRY_PRIORITY_ADJUST
+ 
+ RETRY_PRIORITY_ADJUST
+diff --git a/scrapy/downloadermiddlewares/retry.py b/scrapy/downloadermiddlewares/retry.py
+index 081642a4b..50cbc3111 100644
+--- a/scrapy/downloadermiddlewares/retry.py
++++ b/scrapy/downloadermiddlewares/retry.py
+@@ -9,31 +9,36 @@ RETRY_HTTP_CODES - which HTTP response codes to retry
+ Failed pages are collected on the scraping process and rescheduled at the end,
+ once the spider has finished crawling all regular (non failed) pages.
+ """
++import warnings
+ from logging import Logger, getLogger
+ from typing import Optional, Union
+ 
+-from twisted.internet import defer
+-from twisted.internet.error import (
+-    ConnectError,
+-    ConnectionDone,
+-    ConnectionLost,
+-    ConnectionRefusedError,
+-    DNSLookupError,
+-    TCPTimedOutError,
+-    TimeoutError,
+-)
+-from twisted.web.client import ResponseFailed
+-
+-from scrapy.core.downloader.handlers.http11 import TunnelError
+-from scrapy.exceptions import NotConfigured
++from scrapy.exceptions import NotConfigured, ScrapyDeprecationWarning
+ from scrapy.http.request import Request
++from scrapy.settings import Settings
+ from scrapy.spiders import Spider
++from scrapy.utils.misc import load_object
+ from scrapy.utils.python import global_object_name
+ from scrapy.utils.response import response_status_message
+ 
+ retry_logger = getLogger(__name__)
+ 
+ 
++class BackwardsCompatibilityMetaclass(type):
++    @property
++    def EXCEPTIONS_TO_RETRY(cls):
++        warnings.warn(
++            "Attribute RetryMiddleware.EXCEPTIONS_TO_RETRY is deprecated. "
++            "Use the RETRY_EXCEPTIONS setting instead.",
++            ScrapyDeprecationWarning,
++            stacklevel=2,
++        )
++        return tuple(
++            load_object(x) if isinstance(x, str) else x
++            for x in Settings().getlist("RETRY_EXCEPTIONS")
++        )
++
++
+ def get_retry_request(
+     request: Request,
+     *,
+@@ -121,23 +126,7 @@ def get_retry_request(
+     return None
+ 
+ 
+-class RetryMiddleware:
+-    # IOError is raised by the HttpCompression middleware when trying to
+-    # decompress an empty response
+-    EXCEPTIONS_TO_RETRY = (
+-        defer.TimeoutError,
+-        TimeoutError,
+-        DNSLookupError,
+-        ConnectionRefusedError,
+-        ConnectionDone,
+-        ConnectError,
+-        ConnectionLost,
+-        TCPTimedOutError,
+-        ResponseFailed,
+-        IOError,
+-        TunnelError,
+-    )
+-
++class RetryMiddleware(metaclass=BackwardsCompatibilityMetaclass):
+     def __init__(self, settings):
+         if not settings.getbool("RETRY_ENABLED"):
+             raise NotConfigured
+@@ -147,6 +136,16 @@ class RetryMiddleware:
+         )
+         self.priority_adjust = settings.getint("RETRY_PRIORITY_ADJUST")
+ 
++        if not hasattr(
++            self, "EXCEPTIONS_TO_RETRY"
++        ):  # If EXCEPTIONS_TO_RETRY is not "overriden"
++            self.exceptions_to_retry = tuple(
++                load_object(x) if isinstance(x, str) else x
++                for x in settings.getlist("RETRY_EXCEPTIONS")
++            )
++        else:
++            self.exceptions_to_retry = self.EXCEPTIONS_TO_RETRY
++
+     @classmethod
+     def from_crawler(cls, crawler):
+         return cls(crawler.settings)
+@@ -160,7 +159,7 @@ class RetryMiddleware:
+         return response
+ 
+     def process_exception(self, request, exception, spider):
+-        if isinstance(exception, self.EXCEPTIONS_TO_RETRY) and not request.meta.get(
++        if isinstance(exception, self.exceptions_to_retry) and not request.meta.get(
+             "dont_retry", False
+         ):
+             return self._retry(request, exception, spider)
+diff --git a/scrapy/settings/default_settings.py b/scrapy/settings/default_settings.py
+index 260ec1701..89837b4ab 100644
+--- a/scrapy/settings/default_settings.py
++++ b/scrapy/settings/default_settings.py
+@@ -258,6 +258,21 @@ RETRY_ENABLED = True
+ RETRY_TIMES = 2  # initial response + 2 retries = 3 requests
+ RETRY_HTTP_CODES = [500, 502, 503, 504, 522, 524, 408, 429]
+ RETRY_PRIORITY_ADJUST = -1
++RETRY_EXCEPTIONS = [
++    "twisted.internet.defer.TimeoutError",
++    "twisted.internet.error.TimeoutError",
++    "twisted.internet.error.DNSLookupError",
++    "twisted.internet.error.ConnectionRefusedError",
++    "twisted.internet.error.ConnectionDone",
++    "twisted.internet.error.ConnectError",
++    "twisted.internet.error.ConnectionLost",
++    "twisted.internet.error.TCPTimedOutError",
++    "twisted.web.client.ResponseFailed",
++    # IOError is raised by the HttpCompression middleware when trying to
++    # decompress an empty response
++    IOError,
++    "scrapy.core.downloader.handlers.http11.TunnelError",
++]
+ 
+ ROBOTSTXT_OBEY = False
+ ROBOTSTXT_PARSER = "scrapy.robotstxt.ProtegoRobotParser"
+diff --git a/tests/test_downloadermiddleware_retry.py b/tests/test_downloadermiddleware_retry.py
+index 63bd61848..97ae1e29a 100644
+--- a/tests/test_downloadermiddleware_retry.py
++++ b/tests/test_downloadermiddleware_retry.py
+@@ -1,5 +1,6 @@
+ import logging
+ import unittest
++import warnings
+ 
+ from testfixtures import LogCapture
+ from twisted.internet import defer
+@@ -15,6 +16,7 @@ from twisted.web.client import ResponseFailed
+ from scrapy.downloadermiddlewares.retry import RetryMiddleware, get_retry_request
+ from scrapy.exceptions import IgnoreRequest
+ from scrapy.http import Request, Response
++from scrapy.settings.default_settings import RETRY_EXCEPTIONS
+ from scrapy.spiders import Spider
+ from scrapy.utils.test import get_crawler
+ 
+@@ -110,19 +112,48 @@ class RetryTest(unittest.TestCase):
+             == 2
+         )
+ 
+-    def _test_retry_exception(self, req, exception):
++    def test_exception_to_retry_added(self):
++        exc = ValueError
++        settings_dict = {
++            "RETRY_EXCEPTIONS": list(RETRY_EXCEPTIONS) + [exc],
++        }
++        crawler = get_crawler(Spider, settings_dict=settings_dict)
++        mw = RetryMiddleware.from_crawler(crawler)
++        req = Request(f"http://www.scrapytest.org/{exc.__name__}")
++        self._test_retry_exception(req, exc("foo"), mw)
++
++    def test_exception_to_retry_customMiddleware(self):
++        exc = ValueError
++
++        with warnings.catch_warnings(record=True) as warns:
++
++            class MyRetryMiddleware(RetryMiddleware):
++                EXCEPTIONS_TO_RETRY = RetryMiddleware.EXCEPTIONS_TO_RETRY + (exc,)
++
++            self.assertEqual(len(warns), 1)
++
++        mw2 = MyRetryMiddleware.from_crawler(self.crawler)
++        req = Request(f"http://www.scrapytest.org/{exc.__name__}")
++        req = mw2.process_exception(req, exc("foo"), self.spider)
++        assert isinstance(req, Request)
++        self.assertEqual(req.meta["retry_times"], 1)
++
++    def _test_retry_exception(self, req, exception, mw=None):
++        if mw is None:
++            mw = self.mw
++
+         # first retry
+-        req = self.mw.process_exception(req, exception, self.spider)
++        req = mw.process_exception(req, exception, self.spider)
+         assert isinstance(req, Request)
+         self.assertEqual(req.meta["retry_times"], 1)
+ 
+         # second retry
+-        req = self.mw.process_exception(req, exception, self.spider)
++        req = mw.process_exception(req, exception, self.spider)
+         assert isinstance(req, Request)
+         self.assertEqual(req.meta["retry_times"], 2)
+ 
+         # discard it
+-        req = self.mw.process_exception(req, exception, self.spider)
++        req = mw.process_exception(req, exception, self.spider)
+         self.assertEqual(req, None)
+ 
+ 

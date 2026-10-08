@@ -1,0 +1,758 @@
+commit 5f73dd717b6fae20d95ccbae0857612a352ee816
+Author: Imri Paran <imri.paran@gmail.com>
+Date:   Fri Feb 7 15:21:58 2025 +0100
+
+    Fix 19499: feat(apps): add app config in run record (#19544)
+    
+    * feat(apps): add app config in run record
+    
+    - changed returned schema type of "status" to "AppRunRecord"!
+    - added a "config" field in the app record
+    - added a "pending" stage so that "external" app status can be mapped ti internal app status
+    
+    * added note about schema compatiblity
+    
+    * added app config for external apps
+    
+    * show config for every app run
+    
+    * add tests
+    
+    * revert open change for now
+    
+    * Revert "revert open change for now"
+    
+    This reverts commit e1492a5c92d1967b3d47230a25df4c2c3d399de2.
+    
+    * update dependency
+    
+    ---------
+    
+    Co-authored-by: karanh37 <karanh37@gmail.com>
+    Co-authored-by: Karan Hotchandani <33024356+karanh37@users.noreply.github.com>
+
+diff --git a/openmetadata-service/src/main/java/org/openmetadata/service/apps/scheduler/AbstractOmAppJobListener.java b/openmetadata-service/src/main/java/org/openmetadata/service/apps/scheduler/AbstractOmAppJobListener.java
+index 8d256f4167..d110da423f 100644
+--- a/openmetadata-service/src/main/java/org/openmetadata/service/apps/scheduler/AbstractOmAppJobListener.java
++++ b/openmetadata-service/src/main/java/org/openmetadata/service/apps/scheduler/AbstractOmAppJobListener.java
+@@ -61,7 +61,8 @@ public abstract class AbstractOmAppJobListener implements JobListener {
+               .withTimestamp(jobStartTime)
+               .withRunType(runType)
+               .withStatus(AppRunRecord.Status.RUNNING)
+-              .withScheduleInfo(jobApp.getAppSchedule());
++              .withScheduleInfo(jobApp.getAppSchedule())
++              .withConfig(JsonUtils.getMap(jobApp.getAppConfiguration()));
+ 
+       boolean update = false;
+       if (jobExecutionContext.isRecovering()) {
+diff --git a/openmetadata-service/src/main/java/org/openmetadata/service/resources/apps/AppResource.java b/openmetadata-service/src/main/java/org/openmetadata/service/resources/apps/AppResource.java
+index 0bf712ce9f..dda74168f6 100644
+--- a/openmetadata-service/src/main/java/org/openmetadata/service/resources/apps/AppResource.java
++++ b/openmetadata-service/src/main/java/org/openmetadata/service/resources/apps/AppResource.java
+@@ -251,7 +251,7 @@ public class AppResource extends EntityResource<App, AppRepository> {
+                     mediaType = "application/json",
+                     schema = @Schema(implementation = AppRunList.class)))
+       })
+-  public Response listAppRuns(
++  public ResultList<AppRunRecord> listAppRuns(
+       @Context UriInfo uriInfo,
+       @Context SecurityContext securityContext,
+       @Parameter(description = "Name of the App", schema = @Schema(type = "string"))
+@@ -281,9 +281,7 @@ public class AppResource extends EntityResource<App, AppRepository> {
+           Long endTs) {
+     App installation = repository.getByName(uriInfo, name, repository.getFields("id,pipelines"));
+     if (installation.getAppType().equals(AppType.Internal)) {
+-      return Response.status(Response.Status.OK)
+-          .entity(repository.listAppRuns(installation, limitParam, offset))
+-          .build();
++      return repository.listAppRuns(installation, limitParam, offset);
+     }
+     if (!installation.getPipelines().isEmpty()) {
+       EntityReference pipelineRef = installation.getPipelines().get(0);
+@@ -292,13 +290,27 @@ public class AppResource extends EntityResource<App, AppRepository> {
+       IngestionPipeline ingestionPipeline =
+           ingestionPipelineRepository.get(
+               uriInfo, pipelineRef.getId(), ingestionPipelineRepository.getFields(FIELD_OWNERS));
+-      return Response.ok(
+-              ingestionPipelineRepository.listPipelineStatus(
+-                  ingestionPipeline.getFullyQualifiedName(), startTs, endTs),
+-              MediaType.APPLICATION_JSON_TYPE)
+-          .build();
++      return ingestionPipelineRepository
++          .listPipelineStatus(ingestionPipeline.getFullyQualifiedName(), startTs, endTs)
++          .map(pipelineStatus -> convertPipelineStatus(installation, pipelineStatus));
+     }
+-    throw new IllegalArgumentException("App does not have an associated pipeline.");
++    throw new IllegalArgumentException("App does not have a scheduled deployment");
++  }
++
++  private static AppRunRecord convertPipelineStatus(App app, PipelineStatus pipelineStatus) {
++    return new AppRunRecord()
++        .withAppId(app.getId())
++        .withAppName(app.getName())
++        .withExecutionTime(pipelineStatus.getStartDate())
++        .withEndTime(pipelineStatus.getEndDate())
++        .withStatus(
++            switch (pipelineStatus.getPipelineState()) {
++              case QUEUED -> AppRunRecord.Status.PENDING;
++              case SUCCESS -> AppRunRecord.Status.SUCCESS;
++              case FAILED, PARTIAL_SUCCESS -> AppRunRecord.Status.FAILED;
++              case RUNNING -> AppRunRecord.Status.RUNNING;
++            })
++        .withConfig(pipelineStatus.getConfig());
+   }
+ 
+   @GET
+@@ -617,7 +629,7 @@ public class AppResource extends EntityResource<App, AppRepository> {
+     limits.enforceLimits(
+         securityContext,
+         getResourceContext(),
+-        new OperationContext(Entity.APPLICATION, MetadataOperation.CREATE));
++        new OperationContext(APPLICATION, MetadataOperation.CREATE));
+     if (SCHEDULED_TYPES.contains(app.getScheduleType())) {
+       ApplicationHandler.getInstance()
+           .installApplication(
+diff --git a/openmetadata-service/src/main/java/org/openmetadata/service/util/ResultList.java b/openmetadata-service/src/main/java/org/openmetadata/service/util/ResultList.java
+index b81690dbf3..ecaadd91c7 100644
+--- a/openmetadata-service/src/main/java/org/openmetadata/service/util/ResultList.java
++++ b/openmetadata-service/src/main/java/org/openmetadata/service/util/ResultList.java
+@@ -17,6 +17,8 @@ import com.fasterxml.jackson.annotation.JsonInclude;
+ import com.fasterxml.jackson.annotation.JsonProperty;
+ import com.fasterxml.jackson.annotation.JsonPropertyOrder;
+ import java.util.List;
++import java.util.function.Function;
++import java.util.stream.Collectors;
+ import javax.validation.constraints.NotNull;
+ import org.openmetadata.schema.system.EntityError;
+ import org.openmetadata.schema.type.Paging;
+@@ -95,6 +97,11 @@ public class ResultList<T> {
+     paging = new Paging().withBefore(null).withAfter(null).withTotal(total).withOffset(offset);
+   }
+ 
++  /* Conveniently map the data to another type without the need to create a new ResultList */
++  public <S> ResultList<S> map(Function<T, S> mapper) {
++    return new ResultList<>(data.stream().map(mapper).collect(Collectors.toList()), paging);
++  }
++
+   public ResultList(List<T> data, Integer offset, Integer limit, Integer total) {
+     this.data = data;
+     paging =
+@@ -106,6 +113,17 @@ public class ResultList<T> {
+             .withLimit(limit);
+   }
+ 
++  public ResultList(List<T> data, Paging other) {
++    this.data = data;
++    paging =
++        new Paging()
++            .withBefore(null)
++            .withAfter(null)
++            .withTotal(other.getTotal())
++            .withOffset(other.getOffset())
++            .withLimit(other.getLimit());
++  }
++
+   public ResultList(
+       List<T> data, List<EntityError> errors, String beforeCursor, String afterCursor, int total) {
+     this.data = data;
+diff --git a/openmetadata-spec/src/main/resources/json/schema/entity/applications/appRunRecord.json b/openmetadata-spec/src/main/resources/json/schema/entity/applications/appRunRecord.json
+index 122ee052ef..6dde1cf433 100644
+--- a/openmetadata-spec/src/main/resources/json/schema/entity/applications/appRunRecord.json
++++ b/openmetadata-spec/src/main/resources/json/schema/entity/applications/appRunRecord.json
+@@ -34,7 +34,8 @@
+         "active",
+         "activeError",
+         "stopped",
+-        "success"
++        "success",
++        "pending"
+       ]
+     },
+     "runType": {
+@@ -63,6 +64,10 @@
+     },
+     "scheduleInfo": {
+       "$ref": "./app.json#/definitions/appSchedule"
++    },
++    "config": {
++      "descripton": "The configuration used for this application run. It's type will be based on the application type. Old runs might not be compatible with schema of app configuration.",
++      "$ref": "../../type/basic.json#/definitions/map"
+     }
+   },
+   "additionalProperties": false
+diff --git a/openmetadata-spec/src/main/resources/json/schema/entity/services/ingestionPipelines/ingestionPipeline.json b/openmetadata-spec/src/main/resources/json/schema/entity/services/ingestionPipelines/ingestionPipeline.json
+index 314c78b2e5..3c5bf2fa11 100644
+--- a/openmetadata-spec/src/main/resources/json/schema/entity/services/ingestionPipelines/ingestionPipeline.json
++++ b/openmetadata-spec/src/main/resources/json/schema/entity/services/ingestionPipelines/ingestionPipeline.json
+@@ -43,6 +43,10 @@
+         "status": {
+           "description": "Ingestion Pipeline summary status. Informed at the end of the execution.",
+           "$ref": "status.json#/definitions/ingestionStatus"
++        },
++        "config": {
++          "description": "Pipeline configuration for this particular execution.",
++          "$ref": "../../../type/basic.json#/definitions/map"
+         }
+       },
+       "additionalProperties": false
+diff --git a/openmetadata-ui/src/main/resources/ui/playwright/e2e/Pages/SearchIndexApplication.spec.ts b/openmetadata-ui/src/main/resources/ui/playwright/e2e/Pages/SearchIndexApplication.spec.ts
+index 48d6ab2fe9..96b0fb05e5 100644
+--- a/openmetadata-ui/src/main/resources/ui/playwright/e2e/Pages/SearchIndexApplication.spec.ts
++++ b/openmetadata-ui/src/main/resources/ui/playwright/e2e/Pages/SearchIndexApplication.spec.ts
+@@ -90,6 +90,22 @@ test('Search Index Application', async ({ page }) => {
+     await verifyLastExecutionRun(page);
+   });
+ 
++  await test.step('View App Run Config', async () => {
++    await page.getByTestId('app-historical-config').click();
++    await page.waitForSelector('[role="dialog"].ant-modal');
++
++    await expect(page.locator('[role="dialog"].ant-modal')).toBeVisible();
++
++    await expect(page.locator('.ant-modal-title')).toContainText(
++      'Search Indexing Configuration'
++    );
++
++    await page.click('[data-testid="app-run-config-close"]');
++    await page.waitForSelector('[role="dialog"].ant-modal', {
++      state: 'detached',
++    });
++  });
++
+   await test.step('Edit application', async () => {
+     await page.click('[data-testid="edit-button"]');
+     await page.waitForSelector('[data-testid="schedular-card-container"]');
+diff --git a/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppDetails/AppDetails.component.tsx b/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppDetails/AppDetails.component.tsx
+index ea1c53889c..781b4788fb 100644
+--- a/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppDetails/AppDetails.component.tsx
++++ b/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppDetails/AppDetails.component.tsx
+@@ -365,6 +365,7 @@ const AppDetails = () => {
+                   {appData && (
+                     <AppSchedule
+                       appData={appData}
++                      jsonSchema={jsonSchema as RJSFSchema}
+                       loading={{
+                         isRunLoading: loadingState.isRunLoading,
+                         isDeployLoading: loadingState.isDeployLoading,
+@@ -392,7 +393,10 @@ const AppDetails = () => {
+               key: ApplicationTabs.RECENT_RUNS,
+               children: (
+                 <div className="p-lg">
+-                  <AppRunsHistory appData={appData} />
++                  <AppRunsHistory
++                    appData={appData}
++                    jsonSchema={jsonSchema as RJSFSchema}
++                  />
+                 </div>
+               ),
+             },
+diff --git a/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppRunsHistory/AppRunsHistory.component.tsx b/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppRunsHistory/AppRunsHistory.component.tsx
+index fe54986735..420d459ad3 100644
+--- a/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppRunsHistory/AppRunsHistory.component.tsx
++++ b/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppRunsHistory/AppRunsHistory.component.tsx
+@@ -10,10 +10,11 @@
+  *  See the License for the specific language governing permissions and
+  *  limitations under the License.
+  */
+-import { Button, Col, Row, Typography } from 'antd';
++import validator from '@rjsf/validator-ajv8';
++import { Button, Col, Modal, Row, Space, Typography } from 'antd';
+ import { ColumnsType } from 'antd/lib/table';
+ import { AxiosError } from 'axios';
+-import { isNull } from 'lodash';
++import { isNull, noop } from 'lodash';
+ import React, {
+   forwardRef,
+   useCallback,
+@@ -31,8 +32,12 @@ import {
+ } from '../../../../constants/constants';
+ import { GlobalSettingOptions } from '../../../../constants/GlobalSettings.constants';
+ import { useWebSocketConnector } from '../../../../context/WebSocketProvider/WebSocketProvider';
++import { ServiceCategory } from '../../../../enums/service.enum';
+ import { AppType } from '../../../../generated/entity/applications/app';
+-import { Status } from '../../../../generated/entity/applications/appRunRecord';
++import {
++  AppRunRecord,
++  Status,
++} from '../../../../generated/entity/applications/appRunRecord';
+ import {
+   PipelineState,
+   PipelineStatus,
+@@ -51,16 +56,20 @@ import {
+   getEpochMillisForPastDays,
+   getIntervalInMilliseconds,
+ } from '../../../../utils/date-time/DateTimeUtils';
++import { getEntityName } from '../../../../utils/EntityUtils';
+ import { getLogsViewerPath } from '../../../../utils/RouterUtils';
+ import { showErrorToast } from '../../../../utils/ToastUtils';
+ import ErrorPlaceHolder from '../../../common/ErrorWithPlaceholder/ErrorPlaceHolder';
++import FormBuilder from '../../../common/FormBuilder/FormBuilder';
+ import NextPrevious from '../../../common/NextPrevious/NextPrevious';
+ import { PagingHandlerParams } from '../../../common/NextPrevious/NextPrevious.interface';
+ import StatusBadge from '../../../common/StatusBadge/StatusBadge.component';
+ import { StatusType } from '../../../common/StatusBadge/StatusBadge.interface';
+ import Table from '../../../common/Table/Table';
+ import StopScheduleModal from '../../../Modals/StopScheduleRun/StopScheduleRunModal';
++import applicationsClassBase from '../AppDetails/ApplicationsClassBase';
+ import AppLogsViewer from '../AppLogsViewer/AppLogsViewer.component';
++import './app-run-history.less';
+ import {
+   AppRunRecordWithId,
+   AppRunsHistoryProps,
+@@ -68,7 +77,12 @@ import {
+ 
+ const AppRunsHistory = forwardRef(
+   (
+-    { appData, maxRecords, showPagination = true }: AppRunsHistoryProps,
++    {
++      appData,
++      maxRecords,
++      jsonSchema,
++      showPagination = true,
++    }: AppRunsHistoryProps,
+     ref
+   ) => {
+     const { socket } = useWebSocketConnector();
+@@ -80,6 +94,17 @@ const AppRunsHistory = forwardRef(
+     >([]);
+     const [expandedRowKeys, setExpandedRowKeys] = useState<string[]>([]);
+     const [isStopModalOpen, setIsStopModalOpen] = useState<boolean>(false);
++    const [showConfigModal, setShowConfigModal] = useState<boolean>(false);
++    const [appRunRecordConfig, setAppRunRecordConfig] = useState<
++      AppRunRecord['config']
++    >({});
++    const UiSchema = {
++      ...applicationsClassBase.getJSONUISchema(),
++      'ui:submitButtonProps': {
++        showButton: false,
++        buttonText: 'submit',
++      },
++    };
+ 
+     const {
+       currentPage,
+@@ -132,6 +157,11 @@ const AppRunsHistory = forwardRef(
+       return false;
+     }, []);
+ 
++    const showAppRunConfig = (record: AppRunRecordWithId) => {
++      setShowConfigModal(true);
++      setAppRunRecordConfig(record.config ?? {});
++    };
++
+     const getActionButton = useCallback(
+       (record: AppRunRecordWithId, index: number) => {
+         if (
+@@ -149,6 +179,14 @@ const AppRunsHistory = forwardRef(
+                 onClick={() => handleRowExpandable(record.id)}>
+                 {t('label.log-plural')}
+               </Button>
++              <Button
++                className="m-l-xs p-0"
++                data-testid="app-historical-config"
++                size="small"
++                type="link"
++                onClick={() => showAppRunConfig(record)}>
++                {t('label.config')}
++              </Button>
+               {/* For status running or activewitherror and supportsInterrupt is true, show stop button */}
+               {(record.status === Status.Running ||
+                 record.status === Status.ActiveError) &&
+@@ -214,7 +252,7 @@ const AppRunsHistory = forwardRef(
+             return record.status ? (
+               <StatusBadge
+                 dataTestId="pipeline-status"
+-                label={STATUS_LABEL[record.status]}
++                label={STATUS_LABEL[record.status as keyof typeof STATUS_LABEL]}
+                 status={status}
+               />
+             ) : (
+@@ -408,6 +446,52 @@ const AppRunsHistory = forwardRef(
+             }}
+           />
+         )}
++        <Modal
++          centered
++          destroyOnClose
++          bodyStyle={{
++            maxHeight: 700,
++            overflowY: 'scroll',
++          }}
++          className="app-config-modal"
++          closable={false}
++          data-testid="edit-table-type-property-modal"
++          footer={
++            <Space className="w-full justify-end">
++              <Button
++                data-testid="app-run-config-close"
++                type="primary"
++                onClick={() => setShowConfigModal(false)}>
++                {t('label.close')}
++              </Button>
++            </Space>
++          }
++          maskClosable={false}
++          open={showConfigModal}
++          title={
++            <Typography.Text>
++              {t('label.entity-configuration', {
++                entity: getEntityName(appData) ?? t('label.application'),
++              })}
++            </Typography.Text>
++          }
++          width={800}>
++          <FormBuilder
++            hideCancelButton
++            readonly
++            useSelectWidget
++            cancelText={t('label.back')}
++            formData={appRunRecordConfig}
++            isLoading={false}
++            okText={t('label.submit')}
++            schema={jsonSchema}
++            serviceCategory={ServiceCategory.DASHBOARD_SERVICES}
++            uiSchema={UiSchema}
++            validator={validator}
++            onCancel={noop}
++            onSubmit={noop}
++          />
++        </Modal>
+       </>
+     );
+   }
+diff --git a/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppRunsHistory/AppRunsHistory.interface.ts b/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppRunsHistory/AppRunsHistory.interface.ts
+index 9b31944fb7..5fc0b56045 100644
+--- a/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppRunsHistory/AppRunsHistory.interface.ts
++++ b/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppRunsHistory/AppRunsHistory.interface.ts
+@@ -11,6 +11,7 @@
+  *  limitations under the License.
+  */
+ 
++import { RJSFSchema } from '@rjsf/utils';
+ import { App } from '../../../../generated/entity/applications/app';
+ import { AppRunRecord } from '../../../../generated/entity/applications/appRunRecord';
+ 
+@@ -26,4 +27,5 @@ export interface AppRunsHistoryProps {
+   maxRecords?: number;
+   appData?: App;
+   showPagination?: boolean;
++  jsonSchema: RJSFSchema;
+ }
+diff --git a/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppRunsHistory/AppRunsHistory.test.tsx b/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppRunsHistory/AppRunsHistory.test.tsx
+index b8f49f1a72..440ed4bef6 100644
+--- a/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppRunsHistory/AppRunsHistory.test.tsx
++++ b/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppRunsHistory/AppRunsHistory.test.tsx
+@@ -37,6 +37,18 @@ const mockGetApplicationRuns = jest.fn().mockReturnValue({
+ const mockShowErrorToast = jest.fn();
+ const mockPush = jest.fn();
+ 
++jest.mock('../../../../utils/EntityUtils', () => ({
++  getEntityName: jest.fn().mockReturnValue('username'),
++}));
++
++jest.mock('../../../common/FormBuilder/FormBuilder', () =>
++  jest
++    .fn()
++    .mockImplementation(({ onSubmit }) => (
++      <button onClick={onSubmit}>Configure Save</button>
++    ))
++);
++
+ jest.mock('../../../../hooks/paging/usePaging', () => ({
+   usePaging: jest.fn().mockReturnValue({
+     currentPage: 8,
+@@ -132,6 +144,7 @@ const mockProps1 = {
+   appData: mockApplicationData,
+   maxRecords: 10,
+   showPagination: true,
++  jsonSchema: {},
+ };
+ 
+ const mockProps2 = {
+@@ -256,7 +269,7 @@ describe('AppRunsHistory component', () => {
+   });
+ 
+   it('checking behaviour of component when no prop is passed', async () => {
+-    render(<AppRunsHistory />);
++    render(<AppRunsHistory jsonSchema={{}} />);
+     await waitForElementToBeRemoved(() => screen.getByText('TableLoader'));
+ 
+     expect(screen.getByText('--')).toBeInTheDocument();
+diff --git a/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppRunsHistory/app-run-history.less b/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppRunsHistory/app-run-history.less
+new file mode 100644
+index 0000000000..2bd0f014d9
+--- /dev/null
++++ b/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppRunsHistory/app-run-history.less
+@@ -0,0 +1,17 @@
++/*
++ *  Copyright 2025 Collate.
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *  http://www.apache.org/licenses/LICENSE-2.0
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++.app-config-modal {
++  .ant-modal-body {
++    padding-top: 0;
++  }
++}
+diff --git a/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppSchedule/AppSchedule.component.tsx b/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppSchedule/AppSchedule.component.tsx
+index 5ced368c85..bc46d92eb7 100644
+--- a/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppSchedule/AppSchedule.component.tsx
++++ b/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppSchedule/AppSchedule.component.tsx
+@@ -40,6 +40,7 @@ import { AppScheduleProps } from './AppScheduleProps.interface';
+ const AppSchedule = ({
+   appData,
+   loading: { isRunLoading, isDeployLoading },
++  jsonSchema,
+   onSave,
+   onDemandTrigger,
+   onDeployTrigger,
+@@ -127,6 +128,7 @@ const AppSchedule = ({
+       return (
+         <AppRunsHistory
+           appData={appData}
++          jsonSchema={jsonSchema}
+           maxRecords={1}
+           ref={appRunsHistoryRef}
+           showPagination={false}
+diff --git a/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppSchedule/AppSchedule.test.tsx b/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppSchedule/AppSchedule.test.tsx
+index c5d2f50c07..3371c8e9a4 100644
+--- a/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppSchedule/AppSchedule.test.tsx
++++ b/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppSchedule/AppSchedule.test.tsx
+@@ -76,6 +76,7 @@ const mockProps1 = {
+     isRunLoading: false,
+     isDeployLoading: false,
+   },
++  jsonSchema: {},
+   onSave: mockOnSave,
+   onDemandTrigger: mockOnDemandTrigger,
+   onDeployTrigger: mockOnDeployTrigger,
+diff --git a/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppSchedule/AppScheduleProps.interface.ts b/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppSchedule/AppScheduleProps.interface.ts
+index 5a58a6dbd1..01e8d1ed8b 100644
+--- a/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppSchedule/AppScheduleProps.interface.ts
++++ b/openmetadata-ui/src/main/resources/ui/src/components/Settings/Applications/AppSchedule/AppScheduleProps.interface.ts
+@@ -10,6 +10,7 @@
+  *  See the License for the specific language governing permissions and
+  *  limitations under the License.
+  */
++import { RJSFSchema } from '@rjsf/utils';
+ import { App } from '../../../../generated/entity/applications/app';
+ 
+ export interface AppScheduleProps {
+@@ -18,6 +19,7 @@ export interface AppScheduleProps {
+     isRunLoading: boolean;
+     isDeployLoading: boolean;
+   };
++  jsonSchema: RJSFSchema;
+   onSave: (cron: string) => Promise<void>;
+   onDemandTrigger: () => Promise<void>;
+   onDeployTrigger: () => Promise<void>;
+diff --git a/openmetadata-ui/src/main/resources/ui/src/components/common/Form/JSONSchema/JSONSchemaTemplate/ObjectFieldTemplate.tsx b/openmetadata-ui/src/main/resources/ui/src/components/common/Form/JSONSchema/JSONSchemaTemplate/ObjectFieldTemplate.tsx
+index 3cc716657f..409eb20cfd 100644
+--- a/openmetadata-ui/src/main/resources/ui/src/components/common/Form/JSONSchema/JSONSchemaTemplate/ObjectFieldTemplate.tsx
++++ b/openmetadata-ui/src/main/resources/ui/src/components/common/Form/JSONSchema/JSONSchemaTemplate/ObjectFieldTemplate.tsx
+@@ -64,7 +64,7 @@ export const ObjectFieldTemplate: FunctionComponent<ObjectFieldTemplateProps> =
+ 
+     const fieldElement = (
+       <Fragment>
+-        <Space className="w-full justify-between">
++        <Space className="w-full justify-between header-title-wrapper">
+           <label
+             className={classNames('control-label', {
+               'font-medium text-base-color text-md':
+@@ -104,23 +104,21 @@ export const ObjectFieldTemplate: FunctionComponent<ObjectFieldTemplateProps> =
+           </div>
+         ))}
+         {!isEmpty(advancedProperties) && (
+-          <>
+-            <Collapse
+-              className="advanced-properties-collapse"
+-              expandIconPosition="end">
+-              <Panel header={`${title} ${t('label.advanced-config')}`} key="1">
+-                {advancedProperties.map((element, index) => (
+-                  <div
+-                    className={classNames('property-wrapper', {
+-                      'additional-fields': schema.additionalProperties,
+-                    })}
+-                    key={`${element.content.key}-${index}`}>
+-                    {element.content}
+-                  </div>
+-                ))}
+-              </Panel>
+-            </Collapse>
+-          </>
++          <Collapse
++            className="advanced-properties-collapse"
++            expandIconPosition="end">
++            <Panel header={`${title} ${t('label.advanced-config')}`} key="1">
++              {advancedProperties.map((element, index) => (
++                <div
++                  className={classNames('property-wrapper', {
++                    'additional-fields': schema.additionalProperties,
++                  })}
++                  key={`${element.content.key}-${index}`}>
++                  {element.content}
++                </div>
++              ))}
++            </Panel>
++          </Collapse>
+         )}
+       </Fragment>
+     );
+diff --git a/openmetadata-ui/src/main/resources/ui/src/components/common/Form/JSONSchema/JsonSchemaWidgets/SelectWidget.tsx b/openmetadata-ui/src/main/resources/ui/src/components/common/Form/JSONSchema/JsonSchemaWidgets/SelectWidget.tsx
+index 23d6cdbe4a..c424561e20 100644
+--- a/openmetadata-ui/src/main/resources/ui/src/components/common/Form/JSONSchema/JsonSchemaWidgets/SelectWidget.tsx
++++ b/openmetadata-ui/src/main/resources/ui/src/components/common/Form/JSONSchema/JsonSchemaWidgets/SelectWidget.tsx
+@@ -32,6 +32,7 @@ const SelectWidget: FC<WidgetProps> = (props) => {
+       disabled={rest.disabled}
+       id={rest.id}
+       mode={rest.multiple ? 'multiple' : undefined}
++      open={props.readonly ? false : undefined}
+       placeholder={rest.placeholder}
+       value={rest.value}
+       onBlur={() => onBlur(rest.id, rest.value)}
+diff --git a/openmetadata-ui/src/main/resources/ui/src/components/common/Form/JSONSchema/JsonSchemaWidgets/TreeSelectWidget.tsx b/openmetadata-ui/src/main/resources/ui/src/components/common/Form/JSONSchema/JsonSchemaWidgets/TreeSelectWidget.tsx
+index 44e3baf96a..bbc08d7ac7 100644
+--- a/openmetadata-ui/src/main/resources/ui/src/components/common/Form/JSONSchema/JsonSchemaWidgets/TreeSelectWidget.tsx
++++ b/openmetadata-ui/src/main/resources/ui/src/components/common/Form/JSONSchema/JsonSchemaWidgets/TreeSelectWidget.tsx
+@@ -49,6 +49,7 @@ const TreeSelectWidget: FC<WidgetProps> = ({
+       treeDefaultExpandAll
+       data-testid="tree-select-widget"
+       disabled={rest.disabled}
++      open={rest.readonly ? false : undefined}
+       showCheckedStrategy={TreeSelect.SHOW_PARENT}
+       style={{
+         width: '100%',
+diff --git a/openmetadata-ui/src/main/resources/ui/src/components/common/FormBuilder/FormBuilder.tsx b/openmetadata-ui/src/main/resources/ui/src/components/common/FormBuilder/FormBuilder.tsx
+index 8f4cb2b608..2d035c23c0 100644
+--- a/openmetadata-ui/src/main/resources/ui/src/components/common/FormBuilder/FormBuilder.tsx
++++ b/openmetadata-ui/src/main/resources/ui/src/components/common/FormBuilder/FormBuilder.tsx
+@@ -16,7 +16,7 @@ import Form, { FormProps, IChangeEvent } from '@rjsf/core';
+ import { Button } from 'antd';
+ import classNames from 'classnames';
+ import { LoadingState } from 'Models';
+-import React, { forwardRef, FunctionComponent, useState } from 'react';
++import React, { forwardRef, FunctionComponent, useMemo, useState } from 'react';
+ import { ServiceCategory } from '../../../enums/service.enum';
+ import { ConfigData } from '../../../interface/service.interface';
+ import { transformErrors } from '../../../utils/formUtils';
+@@ -64,6 +64,10 @@ const FormBuilder: FunctionComponent<Props> = forwardRef(
+     },
+     ref
+   ) => {
++    const isReadOnlyForm = useMemo(() => {
++      return !!props.readonly;
++    }, [props.readonly]);
++
+     const [localFormData, setLocalFormData] = useState<ConfigData | undefined>(
+       formatFormDataForRender(formData ?? {})
+     );
+@@ -87,6 +91,39 @@ const FormBuilder: FunctionComponent<Props> = forwardRef(
+       props.onChange && props.onChange(e);
+     };
+ 
++    const submitButton = useMemo(() => {
++      if (status === 'waiting') {
++        return (
++          <Button
++            disabled
++            className="p-x-md p-y-xxs h-auto rounded-6"
++            type="primary">
++            <Loader size="small" type="white" />
++          </Button>
++        );
++      } else if (status === 'success') {
++        return (
++          <Button
++            disabled
++            className="p-x-md p-y-xxs h-auto rounded-6"
++            type="primary">
++            <CheckOutlined />
++          </Button>
++        );
++      } else {
++        return (
++          <Button
++            className="font-medium p-x-md p-y-xxs h-auto rounded-6"
++            data-testid="submit-btn"
++            htmlType="submit"
++            loading={isLoading}
++            type="primary">
++            {okText}
++          </Button>
++        );
++      }
++    }, [status, isLoading, okText]);
++
+     return (
+       <Form
+         focusOnFirstError
+@@ -124,30 +161,7 @@ const FormBuilder: FunctionComponent<Props> = forwardRef(
+             </Button>
+           )}
+ 
+-          {status === 'waiting' ? (
+-            <Button
+-              disabled
+-              className="p-x-md p-y-xxs h-auto rounded-6"
+-              type="primary">
+-              <Loader size="small" type="white" />
+-            </Button>
+-          ) : status === 'success' ? (
+-            <Button
+-              disabled
+-              className="p-x-md p-y-xxs h-auto rounded-6"
+-              type="primary">
+-              <CheckOutlined />
+-            </Button>
+-          ) : (
+-            <Button
+-              className="font-medium p-x-md p-y-xxs h-auto rounded-6"
+-              data-testid="submit-btn"
+-              htmlType="submit"
+-              loading={isLoading}
+-              type="primary">
+-              {okText}
+-            </Button>
+-          )}
++          {!isReadOnlyForm && submitButton}
+         </div>
+       </Form>
+     );
+diff --git a/openmetadata-ui/src/main/resources/ui/src/styles/components/rjsf.less b/openmetadata-ui/src/main/resources/ui/src/styles/components/rjsf.less
+index 6272bae800..d5113faedc 100644
+--- a/openmetadata-ui/src/main/resources/ui/src/styles/components/rjsf.less
++++ b/openmetadata-ui/src/main/resources/ui/src/styles/components/rjsf.less
+@@ -20,6 +20,10 @@
+   display: none;
+ }
+ 
++.rjsf.no-header .header-title-wrapper {
++  display: none;
++}
++
+ .rjsf .form-group.field {
+   margin: 12px 0;
+ }
+@@ -38,6 +42,7 @@
+   text-transform: capitalize;
+   line-height: 2;
+ }
++
+ .rjsf .control-label .required {
+   margin-left: 2px;
+   color: @failed-color;
+@@ -60,6 +65,7 @@
+   &:hover {
+     border: 1px solid @grey-3;
+   }
++
+   &:focus {
+     outline: 2px solid transparent;
+     outline-offset: 2px;

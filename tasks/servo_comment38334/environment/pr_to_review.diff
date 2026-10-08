@@ -1,0 +1,753 @@
+diff --git a/components/devtools/actors/source.rs b/components/devtools/actors/source.rs
+index 7f26f5e979d0c..bbe6f1cb2a708 100644
+--- a/components/devtools/actors/source.rs
++++ b/components/devtools/actors/source.rs
+@@ -56,6 +56,9 @@ pub struct SourceActor {
+     pub content: Option<String>,
+     pub content_type: Option<String>,
+ 
++    // TODO: use it in #37667, then remove this allow
++    #[allow(unused)]
++    pub spidermonkey_id: u32,
+     /// `introductionType` in SpiderMonkey `CompileOptionsWrapper`.
+     pub introduction_type: String,
+ }
+@@ -96,6 +99,7 @@ impl SourceActor {
+         url: ServoUrl,
+         content: Option<String>,
+         content_type: Option<String>,
++        spidermonkey_id: u32,
+         introduction_type: String,
+     ) -> SourceActor {
+         SourceActor {
+@@ -104,6 +108,7 @@ impl SourceActor {
+             content,
+             content_type,
+             is_black_boxed: false,
++            spidermonkey_id,
+             introduction_type,
+         }
+     }
+@@ -114,6 +119,7 @@ impl SourceActor {
+         url: ServoUrl,
+         content: Option<String>,
+         content_type: Option<String>,
++        spidermonkey_id: u32,
+         introduction_type: String,
+     ) -> &SourceActor {
+         let source_actor_name = actors.new_name("source");
+@@ -123,6 +129,7 @@ impl SourceActor {
+             url,
+             content,
+             content_type,
++            spidermonkey_id,
+             introduction_type,
+         );
+         actors.register(Box::new(source_actor));
+diff --git a/components/devtools/lib.rs b/components/devtools/lib.rs
+index 93bb7b18d221d..695c98dba4a83 100644
+--- a/components/devtools/lib.rs
++++ b/components/devtools/lib.rs
+@@ -552,6 +552,7 @@ impl DevtoolsInstance {
+             source_info.url,
+             source_content,
+             source_info.content_type,
++            source_info.spidermonkey_id,
+             source_info.introduction_type,
+         );
+         let source_actor_name = source_actor.name.clone();
+diff --git a/components/script/dom/debuggerglobalscope.rs b/components/script/dom/debuggerglobalscope.rs
+index 1fcf20c7cd82e..f637cf68b2a52 100644
+--- a/components/script/dom/debuggerglobalscope.rs
++++ b/components/script/dom/debuggerglobalscope.rs
+@@ -2,9 +2,9 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+-use base::id::PipelineId;
++use base::id::{Index, PipelineId, PipelineNamespaceId};
+ use constellation_traits::ScriptToConstellationChan;
+-use devtools_traits::{ScriptToDevtoolsControlMsg, WorkerId};
++use devtools_traits::{ScriptToDevtoolsControlMsg, SourceInfo, WorkerId};
+ use dom_struct::dom_struct;
+ use embedder_traits::resources::{self, Resource};
+ use ipc_channel::ipc::IpcSender;
+@@ -13,6 +13,9 @@ use js::rust::Runtime;
+ use js::rust::wrappers::JS_DefineDebuggerObject;
+ use net_traits::ResourceThreads;
+ use profile_traits::{mem, time};
++use script_bindings::codegen::GenericBindings::DebuggerGlobalScopeBinding::{
++    DebuggerGlobalScopeMethods, NotifyNewSource,
++};
+ use script_bindings::realms::InRealm;
+ use script_bindings::reflector::DomObject;
+ use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
+@@ -104,6 +107,10 @@ impl DebuggerGlobalScope {
+         GlobalScope::get_cx()
+     }
+ 
++    pub(crate) fn as_global_scope(&self) -> &GlobalScope {
++        self.upcast::<GlobalScope>()
++    }
++
+     fn evaluate_js(&self, script: &str, can_gc: CanGc) -> bool {
+         rooted!(in (*Self::get_cx()) let mut rval = UndefinedValue());
+         self.global_scope.evaluate_js_on_global_with_result(
+@@ -145,3 +152,99 @@ impl DebuggerGlobalScope {
+         );
+     }
+ }
++
++impl DebuggerGlobalScopeMethods<crate::DomTypeHolder> for DebuggerGlobalScope {
++    // check-tidy: no specs after this line
++    fn NotifyNewSource(&self, args: &NotifyNewSource) {
++        if let Some(devtools_chan) = self.as_global_scope().devtools_chan() {
++            let pipeline_id = PipelineId {
++                namespace_id: PipelineNamespaceId(args.pipelineId.namespaceId),
++                index: Index::new(args.pipelineId.index)
++                    .expect("`pipelineId.index` must not be zero"),
++            };
++
++            if let Some(introduction_type) = args.introductionType.as_ref() {
++                // Check the `introductionType` and `url`, decide whether or not to create a source actor, and if so,
++                // tell the devtools server to create a source actor. Based on the Firefox impl in:
++                // - getDebuggerSourceURL() <https://searchfox.org/mozilla-central/rev/85667ab51e4b2a3352f7077a9ee43513049ed2d6/devtools/server/actors/utils/source-url.js#7-42>
++                // - getSourceURL() <https://searchfox.org/mozilla-central/rev/85667ab51e4b2a3352f7077a9ee43513049ed2d6/devtools/server/actors/source.js#67-109>
++                // - resolveSourceURL() <https://searchfox.org/mozilla-central/rev/85667ab51e4b2a3352f7077a9ee43513049ed2d6/devtools/server/actors/source.js#48-66>
++                // - SourceActor#_isInlineSource <https://searchfox.org/mozilla-central/rev/85667ab51e4b2a3352f7077a9ee43513049ed2d6/devtools/server/actors/source.js#130-143>
++                // - SourceActor#url <https://searchfox.org/mozilla-central/rev/85667ab51e4b2a3352f7077a9ee43513049ed2d6/devtools/server/actors/source.js#157-162>
++
++                // Firefox impl: getDebuggerSourceURL(), getSourceURL()
++                // TODO: handle `about:srcdoc` case (see Firefox getDebuggerSourceURL())
++                // TODO: remove trailing details that may have been appended by SpiderMonkey
++                // (currently impossible to do robustly due to <https://bugzilla.mozilla.org/show_bug.cgi?id=1982001>)
++                let url_original = args.url.str();
++                // FIXME: use page/worker url as base here
++                let url_original = ServoUrl::parse(url_original).ok();
++
++                // If the source has a `urlOverride` (aka `displayURL` aka `//# sourceURL`), it should be a valid url,
++                // possibly relative to the page/worker url, and we should treat the source as coming from that url for
++                // devtools purposes, including the file tree in the Sources tab.
++                // Firefox impl: getSourceURL()
++                let url_override = args
++                    .urlOverride
++                    .as_ref()
++                    .map(|url| url.str())
++                    // FIXME: use page/worker url as base here, not `url_original`
++                    .and_then(|url| ServoUrl::parse_with_base(url_original.as_ref(), url).ok());
++
++                // If the `introductionType` is “eval or eval-like”, the `url` won’t be meaningful, so ignore these
++                // sources unless we have a `urlOverride` (aka `displayURL` aka `//# sourceURL`).
++                // Firefox impl: getDebuggerSourceURL(), getSourceURL()
++                if [
++                    "injectedScript",
++                    "eval",
++                    "debugger eval",
++                    "Function",
++                    "javascriptURL",
++                    "eventHandler",
++                    "domTimer",
++                ]
++                .contains(&introduction_type.str()) &&
++                    url_override.is_none()
++                {
++                    debug!(
++                        "Not creating debuggee: `introductionType` is `{introduction_type}` but no valid url"
++                    );
++                    return;
++                }
++
++                // Sources with an `introductionType` of `inlineScript` are generally inline, meaning their contents
++                // are a substring of the page markup (hence not known to SpiderMonkey, requiring plumbing in Servo).
++                // But sources with a `urlOverride` are not inline, since they get their own place in the Sources tree.
++                // nor are sources created for `<iframe srcdoc>`, since they are not necessarily a substring of the
++                // page markup as originally sent by the server.
++                // Firefox impl: SourceActor#_isInlineSource
++                // TODO: handle `about:srcdoc` case (see Firefox SourceActor#_isInlineSource)
++                let inline = introduction_type.str() == "inlineScript" && url_override.is_none();
++                let Some(url) = url_override.or(url_original) else {
++                    debug!("Not creating debuggee: no valid url");
++                    return;
++                };
++
++                let worker_id = args.workerId.as_ref().map(|id| id.parse().unwrap());
++
++                let source_info = SourceInfo {
++                    url,
++                    introduction_type: introduction_type.str().to_owned(),
++                    inline,
++                    worker_id,
++                    content: (!inline).then(|| args.text.to_string()),
++                    content_type: None, // TODO
++                    spidermonkey_id: args.spidermonkeyId,
++                };
++                devtools_chan
++                    .send(ScriptToDevtoolsControlMsg::CreateSourceActor(
++                        pipeline_id,
++                        source_info,
++                    ))
++                    .expect("Failed to send to devtools server");
++            } else {
++                debug!("Not creating debuggee for script with no `introductionType`");
++            }
++        }
++    }
++}
+diff --git a/components/script/dom/dedicatedworkerglobalscope.rs b/components/script/dom/dedicatedworkerglobalscope.rs
+index aceff6e03ea84..61bc9433bc7cb 100644
+--- a/components/script/dom/dedicatedworkerglobalscope.rs
++++ b/components/script/dom/dedicatedworkerglobalscope.rs
+@@ -9,7 +9,7 @@ use std::thread::{self, JoinHandle};
+ use base::id::{BrowsingContextId, PipelineId, WebViewId};
+ use constellation_traits::{WorkerGlobalScopeInit, WorkerScriptLoadOrigin};
+ use crossbeam_channel::{Receiver, Sender, unbounded};
+-use devtools_traits::{DevtoolScriptControlMsg, ScriptToDevtoolsControlMsg, SourceInfo};
++use devtools_traits::DevtoolScriptControlMsg;
+ use dom_struct::dom_struct;
+ use headers::{HeaderMapExt, ReferrerPolicy as ReferrerPolicyHeader};
+ use ipc_channel::ipc::IpcReceiver;
+@@ -60,9 +60,7 @@ use crate::fetch::{CspViolationsProcessor, load_whole_resource};
+ use crate::messaging::{CommonScriptMsg, ScriptEventLoopReceiver, ScriptEventLoopSender};
+ use crate::realms::{AlreadyInRealm, InRealm, enter_realm};
+ use crate::script_runtime::ScriptThreadEventCategory::WorkerEvent;
+-use crate::script_runtime::{
+-    CanGc, IntroductionType, JSContext as SafeJSContext, Runtime, ThreadSafeJSContext,
+-};
++use crate::script_runtime::{CanGc, JSContext as SafeJSContext, Runtime, ThreadSafeJSContext};
+ use crate::task_queue::{QueuedTask, QueuedTaskConversion, TaskQueue};
+ use crate::task_source::{SendableTaskSource, TaskSourceName};
+ 
+@@ -536,24 +534,6 @@ impl DedicatedWorkerGlobalScope {
+                 ));
+                 global_scope.set_https_state(metadata.https_state);
+                 let source = String::from_utf8_lossy(&bytes);
+-                if let Some(chan) = global_scope.devtools_chan() {
+-                    let pipeline_id = global_scope.pipeline_id();
+-                    let source_info = SourceInfo {
+-                        url: metadata.final_url,
+-                        introduction_type: IntroductionType::WORKER
+-                            .to_str()
+-                            .expect("Guaranteed by definition")
+-                            .to_owned(),
+-                        external: true, // Worker scripts are always external.
+-                        worker_id: Some(global.upcast::<WorkerGlobalScope>().get_worker_id()),
+-                        content: Some(source.to_string()),
+-                        content_type: metadata.content_type.map(|c_type| c_type.0.to_string()),
+-                    };
+-                    let _ = chan.send(ScriptToDevtoolsControlMsg::CreateSourceActor(
+-                        pipeline_id,
+-                        source_info,
+-                    ));
+-                }
+ 
+                 unsafe {
+                     // Handle interrupt requests
+diff --git a/components/script/dom/htmlscriptelement.rs b/components/script/dom/htmlscriptelement.rs
+index 40cc26d48cc67..d0579ef9ed71c 100644
+--- a/components/script/dom/htmlscriptelement.rs
++++ b/components/script/dom/htmlscriptelement.rs
+@@ -8,7 +8,6 @@ use std::path::PathBuf;
+ use std::rc::Rc;
+ 
+ use base::id::{PipelineId, WebViewId};
+-use devtools_traits::{ScriptToDevtoolsControlMsg, SourceInfo};
+ use dom_struct::dom_struct;
+ use encoding_rs::Encoding;
+ use html5ever::{LocalName, Prefix, local_name, ns};
+@@ -1024,59 +1023,6 @@ impl HTMLScriptElement {
+             Ok(script) => script,
+         };
+ 
+-        if let Some(chan) = self.global().devtools_chan() {
+-            let pipeline_id = self.global().pipeline_id();
+-
+-            let (url, content, content_type, introduction_type, is_external) = if script.external {
+-                let content = match &script.code {
+-                    SourceCode::Text(text) => text.to_string(),
+-                    SourceCode::Compiled(compiled) => compiled.original_text.to_string(),
+-                };
+-
+-                // content_type: https://html.spec.whatwg.org/multipage/#scriptingLanguages
+-                (
+-                    script.url.clone(),
+-                    Some(content),
+-                    "text/javascript",
+-                    IntroductionType::SRC_SCRIPT
+-                        .to_str()
+-                        .expect("Guaranteed by definition")
+-                        .to_owned(),
+-                    true,
+-                )
+-            } else {
+-                // TODO: if needed, fetch the page again, in the same way as in the original request.
+-                // Fetch it from cache, even if the original request was non-idempotent (e.g. POST).
+-                // If we can’t fetch it from cache, we should probably give up, because with a real
+-                // fetch, the server could return a different response.
+-
+-                // TODO: handle cases where Content-Type is not text/html.
+-                (
+-                    doc.url(),
+-                    None,
+-                    "text/html",
+-                    IntroductionType::INLINE_SCRIPT
+-                        .to_str()
+-                        .expect("Guaranteed by definition")
+-                        .to_owned(),
+-                    false,
+-                )
+-            };
+-
+-            let source_info = SourceInfo {
+-                url,
+-                introduction_type: introduction_type.to_owned(),
+-                external: is_external,
+-                worker_id: None,
+-                content,
+-                content_type: Some(content_type.to_string()),
+-            };
+-            let _ = chan.send(ScriptToDevtoolsControlMsg::CreateSourceActor(
+-                pipeline_id,
+-                source_info,
+-            ));
+-        }
+-
+         if script.type_ == ScriptType::Classic {
+             unminify_js(&mut script);
+             self.substitute_with_local_script(&mut script);
+diff --git a/components/script/script_runtime.rs b/components/script/script_runtime.rs
+index 44fb45dea70c8..ff2dbd25b4a74 100644
+--- a/components/script/script_runtime.rs
++++ b/components/script/script_runtime.rs
+@@ -1287,6 +1287,7 @@ impl IntroductionType {
+     pub const DOM_TIMER: &CStr = c"domTimer";
+ 
+     /// `introductionType` for web workers.
+-    /// <https://searchfox.org/mozilla-central/rev/202069c4c5113a1a9052d84fa4679d4c1b22113e/devtools/docs/user/debugger-api/debugger.source/index.rst#96>
++    /// FIXME: only documented in older(?) devtools user docs
++    /// <https://firefox-source-docs.mozilla.org/devtools-user/debugger-api/debugger.source/index.html>
+     pub const WORKER: &CStr = c"Worker";
+ }
+diff --git a/components/script_bindings/webidls/DebuggerGlobalScope.webidl b/components/script_bindings/webidls/DebuggerGlobalScope.webidl
+index 4f85602a15733..edb1e9b155e80 100644
+--- a/components/script_bindings/webidls/DebuggerGlobalScope.webidl
++++ b/components/script_bindings/webidls/DebuggerGlobalScope.webidl
+@@ -6,4 +6,21 @@
+ // web pages.
+ [Global=DebuggerGlobalScope, Exposed=DebuggerGlobalScope]
+ interface DebuggerGlobalScope: GlobalScope {
++    undefined notifyNewSource(NotifyNewSource args);
++};
++
++// http://dev.w3.org/csswg/cssom-view/#extensions-to-the-window-interface
++dictionary NotifyNewSource {
++    required PipelineIdInit pipelineId;
++    required DOMString? workerId;
++    required unsigned long spidermonkeyId;
++    required DOMString url;
++    required DOMString? urlOverride;
++    required DOMString text;
++    required DOMString? introductionType;
++};
++
++dictionary PipelineIdInit {
++    required unsigned long namespaceId;
++    required unsigned long index;
+ };
+diff --git a/components/shared/devtools/lib.rs b/components/shared/devtools/lib.rs
+index 3a044a8f4ae4e..8ad872af0eb0f 100644
+--- a/components/shared/devtools/lib.rs
++++ b/components/shared/devtools/lib.rs
+@@ -598,8 +598,9 @@ impl fmt::Display for ShadowRootMode {
+ pub struct SourceInfo {
+     pub url: ServoUrl,
+     pub introduction_type: String,
+-    pub external: bool,
++    pub inline: bool,
+     pub worker_id: Option<WorkerId>,
+     pub content: Option<String>,
+     pub content_type: Option<String>,
++    pub spidermonkey_id: u32,
+ }
+diff --git a/python/servo/devtools_tests.py b/python/servo/devtools_tests.py
+index 1078b7a10b0eb..4426e99ce6e04 100644
+--- a/python/servo/devtools_tests.py
++++ b/python/servo/devtools_tests.py
+@@ -71,8 +71,9 @@ def test_sources_list(self):
+                         [
+                             Source("srcScript", f"{self.base_urls[0]}/classic.js"),
+                             Source("inlineScript", f"{self.base_urls[0]}/test.html"),
+-                            Source("srcScript", f"{self.base_urls[1]}/classic.js"),
+                             Source("inlineScript", f"{self.base_urls[0]}/test.html"),
++                            Source("srcScript", f"{self.base_urls[1]}/classic.js"),
++                            Source("importedModule", f"{self.base_urls[0]}/module.js"),
+                         ]
+                     ),
+                     tuple([Source("Worker", f"{self.base_urls[0]}/classic_worker.js")]),
+@@ -116,7 +117,6 @@ def test_sources_list_with_data_external_module_script(self):
+ 
+     # Sources list for `introductionType` = `importedModule`
+ 
+-    @unittest.expectedFailure
+     def test_sources_list_with_static_import_module(self):
+         self.start_web_server(test_dir=os.path.join(DevtoolsTests.script_path, "devtools_tests/sources"))
+         self.run_servoshell(url=f"{self.base_urls[0]}/test_sources_list_with_static_import_module.html")
+@@ -135,7 +135,6 @@ def test_sources_list_with_static_import_module(self):
+             ),
+         )
+ 
+-    @unittest.expectedFailure
+     def test_sources_list_with_dynamic_import_module(self):
+         self.start_web_server(test_dir=os.path.join(DevtoolsTests.script_path, "devtools_tests/sources"))
+         self.run_servoshell(url=f"{self.base_urls[0]}/test_sources_list_with_dynamic_import_module.html")
+@@ -196,6 +195,302 @@ def test_sources_list_with_module_worker(self):
+             ),
+         )
+ 
++    # Sources list for `introductionType` set to values that require `displayURL` (`//# sourceURL`)
++
++    def test_sources_list_with_injected_script_write_and_display_url(self):
++        self.run_servoshell(
++            url='data:text/html,<script>document.write("<script>//%23 sourceURL=http://test</scr"+"ipt>")</script>'
++        )
++        self.assert_sources_list(
++            set(
++                [
++                    tuple(
++                        [
++                            Source(
++                                "inlineScript",
++                                'data:text/html,<script>document.write("<script>//%23 sourceURL=http://test</scr"+"ipt>")</script>',
++                            ),
++                            Source("injectedScript", "http://test/"),
++                        ]
++                    )
++                ]
++            )
++        )
++
++    def test_sources_list_with_injected_script_write_but_no_display_url(self):
++        self.run_servoshell(url='data:text/html,<script>document.write("<script>1</scr"+"ipt>")</script>')
++        self.assert_sources_list(
++            set(
++                [
++                    tuple(
++                        [
++                            Source(
++                                "inlineScript",
++                                'data:text/html,<script>document.write("<script>1</scr"+"ipt>")</script>',
++                            ),
++                        ]
++                    )
++                ]
++            )
++        )
++
++    def test_sources_list_with_injected_script_append_and_display_url(self):
++        script = 's=document.createElement("script");s.append("//%23 sourceURL=http://test");document.body.append(s)'
++        self.run_servoshell(url=f"data:text/html,<body><script>{script}</script>")
++        self.assert_sources_list(
++            set(
++                [
++                    tuple(
++                        [
++                            Source(
++                                "inlineScript",
++                                f"data:text/html,<body><script>{script}</script>",
++                            ),
++                            Source("injectedScript", "http://test/"),
++                        ]
++                    )
++                ]
++            )
++        )
++
++    def test_sources_list_with_injected_script_append_but_no_display_url(self):
++        script = 's=document.createElement("script");s.append("1");document.body.append(s)'
++        self.run_servoshell(url=f"data:text/html,<body><script>{script}</script>")
++        self.assert_sources_list(
++            set(
++                [
++                    tuple(
++                        [
++                            Source(
++                                "inlineScript",
++                                f"data:text/html,<body><script>{script}</script>",
++                            ),
++                        ]
++                    )
++                ]
++            )
++        )
++
++    def test_sources_list_with_eval_and_display_url(self):
++        self.run_servoshell(url='data:text/html,<script>eval("//%23 sourceURL=http://test")</script>')
++        self.assert_sources_list(
++            set(
++                [
++                    tuple(
++                        [
++                            Source(
++                                "inlineScript", 'data:text/html,<script>eval("//%23 sourceURL=http://test")</script>'
++                            ),
++                            Source("eval", "http://test/"),
++                        ]
++                    )
++                ]
++            )
++        )
++
++    def test_sources_list_with_eval_but_no_display_url(self):
++        self.run_servoshell(url='data:text/html,<script>eval("1")</script>')
++        self.assert_sources_list(set([tuple([Source("inlineScript", 'data:text/html,<script>eval("1")</script>')])]))
++
++    def test_sources_list_with_debugger_eval_and_display_url(self):
++        pass
++
++    def test_sources_list_with_debugger_eval_but_no_display_url(self):
++        pass
++
++    def test_sources_list_with_function_and_display_url(self):
++        self.run_servoshell(url='data:text/html,<script>new Function("//%23 sourceURL=http://test")</script>')
++        self.assert_sources_list(
++            set(
++                [
++                    tuple(
++                        [
++                            Source(
++                                "inlineScript",
++                                'data:text/html,<script>new Function("//%23 sourceURL=http://test")</script>',
++                            ),
++                            Source("Function", "http://test/"),
++                        ]
++                    )
++                ]
++            )
++        )
++
++    def test_sources_list_with_function_but_no_display_url(self):
++        self.run_servoshell(url='data:text/html,<script>new Function("1")</script>')
++        self.assert_sources_list(
++            set(
++                [
++                    tuple(
++                        [
++                            Source("inlineScript", 'data:text/html,<script>new Function("1")</script>'),
++                        ]
++                    )
++                ]
++            )
++        )
++
++    def test_sources_list_with_javascript_url_and_display_url(self):
++        # “1” prefix is a workaround for <https://github.com/servo/servo/issues/38547>
++        self.run_servoshell(
++            url='data:text/html,<a href="javascript:1//%23 sourceURL=http://test"></a><script>document.querySelector("a").click()</script>'
++        )
++        self.assert_sources_list(
++            set(
++                [
++                    tuple(
++                        [
++                            Source(
++                                "inlineScript",
++                                'data:text/html,<a href="javascript:1//%23 sourceURL=http://test"></a><script>document.querySelector("a").click()</script>',
++                            ),
++                            Source("javascriptURL", "http://test/"),
++                        ]
++                    )
++                ]
++            )
++        )
++
++    def test_sources_list_with_javascript_url_but_no_display_url(self):
++        self.run_servoshell(url='data:text/html,<a href="javascript:1"></a>')
++        self.assert_sources_list(set([tuple([])]))
++
++    @unittest.expectedFailure
++    def test_sources_list_with_event_handler_and_display_url(self):
++        self.run_servoshell(url='data:text/html,<a onclick="//%23 sourceURL=http://test"></a>')
++        self.assert_sources_list(
++            set(
++                [
++                    tuple(
++                        [
++                            Source("eventHandler", "http://test/"),
++                        ]
++                    )
++                ]
++            )
++        )
++
++    def test_sources_list_with_event_handler_but_no_display_url(self):
++        self.run_servoshell(url='data:text/html,<a onclick="1"></a>')
++        self.assert_sources_list(set([tuple([])]))
++
++    @unittest.expectedFailure
++    def test_sources_list_with_dom_timer_and_display_url(self):
++        self.run_servoshell(url='data:text/html,<script>setTimeout("//%23 sourceURL=http://test",0)</script>')
++        self.assert_sources_list(
++            set(
++                [
++                    tuple(
++                        [
++                            Source("domTimer", "http://test/"),
++                        ]
++                    )
++                ]
++            )
++        )
++
++    @unittest.expectedFailure
++    def test_sources_list_with_dom_timer_but_no_display_url(self):
++        self.run_servoshell(url='data:text/html,<script>setTimeout("1",0)</script>')
++        self.assert_sources_list(set([tuple([])]))
++
++    # Sources list for scripts with `displayURL` (`//# sourceURL`), despite not being required by `introductionType`
++
++    def test_sources_list_with_inline_script_and_display_url(self):
++        self.run_servoshell(url="data:text/html,<script>//%23 sourceURL=http://test</script>")
++        self.assert_sources_list(
++            set(
++                [
++                    tuple(
++                        [
++                            Source("inlineScript", "http://test/"),
++                        ]
++                    )
++                ]
++            )
++        )
++
++    # Extra test case for situation where `//# sourceURL` can’t be parsed with page url as base.
++    def test_sources_list_with_inline_script_but_invalid_display_url(self):
++        self.run_servoshell(url="data:text/html,<script>//%23 sourceURL=test</script>")
++        self.assert_sources_list(
++            set(
++                [
++                    tuple(
++                        [
++                            Source("inlineScript", "data:text/html,<script>//%23 sourceURL=test</script>"),
++                        ]
++                    )
++                ]
++            )
++        )
++
++    def test_sources_list_with_inline_script_but_no_display_url(self):
++        self.run_servoshell(url="data:text/html,<script>1</script>")
++        self.assert_sources_list(
++            set(
++                [
++                    tuple(
++                        [
++                            Source("inlineScript", "data:text/html,<script>1</script>"),
++                        ]
++                    )
++                ]
++            )
++        )
++
++    # Sources list for inline scripts in `<iframe srcdoc>`
++
++    @unittest.expectedFailure
++    def test_sources_list_with_iframe_srcdoc_and_display_url(self):
++        self.run_servoshell(url='data:text/html,<iframe srcdoc="<script>//%23 sourceURL=http://test</script>">')
++        self.assert_sources_list(
++            set(
++                [
++                    tuple(
++                        [
++                            Source("inlineScript", "http://test/"),
++                        ]
++                    )
++                ]
++            )
++        )
++
++    @unittest.expectedFailure
++    def test_sources_list_with_iframe_srcdoc_but_no_display_url(self):
++        self.run_servoshell(url='data:text/html,<iframe srcdoc="<script>1</script>">')
++        self.assert_sources_list(
++            set(
++                [
++                    tuple(
++                        [
++                            # FIXME: it’s not really gonna be 0
++                            Source("inlineScript", "about:srcdoc#0"),
++                        ]
++                    )
++                ]
++            )
++        )
++
++    @unittest.expectedFailure
++    def test_sources_list_with_iframe_srcdoc_multiple_inline_scripts(self):
++        self.run_servoshell(
++            url='data:text/html,<iframe srcdoc="<script>//%23 sourceURL=http://test</script><script>2</script>">'
++        )
++        self.assert_sources_list(
++            set(
++                [
++                    tuple(
++                        [
++                            Source("inlineScript", "http://test/"),
++                            # FIXME: it’s not really gonna be 0
++                            Source("inlineScript", "about:srcdoc#0"),
++                        ]
++                    )
++                ]
++            )
++        )
++
+     # Source contents
+ 
+     def test_source_content_inline_script(self):
+diff --git a/resources/debugger.js b/resources/debugger.js
+index 2239783b914f9..347d200cb01e3 100644
+--- a/resources/debugger.js
++++ b/resources/debugger.js
+@@ -6,24 +6,21 @@ const dbg = new Debugger;
+ const debuggeesToPipelineIds = new Map;
+ const debuggeesToWorkerIds = new Map;
+ 
+-dbg.onNewGlobalObject = function(global) {
++dbg.uncaughtExceptionHook = function(error) {
++    console.error(`[debugger] Uncaught exception at ${error.fileName}:${error.lineNumber}:${error.columnNumber}: ${error.name}: ${error.message}`);
+ };
+ 
+ dbg.onNewScript = function(script, /* undefined; seems to be `script.global` now */ global) {
+-    try {
+-        // TODO: notify script system about new source
+-        /* notifyNewSource */({
+-            pipelineId: debuggeesToPipelineIds.get(script.global),
+-            workerId: debuggeesToWorkerIds.get(script.global),
+-            spidermonkeyId: script.source.id,
+-            url: script.source.url,
+-            urlOverride: script.source.displayURL,
+-            text: script.source.text,
+-            introductionType: script.source.introductionType ?? null,
+-        });
+-    } catch (error) {
+-        logError(error);
+-    }
++    // TODO: handle wasm (`script.source.introductionType == wasm`)
++    notifyNewSource({
++        pipelineId: debuggeesToPipelineIds.get(script.global),
++        workerId: debuggeesToWorkerIds.get(script.global),
++        spidermonkeyId: script.source.id,
++        url: script.source.url,
++        urlOverride: script.source.displayURL,
++        text: script.source.text,
++        introductionType: script.source.introductionType ?? null,
++    });
+ };
+ 
+ addEventListener("addDebuggee", event => {
+@@ -36,7 +33,3 @@ addEventListener("addDebuggee", event => {
+     });
+     debuggeesToWorkerIds.set(debuggerObject, workerId);
+ });
+-
+-function logError(error) {
+-    console.log(`[debugger] ERROR at ${error.fileName}:${error.lineNumber}:${error.columnNumber}: ${error.name}: ${error.message}`);
+-}

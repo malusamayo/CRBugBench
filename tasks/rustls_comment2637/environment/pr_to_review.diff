@@ -1,0 +1,241 @@
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index a5d17e32bdc..9b4a0b03ff9 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -27,13 +27,12 @@ use crate::hash_hs::{HandshakeHash, HandshakeHashBuffer};
+ use crate::log::{debug, trace, warn};
+ use crate::msgs::base::{Payload, PayloadU8};
+ use crate::msgs::ccs::ChangeCipherSpecPayload;
+-use crate::msgs::codec::{Codec, Reader};
++use crate::msgs::codec::{CERTIFICATE_MAX_SIZE_LIMIT, Codec, Reader};
+ use crate::msgs::enums::{ExtensionType, KeyUpdateRequest};
+ use crate::msgs::handshake::{
+-    CERTIFICATE_MAX_SIZE_LIMIT, CertificatePayloadTls13, ClientExtensions, EchConfigPayload,
+-    HandshakeMessagePayload, HandshakePayload, KeyShareEntry, NewSessionTicketPayloadTls13,
+-    PresharedKeyBinder, PresharedKeyIdentity, PresharedKeyOffer, ServerExtensions,
+-    ServerHelloPayload,
++    CertificatePayloadTls13, ClientExtensions, EchConfigPayload, HandshakeMessagePayload,
++    HandshakePayload, KeyShareEntry, NewSessionTicketPayloadTls13, PresharedKeyBinder,
++    PresharedKeyIdentity, PresharedKeyOffer, ServerExtensions, ServerHelloPayload,
+ };
+ use crate::msgs::message::{Message, MessagePayload};
+ use crate::msgs::persist::{self, Retrieved};
+diff --git a/rustls/src/msgs/base.rs b/rustls/src/msgs/base.rs
+index 6c2d96cd245..abf825fb12d 100644
+--- a/rustls/src/msgs/base.rs
++++ b/rustls/src/msgs/base.rs
+@@ -6,8 +6,7 @@ use pki_types::CertificateDer;
+ use zeroize::Zeroize;
+ 
+ use crate::error::InvalidMessage;
+-use crate::msgs::codec;
+-use crate::msgs::codec::{Codec, Reader};
++use crate::msgs::codec::{self, Codec, LengthPrefixedBuffer, Reader, TlsListElement};
+ 
+ /// An externally length'd payload
+ #[non_exhaustive]
+@@ -63,12 +62,12 @@ impl Payload<'static> {
+ 
+ impl<'a> Codec<'a> for CertificateDer<'a> {
+     fn encode(&self, bytes: &mut Vec<u8>) {
+-        codec::u24(self.as_ref().len() as u32).encode(bytes);
+-        bytes.extend(self.as_ref());
++        let nest = LengthPrefixedBuffer::new(Self::SIZE_LEN, bytes);
++        nest.buf.extend(self.as_ref());
+     }
+ 
+     fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
+-        let len = codec::u24::read(r)?.0 as usize;
++        let len = Self::SIZE_LEN.read(r)?;
+         let mut sub = r.sub(len)?;
+         let body = sub.rest();
+         Ok(Self::from(body))
+diff --git a/rustls/src/msgs/codec.rs b/rustls/src/msgs/codec.rs
+index bd62cd3a6de..701518e5fa4 100644
+--- a/rustls/src/msgs/codec.rs
++++ b/rustls/src/msgs/codec.rs
+@@ -1,6 +1,7 @@
+ use alloc::vec::Vec;
+ use core::fmt::Debug;
+ use core::marker::PhantomData;
++use pki_types::CertificateDer;
+ 
+ use crate::error::InvalidMessage;
+ 
+@@ -274,6 +275,14 @@ impl Codec<'_> for () {
+     }
+ }
+ 
++impl TlsListElement for CertificateDer<'_> {
++    const SIZE_LEN: ListLength = ListLength::NonZeroU24 {
++        max: CERTIFICATE_MAX_SIZE_LIMIT,
++        empty_error: InvalidMessage::IllegalEmptyList("CertificateDer"),
++        too_many_error: InvalidMessage::CertificatePayloadTooLarge,
++    };
++}
++
+ /// A trait for types that can be encoded and decoded in a list.
+ ///
+ /// This trait is used to implement `Codec` for `Vec<T>`. Lists in the TLS wire format are
+@@ -301,6 +310,13 @@ pub(crate) enum ListLength {
+ 
+     /// U24 with imposed upper bound
+     U24 { max: usize, error: InvalidMessage },
++
++    /// U24 but non-empty, with imposed upper bound
++    NonZeroU24 {
++        max: usize,
++        empty_error: InvalidMessage,
++        too_many_error: InvalidMessage,
++    },
+ }
+ 
+ impl ListLength {
+@@ -319,6 +335,15 @@ impl ListLength {
+                 len if len > *max => return Err(*error),
+                 len => len,
+             },
++            Self::NonZeroU24 {
++                max,
++                empty_error,
++                too_many_error,
++            } => match usize::from(u24::read(r)?) {
++                0 => return Err(*empty_error),
++                len if len > *max => return Err(*too_many_error),
++                len => len,
++            },
+         })
+     }
+ }
+@@ -340,7 +365,7 @@ impl<'a> LengthPrefixedBuffer<'a> {
+         buf.extend(match size_len {
+             ListLength::NonZeroU8 { .. } => &[0xff][..],
+             ListLength::U16 | ListLength::NonZeroU16 { .. } => &[0xff, 0xff],
+-            ListLength::U24 { .. } => &[0xff, 0xff, 0xff],
++            ListLength::U24 { .. } | ListLength::NonZeroU24 { .. } => &[0xff, 0xff, 0xff],
+         });
+ 
+         Self {
+@@ -368,7 +393,7 @@ impl Drop for LengthPrefixedBuffer<'_> {
+                     .unwrap();
+                 *out = u16::to_be_bytes(len as u16);
+             }
+-            ListLength::U24 { .. } => {
++            ListLength::U24 { .. } | ListLength::NonZeroU24 { .. } => {
+                 let len = self.buf.len() - self.len_offset - 3;
+                 debug_assert!(len <= 0xff_ffff);
+                 let len_bytes = u32::to_be_bytes(len as u32);
+@@ -381,6 +406,13 @@ impl Drop for LengthPrefixedBuffer<'_> {
+     }
+ }
+ 
++/// TLS has a 16MB size limit on any handshake message,
++/// plus a 16MB limit on any given certificate.
++///
++/// We contract that to 64KB to limit the amount of memory allocation
++/// that is directly controllable by the peer.
++pub(crate) const CERTIFICATE_MAX_SIZE_LIMIT: usize = 0x1_0000;
++
+ #[cfg(test)]
+ mod tests {
+     use std::prelude::v1::*;
+diff --git a/rustls/src/msgs/handshake.rs b/rustls/src/msgs/handshake.rs
+index aaf5948ed9a..9139316e57b 100644
+--- a/rustls/src/msgs/handshake.rs
++++ b/rustls/src/msgs/handshake.rs
+@@ -19,7 +19,8 @@ use crate::ffdhe_groups::FfdheGroup;
+ use crate::log::warn;
+ use crate::msgs::base::{MaybeEmpty, NonEmpty, Payload, PayloadU8, PayloadU16, PayloadU24};
+ use crate::msgs::codec::{
+-    self, Codec, LengthPrefixedBuffer, ListLength, Reader, TlsListElement, TlsListIter,
++    self, CERTIFICATE_MAX_SIZE_LIMIT, Codec, LengthPrefixedBuffer, ListLength, Reader,
++    TlsListElement, TlsListIter,
+ };
+ use crate::msgs::enums::{
+     CertificateStatusType, ClientCertificateType, Compression, ECCurveType, ECPointFormat,
+@@ -1638,20 +1639,6 @@ impl<'a> Deref for CertificateChain<'a> {
+     }
+ }
+ 
+-impl TlsListElement for CertificateDer<'_> {
+-    const SIZE_LEN: ListLength = ListLength::U24 {
+-        max: CERTIFICATE_MAX_SIZE_LIMIT,
+-        error: InvalidMessage::CertificatePayloadTooLarge,
+-    };
+-}
+-
+-/// TLS has a 16MB size limit on any handshake message,
+-/// plus a 16MB limit on any given certificate.
+-///
+-/// We contract that to 64KB to limit the amount of memory allocation
+-/// that is directly controllable by the peer.
+-pub(crate) const CERTIFICATE_MAX_SIZE_LIMIT: usize = 0x1_0000;
+-
+ extension_struct! {
+     pub(crate) struct CertificateExtensions<'a> {
+         ExtensionType::StatusRequest =>
+diff --git a/rustls/src/msgs/persist.rs b/rustls/src/msgs/persist.rs
+index ade850bad00..5d8b63c1a35 100644
+--- a/rustls/src/msgs/persist.rs
++++ b/rustls/src/msgs/persist.rs
+@@ -533,6 +533,8 @@ impl Codec<'_> for CommonServerSessionValue {
+ 
+ #[cfg(test)]
+ mod tests {
++    use pki_types::CertificateDer;
++
+     use super::*;
+ 
+     #[cfg(feature = "std")] // for UnixTime::now
+@@ -568,10 +570,29 @@ mod tests {
+ 
+     #[test]
+     fn serversessionvalue_with_cert() {
++        std::eprintln!(
++            "{:#04x?}",
++            ServerSessionValue::Tls13(Tls13ServerSessionValue::new(
++                CommonServerSessionValue::new(
++                    None,
++                    CipherSuite::TLS13_AES_128_GCM_SHA256,
++                    Some(CertificateChain(alloc::vec![CertificateDer::from(
++                        &[10, 11, 12][..],
++                    )])),
++                    None,
++                    alloc::vec![4, 5, 6],
++                    UnixTime::now(),
++                ),
++                &[1, 2, 3],
++                0x12345678,
++            ))
++            .get_encoding()
++        );
++
+         let bytes = [
+-            0x03, 0x04, 0x00, 0x13, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x04, 0x05,
+-            0x06, 0x00, 0x00, 0x00, 0x00, 0x68, 0x6e, 0x94, 0x32, 0x03, 0x01, 0x02, 0x03, 0x12,
+-            0x34, 0x56, 0x78,
++            0x03, 0x04, 0x00, 0x13, 0x01, 0x01, 0x00, 0x00, 0x06, 0x00, 0x00, 0x03, 0x0a, 0x0b,
++            0x0c, 0x00, 0x00, 0x03, 0x04, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x68, 0xc1, 0x95,
++            0xb9, 0x03, 0x01, 0x02, 0x03, 0x12, 0x34, 0x56, 0x78,
+         ];
+         let mut rd = Reader::init(&bytes);
+         let ssv = ServerSessionValue::read(&mut rd).unwrap();
+diff --git a/rustls/src/server/tls13.rs b/rustls/src/server/tls13.rs
+index 6de8ebfd5d3..0583e0cc33c 100644
+--- a/rustls/src/server/tls13.rs
++++ b/rustls/src/server/tls13.rs
+@@ -19,11 +19,11 @@ use crate::enums::{AlertDescription, ContentType, HandshakeType, ProtocolVersion
+ use crate::error::{Error, InvalidMessage, PeerIncompatible, PeerMisbehaved};
+ use crate::hash_hs::HandshakeHash;
+ use crate::log::{debug, trace, warn};
+-use crate::msgs::codec::{Codec, Reader};
++use crate::msgs::codec::{CERTIFICATE_MAX_SIZE_LIMIT, Codec, Reader};
+ use crate::msgs::enums::KeyUpdateRequest;
+ use crate::msgs::handshake::{
+-    CERTIFICATE_MAX_SIZE_LIMIT, CertificateChain, CertificatePayloadTls13, HandshakeMessagePayload,
+-    HandshakePayload, NewSessionTicketPayloadTls13,
++    CertificateChain, CertificatePayloadTls13, HandshakeMessagePayload, HandshakePayload,
++    NewSessionTicketPayloadTls13,
+ };
+ use crate::msgs::message::{Message, MessagePayload};
+ use crate::msgs::persist;

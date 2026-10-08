@@ -1,0 +1,243 @@
+diff --git a/tabby-core/src/api/platform.ts b/tabby-core/src/api/platform.ts
+index 9a87dc1834e..bf72880a3fb 100644
+--- a/tabby-core/src/api/platform.ts
++++ b/tabby-core/src/api/platform.ts
+@@ -22,6 +22,7 @@ export interface MessageBoxResult {
+ 
+ export abstract class FileTransfer {
+     abstract getName (): string
++    abstract getRelativePath (): string
+     abstract getMode (): number
+     abstract getSize (): number
+     abstract close (): void
+@@ -84,6 +85,7 @@ export abstract class FileUpload extends FileTransfer {
+ 
+ export interface FileUploadOptions {
+     multiple: boolean
++    directory: boolean
+ }
+ 
+ export type PlatformTheme = 'light'|'dark'
+@@ -202,6 +204,10 @@ export class HTMLFileUpload extends FileUpload {
+         return this.file.name
+     }
+ 
++    getRelativePath (): string {
++        return ''
++    }
++
+     getMode (): number {
+         return 0o644
+     }
+diff --git a/tabby-electron/src/services/platform.service.ts b/tabby-electron/src/services/platform.service.ts
+index 85ff48f69d9..87d5fca54f1 100644
+--- a/tabby-electron/src/services/platform.service.ts
++++ b/tabby-electron/src/services/platform.service.ts
+@@ -48,6 +48,20 @@ export class ElectronPlatformService extends PlatformService {
+         })
+     }
+ 
++    async getAllFiles (dir: string): Promise<string[]> {
++        let files: string[] = []
++        const items = await fs.readdir(dir, { withFileTypes: true })
++        for (const item of items) {
++            const fullPath = path.posix.join(dir, item.name)
++            if (item.isDirectory()) {
++                files = files.concat(await this.getAllFiles(fullPath))
++            } else {
++                files.push(fullPath)
++            }
++        }
++        return files
++    }
++
+     readClipboard (): string {
+         return this.electron.clipboard.readText()
+     }
+@@ -187,12 +201,15 @@ export class ElectronPlatformService extends PlatformService {
+     }
+ 
+     async startUpload (options?: FileUploadOptions, paths?: string[]): Promise<FileUpload[]> {
+-        options ??= { multiple: false }
++        options ??= { multiple: false, directory: false }
+ 
+         const properties: any[] = ['openFile', 'treatPackageAsDirectory']
+         if (options.multiple) {
+             properties.push('multiSelections')
+         }
++        if (options.directory) {
++            properties.push('openDirectory')
++        }
+ 
+         if (!paths) {
+             const result = await this.electron.dialog.showOpenDialog(
+@@ -208,12 +225,29 @@ export class ElectronPlatformService extends PlatformService {
+             paths = result.filePaths
+         }
+ 
+-        return Promise.all(paths.map(async p => {
+-            const transfer = new ElectronFileUpload(p, this.electron)
+-            await wrapPromise(this.zone, transfer.open())
+-            this.fileTransferStarted.next(transfer)
+-            return transfer
+-        }))
++        if(options.directory) {
++            let allFiles: string[] = []
++            let relativePaths: string[] = []
++            for (const folderPath of paths) {
++                const files = await this.getAllFiles(folderPath)
++                allFiles = allFiles.concat(files)
++                relativePaths = relativePaths.concat(files.map(file => path.posix.join(path.basename(folderPath), path.posix.relative(folderPath, file))))
++            }
++
++            return Promise.all(allFiles.map(async (p, index) => {
++                const transfer = new ElectronFileUpload(p, this.electron, relativePaths[index])
++                await wrapPromise(this.zone, transfer.open())
++                this.fileTransferStarted.next(transfer)
++                return transfer
++            }))
++        } else {
++            return Promise.all(paths.map(async p => {
++                const transfer = new ElectronFileUpload(p, this.electron)
++                await wrapPromise(this.zone, transfer.open())
++                this.fileTransferStarted.next(transfer)
++                return transfer
++            }))
++        }
+     }
+ 
+     async startDownload (name: string, mode: number, size: number, filePath?: string): Promise<FileDownload|null> {
+@@ -266,7 +300,7 @@ class ElectronFileUpload extends FileUpload {
+     private buffer: Buffer
+     private powerSaveBlocker = 0
+ 
+-    constructor (private filePath: string, private electron: ElectronService) {
++    constructor (private filePath: string, private electron: ElectronService, private relativePath = '') {
+         super()
+         this.buffer = Buffer.alloc(256 * 1024)
+         this.powerSaveBlocker = electron.powerSaveBlocker.start('prevent-app-suspension')
+@@ -283,6 +317,10 @@ class ElectronFileUpload extends FileUpload {
+         return path.basename(this.filePath)
+     }
+ 
++    getRelativePath (): string {
++        return this.relativePath
++    }
++
+     getMode (): number {
+         return this.mode
+     }
+@@ -325,6 +363,10 @@ class ElectronFileDownload extends FileDownload {
+         return path.basename(this.filePath)
+     }
+ 
++    getRelativePath (): string {
++        return ''
++    }
++
+     getMode (): number {
+         return this.mode
+     }
+diff --git a/tabby-electron/src/sftpContextMenu.ts b/tabby-electron/src/sftpContextMenu.ts
+index 2443aad65e1..9ec30a6102b 100644
+--- a/tabby-electron/src/sftpContextMenu.ts
++++ b/tabby-electron/src/sftpContextMenu.ts
+@@ -54,7 +54,7 @@ export class EditSFTPContextMenu extends SFTPContextMenuItemProvider {
+             if (event === 'rename') {
+                 watcher.close()
+             }
+-            const upload = await this.platform.startUpload({ multiple: false }, [tempPath])
++            const upload = await this.platform.startUpload({ multiple: false, directory: false }, [tempPath])
+             if (!upload.length) {
+                 return
+             }
+diff --git a/tabby-ssh/src/components/sftpPanel.component.pug b/tabby-ssh/src/components/sftpPanel.component.pug
+index 57e96941940..36376f87f6c 100644
+--- a/tabby-ssh/src/components/sftpPanel.component.pug
++++ b/tabby-ssh/src/components/sftpPanel.component.pug
+@@ -25,6 +25,10 @@
+         i.fas.fa-upload.me-1
+         div(translate) Upload
+ 
++    button.btn.btn-link.btn-sm.flex-shrink-0.d-flex((click)='uploadFolder()')
++        i.fas.fa-upload.me-1
++        div(translate) Upload Folder
++
+     button.btn.btn-link.text-decoration-none((click)='close()') !{require('../../../tabby-core/src/icons/times.svg')}
+ 
+ .body(dropZone, (transfer)='uploadOne($event)')
+diff --git a/tabby-ssh/src/components/sftpPanel.component.ts b/tabby-ssh/src/components/sftpPanel.component.ts
+index e9662443796..773e34c03d6 100644
+--- a/tabby-ssh/src/components/sftpPanel.component.ts
++++ b/tabby-ssh/src/components/sftpPanel.component.ts
+@@ -176,10 +176,41 @@ export class SFTPPanelComponent {
+     }
+ 
+     async upload (): Promise<void> {
+-        const transfers = await this.platform.startUpload({ multiple: true })
++        const transfers = await this.platform.startUpload({ multiple: true, directory: false })
+         await Promise.all(transfers.map(t => this.uploadOne(t)))
+     }
+ 
++    async uploadFolder (): Promise<void> {
++        const transfers = await this.platform.startUpload({ multiple: true, directory: true })
++        await Promise.all(transfers.map(t => this.uploadOneWithFolder(t)))
++    }
++
++    async uploadOneWithFolder (transfer: FileUpload): Promise<void> {
++        const savedPath = this.path
++
++        try {
++            await this.sftp.stat(path.join(this.path, transfer.getRelativePath()))
++        } catch (e) {
++            if (e instanceof Error && e.message.includes('No such file')) {
++                let accumPath = ''
++                for (const pathParts of path.posix.dirname(transfer.getRelativePath()).split(path.posix.sep)) {
++                    accumPath = path.posix.join(accumPath, pathParts)
++                    this.sftp.mkdir(path.join(this.path, accumPath)).then(() => {
++                        this.notifications.notice('The directory was created successfully')
++                    }).catch(() => {
++                        // Intentionally ignoring errors from making duplicate dirs.
++                    })
++                }
++            } else {
++                throw e
++            }
++        }
++        await this.sftp.upload(path.join(this.path, transfer.getRelativePath()), transfer)
++        if (this.path === savedPath) {
++            await this.navigate(this.path)
++        }
++    }
++
+     async uploadOne (transfer: FileUpload): Promise<void> {
+         const savedPath = this.path
+         await this.sftp.upload(path.join(this.path, transfer.getName()), transfer)
+diff --git a/tabby-terminal/src/features/zmodem.ts b/tabby-terminal/src/features/zmodem.ts
+index ed45e6769af..414846e2b33 100644
+--- a/tabby-terminal/src/features/zmodem.ts
++++ b/tabby-terminal/src/features/zmodem.ts
+@@ -74,7 +74,7 @@ class ZModemMiddleware extends SessionMiddleware {
+         this.logger.info('new session', zsession)
+ 
+         if (zsession.type === 'send') {
+-            const transfers = await this.platform.startUpload({ multiple: true })
++            const transfers = await this.platform.startUpload({ multiple: true, directory: false })
+             let filesRemaining = transfers.length
+             let sizeRemaining = transfers.reduce((a, b) => a + b.getSize(), 0)
+             for (const transfer of transfers) {
+diff --git a/tabby-web/src/platform.ts b/tabby-web/src/platform.ts
+index 035e2b6bb14..aa1d5045610 100644
+--- a/tabby-web/src/platform.ts
++++ b/tabby-web/src/platform.ts
+@@ -159,6 +159,10 @@ class HTMLFileDownload extends FileDownload {
+         return this.name
+     }
+ 
++    getRelativePath (): string {
++        return ''
++    }
++
+     getMode (): number {
+         return this.mode
+     }

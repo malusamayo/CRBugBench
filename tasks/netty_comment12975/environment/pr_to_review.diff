@@ -1,0 +1,207 @@
+diff --git a/codec-http2/src/main/java/io/netty/handler/codec/http2/DefaultHttp2Headers.java b/codec-http2/src/main/java/io/netty/handler/codec/http2/DefaultHttp2Headers.java
+index 3ace8c6a99f..5a409d0c361 100644
+--- a/codec-http2/src/main/java/io/netty/handler/codec/http2/DefaultHttp2Headers.java
++++ b/codec-http2/src/main/java/io/netty/handler/codec/http2/DefaultHttp2Headers.java
+@@ -79,9 +79,6 @@ public void validateName(CharSequence name) {
+                     PlatformDependent.throwException(connectionError(
+                             PROTOCOL_ERROR, "Invalid HTTP/2 pseudo-header '%s' encountered.", name));
+                 }
+-            } else if (HttpHeaderValidationUtil.isConnectionHeader(name, true)) {
+-                PlatformDependent.throwException(connectionError(
+-                        PROTOCOL_ERROR, "Illegal connection-specific header '%s' encountered.", name));
+             }
+         }
+     };
+@@ -174,17 +171,6 @@ protected void validateName(NameValidator<CharSequence> validator, boolean forAd
+         }
+     }
+ 
+-    @Override
+-    protected void validateValue(ValueValidator<CharSequence> validator, CharSequence name, CharSequence value) {
+-        if (nameValidator() == HTTP2_NAME_VALIDATOR) {
+-            if (HttpHeaderValidationUtil.isTeNotTrailers(name, value)) {
+-                PlatformDependent.throwException(connectionError(PROTOCOL_ERROR,
+-                        "Illegal value specified for the 'TE' header (only 'trailers' is allowed)."));
+-            }
+-        }
+-        super.validateValue(validator, name, value);
+-    }
+-
+     @Override
+     public Http2Headers clear() {
+         firstNonPseudo = head;
+diff --git a/codec-http2/src/main/java/io/netty/handler/codec/http2/HpackDecoder.java b/codec-http2/src/main/java/io/netty/handler/codec/http2/HpackDecoder.java
+index ba1e086ce0b..ab5fe18d183 100644
+--- a/codec-http2/src/main/java/io/netty/handler/codec/http2/HpackDecoder.java
++++ b/codec-http2/src/main/java/io/netty/handler/codec/http2/HpackDecoder.java
+@@ -32,6 +32,7 @@
+ package io.netty.handler.codec.http2;
+ 
+ import io.netty.buffer.ByteBuf;
++import io.netty.handler.codec.http.HttpHeaderValidationUtil;
+ import io.netty.handler.codec.http2.HpackUtil.IndexType;
+ import io.netty.util.AsciiString;
+ 
+@@ -375,8 +376,8 @@ private void setDynamicTableSize(long dynamicTableSize) throws Http2Exception {
+         hpackDynamicTable.setCapacity(dynamicTableSize);
+     }
+ 
+-    private static HeaderType validateHeader(int streamId, AsciiString name, HeaderType previousHeaderType)
+-            throws Http2Exception {
++    private static HeaderType validateHeader(int streamId, AsciiString name, CharSequence value,
++            HeaderType previousHeaderType) throws Http2Exception {
+         if (hasPseudoHeaderFormat(name)) {
+             if (previousHeaderType == HeaderType.REGULAR_HEADER) {
+                 throw streamError(streamId, PROTOCOL_ERROR,
+@@ -390,42 +391,15 @@ private static HeaderType validateHeader(int streamId, AsciiString name, HeaderT
+             }
+             return currentHeaderType;
+         }
+-
+-        return HeaderType.REGULAR_HEADER;
+-    }
+-
+-    private static boolean contains(Http2Headers headers, AsciiString name) {
+-        if (headers == EmptyHttp2Headers.INSTANCE) {
+-            return false;
+-        }
+-        if (headers instanceof DefaultHttp2Headers || headers instanceof ReadOnlyHttp2Headers) {
+-            return headers.contains(name);
+-        }
+-        // We can't be sure the Http2Headers implementation support contains on pseudo-headers,
+-        // so we have to use the direct accessors instead.
+-        if (Http2Headers.PseudoHeaderName.METHOD.value().equals(name)) {
+-            return headers.method() != null;
++        if (HttpHeaderValidationUtil.isConnectionHeader(name, true)) {
++            throw streamError(streamId, PROTOCOL_ERROR, "Illegal connection-specific header '%s' encountered.", name);
+         }
+-        if (Http2Headers.PseudoHeaderName.SCHEME.value().equals(name)) {
+-            return headers.scheme() != null;
++        if (HttpHeaderValidationUtil.isTeNotTrailers(name, value)) {
++            throw streamError(streamId, PROTOCOL_ERROR,
++                    "Illegal value specified for the 'TE' header (only 'trailers' is allowed).");
+         }
+-        if (Http2Headers.PseudoHeaderName.AUTHORITY.value().equals(name)) {
+-            return headers.authority() != null;
+-        }
+-        if (Http2Headers.PseudoHeaderName.PATH.value().equals(name)) {
+-            return headers.path() != null;
+-        }
+-        if (Http2Headers.PseudoHeaderName.STATUS.value().equals(name)) {
+-            return headers.status() != null;
+-        }
+-        // Note: We don't check PROTOCOL because the API presents no alternative way to access it.
+-        return false;
+-    }
+ 
+-    private static Http2Exception illegalHeaderValue(int streamId, AsciiString name, int illegalByte, int index) {
+-        return streamError(streamId, PROTOCOL_ERROR,
+-                "Illegal header value given for header '%s': illegal byte 0x%X at index %s.",
+-                name, illegalByte, index);
++        return HeaderType.REGULAR_HEADER;
+     }
+ 
+     private AsciiString readName(int index) throws Http2Exception {
+@@ -578,7 +552,7 @@ void appendToHeaderList(AsciiString name, AsciiString value) {
+             try {
+                 headers.add(name, value);
+                 if (validateHeaders) {
+-                    previousType = validateHeader(streamId, name, previousType);
++                    previousType = validateHeader(streamId, name, value, previousType);
+                 }
+             } catch (IllegalArgumentException ex) {
+                 validationException = streamError(streamId, PROTOCOL_ERROR, ex,
+diff --git a/codec-http2/src/test/java/io/netty/handler/codec/http2/DefaultHttp2HeadersTest.java b/codec-http2/src/test/java/io/netty/handler/codec/http2/DefaultHttp2HeadersTest.java
+index bd9fb50120c..322bbc00dec 100644
+--- a/codec-http2/src/test/java/io/netty/handler/codec/http2/DefaultHttp2HeadersTest.java
++++ b/codec-http2/src/test/java/io/netty/handler/codec/http2/DefaultHttp2HeadersTest.java
+@@ -20,6 +20,8 @@
+ import io.netty.util.internal.StringUtil;
+ import org.junit.jupiter.api.Test;
+ import org.junit.jupiter.api.function.Executable;
++import org.junit.jupiter.params.ParameterizedTest;
++import org.junit.jupiter.params.provider.CsvSource;
+ 
+ import java.util.Map.Entry;
+ 
+@@ -190,6 +192,15 @@ void setMustOverwritePseudoHeaders() {
+         assertEquals(of("http"), headers.scheme());
+     }
+ 
++    @ParameterizedTest(name = "{displayName} [{index}] name={0} value={1}")
++    @CsvSource(value = {"upgrade,protocol1", "connection,close", "keep-alive,timeout=5", "proxy-connection,close",
++            "transfer-encoding,chunked", "te,something-else"})
++    void possibleToAddConnectionHeaders(String name, String value) {
++        Http2Headers headers = newHeaders();
++        headers.add(name, value);
++        assertTrue(headers.contains(name, value));
++    }
++
+     private static void verifyAllPseudoHeadersPresent(Http2Headers headers) {
+         for (PseudoHeaderName pseudoName : PseudoHeaderName.values()) {
+             assertNotNull(headers.get(pseudoName.value()));
+diff --git a/codec-http2/src/test/java/io/netty/handler/codec/http2/HpackDecoderTest.java b/codec-http2/src/test/java/io/netty/handler/codec/http2/HpackDecoderTest.java
+index 9c59647998e..452f4179cee 100644
+--- a/codec-http2/src/test/java/io/netty/handler/codec/http2/HpackDecoderTest.java
++++ b/codec-http2/src/test/java/io/netty/handler/codec/http2/HpackDecoderTest.java
+@@ -37,12 +37,15 @@
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.Test;
+ import org.junit.jupiter.api.function.Executable;
++import org.junit.jupiter.params.ParameterizedTest;
++import org.junit.jupiter.params.provider.CsvSource;
+ import org.mockito.MockingDetails;
+ import org.mockito.invocation.Invocation;
+ 
+ import java.lang.reflect.Method;
+ 
+ import static io.netty.handler.codec.http2.HpackDecoder.decodeULE128;
++import static io.netty.handler.codec.http2.Http2Error.PROTOCOL_ERROR;
+ import static io.netty.handler.codec.http2.Http2HeadersEncoder.NEVER_SENSITIVE;
+ import static io.netty.util.AsciiString.EMPTY_STRING;
+ import static io.netty.util.AsciiString.of;
+@@ -765,12 +768,42 @@ public void pseudoHeaderAfterRegularHeader() throws Exception {
+ 
+             final Http2Headers decoded = new DefaultHttp2Headers();
+ 
+-            assertThrows(Http2Exception.StreamException.class, new Executable() {
++            Http2Exception.StreamException e = assertThrows(Http2Exception.StreamException.class, new Executable() {
+                 @Override
+                 public void execute() throws Throwable {
+-                    hpackDecoder.decode(1, in, decoded, true);
++                    hpackDecoder.decode(3, in, decoded, true);
++                }
++            });
++            assertThat(e.streamId(), is(3));
++            assertThat(e.error(), is(PROTOCOL_ERROR));
++        } finally {
++            in.release();
++        }
++    }
++
++    @ParameterizedTest(name = "{displayName} [{index}] name={0} value={1}")
++    @CsvSource(value = {"upgrade,protocol1", "connection,close", "keep-alive,timeout=5", "proxy-connection,close",
++            "transfer-encoding,chunked", "te,something-else"})
++    public void receivedConnectionHeader(String name, String value) throws Exception {
++        final ByteBuf in = Unpooled.buffer(200);
++        try {
++            HpackEncoder hpackEncoder = new HpackEncoder(true);
++
++            Http2Headers toEncode = new InOrderHttp2Headers();
++            toEncode.add(":method", "GET");
++            toEncode.add(name, value);
++            hpackEncoder.encodeHeaders(1, in, toEncode, NEVER_SENSITIVE);
++
++            final Http2Headers decoded = new DefaultHttp2Headers();
++
++            Http2Exception.StreamException e = assertThrows(Http2Exception.StreamException.class, new Executable() {
++                @Override
++                public void execute() throws Throwable {
++                    hpackDecoder.decode(3, in, decoded, true);
+                 }
+             });
++            assertThat(e.streamId(), is(3));
++            assertThat(e.error(), is(PROTOCOL_ERROR));
+         } finally {
+             in.release();
+         }

@@ -1,0 +1,416 @@
+commit a60fd07bc3b249b6bc0a07e675b5f3d8023a7dd4
+Author: Rein F <public@reinfernhout.xyz>
+Date:   Wed Apr 28 20:54:27 2021 +0200
+
+    ls: improvements on time handling (#1986)
+    
+    * ls: added creation time
+    
+    * ls: Added most time features
+    
+    Missing support for posix-,Format+, translating via locales. Also required more tests
+    
+    * ls: rustfmt
+    
+    * ls: Additional changes and fixes
+    
+    Fixed the argument order, fixed a wrong iso format.
+    
+    * ls: additional tests for styles
+    
+    * ls: perfected arg parsing on time styles
+    
+    * fix birthime test
+    
+    * ls: Use 'stdout_str' in new tests
+    
+    * ls: Disabled birthtime test for windows
+    
+    * ls: removed indoc as a dependency
+    
+    * ls: birthime test, sync first created file
+    
+    * ls: birthime test, add comment explaining sync
+    
+    * Removed ruby testfile birth_test.rb
+    
+    This accidentally got commited in a merge
+
+diff --git a/src/uu/ls/Cargo.toml b/src/uu/ls/Cargo.toml
+index d479a57f4..ab58a7300 100644
+--- a/src/uu/ls/Cargo.toml
++++ b/src/uu/ls/Cargo.toml
+@@ -15,16 +15,17 @@ edition = "2018"
+ path = "src/ls.rs"
+ 
+ [dependencies]
++locale = "0.2.2"
++chrono = "0.4.19"
+ clap = "2.33"
+ unicode-width = "0.1.8"
+ number_prefix = "0.4"
+ term_grid = "0.1.5"
+ termsize = "0.1.6"
+-time = "0.1.40"
+ globset = "0.4.6"
+-lscolors = { version="0.7.1", features=["ansi_term"] }
+-uucore = { version=">=0.0.8", package="uucore", path="../../uucore", features=["entries", "fs"] }
+-uucore_procs = { version=">=0.0.5", package="uucore_procs", path="../../uucore_procs" }
++lscolors = { version = "0.7.1", features = ["ansi_term"] }
++uucore = { version = ">=0.0.8", package = "uucore", path = "../../uucore", features = ["entries", "fs"] }
++uucore_procs = { version = ">=0.0.5", package = "uucore_procs", path = "../../uucore_procs" }
+ once_cell = "1.7.2"
+ atty = "0.2"
+ 
+diff --git a/src/uu/ls/src/ls.rs b/src/uu/ls/src/ls.rs
+index 3245e2a56..d78e1977a 100644
+--- a/src/uu/ls/src/ls.rs
++++ b/src/uu/ls/src/ls.rs
+@@ -38,8 +38,11 @@ use std::{
+     os::unix::fs::{FileTypeExt, MetadataExt},
+     time::Duration,
+ };
++
++use chrono;
++
+ use term_grid::{Cell, Direction, Filling, Grid, GridOptions};
+-use time::{strftime, Timespec};
++
+ use unicode_width::UnicodeWidthStr;
+ #[cfg(unix)]
+ use uucore::libc::{S_IXGRP, S_IXOTH, S_IXUSR};
+@@ -50,6 +53,8 @@ static ABOUT: &str = "
+  the command line, expect that it will ignore files and directories
+  whose names start with '.'
+ ";
++static AFTER_HELP: &str = "The TIME_STYLE argument can be full-iso, long-iso, iso.
++Also the TIME_STYLE environment variable sets the default style to use.";
+ 
+ fn get_usage() -> String {
+     format!("{0} [OPTION]... [FILE]...", executable!())
+@@ -117,6 +122,8 @@ pub mod options {
+     pub static COLOR: &str = "color";
+     pub static PATHS: &str = "paths";
+     pub static INDICATOR_STYLE: &str = "indicator-style";
++    pub static TIME_STYLE: &str = "time-style";
++    pub static FULL_TIME: &str = "full-time";
+     pub static HIDE: &str = "hide";
+     pub static IGNORE: &str = "ignore";
+ }
+@@ -156,6 +163,15 @@ enum Time {
+     Modification,
+     Access,
+     Change,
++    Birth,
++}
++
++#[derive(Debug)]
++enum TimeStyle {
++    FullIso,
++    LongIso,
++    Iso,
++    Locale,
+ }
+ 
+ enum Dereference {
+@@ -191,6 +207,7 @@ struct Config {
+     width: Option<u16>,
+     quoting_style: QuotingStyle,
+     indicator_style: IndicatorStyle,
++    time_style: TimeStyle,
+ }
+ 
+ // Fields that can be removed or added to the long format
+@@ -251,6 +268,7 @@ impl Config {
+                 options::format::LONG_NO_OWNER,
+                 options::format::LONG_NO_GROUP,
+                 options::format::LONG_NUMERIC_UID_GID,
++                options::FULL_TIME,
+             ]
+             .iter()
+             .flat_map(|opt| options.indices_of(opt))
+@@ -302,6 +320,7 @@ impl Config {
+             match field {
+                 "ctime" | "status" => Time::Change,
+                 "access" | "atime" | "use" => Time::Access,
++                "birth" | "creation" => Time::Birth,
+                 // below should never happen as clap already restricts the values.
+                 _ => unreachable!("Invalid field for --time"),
+             }
+@@ -439,6 +458,30 @@ impl Config {
+             IndicatorStyle::None
+         };
+ 
++        let time_style = if let Some(field) = options.value_of(options::TIME_STYLE) {
++            //If both FULL_TIME and TIME_STYLE are present
++            //The one added last is dominant
++            if options.is_present(options::FULL_TIME)
++                && options.indices_of(options::FULL_TIME).unwrap().last()
++                    > options.indices_of(options::TIME_STYLE).unwrap().last()
++            {
++                TimeStyle::FullIso
++            } else {
++                //Clap handles the env variable "TIME_STYLE"
++                match field {
++                    "full-iso" => TimeStyle::FullIso,
++                    "long-iso" => TimeStyle::LongIso,
++                    "iso" => TimeStyle::Iso,
++                    "locale" => TimeStyle::Locale,
++                    // below should never happen as clap already restricts the values.
++                    _ => unreachable!("Invalid field for --time-style"),
++                }
++            }
++        } else if options.is_present(options::FULL_TIME) {
++            TimeStyle::FullIso
++        } else {
++            TimeStyle::Locale
++        };
+         let mut ignore_patterns = GlobSetBuilder::new();
+         if options.is_present(options::IGNORE_BACKUPS) {
+             ignore_patterns.add(Glob::new("*~").unwrap());
+@@ -504,6 +547,7 @@ impl Config {
+             width,
+             quoting_style,
+             indicator_style,
++            time_style,
+         }
+     }
+ }
+@@ -696,10 +740,11 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
+                 .long(options::TIME)
+                 .help("Show time in <field>:\n\
+                     \taccess time (-u): atime, access, use;\n\
+-                    \tchange time (-t): ctime, status.")
++                    \tchange time (-t): ctime, status.\n\
++                    \tbirth time: birth, creation;")
+                 .value_name("field")
+                 .takes_value(true)
+-                .possible_values(&["atime", "access", "use", "ctime", "status"])
++                .possible_values(&["atime", "access", "use", "ctime", "status", "birth", "creation"])
+                 .hide_possible_values(true)
+                 .require_equals(true)
+                 .overrides_with_all(&[
+@@ -1020,9 +1065,34 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
+                     options::indicator_style::CLASSIFY,
+                     options::INDICATOR_STYLE,
+                 ]))
++        .arg(
++            //This still needs support for posix-*, +FORMAT
++            Arg::with_name(options::TIME_STYLE)
++                .long(options::TIME_STYLE)
++                .help("time/date format with -l; see TIME_STYLE below")
++                .value_name("TIME_STYLE")
++                .env("TIME_STYLE")
++                .possible_values(&[
++                    "full-iso",
++                    "long-iso",
++                    "iso",
++                    "locale",
++                ])
++                .overrides_with_all(&[
++                    options::TIME_STYLE
++                ])
++        )
++        .arg(
++            Arg::with_name(options::FULL_TIME)
++            .long(options::FULL_TIME)
++            .overrides_with(options::FULL_TIME)
++            .help("like -l --time-style=full-iso")
++        )
+ 
+     // Positional arguments
+-        .arg(Arg::with_name(options::PATHS).multiple(true).takes_value(true));
++        .arg(Arg::with_name(options::PATHS).multiple(true).takes_value(true))
++
++        .after_help(AFTER_HELP);
+ 
+     let matches = app.get_matches_from(args);
+ 
+@@ -1480,6 +1550,7 @@ fn get_system_time(md: &Metadata, config: &Config) -> Option<SystemTime> {
+         Time::Change => Some(UNIX_EPOCH + Duration::new(md.ctime() as u64, md.ctime_nsec() as u32)),
+         Time::Modification => md.modified().ok(),
+         Time::Access => md.accessed().ok(),
++        Time::Birth => md.created().ok(),
+     }
+ }
+ 
+@@ -1492,18 +1563,35 @@ fn get_system_time(md: &Metadata, config: &Config) -> Option<SystemTime> {
+     }
+ }
+ 
+-fn get_time(md: &Metadata, config: &Config) -> Option<time::Tm> {
+-    let duration = get_system_time(md, config)?
+-        .duration_since(UNIX_EPOCH)
+-        .ok()?;
+-    let secs = duration.as_secs() as i64;
+-    let nsec = duration.subsec_nanos() as i32;
+-    Some(time::at(Timespec::new(secs, nsec)))
++fn get_time(md: &Metadata, config: &Config) -> Option<chrono::DateTime<chrono::Local>> {
++    let time = get_system_time(md, config)?;
++    Some(time.into())
+ }
+ 
+ fn display_date(metadata: &Metadata, config: &Config) -> String {
+     match get_time(metadata, config) {
+-        Some(time) => strftime("%F %R", &time).unwrap(),
++        Some(time) => {
++            //Date is recent if from past 6 months
++            //According to GNU a Gregorian year has 365.2425 * 24 * 60 * 60 == 31556952 seconds on the average.
++            let recent = time + chrono::Duration::seconds(31556952 / 2) > chrono::Local::now();
++
++            match config.time_style {
++                TimeStyle::FullIso => time.format("%Y-%m-%d %H:%M:%S.%f %z"),
++                TimeStyle::LongIso => time.format("%Y-%m-%d %H:%M"),
++                TimeStyle::Iso => time.format(if recent { "%m-%d %H:%M" } else { "%Y-%m-%d " }),
++                TimeStyle::Locale => {
++                    let fmt = if recent { "%b %e %H:%M" } else { "%b %e  %Y" };
++
++                    //In this version of chrono translating can be done
++                    //The function is chrono::datetime::DateTime::format_localized
++                    //However it's currently still hard to get the current pure-rust-locale
++                    //So it's not yet implemented
++
++                    time.format(fmt)
++                }
++            }
++            .to_string()
++        }
+         None => "???".into(),
+     }
+ }
+diff --git a/src/uucore/Cargo.toml b/src/uucore/Cargo.toml
+index 855e64b36..291456760 100644
+--- a/src/uucore/Cargo.toml
++++ b/src/uucore/Cargo.toml
+@@ -24,7 +24,7 @@ thiserror = { version="1.0", optional=true }
+ lazy_static = { version="1.3", optional=true }
+ nix = { version="<= 0.13", optional=true }
+ platform-info = { version="<= 0.1", optional=true }
+-time = { version="<= 0.1.42", optional=true }
++time = { version="<= 0.1.43", optional=true }
+ # * "problem" dependencies (pinned)
+ data-encoding = { version="~2.1", optional=true } ## data-encoding: require v2.1; but v2.2.0 breaks the build for MinSRV v1.31.0
+ libc = { version="0.2.15, <= 0.2.85", optional=true } ## libc: initial utmp support added in v0.2.15; but v0.2.68 breaks the build for MinSRV v1.31.0
+diff --git a/tests/by-util/test_ls.rs b/tests/by-util/test_ls.rs
+index 1a3bdf78a..eeb7a6248 100644
+--- a/tests/by-util/test_ls.rs
++++ b/tests/by-util/test_ls.rs
+@@ -558,6 +558,118 @@ fn test_ls_long_ctime() {
+     }
+ }
+ 
++#[test]
++#[cfg(not(windows))]
++// This test is currently failing on windows
++fn test_ls_order_birthtime() {
++    let scene = TestScenario::new(util_name!());
++    let at = &scene.fixtures;
++
++    /*
++        Here we make 2 files with a timeout in between.
++        After creating the first file try to sync it.
++        This ensures the file gets created immediately instead of being saved
++        inside the OS's IO operation buffer.
++        Without this, both files might accidentally be created at the same time,
++        even though we placed a timeout between creating the two.
++
++        https://github.com/uutils/coreutils/pull/1986/#issuecomment-828490651
++    */
++    at.make_file("test-birthtime-1").sync_all().unwrap();
++    std::thread::sleep(std::time::Duration::from_millis(1));
++    at.make_file("test-birthtime-2");
++    at.touch("test-birthtime-1");
++
++    let result = scene.ucmd().arg("--time=birth").arg("-t").run();
++
++    #[cfg(not(windows))]
++    assert_eq!(result.stdout_str(), "test-birthtime-2\ntest-birthtime-1\n");
++    #[cfg(windows)]
++    assert_eq!(result.stdout_str(), "test-birthtime-2  test-birthtime-1\n");
++}
++
++#[test]
++fn test_ls_styles() {
++    let scene = TestScenario::new(util_name!());
++    let at = &scene.fixtures;
++    at.touch("test");
++
++    let re_full = Regex::new(
++        r"[a-z-]* \d* \w* \w* \d* \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d* \+\d{4} test\n",
++    )
++    .unwrap();
++    let re_long =
++        Regex::new(r"[a-z-]* \d* \w* \w* \d* \d{4}-\d{2}-\d{2} \d{2}:\d{2} test\n").unwrap();
++    let re_iso = Regex::new(r"[a-z-]* \d* \w* \w* \d* \d{2}-\d{2} \d{2}:\d{2} test\n").unwrap();
++    let re_locale =
++        Regex::new(r"[a-z-]* \d* \w* \w* \d* [A-Z][a-z]{2} \d{2} \d{2}:\d{2} test\n").unwrap();
++
++    //full-iso
++    let result = scene
++        .ucmd()
++        .arg("-l")
++        .arg("--time-style=full-iso")
++        .succeeds();
++    assert!(re_full.is_match(&result.stdout_str()));
++    //long-iso
++    let result = scene
++        .ucmd()
++        .arg("-l")
++        .arg("--time-style=long-iso")
++        .succeeds();
++    assert!(re_long.is_match(&result.stdout_str()));
++    //iso
++    let result = scene.ucmd().arg("-l").arg("--time-style=iso").succeeds();
++    assert!(re_iso.is_match(&result.stdout_str()));
++    //locale
++    let result = scene.ucmd().arg("-l").arg("--time-style=locale").succeeds();
++    assert!(re_locale.is_match(&result.stdout_str()));
++
++    //Overwrite options tests
++    let result = scene
++        .ucmd()
++        .arg("-l")
++        .arg("--time-style=long-iso")
++        .arg("--time-style=iso")
++        .succeeds();
++    assert!(re_iso.is_match(&result.stdout_str()));
++    let result = scene
++        .ucmd()
++        .arg("--time-style=iso")
++        .arg("--full-time")
++        .succeeds();
++    assert!(re_full.is_match(&result.stdout_str()));
++    let result = scene
++        .ucmd()
++        .arg("--full-time")
++        .arg("--time-style=iso")
++        .succeeds();
++    assert!(re_iso.is_match(&result.stdout_str()));
++
++    let result = scene
++        .ucmd()
++        .arg("--full-time")
++        .arg("--time-style=iso")
++        .arg("--full-time")
++        .succeeds();
++    assert!(re_full.is_match(&result.stdout_str()));
++
++    let result = scene
++        .ucmd()
++        .arg("--full-time")
++        .arg("-x")
++        .arg("-l")
++        .succeeds();
++    assert!(re_full.is_match(&result.stdout_str()));
++
++    at.touch("test2");
++    let result = scene.ucmd().arg("--full-time").arg("-x").succeeds();
++    #[cfg(not(windows))]
++    assert_eq!(result.stdout_str(), "test\ntest2\n");
++    #[cfg(windows)]
++    assert_eq!(result.stdout_str(), "test  test2\n");
++}
++
+ #[test]
+ fn test_ls_order_time() {
+     let scene = TestScenario::new(util_name!());

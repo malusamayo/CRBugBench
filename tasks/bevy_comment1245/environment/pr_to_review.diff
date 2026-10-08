@@ -1,0 +1,980 @@
+diff --git a/crates/bevy_text/src/draw.rs b/crates/bevy_text/src/draw.rs
+index e516f4890daff6..0710a3494d3874 100644
+--- a/crates/bevy_text/src/draw.rs
++++ b/crates/bevy_text/src/draw.rs
+@@ -11,7 +11,7 @@ use bevy_render::{
+ use bevy_sprite::TextureAtlasSprite;
+ use glyph_brush_layout::{HorizontalAlign, VerticalAlign};
+ 
+-use crate::PositionedGlyph;
++use crate::{PositionedGlyph, TextSection};
+ 
+ #[derive(Debug, Clone, Copy)]
+ pub struct TextAlignment {
+@@ -32,7 +32,6 @@ impl Default for TextAlignment {
+ pub struct TextStyle {
+     pub font_size: f32,
+     pub color: Color,
+-    pub alignment: TextAlignment,
+ }
+ 
+ impl Default for TextStyle {
+@@ -40,7 +39,6 @@ impl Default for TextStyle {
+         Self {
+             color: Color::WHITE,
+             font_size: 12.0,
+-            alignment: TextAlignment::default(),
+         }
+     }
+ }
+@@ -49,7 +47,7 @@ pub struct DrawableText<'a> {
+     pub render_resource_bindings: &'a mut RenderResourceBindings,
+     pub position: Vec3,
+     pub scale_factor: f32,
+-    pub style: &'a TextStyle,
++    pub sections: &'a [TextSection],
+     pub text_glyphs: &'a Vec<PositionedGlyph>,
+     pub msaa: &'a Msaa,
+     pub font_quad_vertex_descriptor: &'a VertexBufferDescriptor,
+@@ -103,7 +101,7 @@ impl<'a> Drawable for DrawableText<'a> {
+ 
+             let sprite = TextureAtlasSprite {
+                 index: tv.atlas_info.glyph_index,
+-                color: self.style.color,
++                color: self.sections[tv.section_index].style.color,
+             };
+ 
+             // To get the rendering right for non-one scaling factors, we need
+diff --git a/crates/bevy_text/src/glyph_brush.rs b/crates/bevy_text/src/glyph_brush.rs
+index d225bf9aa5d8d3..0199ad6d810c53 100644
+--- a/crates/bevy_text/src/glyph_brush.rs
++++ b/crates/bevy_text/src/glyph_brush.rs
+@@ -4,7 +4,7 @@ use bevy_math::{Size, Vec2};
+ use bevy_render::prelude::Texture;
+ use bevy_sprite::TextureAtlas;
+ use glyph_brush_layout::{
+-    FontId, GlyphPositioner, Layout, SectionGeometry, SectionGlyph, ToSectionText,
++    FontId, GlyphPositioner, Layout, SectionGeometry, SectionGlyph, SectionText, ToSectionText,
+ };
+ 
+ use crate::{error::TextError, Font, FontAtlasSet, GlyphAtlasInfo, TextAlignment};
+@@ -46,6 +46,7 @@ impl GlyphBrush {
+     pub fn process_glyphs(
+         &self,
+         glyphs: Vec<SectionGlyph>,
++        sections: &[SectionText],
+         font_atlas_set_storage: &mut Assets<FontAtlasSet>,
+         fonts: &Assets<Font>,
+         texture_atlases: &mut Assets<TextureAtlas>,
+@@ -55,16 +56,26 @@ impl GlyphBrush {
+             return Ok(Vec::new());
+         }
+ 
+-        let first_glyph = glyphs.first().expect("Must have at least one glyph.");
+-        let font_id = first_glyph.font_id.0;
+-        let handle = &self.handles[font_id];
+-        let font = fonts.get(handle).ok_or(TextError::NoSuchFont)?;
+-        let font_size = first_glyph.glyph.scale.y;
+-        let scaled_font = ab_glyph::Font::as_scaled(&font.font, font_size);
++        let sections_data = sections
++            .iter()
++            .map(|section| {
++                let handle = &self.handles[section.font_id.0];
++                let font = fonts.get(handle).ok_or(TextError::NoSuchFont)?;
++                let font_size = section.scale.y;
++                Ok((
++                    handle,
++                    font,
++                    font_size,
++                    ab_glyph::Font::as_scaled(&font.font, font_size),
++                ))
++            })
++            .collect::<Result<Vec<_>, _>>()?;
++
+         let mut max_y = std::f32::MIN;
+         let mut min_x = std::f32::MAX;
+-        for section_glyph in glyphs.iter() {
+-            let glyph = &section_glyph.glyph;
++        for sg in glyphs.iter() {
++            let glyph = &sg.glyph;
++            let scaled_font = sections_data[sg.section_index].3;
+             max_y = max_y.max(glyph.position.y - scaled_font.descent());
+             min_x = min_x.min(glyph.position.x);
+         }
+@@ -82,14 +93,15 @@ impl GlyphBrush {
+             let glyph_id = glyph.id;
+             let glyph_position = glyph.position;
+             let adjust = GlyphPlacementAdjuster::new(&mut glyph);
+-            if let Some(outlined_glyph) = font.font.outline_glyph(glyph) {
++            let section_data = sections_data[sg.section_index];
++            if let Some(outlined_glyph) = section_data.1.font.outline_glyph(glyph) {
+                 let bounds = outlined_glyph.px_bounds();
+-                let handle_font_atlas: Handle<FontAtlasSet> = handle.as_weak();
++                let handle_font_atlas: Handle<FontAtlasSet> = section_data.0.as_weak();
+                 let font_atlas_set = font_atlas_set_storage
+                     .get_or_insert_with(handle_font_atlas, FontAtlasSet::default);
+ 
+                 let atlas_info = font_atlas_set
+-                    .get_glyph_atlas_info(font_size, glyph_id, glyph_position)
++                    .get_glyph_atlas_info(section_data.2, glyph_id, glyph_position)
+                     .map(Ok)
+                     .unwrap_or_else(|| {
+                         font_atlas_set.add_glyph_to_atlas(texture_atlases, textures, outlined_glyph)
+@@ -107,6 +119,7 @@ impl GlyphBrush {
+                 positioned_glyphs.push(PositionedGlyph {
+                     position,
+                     atlas_info,
++                    section_index: sg.section_index,
+                 });
+             }
+         }
+@@ -126,6 +139,7 @@ impl GlyphBrush {
+ pub struct PositionedGlyph {
+     pub position: Vec2,
+     pub atlas_info: GlyphAtlasInfo,
++    pub section_index: usize,
+ }
+ 
+ #[cfg(feature = "subpixel_glyph_atlas")]
+diff --git a/crates/bevy_text/src/lib.rs b/crates/bevy_text/src/lib.rs
+index 12043a9b9c09fa..d642e561436837 100644
+--- a/crates/bevy_text/src/lib.rs
++++ b/crates/bevy_text/src/lib.rs
+@@ -21,7 +21,7 @@ pub use text::*;
+ pub use text2d::*;
+ 
+ pub mod prelude {
+-    pub use crate::{Font, Text, Text2dBundle, TextAlignment, TextError, TextStyle};
++    pub use crate::{Font, Text, Text2dBundle, TextAlignment, TextError, TextSection, TextStyle};
+     pub use glyph_brush_layout::{HorizontalAlign, VerticalAlign};
+ }
+ 
+diff --git a/crates/bevy_text/src/pipeline.rs b/crates/bevy_text/src/pipeline.rs
+index 5fb980ab0c0124..575a08935f9833 100644
+--- a/crates/bevy_text/src/pipeline.rs
++++ b/crates/bevy_text/src/pipeline.rs
+@@ -10,7 +10,8 @@ use bevy_utils::HashMap;
+ use glyph_brush_layout::{FontId, SectionText};
+ 
+ use crate::{
+-    error::TextError, glyph_brush::GlyphBrush, Font, FontAtlasSet, PositionedGlyph, TextAlignment,
++    error::TextError, glyph_brush::GlyphBrush, scale_value, Font, FontAtlasSet, PositionedGlyph,
++    TextAlignment, TextSection,
+ };
+ 
+ pub struct TextPipeline<ID> {
+@@ -35,7 +36,7 @@ pub struct TextLayoutInfo {
+ }
+ 
+ impl<ID: Hash + Eq> TextPipeline<ID> {
+-    pub fn get_or_insert_font_id(&mut self, handle: Handle<Font>, font: &Font) -> FontId {
++    pub fn get_or_insert_font_id(&mut self, handle: &Handle<Font>, font: &Font) -> FontId {
+         let brush = &mut self.brush;
+         *self
+             .map_font_id
+@@ -51,30 +52,38 @@ impl<ID: Hash + Eq> TextPipeline<ID> {
+     pub fn queue_text(
+         &mut self,
+         id: ID,
+-        font_handle: Handle<Font>,
+         fonts: &Assets<Font>,
+-        text: &str,
+-        font_size: f32,
++        sections: &[TextSection],
++        scale_factor: f64,
+         text_alignment: TextAlignment,
+         bounds: Size,
+         font_atlas_set_storage: &mut Assets<FontAtlasSet>,
+         texture_atlases: &mut Assets<TextureAtlas>,
+         textures: &mut Assets<Texture>,
+     ) -> Result<(), TextError> {
+-        let font = fonts.get(font_handle.id).ok_or(TextError::NoSuchFont)?;
+-        let font_id = self.get_or_insert_font_id(font_handle, font);
+-
+-        let section = SectionText {
+-            font_id,
+-            scale: PxScale::from(font_size),
+-            text,
+-        };
+-
+-        let scaled_font = ab_glyph::Font::as_scaled(&font.font, font_size);
++        let mut scaled_fonts = Vec::new();
++        let sections = sections
++            .iter()
++            .map(|section| {
++                let font = fonts.get(section.font.id).ok_or(TextError::NoSuchFont)?;
++                let font_id = self.get_or_insert_font_id(&section.font, font);
++                let font_size = scale_value(section.style.font_size, scale_factor);
++
++                scaled_fonts.push(ab_glyph::Font::as_scaled(&font.font, font_size));
++
++                let section = SectionText {
++                    font_id,
++                    scale: PxScale::from(section.style.font_size),
++                    text: &section.value,
++                };
++
++                Ok(section)
++            })
++            .collect::<Result<Vec<_>, _>>()?;
+ 
+         let section_glyphs = self
+             .brush
+-            .compute_glyphs(&[section], bounds, text_alignment)?;
++            .compute_glyphs(&sections, bounds, text_alignment)?;
+ 
+         if section_glyphs.is_empty() {
+             self.glyph_map.insert(
+@@ -92,8 +101,9 @@ impl<ID: Hash + Eq> TextPipeline<ID> {
+         let mut max_x: f32 = std::f32::MIN;
+         let mut max_y: f32 = std::f32::MIN;
+ 
+-        for section_glyph in section_glyphs.iter() {
+-            let glyph = &section_glyph.glyph;
++        for sg in section_glyphs.iter() {
++            let scaled_font = scaled_fonts[sg.section_index];
++            let glyph = &sg.glyph;
+             min_x = min_x.min(glyph.position.x);
+             min_y = min_y.min(glyph.position.y - scaled_font.ascent());
+             max_x = max_x.max(glyph.position.x + scaled_font.h_advance(glyph.id));
+@@ -104,6 +114,7 @@ impl<ID: Hash + Eq> TextPipeline<ID> {
+ 
+         let glyphs = self.brush.process_glyphs(
+             section_glyphs,
++            &sections,
+             font_atlas_set_storage,
+             fonts,
+             texture_atlases,
+diff --git a/crates/bevy_text/src/text.rs b/crates/bevy_text/src/text.rs
+index 1469aa6b50c64f..825a702543e1e2 100644
+--- a/crates/bevy_text/src/text.rs
++++ b/crates/bevy_text/src/text.rs
+@@ -1,10 +1,16 @@
+ use bevy_asset::Handle;
+ use bevy_math::Size;
+ 
+-use crate::{Font, TextStyle};
++use crate::{Font, TextAlignment, TextStyle};
+ 
+ #[derive(Debug, Default, Clone)]
+ pub struct Text {
++    pub sections: Vec<TextSection>,
++    pub alignment: TextAlignment,
++}
++
++#[derive(Debug, Default, Clone)]
++pub struct TextSection {
+     pub value: String,
+     pub font: Handle<Font>,
+     pub style: TextStyle,
+diff --git a/crates/bevy_text/src/text2d.rs b/crates/bevy_text/src/text2d.rs
+index e1279f0cf07b6a..ad5bbebda4294a 100644
+--- a/crates/bevy_text/src/text2d.rs
++++ b/crates/bevy_text/src/text2d.rs
+@@ -90,12 +90,12 @@ pub fn draw_text2d_system(
+ 
+         if let Some(text_glyphs) = text_pipeline.get_glyphs(&entity) {
+             let position = global_transform.translation
+-                + match text.style.alignment.vertical {
++                + match text.alignment.vertical {
+                     VerticalAlign::Top => Vec3::zero(),
+                     VerticalAlign::Center => Vec3::new(0.0, -height * 0.5, 0.0),
+                     VerticalAlign::Bottom => Vec3::new(0.0, -height, 0.0),
+                 }
+-                + match text.style.alignment.horizontal {
++                + match text.alignment.horizontal {
+                     HorizontalAlign::Left => Vec3::new(-width, 0.0, 0.0),
+                     HorizontalAlign::Center => Vec3::new(-width * 0.5, 0.0, 0.0),
+                     HorizontalAlign::Right => Vec3::zero(),
+@@ -108,7 +108,7 @@ pub fn draw_text2d_system(
+                 text_glyphs: &text_glyphs.glyphs,
+                 font_quad_vertex_descriptor: &vertex_buffer_descriptor,
+                 scale_factor,
+-                style: &text.style,
++                sections: &text.sections,
+             };
+ 
+             drawable_text.draw(&mut draw, &mut context).unwrap();
+@@ -158,11 +158,10 @@ pub fn text2d_system(
+         if let Ok((text, mut calculated_size)) = query.get_mut(entity) {
+             match text_pipeline.queue_text(
+                 entity,
+-                text.font.clone(),
+                 &fonts,
+-                &text.value,
+-                scale_value(text.style.font_size, scale_factor),
+-                text.style.alignment,
++                &text.sections,
++                scale_factor,
++                text.alignment,
+                 Size::new(f32::MAX, f32::MAX),
+                 &mut *font_atlas_set_storage,
+                 &mut *texture_atlases,
+@@ -191,6 +190,6 @@ pub fn text2d_system(
+     queued_text.entities = new_queue;
+ }
+ 
+-fn scale_value(value: f32, factor: f64) -> f32 {
++pub fn scale_value(value: f32, factor: f64) -> f32 {
+     (value as f64 * factor) as f32
+ }
+diff --git a/crates/bevy_ui/src/widget/text.rs b/crates/bevy_ui/src/widget/text.rs
+index cf9cb2a52d9b2a..c1f2ab0f438d48 100644
+--- a/crates/bevy_ui/src/widget/text.rs
++++ b/crates/bevy_ui/src/widget/text.rs
+@@ -93,11 +93,10 @@ pub fn text_system(
+ 
+             match text_pipeline.queue_text(
+                 entity,
+-                text.font.clone(),
+                 &fonts,
+-                &text.value,
+-                scale_value(text.style.font_size, scale_factor),
+-                text.style.alignment,
++                &text.sections,
++                scale_factor,
++                text.alignment,
+                 node_size,
+                 &mut *font_atlas_set_storage,
+                 &mut *texture_atlases,
+@@ -160,7 +159,7 @@ pub fn draw_text_system(
+                 msaa: &msaa,
+                 text_glyphs: &text_glyphs.glyphs,
+                 font_quad_vertex_descriptor: &vertex_buffer_descriptor,
+-                style: &text.style,
++                sections: &text.sections,
+             };
+ 
+             drawable_text.draw(&mut draw, &mut context).unwrap();
+diff --git a/examples/2d/contributors.rs b/examples/2d/contributors.rs
+index a38ab5dca2243a..b7ab3a77f1f877 100644
+--- a/examples/2d/contributors.rs
++++ b/examples/2d/contributors.rs
+@@ -41,7 +41,7 @@ const GRAVITY: f32 = -9.821 * 100.0;
+ const SPRITE_SIZE: f32 = 75.0;
+ 
+ const COL_DESELECTED: Color = Color::rgb_linear(0.03, 0.03, 0.03);
+-const COL_SELECTED: Color = Color::rgb_linear(5.0, 5.0, 5.0);
++const COL_SELECTED: Color = Color::WHITE;
+ 
+ const SHOWCASE_TIMER_SECS: f32 = 3.0;
+ 
+@@ -113,13 +113,25 @@ fn setup(
+                 ..Default::default()
+             },
+             text: Text {
+-                value: "Contributor showcase".to_string(),
+-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+-                style: TextStyle {
+-                    font_size: 60.0,
+-                    color: Color::WHITE,
+-                    ..Default::default()
+-                },
++                sections: vec![
++                    TextSection {
++                        value: "Contributor showcase".to_string(),
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        style: TextStyle {
++                            font_size: 60.0,
++                            color: Color::WHITE,
++                        },
++                    },
++                    TextSection {
++                        value: "".to_string(),
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        style: TextStyle {
++                            font_size: 60.0,
++                            color: Color::WHITE,
++                        },
++                    },
++                ],
++                ..Default::default()
+             },
+             ..Default::default()
+         });
+@@ -195,7 +207,9 @@ fn select(
+ 
+     trans.translation.z = 100.0;
+ 
+-    text.value = format!("Contributor: {}", name);
++    text.sections[0].value = "Contributor: ".to_string();
++    text.sections[1].value = name.to_string();
++    text.sections[1].style.color = mat.color;
+ 
+     Some(())
+ }
+@@ -312,9 +326,8 @@ fn contributors() -> Contributors {
+ /// Because there is no `Mul<Color> for Color` instead `[f32; 3]` is
+ /// used.
+ fn gen_color(rng: &mut impl Rng) -> [f32; 3] {
+-    let r = rng.gen_range(0.2, 1.0);
+-    let g = rng.gen_range(0.2, 1.0);
+-    let b = rng.gen_range(0.2, 1.0);
+-    let v = Vec3::new(r, g, b);
+-    v.normalize().into()
++    let r = rng.gen_range(0.3, 1.0);
++    let g = rng.gen_range(0.3, 1.0);
++    let b = rng.gen_range(0.3, 1.0);
++    [r, g, b]
+ }
+diff --git a/examples/2d/text2d.rs b/examples/2d/text2d.rs
+index 33bd0d16c65110..e814cee3442a6e 100644
+--- a/examples/2d/text2d.rs
++++ b/examples/2d/text2d.rs
+@@ -14,15 +14,17 @@ fn setup(commands: &mut Commands, asset_server: Res<AssetServer>) {
+         .spawn(Camera2dBundle::default())
+         .spawn(Text2dBundle {
+             text: Text {
+-                value: "This text is in the 2D scene.".to_string(),
+-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+-                style: TextStyle {
+-                    font_size: 60.0,
+-                    color: Color::WHITE,
+-                    alignment: TextAlignment {
+-                        vertical: VerticalAlign::Center,
+-                        horizontal: HorizontalAlign::Center,
++                sections: vec![TextSection {
++                    value: "This text is in the 2D scene.".to_string(),
++                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                    style: TextStyle {
++                        font_size: 60.0,
++                        color: Color::WHITE,
+                     },
++                }],
++                alignment: TextAlignment {
++                    vertical: VerticalAlign::Center,
++                    horizontal: HorizontalAlign::Center,
+                 },
+             },
+             ..Default::default()
+diff --git a/examples/ecs/state.rs b/examples/ecs/state.rs
+index 5d7c31d779eb05..28302bb2534cdd 100644
+--- a/examples/ecs/state.rs
++++ b/examples/ecs/state.rs
+@@ -53,13 +53,15 @@ fn setup_menu(
+         .with_children(|parent| {
+             parent.spawn(TextBundle {
+                 text: Text {
+-                    value: "Play".to_string(),
+-                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+-                    style: TextStyle {
+-                        font_size: 40.0,
+-                        color: Color::rgb(0.9, 0.9, 0.9),
+-                        ..Default::default()
+-                    },
++                    sections: vec![TextSection {
++                        value: "Play".to_string(),
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        style: TextStyle {
++                            font_size: 40.0,
++                            color: Color::rgb(0.9, 0.9, 0.9),
++                        },
++                    }],
++                    ..Default::default()
+                 },
+                 ..Default::default()
+             });
+diff --git a/examples/game/breakout.rs b/examples/game/breakout.rs
+index 3d52641803c566..104bef11d41a69 100644
+--- a/examples/game/breakout.rs
++++ b/examples/game/breakout.rs
+@@ -68,13 +68,25 @@ fn setup(
+         // scoreboard
+         .spawn(TextBundle {
+             text: Text {
+-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+-                value: "Score:".to_string(),
+-                style: TextStyle {
+-                    color: Color::rgb(0.5, 0.5, 1.0),
+-                    font_size: 40.0,
+-                    ..Default::default()
+-                },
++                sections: vec![
++                    TextSection {
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        value: "Score: ".to_string(),
++                        style: TextStyle {
++                            color: Color::rgb(0.5, 0.5, 1.0),
++                            font_size: 40.0,
++                        },
++                    },
++                    TextSection {
++                        font: asset_server.load("fonts/FiraMono-Medium.ttf"),
++                        value: "".to_string(),
++                        style: TextStyle {
++                            color: Color::rgb(0.9, 0.3, 1.0),
++                            font_size: 60.0,
++                        },
++                    },
++                ],
++                ..Default::default()
+             },
+             style: Style {
+                 position_type: PositionType::Absolute,
+@@ -191,7 +203,7 @@ fn ball_movement_system(time: Res<Time>, mut ball_query: Query<(&Ball, &mut Tran
+ 
+ fn scoreboard_system(scoreboard: Res<Scoreboard>, mut query: Query<&mut Text>) {
+     for mut text in query.iter_mut() {
+-        text.value = format!("Score: {}", scoreboard.score);
++        text.sections[1].value = scoreboard.score.to_string();
+     }
+ }
+ 
+diff --git a/examples/scene/scene.rs b/examples/scene/scene.rs
+index b44282871ad262..75bdf7d8866b58 100644
+--- a/examples/scene/scene.rs
++++ b/examples/scene/scene.rs
+@@ -103,13 +103,15 @@ fn infotext_system(commands: &mut Commands, asset_server: Res<AssetServer>) {
+             ..Default::default()
+         },
+         text: Text {
+-            value: "Nothing to see in this window! Check the console output!".to_string(),
+-            font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+-            style: TextStyle {
+-                font_size: 50.0,
+-                color: Color::WHITE,
+-                ..Default::default()
+-            },
++            sections: vec![TextSection {
++                value: "Nothing to see in this window! Check the console output!".to_string(),
++                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                style: TextStyle {
++                    font_size: 50.0,
++                    color: Color::WHITE,
++                },
++            }],
++            ..Default::default()
+         },
+         ..Default::default()
+     });
+diff --git a/examples/tools/bevymark.rs b/examples/tools/bevymark.rs
+index a2983947b9d508..3b092bace739de 100644
+--- a/examples/tools/bevymark.rs
++++ b/examples/tools/bevymark.rs
+@@ -54,13 +54,41 @@ fn setup(commands: &mut Commands, asset_server: Res<AssetServer>) {
+         .spawn(CameraUiBundle::default())
+         .spawn(TextBundle {
+             text: Text {
+-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+-                value: "Bird Count:".to_string(),
+-                style: TextStyle {
+-                    color: Color::rgb(0.0, 1.0, 0.0),
+-                    font_size: 40.0,
+-                    ..Default::default()
+-                },
++                sections: vec![
++                    TextSection {
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        value: "Bird Count: ".to_string(),
++                        style: TextStyle {
++                            color: Color::rgb(0.0, 1.0, 0.0),
++                            font_size: 40.0,
++                        },
++                    },
++                    TextSection {
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        value: "".to_string(),
++                        style: TextStyle {
++                            color: Color::rgb(0.0, 1.0, 1.0),
++                            font_size: 40.0,
++                        },
++                    },
++                    TextSection {
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        value: "\nAverage FPS: ".to_string(),
++                        style: TextStyle {
++                            color: Color::rgb(0.0, 1.0, 0.0),
++                            font_size: 40.0,
++                        },
++                    },
++                    TextSection {
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        value: "".to_string(),
++                        style: TextStyle {
++                            color: Color::rgb(0.0, 1.0, 1.0),
++                            font_size: 40.0,
++                        },
++                    },
++                ],
++                ..Default::default()
+             },
+             style: Style {
+                 position_type: PositionType::Absolute,
+@@ -150,7 +178,8 @@ fn counter_system(
+     if let Some(fps) = diagnostics.get(FrameTimeDiagnosticsPlugin::FPS) {
+         if let Some(average) = fps.average() {
+             for mut text in query.iter_mut() {
+-                text.value = format!("Bird Count: {}\nAverage FPS: {:.2}", counter.count, average);
++                text.sections[1].value = format!("{}", counter.count);
++                text.sections[3].value = format!("{:.2}", average);
+             }
+         }
+     };
+diff --git a/examples/ui/button.rs b/examples/ui/button.rs
+index d67762853957b9..198117ca4e3508 100644
+--- a/examples/ui/button.rs
++++ b/examples/ui/button.rs
+@@ -39,15 +39,15 @@ fn button_system(
+         let mut text = text_query.get_mut(children[0]).unwrap();
+         match *interaction {
+             Interaction::Clicked => {
+-                text.value = "Press".to_string();
++                text.sections[0].value = "Press".to_string();
+                 *material = button_materials.pressed.clone();
+             }
+             Interaction::Hovered => {
+-                text.value = "Hover".to_string();
++                text.sections[0].value = "Hover".to_string();
+                 *material = button_materials.hovered.clone();
+             }
+             Interaction::None => {
+-                text.value = "Button".to_string();
++                text.sections[0].value = "Button".to_string();
+                 *material = button_materials.normal.clone();
+             }
+         }
+@@ -79,13 +79,15 @@ fn setup(
+         .with_children(|parent| {
+             parent.spawn(TextBundle {
+                 text: Text {
+-                    value: "Button".to_string(),
+-                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+-                    style: TextStyle {
+-                        font_size: 40.0,
+-                        color: Color::rgb(0.9, 0.9, 0.9),
+-                        ..Default::default()
+-                    },
++                    sections: vec![TextSection {
++                        value: "Button".to_string(),
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        style: TextStyle {
++                            font_size: 40.0,
++                            color: Color::rgb(0.9, 0.9, 0.9),
++                        },
++                    }],
++                    ..Default::default()
+                 },
+                 ..Default::default()
+             });
+diff --git a/examples/ui/font_atlas_debug.rs b/examples/ui/font_atlas_debug.rs
+index 92be9e7a7e4085..d3a480927eacbd 100644
+--- a/examples/ui/font_atlas_debug.rs
++++ b/examples/ui/font_atlas_debug.rs
+@@ -1,5 +1,6 @@
+ use bevy::{prelude::*, text::FontAtlasSet};
+ 
++// TODO: This is now broken.
+ /// This example illustrates how FontAtlases are populated. Bevy uses FontAtlases under the hood to optimize text rendering.
+ fn main() {
+     App::build()
+@@ -34,12 +35,14 @@ fn atlas_render_system(
+     font_atlas_sets: Res<Assets<FontAtlasSet>>,
+     texture_atlases: Res<Assets<TextureAtlas>>,
+ ) {
++    let count = font_atlas_sets.iter().count();
+     if let Some(set) = font_atlas_sets.get(&state.handle.as_weak::<FontAtlasSet>()) {
+         if let Some((_size, font_atlas)) = set.iter().next() {
+             let x_offset = state.atlas_count as f32;
+             if state.atlas_count == font_atlas.len() as u32 {
+                 return;
+             }
++            dbg!(count);
+             let texture_atlas = texture_atlases
+                 .get(&font_atlas[state.atlas_count as usize].texture_atlas)
+                 .unwrap();
+@@ -65,8 +68,8 @@ fn text_update_system(mut state: ResMut<State>, time: Res<Time>, mut query: Quer
+     if state.timer.tick(time.delta_seconds()).finished() {
+         for mut text in query.iter_mut() {
+             let c = rand::random::<u8>() as char;
+-            if !text.value.contains(c) {
+-                text.value = format!("{}{}", text.value, c);
++            if !text.sections[0].value.contains(c) {
++                text.sections[0].value.push(c);
+             }
+         }
+ 
+@@ -79,13 +82,15 @@ fn setup(commands: &mut Commands, asset_server: Res<AssetServer>, mut state: Res
+     state.handle = font_handle.clone();
+     commands.spawn(CameraUiBundle::default()).spawn(TextBundle {
+         text: Text {
+-            value: "a".to_string(),
+-            font: font_handle,
+-            style: TextStyle {
+-                font_size: 60.0,
+-                color: Color::WHITE,
+-                ..Default::default()
+-            },
++            sections: vec![TextSection {
++                value: "a".to_string(),
++                font: font_handle,
++                style: TextStyle {
++                    font_size: 60.0,
++                    color: Color::MIDNIGHT_BLUE,
++                },
++            }],
++            ..Default::default()
+         },
+         ..Default::default()
+     });
+diff --git a/examples/ui/text.rs b/examples/ui/text.rs
+index 86e8007d201f03..4677c00e4efa68 100644
+--- a/examples/ui/text.rs
++++ b/examples/ui/text.rs
+@@ -21,7 +21,7 @@ fn text_update_system(diagnostics: Res<Diagnostics>, mut query: Query<&mut Text,
+     for mut text in query.iter_mut() {
+         if let Some(fps) = diagnostics.get(FrameTimeDiagnosticsPlugin::FPS) {
+             if let Some(average) = fps.average() {
+-                text.value = format!("FPS: {:.2}", average);
++                text.sections[1].value = format!("{:.2}", average);
+             }
+         }
+     }
+@@ -38,13 +38,25 @@ fn setup(commands: &mut Commands, asset_server: Res<AssetServer>) {
+                 ..Default::default()
+             },
+             text: Text {
+-                value: "FPS:".to_string(),
+-                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+-                style: TextStyle {
+-                    font_size: 60.0,
+-                    color: Color::WHITE,
+-                    ..Default::default()
+-                },
++                sections: vec![
++                    TextSection {
++                        value: "FPS: ".to_string(),
++                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                        style: TextStyle {
++                            font_size: 60.0,
++                            color: Color::WHITE,
++                        },
++                    },
++                    TextSection {
++                        value: "".to_string(),
++                        font: asset_server.load("fonts/FiraMono-Medium.ttf"),
++                        style: TextStyle {
++                            font_size: 60.0,
++                            color: Color::RED,
++                        },
++                    },
++                ],
++                ..Default::default()
+             },
+             ..Default::default()
+         })
+diff --git a/examples/ui/text_debug.rs b/examples/ui/text_debug.rs
+index b89c7b724a87cb..1c8dc0be17f7d2 100644
+--- a/examples/ui/text_debug.rs
++++ b/examples/ui/text_debug.rs
+@@ -34,13 +34,15 @@ fn infotext_system(commands: &mut Commands, asset_server: Res<AssetServer>) {
+             ..Default::default()
+         },
+         text: Text {
+-            value: "This is\ntext with\nline breaks\nin the top left".to_string(),
+-            font: font.clone(),
+-            style: TextStyle {
+-                font_size: 50.0,
+-                color: Color::WHITE,
+-                alignment: TextAlignment::default(),
+-            },
++            sections: vec![TextSection {
++                value: "This is\ntext with\nline breaks\nin the top left".to_string(),
++                font: font.clone(),
++                style: TextStyle {
++                    font_size: 50.0,
++                    color: Color::WHITE,
++                },
++            }],
++            alignment: TextAlignment::default(),
+         },
+         ..Default::default()
+     });
+@@ -60,16 +62,19 @@ fn infotext_system(commands: &mut Commands, asset_server: Res<AssetServer>) {
+             ..Default::default()
+         },
+         text: Text {
+-            value: "This is very long text with limited width in the top right and is also pink"
+-                .to_string(),
+-            font: font.clone(),
+-            style: TextStyle {
+-                font_size: 50.0,
+-                color: Color::rgb(0.8, 0.2, 0.7),
+-                alignment: TextAlignment {
+-                    horizontal: HorizontalAlign::Center,
+-                    vertical: VerticalAlign::Center,
++            sections: vec![TextSection {
++                value:
++                    "This text is very long, has a limited width, is centred, is positioned in the top right and is also coloured pink."
++                        .to_string(),
++                font: font.clone(),
++                style: TextStyle {
++                    font_size: 50.0,
++                    color: Color::rgb(0.8, 0.2, 0.7),
+                 },
++            }],
++            alignment: TextAlignment {
++                horizontal: HorizontalAlign::Center,
++                vertical: VerticalAlign::Center,
+             },
+         },
+         ..Default::default()
+@@ -87,13 +92,57 @@ fn infotext_system(commands: &mut Commands, asset_server: Res<AssetServer>) {
+                 ..Default::default()
+             },
+             text: Text {
+-                value: "This text changes in the bottom right".to_string(),
+-                font: font.clone(),
+-                style: TextStyle {
+-                    font_size: 30.0,
+-                    color: Color::WHITE,
+-                    alignment: TextAlignment::default(),
+-                },
++                sections: vec![
++                    TextSection {
++                        value: "This text changes in the bottom right".to_string(),
++                        font: font.clone(),
++                        style: TextStyle {
++                            font_size: 30.0,
++                            color: Color::WHITE,
++                        },
++                    },
++                    TextSection {
++                        value: "\nThis text changes in the bottom right - ".to_string(),
++                        font: font.clone(),
++                        style: TextStyle {
++                            font_size: 30.0,
++                            color: Color::RED,
++                        },
++                    },
++                    TextSection {
++                        value: "".to_string(),
++                        font: font.clone(),
++                        style: TextStyle {
++                            font_size: 30.0,
++                            color: Color::ORANGE_RED,
++                        },
++                    },
++                    TextSection {
++                        value: " fps, ".to_string(),
++                        font: font.clone(),
++                        style: TextStyle {
++                            font_size: 30.0,
++                            color: Color::YELLOW,
++                        },
++                    },
++                    TextSection {
++                        value: "".to_string(),
++                        font: font.clone(),
++                        style: TextStyle {
++                            font_size: 30.0,
++                            color: Color::GREEN,
++                        },
++                    },
++                    TextSection {
++                        value: " ms/frame".to_string(),
++                        font: font.clone(),
++                        style: TextStyle {
++                            font_size: 30.0,
++                            color: Color::BLUE,
++                        },
++                    },
++                ],
++                alignment: TextAlignment::default(),
+             },
+             ..Default::default()
+         })
+@@ -114,14 +163,16 @@ fn infotext_system(commands: &mut Commands, asset_server: Res<AssetServer>) {
+             ..Default::default()
+         },
+         text: Text {
+-            value: "This\ntext has\nline breaks and also a set width in the bottom left"
+-                .to_string(),
+-            font,
+-            style: TextStyle {
+-                font_size: 50.0,
+-                color: Color::WHITE,
+-                alignment: TextAlignment::default(),
+-            },
++            sections: vec![TextSection {
++                value: "This\ntext has\nline breaks and also a set width in the bottom left"
++                    .to_string(),
++                font,
++                style: TextStyle {
++                    font_size: 50.0,
++                    color: Color::WHITE,
++                },
++            }],
++            alignment: TextAlignment::default(),
+         },
+         ..Default::default()
+     });
+@@ -148,10 +199,14 @@ fn change_text_system(
+             }
+         }
+ 
+-        text.value = format!(
++        text.sections[0].value = format!(
+             "This text changes in the bottom right - {:.1} fps, {:.3} ms/frame",
+             fps,
+             frame_time * 1000.0,
+         );
++
++        text.sections[2].value = format!("{:.1}", fps,);
++
++        text.sections[4].value = format!("{:.3}", frame_time * 1000.0,);
+     }
+ }
+diff --git a/examples/ui/ui.rs b/examples/ui/ui.rs
+index e7aed775b7ffbe..cd29463d6cf92a 100644
+--- a/examples/ui/ui.rs
++++ b/examples/ui/ui.rs
+@@ -58,13 +58,15 @@ fn setup(
+                                     ..Default::default()
+                                 },
+                                 text: Text {
+-                                    value: "Text Example".to_string(),
+-                                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+-                                    style: TextStyle {
+-                                        font_size: 30.0,
+-                                        color: Color::WHITE,
+-                                        ..Default::default()
+-                                    },
++                                    sections: vec![TextSection {
++                                        value: "Text Example".to_string(),
++                                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                                        style: TextStyle {
++                                            font_size: 30.0,
++                                            color: Color::WHITE,
++                                        },
++                                    }],
++                                    ..Default::default()
+                                 },
+                                 ..Default::default()
+                             });
+diff --git a/examples/window/scale_factor_override.rs b/examples/window/scale_factor_override.rs
+index e095c6d795b8f0..30a74d398f1cf5 100644
+--- a/examples/window/scale_factor_override.rs
++++ b/examples/window/scale_factor_override.rs
+@@ -52,13 +52,15 @@ fn setup(
+                             ..Default::default()
+                         },
+                         text: Text {
+-                            value: "Example text".to_string(),
+-                            font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+-                            style: TextStyle {
+-                                font_size: 30.0,
+-                                color: Color::WHITE,
+-                                ..Default::default()
+-                            },
++                            sections: vec![TextSection {
++                                value: "Example text".to_string(),
++                                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
++                                style: TextStyle {
++                                    font_size: 30.0,
++                                    color: Color::WHITE,
++                                },
++                            }],
++                            ..Default::default()
+                         },
+                         ..Default::default()
+                     });

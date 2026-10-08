@@ -1,0 +1,263 @@
+diff --git a/extensions/wikibase/src/org/openrefine/wikibase/editing/EditBatchProcessor.java b/extensions/wikibase/src/org/openrefine/wikibase/editing/EditBatchProcessor.java
+index 4a227b8a61b4..057cf6035882 100644
+--- a/extensions/wikibase/src/org/openrefine/wikibase/editing/EditBatchProcessor.java
++++ b/extensions/wikibase/src/org/openrefine/wikibase/editing/EditBatchProcessor.java
+@@ -29,6 +29,7 @@
+ import java.util.Collections;
+ import java.util.LinkedList;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.Map;
+ import java.util.OptionalLong;
+ import java.util.Set;
+@@ -39,6 +40,7 @@
+ import org.wikidata.wdtk.datamodel.interfaces.EntityDocument;
+ import org.wikidata.wdtk.datamodel.interfaces.EntityIdValue;
+ import org.wikidata.wdtk.datamodel.interfaces.EntityUpdate;
++import org.wikidata.wdtk.datamodel.interfaces.LabeledDocument;
+ import org.wikidata.wdtk.wikibaseapi.ApiConnection;
+ import org.wikidata.wdtk.wikibaseapi.EditingResult;
+ import org.wikidata.wdtk.wikibaseapi.WikibaseDataEditor;
+@@ -183,14 +185,22 @@ public EditResult performEdit()
+                 // New entities
+                 ReconEntityIdValue newCell = (ReconEntityIdValue) update.getEntityId();
+                 EntityIdValue createdDocId;
++                String label = "";
+                 if (update instanceof MediaInfoEdit) {
+                     MediaFileUtils mediaFileUtils = new MediaFileUtils(connection);
+                     createdDocId = ((MediaInfoEdit) update).uploadNewFile(editor, mediaFileUtils, summary, tags, filePageWaitTime,
+                             filePageMaxWaitTime);
++                    label = "File:".concat(((MediaInfoEdit) update).getFileName());
+                 } else {
+-                    createdDocId = editor.createEntityDocument(update.toNewEntity(), summary, tags).getEntityId();
++                    LabeledDocument labeledDocument = (LabeledDocument) editor.createEntityDocument(update.toNewEntity(), summary, tags);
++                    createdDocId = labeledDocument.getEntityId();
++                    if (labeledDocument != null && labeledDocument.getLabels() != null) {
++                        label = labeledDocument.getLabels().get(Locale.getDefault().getLanguage()) != null
++                                ? labeledDocument.getLabels().get(Locale.getDefault().getLanguage()).getText()
++                                : "";
++                    }
+                 }
+-                library.setId(newCell.getReconInternalId(), createdDocId.getId());
++                library.setId(newCell.getReconInternalId(), createdDocId.getId(), label);
+                 newEntityUrl = createdDocId.getSiteIri() + createdDocId.getId();
+             } else {
+                 // Existing entities
+diff --git a/extensions/wikibase/src/org/openrefine/wikibase/editing/NewEntityLibrary.java b/extensions/wikibase/src/org/openrefine/wikibase/editing/NewEntityLibrary.java
+index 696b1df6ccac..540a8c63ac34 100644
+--- a/extensions/wikibase/src/org/openrefine/wikibase/editing/NewEntityLibrary.java
++++ b/extensions/wikibase/src/org/openrefine/wikibase/editing/NewEntityLibrary.java
+@@ -50,14 +50,14 @@
+  */
+ public class NewEntityLibrary {
+ 
+-    private Map<Long, String> map;
++    private Map<Long, HashMap> map;
+ 
+     public NewEntityLibrary() {
+         map = new HashMap<>();
+     }
+ 
+     @JsonCreator
+-    public NewEntityLibrary(@JsonProperty("qidMap") Map<Long, String> map) {
++    public NewEntityLibrary(@JsonProperty("qidMap") Map<Long, HashMap> map) {
+         this.map = map;
+     }
+ 
+@@ -69,7 +69,17 @@ public NewEntityLibrary(@JsonProperty("qidMap") Map<Long, String> map) {
+      * @return the id (or null if unallocated yet)
+      */
+     public String getId(long id) {
+-        return map.get(id);
++        if (map.get(id) != null) {
++            return map.get(id).get("returnedId").toString();
++        }
++        return null;
++    }
++
++    public String getLabel(long id) {
++        if (map.get(id) != null) {
++            return map.get(id).get("label").toString();
++        }
++        return null;
+     }
+ 
+     /**
+@@ -80,8 +90,12 @@ public String getId(long id) {
+      * @param returnedId
+      *            : the associated id returned by Wikibase
+      */
+-    public void setId(long id, String returnedId) {
+-        map.put(id, returnedId);
++    public void setId(long id, String returnedId, String label) {
++        if (!map.containsKey(id)) {
++            map.put(id, new HashMap<>());
++        }
++        map.get(id).put("label", label);
++        map.get(id).put("returnedId", returnedId);
+     }
+ 
+     /**
+@@ -112,7 +126,8 @@ public void updateReconciledCells(Project project, boolean reset) {
+                 if (Recon.Judgment.New.equals(recon.judgment) && !reset
+                         && map.containsKey(recon.id)) {
+                     recon.judgment = Recon.Judgment.Matched;
+-                    recon.match = new ReconCandidate(map.get(recon.id), cell.value.toString(),
++                    recon.match = new ReconCandidate(map.get(recon.id).get("returnedId").toString(),
++                            map.get(recon.id).get("label").toString(),
+                             new String[0], 100);
+                     recon.addCandidate(recon.match);
+                     changed = true;
+@@ -154,7 +169,7 @@ public void updateReconciledCells(Project project, boolean reset) {
+      * @return the underlying map
+      */
+     @JsonProperty("qidMap")
+-    public Map<Long, String> getIdMap() {
++    public Map<Long, HashMap> getIdMap() {
+         return map;
+     }
+ 
+diff --git a/extensions/wikibase/src/org/openrefine/wikibase/operations/PerformWikibaseEditsOperation.java b/extensions/wikibase/src/org/openrefine/wikibase/operations/PerformWikibaseEditsOperation.java
+index 2bdb3fd831f6..01f30c5685e9 100644
+--- a/extensions/wikibase/src/org/openrefine/wikibase/operations/PerformWikibaseEditsOperation.java
++++ b/extensions/wikibase/src/org/openrefine/wikibase/operations/PerformWikibaseEditsOperation.java
+@@ -287,6 +287,7 @@ protected PerformEditsProcess(Project project, Engine engine, String description
+                 onDone.add(createFacetAction);
+ 
+             }
++
+         }
+ 
+         @Override
+diff --git a/extensions/wikibase/src/org/openrefine/wikibase/updates/MediaInfoEdit.java b/extensions/wikibase/src/org/openrefine/wikibase/updates/MediaInfoEdit.java
+index dede650c5e1d..40dcee8893e7 100644
+--- a/extensions/wikibase/src/org/openrefine/wikibase/updates/MediaInfoEdit.java
++++ b/extensions/wikibase/src/org/openrefine/wikibase/updates/MediaInfoEdit.java
+@@ -314,7 +314,8 @@ protected MediaInfoIdValue uploadSdc(WikibaseDataEditor editor, MediaFileUtils m
+         ReconEntityIdValue reconEntityIdValue = (ReconEntityIdValue) id;
+         MediaInfoIdValue mid = response.getMid(mediaFileUtils.getApiConnection(), reconEntityIdValue.getRecon().identifierSpace);
+         NewEntityLibrary library = new NewEntityLibrary();
+-        library.setId(reconEntityIdValue.getReconInternalId(), mid.getId());
++        String label = this.fileName.startsWith("File:") ? this.fileName : "File:".concat(this.fileName);
++        library.setId(reconEntityIdValue.getReconInternalId(), mid.getId(), label);
+         ReconEntityRewriter rewriter = new ReconEntityRewriter(library, id);
+         try {
+             MediaInfoEdit rewritten = (MediaInfoEdit) rewriter.rewrite(this);
+diff --git a/extensions/wikibase/tests/src/org/openrefine/wikibase/editing/EditBatchProcessorTest.java b/extensions/wikibase/tests/src/org/openrefine/wikibase/editing/EditBatchProcessorTest.java
+index 26d959216446..3e27be36cefe 100644
+--- a/extensions/wikibase/tests/src/org/openrefine/wikibase/editing/EditBatchProcessorTest.java
++++ b/extensions/wikibase/tests/src/org/openrefine/wikibase/editing/EditBatchProcessorTest.java
+@@ -142,7 +142,7 @@ public void testNewItem()
+         assertEquals(100, processor.progress());
+ 
+         NewEntityLibrary expectedLibrary = new NewEntityLibrary();
+-        expectedLibrary.setId(1234L, "Q1234");
++        expectedLibrary.setId(1234L, "Q1234", "better label");
+         assertEquals(expectedLibrary, library);
+     }
+ 
+diff --git a/extensions/wikibase/tests/src/org/openrefine/wikibase/editing/NewEntityLibraryTest.java b/extensions/wikibase/tests/src/org/openrefine/wikibase/editing/NewEntityLibraryTest.java
+index b25f029fe42a..447a64e9660e 100644
+--- a/extensions/wikibase/tests/src/org/openrefine/wikibase/editing/NewEntityLibraryTest.java
++++ b/extensions/wikibase/tests/src/org/openrefine/wikibase/editing/NewEntityLibraryTest.java
+@@ -48,8 +48,8 @@ public class NewEntityLibraryTest extends WikidataRefineTest {
+     @BeforeMethod
+     public void setUp() {
+         library = new NewEntityLibrary();
+-        library.setId(1234L, "Q345");
+-        library.setId(3289L, "Q384");
++        library.setId(1234L, "Q345", "new uni");
++        library.setId(3289L, "Q384", "University of Ljubljana");
+     }
+ 
+     @Test
+@@ -87,7 +87,17 @@ public void testUpdateReconciledCells() {
+     @Test
+     public void testSerialize() {
+         JacksonSerializationTest.canonicalSerialization(NewEntityLibrary.class, library,
+-                "{\"qidMap\":{\"1234\":\"Q345\",\"3289\":\"Q384\"}}");
++                "{  \"qidMap\": {" +
++                        "    \"1234\": {" +
++                        "      \"label\": \"new uni\"," +
++                        "      \"returnedId\": \"Q345\"" +
++                        "    },\n" +
++                        "    \"3289\": {" +
++                        "      \"label\": \"University of Ljubljana\"," +
++                        "      \"returnedId\": \"Q384\"" +
++                        "    }" +
++                        "  }" +
++                        "}");
+     }
+ 
+     private void isMatchedTo(String qid, Cell cell) {
+diff --git a/extensions/wikibase/tests/src/org/openrefine/wikibase/editing/ReconEntityRewriterTest.java b/extensions/wikibase/tests/src/org/openrefine/wikibase/editing/ReconEntityRewriterTest.java
+index cfbaae0d3144..395a3174433e 100644
+--- a/extensions/wikibase/tests/src/org/openrefine/wikibase/editing/ReconEntityRewriterTest.java
++++ b/extensions/wikibase/tests/src/org/openrefine/wikibase/editing/ReconEntityRewriterTest.java
+@@ -60,7 +60,7 @@ public void testNotCreatedYet() {
+     @Test
+     public void testSuccessfulRewrite() {
+         rewriter = new ReconEntityRewriter(library, TestingData.newIdA);
+-        library.setId(4567L, "Q1234");
++        library.setId(4567L, "Q1234", "Q1234");
+         assertEquals(newlyCreated, rewriter.copy(TestingData.newIdB));
+     }
+ 
+@@ -74,7 +74,7 @@ public void testSubjectNotRewritten() {
+     @Test
+     public void testSubjectRewritten() {
+         ItemIdValue subject = TestingData.newIdB;
+-        library.setId(4567L, "Q1234");
++        library.setId(4567L, "Q1234", "Q1234");
+         rewriter = new ReconEntityRewriter(library, subject);
+         assertEquals(newlyCreated, rewriter.copy(subject));
+     }
+@@ -89,7 +89,7 @@ public void testMatched() {
+     public void testRewriteCreate() throws NewEntityNotCreatedYetException {
+         ItemIdValue subject = TestingData.newIdA;
+         rewriter = new ReconEntityRewriter(library, subject);
+-        library.setId(4567L, "Q1234");
++        library.setId(4567L, "Q1234", "label");
+         TermedStatementEntityEdit update = new ItemEditBuilder(subject)
+                 .addStatement(TestingData.generateStatementAddition(subject, TestingData.newIdB))
+                 .addStatement(TestingData.generateStatementDeletion(subject, TestingData.existingId))
+@@ -114,7 +114,7 @@ public void testRewriteCreate() throws NewEntityNotCreatedYetException {
+     public void testRewriteUpdateOnPreviouslyCreatedEntity() throws NewEntityNotCreatedYetException {
+         ItemIdValue subject = TestingData.newIdA;
+         rewriter = new ReconEntityRewriter(library, subject);
+-        library.setId(4567L, "Q1234");
++        library.setId(4567L, "Q1234", "Q1234");
+         TermedStatementEntityEdit update = new ItemEditBuilder(TestingData.newIdB)
+                 .addDescription(Datamodel.makeMonolingualTextValue("beschreibung", "de"), false)
+                 .addAlias(Datamodel.makeMonolingualTextValue("darstellung", "de"))
+@@ -133,7 +133,7 @@ public void testRewriteUpdateOnPreviouslyCreatedEntity() throws NewEntityNotCrea
+     public void testRewriteUpdateOnExistingEntity() throws NewEntityNotCreatedYetException {
+         ItemIdValue subject = TestingData.matchedId;
+         rewriter = new ReconEntityRewriter(library, subject);
+-        library.setId(4567L, "Q1234");
++        library.setId(4567L, "Q1234", "label");
+         TermedStatementEntityEdit update = new ItemEditBuilder(subject)
+                 .addStatement(TestingData.generateStatementAddition(subject, TestingData.newIdB))
+                 .addStatement(TestingData.generateStatementDeletion(subject, TestingData.existingId))
+@@ -158,7 +158,7 @@ public void testRewriteUpdateOnExistingEntity() throws NewEntityNotCreatedYetExc
+     public void testRewritePropertyUpdateOnExistingEntity() throws NewEntityNotCreatedYetException {
+         ItemIdValue subject = TestingData.existingId;
+         rewriter = new ReconEntityRewriter(library, subject);
+-        library.setId(7654L, "P1234");
++        library.setId(7654L, "P1234", "label");
+         TermedStatementEntityEdit update = new ItemEditBuilder(subject)
+                 .addStatement(TestingData.generateStatementAddition(subject, TestingData.newPropertyIdB))
+                 .addStatement(TestingData.generateStatementDeletion(subject, TestingData.existingPropertyId))
+diff --git a/extensions/wikibase/tests/src/org/openrefine/wikibase/operations/PerformWikibaseEditsOperationTest.java b/extensions/wikibase/tests/src/org/openrefine/wikibase/operations/PerformWikibaseEditsOperationTest.java
+index 5f35fd64af0c..522ef7826fe6 100644
+--- a/extensions/wikibase/tests/src/org/openrefine/wikibase/operations/PerformWikibaseEditsOperationTest.java
++++ b/extensions/wikibase/tests/src/org/openrefine/wikibase/operations/PerformWikibaseEditsOperationTest.java
+@@ -77,7 +77,7 @@ public void testGetTagCandidates() {
+     @Test
+     public void testLoadChange()
+             throws Exception {
+-        String changeString = "newItems={\"qidMap\":{\"1234\":\"Q789\"}}\n" + "/ec/\n";
++        String changeString = "newItems={\"qidMap\":{\"1234\":{\"returnedId\":\"Q789\",\"label\":\"Q789\"}}}\n" + "/ec/\n";
+         LineNumberReader reader = makeReader(changeString);
+         Change change = PerformWikibaseEditsOperation.PerformWikibaseEditsChange.load(reader, pool);
+ 

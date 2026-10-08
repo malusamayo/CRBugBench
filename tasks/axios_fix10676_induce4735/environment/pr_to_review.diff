@@ -1,0 +1,344 @@
+commit c008e57fe4ef586290d01beed0b6cb099c2c7a41
+Author: Dmitriy Mozgovoy <robotshara@gmail.com>
+Date:   Wed May 25 09:21:40 2022 +0300
+
+    Added `axios.formToJSON` method; (#4735)
+    
+    * Draft
+    
+    * Added `formDataToJSON` helper;
+    Added `axios.formToJSON` method;
+    Added client tests;
+    
+    Co-authored-by: Jay <jasonsaayman@gmail.com>
+
+diff --git a/index.d.ts b/index.d.ts
+index b98a5c61..b62d0734 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -300,6 +300,12 @@ export interface GenericFormData {
+   append(name: string, value: any, options?: any): any;
+ }
+ 
++export interface GenericHTMLFormElement {
++  name: string;
++  method: string;
++  submit(): void;
++}
++
+ export interface AxiosStatic extends AxiosInstance {
+   create(config?: CreateAxiosDefaults): AxiosInstance;
+   Cancel: CancelStatic;
+@@ -312,6 +318,7 @@ export interface AxiosStatic extends AxiosInstance {
+   spread<T, R>(callback: (...args: T[]) => R): (array: T[]) => R;
+   isAxiosError<T = any, D = any>(payload: any): payload is AxiosError<T, D>;
+   toFormData(sourceObj: object, targetFormData?: GenericFormData, options?: FormSerializerOptions): GenericFormData;
++  formToJSON(form: GenericFormData|GenericHTMLFormElement): object;
+ }
+ 
+ declare const axios: AxiosStatic;
+diff --git a/lib/axios.js b/lib/axios.js
+index cf6583cf..bbbe301b 100644
+--- a/lib/axios.js
++++ b/lib/axios.js
+@@ -5,7 +5,7 @@ var bind = require('./helpers/bind');
+ var Axios = require('./core/Axios');
+ var mergeConfig = require('./core/mergeConfig');
+ var defaults = require('./defaults');
+-
++var formDataToJSON = require('./helpers/formDataToJSON');
+ /**
+  * Create an instance of Axios
+  *
+@@ -58,6 +58,10 @@ axios.spread = require('./helpers/spread');
+ // Expose isAxiosError
+ axios.isAxiosError = require('./helpers/isAxiosError');
+ 
++axios.formToJSON = function(thing) {
++  return formDataToJSON(utils.isHTMLForm(thing) ? new FormData(thing) : thing);
++};
++
+ module.exports = axios;
+ 
+ // Allow use of default import syntax in TypeScript
+diff --git a/lib/core/Axios.js b/lib/core/Axios.js
+index 3a791710..ef7e8101 100644
+--- a/lib/core/Axios.js
++++ b/lib/core/Axios.js
+@@ -25,7 +25,8 @@ function Axios(instanceConfig) {
+ /**
+  * Dispatch a request
+  *
+- * @param {Object} config The config specific for this request (merged with this.defaults)
++ * @param {String|Object} configOrUrl The config specific for this request (merged with this.defaults)
++ * @param {?Object} config
+  */
+ Axios.prototype.request = function request(configOrUrl, config) {
+   /*eslint no-param-reassign:0*/
+diff --git a/lib/defaults/index.js b/lib/defaults/index.js
+index 9f1564af..d7ed0259 100644
+--- a/lib/defaults/index.js
++++ b/lib/defaults/index.js
+@@ -7,6 +7,7 @@ var transitionalDefaults = require('./transitional');
+ var toFormData = require('../helpers/toFormData');
+ var toURLEncodedForm = require('../helpers/toURLEncodedForm');
+ var platform = require('../platform');
++var formDataToJSON = require('../helpers/formDataToJSON');
+ 
+ var DEFAULT_CONTENT_TYPE = {
+   'Content-Type': 'application/x-www-form-urlencoded'
+@@ -55,8 +56,24 @@ var defaults = {
+     normalizeHeaderName(headers, 'Accept');
+     normalizeHeaderName(headers, 'Content-Type');
+ 
+-    if (utils.isFormData(data) ||
+-      utils.isArrayBuffer(data) ||
++    var contentType = headers && headers['Content-Type'] || '';
++    var hasJSONContentType = contentType.indexOf('application/json') > -1;
++    var isObjectPayload = utils.isObject(data);
++
++    if (isObjectPayload && utils.isHTMLForm(data)) {
++      data = new FormData(data);
++    }
++
++    var isFormData = utils.isFormData(data);
++
++    if (isFormData) {
++      if (!hasJSONContentType) {
++        return data;
++      }
++      return hasJSONContentType ? JSON.stringify(formDataToJSON(data)) : data;
++    }
++
++    if (utils.isArrayBuffer(data) ||
+       utils.isBuffer(data) ||
+       utils.isStream(data) ||
+       utils.isFile(data) ||
+@@ -72,8 +89,6 @@ var defaults = {
+       return data.toString();
+     }
+ 
+-    var isObjectPayload = utils.isObject(data);
+-    var contentType = headers && headers['Content-Type'] || '';
+     var isFileList;
+ 
+     if (isObjectPayload) {
+@@ -81,7 +96,7 @@ var defaults = {
+         return toURLEncodedForm(data, this.formSerializer).toString();
+       }
+ 
+-      if ((isFileList = utils.isFileList(data)) || contentType.indexOf('multipart/form-data') !== -1) {
++      if ((isFileList = utils.isFileList(data)) || contentType.indexOf('multipart/form-data') > -1) {
+         var _FormData = this.env && this.env.FormData;
+ 
+         return toFormData(
+@@ -92,7 +107,7 @@ var defaults = {
+       }
+     }
+ 
+-    if (isObjectPayload || contentType.indexOf('application/json') !== -1) {
++    if (isObjectPayload || hasJSONContentType ) {
+       setContentTypeIfUnset(headers, 'application/json');
+       return stringifySafely(data);
+     }
+diff --git a/lib/helpers/formDataToJSON.js b/lib/helpers/formDataToJSON.js
+new file mode 100644
+index 00000000..45a10364
+--- /dev/null
++++ b/lib/helpers/formDataToJSON.js
+@@ -0,0 +1,71 @@
++'use strict';
++
++var utils = require('../utils');
++
++function parsePropPath(name) {
++  // foo[x][y][z]
++  // foo.x.y.z
++  // foo-x-y-z
++  // foo x y z
++  return utils.matchAll(/\w+|\[(\w*)]/g, name).map(function(match) {
++    return match[0] === '[]' ? '' : match[1] || match[0];
++  });
++}
++
++function arrayToObject(arr) {
++  var obj = {};
++  var keys = Object.keys(arr);
++  var i;
++  var len = keys.length;
++  var key;
++  for (i = 0; i < len; i++) {
++    key = keys[i];
++    obj[key] = arr[key];
++  }
++  return obj;
++}
++
++function formDataToJSON(formData) {
++  function buildPath(path, value, target, index) {
++    var name = path[index++];
++    var isNumericKey = Number.isFinite(+name);
++    var isLast = index >= path.length;
++    name = !name && utils.isArray(target) ? target.length : name;
++
++    if (isLast) {
++      if (utils.hasOwnProperty(target, name)) {
++        target[name] = [target[name], value];
++      } else {
++        target[name] = value;
++      }
++
++      return !isNumericKey;
++    }
++
++    if (!target[name] || !utils.isObject(target[name])) {
++      target[name] = [];
++    }
++
++    var result = buildPath(path, value, target[name], index);
++
++    if (result && utils.isArray(target[name])) {
++      target[name] = arrayToObject(target[name]);
++    }
++
++    return !isNumericKey;
++  }
++
++  if (utils.isFormData(formData) && utils.isFunction(formData.entries)) {
++    var obj = {};
++
++    utils.forEachEntry(formData, function(name, value) {
++      buildPath(parsePropPath(name), value, obj, 0);
++    });
++
++    return obj;
++  }
++
++  return null;
++}
++
++module.exports = formDataToJSON;
+diff --git a/lib/utils.js b/lib/utils.js
+index 0303f007..577462f9 100644
+--- a/lib/utils.js
++++ b/lib/utils.js
+@@ -441,6 +441,38 @@ var isTypedArray = (function(TypedArray) {
+   };
+ })(typeof Uint8Array !== 'undefined' && Object.getPrototypeOf(Uint8Array));
+ 
++function forEachEntry(obj, fn) {
++  var generator = obj && obj[Symbol.iterator];
++
++  var iterator = generator.call(obj);
++
++  var result;
++
++  while ((result = iterator.next()) && !result.done) {
++    var pair = result.value;
++    fn.call(obj, pair[0], pair[1]);
++  }
++}
++
++function matchAll(regExp, str) {
++  var matches;
++  var arr = [];
++
++  while ((matches = regExp.exec(str)) !== null) {
++    arr.push(matches);
++  }
++
++  return arr;
++}
++
++var isHTMLForm = kindOfTest('HTMLFormElement');
++
++var hasOwnProperty = (function resolver(_hasOwnProperty) {
++  return function(obj, prop) {
++    return _hasOwnProperty.call(obj, prop);
++  };
++})(Object.prototype.hasOwnProperty);
++
+ module.exports = {
+   isArray: isArray,
+   isArrayBuffer: isArrayBuffer,
+@@ -471,5 +503,9 @@ module.exports = {
+   endsWith: endsWith,
+   toArray: toArray,
+   isTypedArray: isTypedArray,
+-  isFileList: isFileList
++  isFileList: isFileList,
++  forEachEntry: forEachEntry,
++  matchAll: matchAll,
++  isHTMLForm: isHTMLForm,
++  hasOwnProperty: hasOwnProperty
+ };
+diff --git a/test/specs/helpers/formDataToJSON.spec.js b/test/specs/helpers/formDataToJSON.spec.js
+new file mode 100644
+index 00000000..69ea1a6d
+--- /dev/null
++++ b/test/specs/helpers/formDataToJSON.spec.js
+@@ -0,0 +1,50 @@
++var formDataToJSON = require('../../../lib/helpers/formDataToJSON');
++
++describe('formDataToJSON', function () {
++  it('should convert a FormData Object to JSON Object', function () {
++    const formData = new FormData();
++
++    formData.append('foo[bar][baz]', '123');
++
++    expect(formDataToJSON(formData)).toEqual({
++      foo: {
++        bar: {
++          baz: '123'
++        }
++      }
++    });
++  });
++
++  it('should convert repeatable values as an array', function () {
++    const formData = new FormData();
++
++    formData.append('foo', '1');
++    formData.append('foo', '2');
++
++    expect(formDataToJSON(formData)).toEqual({
++      foo: ['1', '2']
++    });
++  });
++
++  it('should convert props with empty brackets to arrays', function () {
++    const formData = new FormData();
++
++    formData.append('foo[]', '1');
++    formData.append('foo[]', '2');
++
++    expect(formDataToJSON(formData)).toEqual({
++      foo: ['1', '2']
++    });
++  });
++
++  it('should supported indexed arrays', function () {
++    const formData = new FormData();
++
++    formData.append('foo[0]', '1');
++    formData.append('foo[1]', '2');
++
++    expect(formDataToJSON(formData)).toEqual({
++      foo: ['1', '2']
++    });
++  });
++});
+diff --git a/test/specs/instance.spec.js b/test/specs/instance.spec.js
+index e1b9a7c9..e29c2f71 100644
+--- a/test/specs/instance.spec.js
++++ b/test/specs/instance.spec.js
+@@ -25,7 +25,8 @@ describe('instance', function () {
+         'isAxiosError',
+         'VERSION',
+         'default',
+-        'toFormData'
++        'toFormData',
++        'formToJSON'
+       ].indexOf(prop) > -1) {
+         continue;
+       }

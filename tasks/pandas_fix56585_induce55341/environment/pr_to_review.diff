@@ -1,0 +1,293 @@
+commit 87d3fe4702bf885ab8f9c01d22804352189469f2
+Author: Patrick Hoefler <61934744+phofl@users.noreply.github.com>
+Date:   Fri Nov 17 18:44:28 2023 +0100
+
+    ENH: Implement convert_dtypes on block level (#55341)
+    
+    * ENH: Implement convert_dtypes on block level
+    
+    * ENH: Implement convert_dtypes on block level
+    
+    * Update
+    
+    * Fix typing
+    
+    * BUG: Fix convert_dtypes for all na column and arrow backend
+    
+    BUG: Fix convert_dtypes for all na column and arrow backend
+    
+    * Update cast.py
+    
+    * Fix
+    
+    * Fix
+    
+    * Fix typing
+
+diff --git a/pandas/core/dtypes/cast.py b/pandas/core/dtypes/cast.py
+index 716d1a78f9..3cac25600b 100644
+--- a/pandas/core/dtypes/cast.py
++++ b/pandas/core/dtypes/cast.py
+@@ -1133,7 +1133,7 @@ def convert_dtypes(
+                 base_dtype = inferred_dtype
+             if (
+                 base_dtype.kind == "O"  # type: ignore[union-attr]
+-                and len(input_array) > 0
++                and input_array.size > 0
+                 and isna(input_array).all()
+             ):
+                 import pyarrow as pa
+diff --git a/pandas/core/generic.py b/pandas/core/generic.py
+index 1674960f21..e2e81155e1 100644
+--- a/pandas/core/generic.py
++++ b/pandas/core/generic.py
+@@ -6940,36 +6940,16 @@ class NDFrame(PandasObject, indexing.IndexingMixin):
+         dtype: string
+         """
+         check_dtype_backend(dtype_backend)
+-        if self.ndim == 1:
+-            return self._convert_dtypes(
+-                infer_objects,
+-                convert_string,
+-                convert_integer,
+-                convert_boolean,
+-                convert_floating,
+-                dtype_backend=dtype_backend,
+-            )
+-        else:
+-            results = [
+-                col._convert_dtypes(
+-                    infer_objects,
+-                    convert_string,
+-                    convert_integer,
+-                    convert_boolean,
+-                    convert_floating,
+-                    dtype_backend=dtype_backend,
+-                )
+-                for col_name, col in self.items()
+-            ]
+-            if len(results) > 0:
+-                result = concat(results, axis=1, copy=False, keys=self.columns)
+-                cons = cast(type["DataFrame"], self._constructor)
+-                result = cons(result)
+-                result = result.__finalize__(self, method="convert_dtypes")
+-                # https://github.com/python/mypy/issues/8354
+-                return cast(Self, result)
+-            else:
+-                return self.copy(deep=None)
++        new_mgr = self._mgr.convert_dtypes(  # type: ignore[union-attr]
++            infer_objects=infer_objects,
++            convert_string=convert_string,
++            convert_integer=convert_integer,
++            convert_boolean=convert_boolean,
++            convert_floating=convert_floating,
++            dtype_backend=dtype_backend,
++        )
++        res = self._constructor_from_mgr(new_mgr, axes=new_mgr.axes)
++        return res.__finalize__(self, method="convert_dtypes")
+ 
+     # ----------------------------------------------------------------------
+     # Filling NA's
+diff --git a/pandas/core/internals/blocks.py b/pandas/core/internals/blocks.py
+index a3c2ede55d..b44afa83d9 100644
+--- a/pandas/core/internals/blocks.py
++++ b/pandas/core/internals/blocks.py
+@@ -33,6 +33,7 @@ from pandas._libs.missing import NA
+ from pandas._typing import (
+     ArrayLike,
+     AxisInt,
++    DtypeBackend,
+     DtypeObj,
+     F,
+     FillnaOptions,
+@@ -55,6 +56,7 @@ from pandas.core.dtypes.astype import (
+ from pandas.core.dtypes.cast import (
+     LossySetitemError,
+     can_hold_element,
++    convert_dtypes,
+     find_result_type,
+     maybe_downcast_to_dtype,
+     np_can_hold_element,
+@@ -636,6 +638,52 @@ class Block(PandasObject, libinternals.Block):
+         res_values = maybe_coerce_values(res_values)
+         return [self.make_block(res_values, refs=refs)]
+ 
++    def convert_dtypes(
++        self,
++        copy: bool,
++        using_cow: bool,
++        infer_objects: bool = True,
++        convert_string: bool = True,
++        convert_integer: bool = True,
++        convert_boolean: bool = True,
++        convert_floating: bool = True,
++        dtype_backend: DtypeBackend = "numpy_nullable",
++    ) -> list[Block]:
++        if infer_objects and self.is_object:
++            blks = self.convert(copy=False, using_cow=using_cow)
++        else:
++            blks = [self]
++
++        if not any(
++            [convert_floating, convert_integer, convert_boolean, convert_string]
++        ):
++            return [b.copy(deep=copy) for b in blks]
++
++        rbs = []
++        for blk in blks:
++            # Determine dtype column by column
++            sub_blks = [blk] if blk.ndim == 1 or self.shape[0] == 1 else blk._split()
++            dtypes = [
++                convert_dtypes(
++                    b.values,
++                    convert_string,
++                    convert_integer,
++                    convert_boolean,
++                    convert_floating,
++                    infer_objects,
++                    dtype_backend,
++                )
++                for b in sub_blks
++            ]
++            if all(dtype == self.dtype for dtype in dtypes):
++                # Avoid block splitting if no dtype changes
++                rbs.append(blk.copy(deep=copy))
++                continue
++
++            for dtype, b in zip(dtypes, sub_blks):
++                rbs.append(b.astype(dtype=dtype, copy=copy, squeeze=b.ndim != 1))
++        return rbs
++
+     # ---------------------------------------------------------------------
+     # Array-Like Methods
+ 
+@@ -651,6 +699,7 @@ class Block(PandasObject, libinternals.Block):
+         copy: bool = False,
+         errors: IgnoreRaise = "raise",
+         using_cow: bool = False,
++        squeeze: bool = False,
+     ) -> Block:
+         """
+         Coerce to the new dtype.
+@@ -665,12 +714,18 @@ class Block(PandasObject, libinternals.Block):
+             - ``ignore`` : suppress exceptions. On error return original object
+         using_cow: bool, default False
+             Signaling if copy on write copy logic is used.
++        squeeze : bool, default False
++            squeeze values to ndim=1 if only one column is given
+ 
+         Returns
+         -------
+         Block
+         """
+         values = self.values
++        if squeeze and values.ndim == 2:
++            if values.shape[0] != 1:
++                raise ValueError("Can not squeeze with more than one column.")
++            values = values[0, :]  # type: ignore[call-overload]
+ 
+         new_values = astype_array_safe(values, dtype, copy=copy, errors=errors)
+ 
+diff --git a/pandas/core/internals/managers.py b/pandas/core/internals/managers.py
+index 13c039cef3..ac930efbce 100644
+--- a/pandas/core/internals/managers.py
++++ b/pandas/core/internals/managers.py
+@@ -464,6 +464,16 @@ class BaseBlockManager(DataManager):
+ 
+         return self.apply("convert", copy=copy, using_cow=using_copy_on_write())
+ 
++    def convert_dtypes(self, **kwargs):
++        if using_copy_on_write():
++            copy = False
++        else:
++            copy = True
++
++        return self.apply(
++            "convert_dtypes", copy=copy, using_cow=using_copy_on_write(), **kwargs
++        )
++
+     def get_values_for_csv(
+         self, *, float_format, date_format, decimal, na_rep: str = "nan", quoting=None
+     ) -> Self:
+diff --git a/pandas/core/series.py b/pandas/core/series.py
+index a021ea7961..1bbd10429e 100644
+--- a/pandas/core/series.py
++++ b/pandas/core/series.py
+@@ -61,7 +61,6 @@ from pandas.util._validators import (
+ from pandas.core.dtypes.astype import astype_is_view
+ from pandas.core.dtypes.cast import (
+     LossySetitemError,
+-    convert_dtypes,
+     maybe_box_native,
+     maybe_cast_pointwise_result,
+ )
+@@ -167,7 +166,6 @@ if TYPE_CHECKING:
+         CorrelationMethod,
+         DropKeep,
+         Dtype,
+-        DtypeBackend,
+         DtypeObj,
+         FilePath,
+         Frequency,
+@@ -5556,39 +5554,6 @@ class Series(base.IndexOpsMixin, NDFrame):  # type: ignore[misc]
+ 
+         return lmask & rmask
+ 
+-    # ----------------------------------------------------------------------
+-    # Convert to types that support pd.NA
+-
+-    def _convert_dtypes(
+-        self,
+-        infer_objects: bool = True,
+-        convert_string: bool = True,
+-        convert_integer: bool = True,
+-        convert_boolean: bool = True,
+-        convert_floating: bool = True,
+-        dtype_backend: DtypeBackend = "numpy_nullable",
+-    ) -> Series:
+-        input_series = self
+-        if infer_objects:
+-            input_series = input_series.infer_objects()
+-            if is_object_dtype(input_series.dtype):
+-                input_series = input_series.copy(deep=None)
+-
+-        if convert_string or convert_integer or convert_boolean or convert_floating:
+-            inferred_dtype = convert_dtypes(
+-                input_series._values,
+-                convert_string,
+-                convert_integer,
+-                convert_boolean,
+-                convert_floating,
+-                infer_objects,
+-                dtype_backend,
+-            )
+-            result = input_series.astype(inferred_dtype)
+-        else:
+-            result = input_series.copy(deep=None)
+-        return result
+-
+     # error: Cannot determine type of 'isna'
+     @doc(NDFrame.isna, klass=_shared_doc_kwargs["klass"])  # type: ignore[has-type]
+     def isna(self) -> Series:
+diff --git a/pandas/tests/frame/methods/test_convert_dtypes.py b/pandas/tests/frame/methods/test_convert_dtypes.py
+index c2b1016e88..4c371afcc4 100644
+--- a/pandas/tests/frame/methods/test_convert_dtypes.py
++++ b/pandas/tests/frame/methods/test_convert_dtypes.py
+@@ -175,3 +175,17 @@ class TestConvertDtypes:
+         expected = ser.astype("timestamp[ms][pyarrow]")
+         result = expected.convert_dtypes(dtype_backend="pyarrow")
+         tm.assert_series_equal(result, expected)
++
++    def test_convert_dtypes_avoid_block_splitting(self):
++        # GH#55341
++        df = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6], "c": "a"})
++        result = df.convert_dtypes(convert_integer=False)
++        expected = pd.DataFrame(
++            {
++                "a": [1, 2, 3],
++                "b": [4, 5, 6],
++                "c": pd.Series(["a"] * 3, dtype="string[python]"),
++            }
++        )
++        tm.assert_frame_equal(result, expected)
++        assert result._mgr.nblocks == 2

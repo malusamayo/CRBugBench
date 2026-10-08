@@ -1,0 +1,2311 @@
+commit d8784d4155f5544d7046e17f7310a6b011336964
+Author: Jeremy Stretch <jstretch@netboxlabs.com>
+Date:   Thu Feb 2 10:06:23 2023 -0500
+
+    Closes #11558: Add support for remote data sources (#11646)
+    
+    * WIP
+    
+    * WIP
+    
+    * Add git sync
+    
+    * Fix file hashing
+    
+    * Add last_synced to DataSource
+    
+    * Build out UI & API resources
+    
+    * Add status field to DataSource
+    
+    * Add UI control to sync data source
+    
+    * Add API endpoint to sync data sources
+    
+    * Fix display of DataSource job results
+    
+    * DataSource password should be write-only
+    
+    * General cleanup
+    
+    * Add data file UI view
+    
+    * Punt on HTTP, FTP support for now
+    
+    * Add DataSource URL validation
+    
+    * Add HTTP proxy support to git fetcher
+    
+    * Add management command to sync data sources
+    
+    * DataFile REST API endpoints should be read-only
+    
+    * Refactor fetch methods into backend classes
+    
+    * Replace auth & git branch fields with general-purpose parameters
+    
+    * Fix last_synced time
+    
+    * Render discrete form fields for backend parameters
+    
+    * Enable dynamic edit form for DataSource
+    
+    * Register DataBackend classes in application registry
+    
+    * Add search indexers for DataSource, DataFile
+    
+    * Add single & bulk delete views for DataFile
+    
+    * Add model documentation
+    
+    * Convert DataSource to a primary model
+    
+    * Introduce pre_sync & post_sync signals
+    
+    * Clean up migrations
+    
+    * Rename url to source_url
+    
+    * Clean up filtersets
+    
+    * Add API & filterset tests
+    
+    * Add view tests
+    
+    * Add initSelect() to HTMX refresh handler
+    
+    * Render DataSourceForm fieldsets dynamically
+    
+    * Update compiled static resources
+
+diff --git a/docs/models/core/datafile.md b/docs/models/core/datafile.md
+new file mode 100644
+index 000000000..3e2aa2f27
+--- /dev/null
++++ b/docs/models/core/datafile.md
+@@ -0,0 +1,25 @@
++# Data Files
++
++A data file object is the representation in NetBox's database of some file belonging to a remote [data source](./datasource.md). Data files are synchronized automatically, and cannot be modified locally (although they can be deleted).
++
++## Fields
++
++### Source
++
++The [data source](./datasource.md) to which this file belongs.
++
++### Path
++
++The path to the file, relative to its source's URL. For example, a file at `/opt/config-data/routing/bgp/peer.yaml` with a source URL of `file:///opt/config-data/` would have its path set to `routing/bgp/peer.yaml`.
++
++### Last Updated
++
++The date and time at which the file most recently updated from its source. Note that this attribute is updated only when the file's contents have been modified. Re-synchronizing the data source will not update this timestamp if the upstream file's data has not changed.
++
++### Size
++
++The file's size, in bytes.
++
++### Hash
++
++A [SHA256 hash](https://en.wikipedia.org/wiki/SHA-2) of the file's data. This can be compared to a hash taken from the original file to determine whether any changes have been made.
+diff --git a/docs/models/core/datasource.md b/docs/models/core/datasource.md
+new file mode 100644
+index 000000000..d16abdd10
+--- /dev/null
++++ b/docs/models/core/datasource.md
+@@ -0,0 +1,47 @@
++# Data Sources
++
++A data source represents some external repository of data which NetBox can consume, such as a git repository. Files within the data source are synchronized to NetBox by saving them in the database as [data file](./datafile.md) objects.
++
++## Fields
++
++### Name
++
++The data source's human-friendly name.
++
++### Type
++
++The type of data source. Supported options include:
++
++* Local directory
++* git repository
++
++### URL
++
++The URL identifying the remote source. Some examples are included below.
++
++| Type | Example URL |
++|------|-------------|
++| Local | file:///var/my/data/source/ |
++| git | https://https://github.com/my-organization/my-repo |
++
++### Status
++
++The source's current synchronization status. Note that this cannot be set manually: It is updated automatically when the source is synchronized.
++
++### Enabled
++
++If false, synchronization will be disabled.
++
++### Ignore Rules
++
++A set of rules (one per line) identifying filenames to ignore during synchronization. Some examples are provided below. See Python's [`fnmatch()` documentation](https://docs.python.org/3/library/fnmatch.html) for a complete reference.
++
++| Rule           | Description                              |
++|----------------|------------------------------------------|
++| `README`       | Ignore any files named `README`          |
++| `*.txt`        | Ignore any files with a `.txt` extension |
++| `data???.json` | Ignore e.g. `data123.json`               |
++
++### Last Synced
++
++The date and time at which the source was most recently synchronized successfully.
+diff --git a/netbox/core/__init__.py b/netbox/core/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/netbox/core/api/__init__.py b/netbox/core/api/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/netbox/core/api/nested_serializers.py b/netbox/core/api/nested_serializers.py
+new file mode 100644
+index 000000000..0a8351fec
+--- /dev/null
++++ b/netbox/core/api/nested_serializers.py
+@@ -0,0 +1,25 @@
++from rest_framework import serializers
++
++from core.models import *
++from netbox.api.serializers import WritableNestedSerializer
++
++__all__ = [
++    'NestedDataFileSerializer',
++    'NestedDataSourceSerializer',
++]
++
++
++class NestedDataSourceSerializer(WritableNestedSerializer):
++    url = serializers.HyperlinkedIdentityField(view_name='core-api:datasource-detail')
++
++    class Meta:
++        model = DataSource
++        fields = ['id', 'url', 'display', 'name']
++
++
++class NestedDataFileSerializer(WritableNestedSerializer):
++    url = serializers.HyperlinkedIdentityField(view_name='core-api:datafile-detail')
++
++    class Meta:
++        model = DataFile
++        fields = ['id', 'url', 'display', 'path']
+diff --git a/netbox/core/api/serializers.py b/netbox/core/api/serializers.py
+new file mode 100644
+index 000000000..4c29fd69e
+--- /dev/null
++++ b/netbox/core/api/serializers.py
+@@ -0,0 +1,51 @@
++from rest_framework import serializers
++
++from core.choices import *
++from core.models import *
++from netbox.api.fields import ChoiceField
++from netbox.api.serializers import NetBoxModelSerializer
++from .nested_serializers import *
++
++__all__ = (
++    'DataSourceSerializer',
++)
++
++
++class DataSourceSerializer(NetBoxModelSerializer):
++    url = serializers.HyperlinkedIdentityField(
++        view_name='core-api:datasource-detail'
++    )
++    type = ChoiceField(
++        choices=DataSourceTypeChoices
++    )
++    status = ChoiceField(
++        choices=DataSourceStatusChoices,
++        read_only=True
++    )
++
++    # Related object counts
++    file_count = serializers.IntegerField(
++        read_only=True
++    )
++
++    class Meta:
++        model = DataSource
++        fields = [
++            'id', 'url', 'display', 'name', 'type', 'source_url', 'enabled', 'status', 'description', 'comments',
++            'parameters', 'ignore_rules', 'created', 'last_updated', 'file_count',
++        ]
++
++
++class DataFileSerializer(NetBoxModelSerializer):
++    url = serializers.HyperlinkedIdentityField(
++        view_name='core-api:datafile-detail'
++    )
++    source = NestedDataSourceSerializer(
++        read_only=True
++    )
++
++    class Meta:
++        model = DataFile
++        fields = [
++            'id', 'url', 'display', 'source', 'path', 'last_updated', 'size', 'hash',
++        ]
+diff --git a/netbox/core/api/urls.py b/netbox/core/api/urls.py
+new file mode 100644
+index 000000000..364e5db55
+--- /dev/null
++++ b/netbox/core/api/urls.py
+@@ -0,0 +1,13 @@
++from netbox.api.routers import NetBoxRouter
++from . import views
++
++
++router = NetBoxRouter()
++router.APIRootView = views.CoreRootView
++
++# Data sources
++router.register('data-sources', views.DataSourceViewSet)
++router.register('data-files', views.DataFileViewSet)
++
++app_name = 'core-api'
++urlpatterns = router.urls
+diff --git a/netbox/core/api/views.py b/netbox/core/api/views.py
+new file mode 100644
+index 000000000..b2d8c0ed4
+--- /dev/null
++++ b/netbox/core/api/views.py
+@@ -0,0 +1,52 @@
++from django.shortcuts import get_object_or_404
++
++from rest_framework.decorators import action
++from rest_framework.exceptions import PermissionDenied
++from rest_framework.response import Response
++from rest_framework.routers import APIRootView
++
++from core import filtersets
++from core.models import *
++from netbox.api.viewsets import NetBoxModelViewSet, NetBoxReadOnlyModelViewSet
++from utilities.utils import count_related
++from . import serializers
++
++
++class CoreRootView(APIRootView):
++    """
++    Core API root view
++    """
++    def get_view_name(self):
++        return 'Core'
++
++
++#
++# Data sources
++#
++
++class DataSourceViewSet(NetBoxModelViewSet):
++    queryset = DataSource.objects.annotate(
++        file_count=count_related(DataFile, 'source')
++    )
++    serializer_class = serializers.DataSourceSerializer
++    filterset_class = filtersets.DataSourceFilterSet
++
++    @action(detail=True, methods=['post'])
++    def sync(self, request, pk):
++        """
++        Enqueue a job to synchronize the DataSource.
++        """
++        if not request.user.has_perm('extras.sync_datasource'):
++            raise PermissionDenied("Syncing data sources requires the core.sync_datasource permission.")
++
++        datasource = get_object_or_404(DataSource, pk=pk)
++        datasource.enqueue_sync_job(request)
++        serializer = serializers.DataSourceSerializer(datasource, context={'request': request})
++
++        return Response(serializer.data)
++
++
++class DataFileViewSet(NetBoxReadOnlyModelViewSet):
++    queryset = DataFile.objects.defer('data').prefetch_related('source')
++    serializer_class = serializers.DataFileSerializer
++    filterset_class = filtersets.DataFileFilterSet
+diff --git a/netbox/core/apps.py b/netbox/core/apps.py
+new file mode 100644
+index 000000000..c4886eb41
+--- /dev/null
++++ b/netbox/core/apps.py
+@@ -0,0 +1,8 @@
++from django.apps import AppConfig
++
++
++class CoreConfig(AppConfig):
++    name = "core"
++
++    def ready(self):
++        from . import data_backends, search
+diff --git a/netbox/core/choices.py b/netbox/core/choices.py
+new file mode 100644
+index 000000000..6927c83fb
+--- /dev/null
++++ b/netbox/core/choices.py
+@@ -0,0 +1,34 @@
++from django.utils.translation import gettext as _
++
++from utilities.choices import ChoiceSet
++
++
++#
++# Data sources
++#
++
++class DataSourceTypeChoices(ChoiceSet):
++    LOCAL = 'local'
++    GIT = 'git'
++
++    CHOICES = (
++        (LOCAL, _('Local'), 'gray'),
++        (GIT, _('Git'), 'blue'),
++    )
++
++
++class DataSourceStatusChoices(ChoiceSet):
++
++    NEW = 'new'
++    QUEUED = 'queued'
++    SYNCING = 'syncing'
++    COMPLETED = 'completed'
++    FAILED = 'failed'
++
++    CHOICES = (
++        (NEW, _('New'), 'blue'),
++        (QUEUED, _('Queued'), 'orange'),
++        (SYNCING, _('Syncing'), 'cyan'),
++        (COMPLETED, _('Completed'), 'green'),
++        (FAILED, _('Failed'), 'red'),
++    )
+diff --git a/netbox/core/data_backends.py b/netbox/core/data_backends.py
+new file mode 100644
+index 000000000..5d0e80584
+--- /dev/null
++++ b/netbox/core/data_backends.py
+@@ -0,0 +1,117 @@
++import logging
++import subprocess
++import tempfile
++from contextlib import contextmanager
++from urllib.parse import quote, urlunparse, urlparse
++
++from django import forms
++from django.conf import settings
++from django.utils.translation import gettext as _
++
++from netbox.registry import registry
++from .choices import DataSourceTypeChoices
++from .exceptions import SyncError
++
++__all__ = (
++    'LocalBackend',
++    'GitBackend',
++)
++
++logger = logging.getLogger('netbox.data_backends')
++
++
++def register_backend(name):
++    """
++    Decorator for registering a DataBackend class.
++    """
++    def _wrapper(cls):
++        registry['data_backends'][name] = cls
++        return cls
++
++    return _wrapper
++
++
++class DataBackend:
++    parameters = {}
++
++    def __init__(self, url, **kwargs):
++        self.url = url
++        self.params = kwargs
++
++    @property
++    def url_scheme(self):
++        return urlparse(self.url).scheme.lower()
++
++    @contextmanager
++    def fetch(self):
++        raise NotImplemented()
++
++
++@register_backend(DataSourceTypeChoices.LOCAL)
++class LocalBackend(DataBackend):
++
++    @contextmanager
++    def fetch(self):
++        logger.debug(f"Data source type is local; skipping fetch")
++        local_path = urlparse(self.url).path  # Strip file:// scheme
++
++        yield local_path
++
++
++@register_backend(DataSourceTypeChoices.GIT)
++class GitBackend(DataBackend):
++    parameters = {
++        'username': forms.CharField(
++            required=False,
++            label=_('Username'),
++            widget=forms.TextInput(attrs={'class': 'form-control'})
++        ),
++        'password': forms.CharField(
++            required=False,
++            label=_('Password'),
++            widget=forms.TextInput(attrs={'class': 'form-control'})
++        ),
++        'branch': forms.CharField(
++            required=False,
++            label=_('Branch'),
++            widget=forms.TextInput(attrs={'class': 'form-control'})
++        )
++    }
++
++    @contextmanager
++    def fetch(self):
++        local_path = tempfile.TemporaryDirectory()
++
++        # Add authentication credentials to URL (if specified)
++        username = self.params.get('username')
++        password = self.params.get('password')
++        if username and password:
++            url_components = list(urlparse(self.url))
++            # Prepend username & password to netloc
++            url_components[1] = quote(f'{username}@{password}:') + url_components[1]
++            url = urlunparse(url_components)
++        else:
++            url = self.url
++
++        # Compile git arguments
++        args = ['git', 'clone', '--depth', '1']
++        if branch := self.params.get('branch'):
++            args.extend(['--branch', branch])
++        args.extend([url, local_path.name])
++
++        # Prep environment variables
++        env_vars = {}
++        if settings.HTTP_PROXIES and self.url_scheme in ('http', 'https'):
++            env_vars['http_proxy'] = settings.HTTP_PROXIES.get(self.url_scheme)
++
++        logger.debug(f"Cloning git repo: {' '.join(args)}")
++        try:
++            subprocess.run(args, check=True, capture_output=True, env=env_vars)
++        except subprocess.CalledProcessError as e:
++            raise SyncError(
++                f"Fetching remote data failed: {e.stderr}"
++            )
++
++        yield local_path.name
++
++        local_path.cleanup()
+diff --git a/netbox/core/exceptions.py b/netbox/core/exceptions.py
+new file mode 100644
+index 000000000..8412b0378
+--- /dev/null
++++ b/netbox/core/exceptions.py
+@@ -0,0 +1,2 @@
++class SyncError(Exception):
++    pass
+diff --git a/netbox/core/filtersets.py b/netbox/core/filtersets.py
+new file mode 100644
+index 000000000..3bff34158
+--- /dev/null
++++ b/netbox/core/filtersets.py
+@@ -0,0 +1,64 @@
++from django.db.models import Q
++from django.utils.translation import gettext as _
++
++import django_filters
++
++from netbox.filtersets import ChangeLoggedModelFilterSet, NetBoxModelFilterSet
++from .choices import *
++from .models import *
++
++__all__ = (
++    'DataFileFilterSet',
++    'DataSourceFilterSet',
++)
++
++
++class DataSourceFilterSet(NetBoxModelFilterSet):
++    type = django_filters.MultipleChoiceFilter(
++        choices=DataSourceTypeChoices,
++        null_value=None
++    )
++    status = django_filters.MultipleChoiceFilter(
++        choices=DataSourceStatusChoices,
++        null_value=None
++    )
++
++    class Meta:
++        model = DataSource
++        fields = ('id', 'name', 'enabled')
++
++    def search(self, queryset, name, value):
++        if not value.strip():
++            return queryset
++        return queryset.filter(
++            Q(name__icontains=value) |
++            Q(description__icontains=value) |
++            Q(comments__icontains=value)
++        )
++
++
++class DataFileFilterSet(ChangeLoggedModelFilterSet):
++    q = django_filters.CharFilter(
++        method='search'
++    )
++    source_id = django_filters.ModelMultipleChoiceFilter(
++        queryset=DataSource.objects.all(),
++        label=_('Data source (ID)'),
++    )
++    source = django_filters.ModelMultipleChoiceFilter(
++        field_name='source__name',
++        queryset=DataSource.objects.all(),
++        to_field_name='name',
++        label=_('Data source (name)'),
++    )
++
++    class Meta:
++        model = DataFile
++        fields = ('id', 'path', 'last_updated', 'size', 'hash')
++
++    def search(self, queryset, name, value):
++        if not value.strip():
++            return queryset
++        return queryset.filter(
++            Q(path__icontains=value)
++        )
+diff --git a/netbox/core/forms/__init__.py b/netbox/core/forms/__init__.py
+new file mode 100644
+index 000000000..1499f98b2
+--- /dev/null
++++ b/netbox/core/forms/__init__.py
+@@ -0,0 +1,4 @@
++from .bulk_edit import *
++from .bulk_import import *
++from .filtersets import *
++from .model_forms import *
+diff --git a/netbox/core/forms/bulk_edit.py b/netbox/core/forms/bulk_edit.py
+new file mode 100644
+index 000000000..c5713b626
+--- /dev/null
++++ b/netbox/core/forms/bulk_edit.py
+@@ -0,0 +1,50 @@
++from django import forms
++from django.utils.translation import gettext as _
++
++from core.choices import DataSourceTypeChoices
++from core.models import *
++from netbox.forms import NetBoxModelBulkEditForm
++from utilities.forms import (
++    add_blank_choice, BulkEditNullBooleanSelect, CommentField, SmallTextarea, StaticSelect,
++)
++
++__all__ = (
++    'DataSourceBulkEditForm',
++)
++
++
++class DataSourceBulkEditForm(NetBoxModelBulkEditForm):
++    type = forms.ChoiceField(
++        choices=add_blank_choice(DataSourceTypeChoices),
++        required=False,
++        initial='',
++        widget=StaticSelect()
++    )
++    enabled = forms.NullBooleanField(
++        required=False,
++        widget=BulkEditNullBooleanSelect(),
++        label=_('Enforce unique space')
++    )
++    description = forms.CharField(
++        max_length=200,
++        required=False
++    )
++    comments = CommentField(
++        widget=SmallTextarea,
++        label=_('Comments')
++    )
++    parameters = forms.JSONField(
++        required=False
++    )
++    ignore_rules = forms.CharField(
++        required=False,
++        widget=forms.Textarea()
++    )
++
++    model = DataSource
++    fieldsets = (
++        (None, ('type', 'enabled', 'description', 'comments', 'parameters', 'ignore_rules')),
++    )
++    nullable_fields = (
++        'description', 'description', 'parameters', 'comments', 'parameters', 'ignore_rules',
++    )
+diff --git a/netbox/core/forms/bulk_import.py b/netbox/core/forms/bulk_import.py
+new file mode 100644
+index 000000000..78a859dcb
+--- /dev/null
++++ b/netbox/core/forms/bulk_import.py
+@@ -0,0 +1,15 @@
++from core.models import *
++from netbox.forms import NetBoxModelImportForm
++
++__all__ = (
++    'DataSourceImportForm',
++)
++
++
++class DataSourceImportForm(NetBoxModelImportForm):
++
++    class Meta:
++        model = DataSource
++        fields = (
++            'name', 'type', 'source_url', 'enabled', 'description', 'comments', 'parameters', 'ignore_rules',
++        )
+diff --git a/netbox/core/forms/filtersets.py b/netbox/core/forms/filtersets.py
+new file mode 100644
+index 000000000..433f07067
+--- /dev/null
++++ b/netbox/core/forms/filtersets.py
+@@ -0,0 +1,49 @@
++from django import forms
++from django.utils.translation import gettext as _
++
++from core.choices import *
++from core.models import *
++from netbox.forms import NetBoxModelFilterSetForm
++from utilities.forms import (
++    BOOLEAN_WITH_BLANK_CHOICES, DynamicModelMultipleChoiceField, MultipleChoiceField, StaticSelect,
++)
++
++__all__ = (
++    'DataFileFilterForm',
++    'DataSourceFilterForm',
++)
++
++
++class DataSourceFilterForm(NetBoxModelFilterSetForm):
++    model = DataSource
++    fieldsets = (
++        (None, ('q', 'filter_id')),
++        ('Data Source', ('type', 'status')),
++    )
++    type = MultipleChoiceField(
++        choices=DataSourceTypeChoices,
++        required=False
++    )
++    status = MultipleChoiceField(
++        choices=DataSourceStatusChoices,
++        required=False
++    )
++    enabled = forms.NullBooleanField(
++        required=False,
++        widget=StaticSelect(
++            choices=BOOLEAN_WITH_BLANK_CHOICES
++        )
++    )
++
++
++class DataFileFilterForm(NetBoxModelFilterSetForm):
++    model = DataFile
++    fieldsets = (
++        (None, ('q', 'filter_id')),
++        ('File', ('source_id',)),
++    )
++    source_id = DynamicModelMultipleChoiceField(
++        queryset=DataSource.objects.all(),
++        required=False,
++        label=_('Data source')
++    )
+diff --git a/netbox/core/forms/model_forms.py b/netbox/core/forms/model_forms.py
+new file mode 100644
+index 000000000..786e71c3a
+--- /dev/null
++++ b/netbox/core/forms/model_forms.py
+@@ -0,0 +1,81 @@
++import copy
++
++from django import forms
++
++from core.models import *
++from netbox.forms import NetBoxModelForm, StaticSelect
++from netbox.registry import registry
++from utilities.forms import CommentField
++
++__all__ = (
++    'DataSourceForm',
++)
++
++
++class DataSourceForm(NetBoxModelForm):
++    comments = CommentField()
++
++    class Meta:
++        model = DataSource
++        fields = [
++            'name', 'type', 'source_url', 'enabled', 'description', 'comments', 'ignore_rules', 'tags',
++        ]
++        widgets = {
++            'type': StaticSelect(
++                attrs={
++                    'hx-get': '.',
++                    'hx-include': '#form_fields input',
++                    'hx-target': '#form_fields',
++                }
++            ),
++            'ignore_rules': forms.Textarea(
++                attrs={
++                    'rows': 5,
++                    'class': 'font-monospace',
++                    'placeholder': '.cache\n*.txt'
++                }
++            ),
++        }
++
++    @property
++    def fieldsets(self):
++        fieldsets = [
++            ('Source', ('name', 'type', 'source_url', 'enabled', 'description', 'tags', 'ignore_rules')),
++        ]
++        if self.backend_fields:
++            fieldsets.append(
++                ('Backend', self.backend_fields)
++            )
++
++        return fieldsets
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++
++        backend_classes = registry['data_backends']
++
++        if self.is_bound and self.data.get('type') in backend_classes:
++            type_ = self.data['type']
++        elif self.initial and self.initial.get('type') in backend_classes:
++            type_ = self.initial['type']
++        else:
++            type_ = self.fields['type'].initial
++        backend = backend_classes.get(type_)
++
++        self.backend_fields = []
++        for name, form_field in backend.parameters.items():
++            field_name = f'backend_{name}'
++            self.backend_fields.append(field_name)
++            self.fields[field_name] = copy.copy(form_field)
++            if self.instance and self.instance.parameters:
++                self.fields[field_name].initial = self.instance.parameters.get(name)
++
++    def save(self, *args, **kwargs):
++
++        parameters = {}
++        for name in self.fields:
++            if name.startswith('backend_'):
++                parameters[name[8:]] = self.cleaned_data[name]
++        self.instance.parameters = parameters
++
++        return super().save(*args, **kwargs)
+diff --git a/netbox/core/graphql/__init__.py b/netbox/core/graphql/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/netbox/core/graphql/schema.py b/netbox/core/graphql/schema.py
+new file mode 100644
+index 000000000..201965430
+--- /dev/null
++++ b/netbox/core/graphql/schema.py
+@@ -0,0 +1,12 @@
++import graphene
++
++from netbox.graphql.fields import ObjectField, ObjectListField
++from .types import *
++
++
++class CoreQuery(graphene.ObjectType):
++    data_file = ObjectField(DataFileType)
++    data_file_list = ObjectListField(DataFileType)
++
++    data_source = ObjectField(DataSourceType)
++    data_source_list = ObjectListField(DataSourceType)
+diff --git a/netbox/core/graphql/types.py b/netbox/core/graphql/types.py
+new file mode 100644
+index 000000000..402e36345
+--- /dev/null
++++ b/netbox/core/graphql/types.py
+@@ -0,0 +1,21 @@
++from core import filtersets, models
++from netbox.graphql.types import BaseObjectType, NetBoxObjectType
++
++__all__ = (
++    'DataFileType',
++    'DataSourceType',
++)
++
++
++class DataFileType(BaseObjectType):
++    class Meta:
++        model = models.DataFile
++        exclude = ('data',)
++        filterset_class = filtersets.DataFileFilterSet
++
++
++class DataSourceType(NetBoxObjectType):
++    class Meta:
++        model = models.DataSource
++        fields = '__all__'
++        filterset_class = filtersets.DataSourceFilterSet
+diff --git a/netbox/core/jobs.py b/netbox/core/jobs.py
+new file mode 100644
+index 000000000..ee285fa7c
+--- /dev/null
++++ b/netbox/core/jobs.py
+@@ -0,0 +1,29 @@
++import logging
++
++from extras.choices import JobResultStatusChoices
++from netbox.search.backends import search_backend
++from .choices import *
++from .exceptions import SyncError
++from .models import DataSource
++
++logger = logging.getLogger(__name__)
++
++
++def sync_datasource(job_result, *args, **kwargs):
++    """
++    Call sync() on a DataSource.
++    """
++    datasource = DataSource.objects.get(name=job_result.name)
++
++    try:
++        job_result.start()
++        datasource.sync()
++
++        # Update the search cache for DataFiles belonging to this source
++        search_backend.cache(datasource.datafiles.iterator())
++
++    except SyncError as e:
++        job_result.set_status(JobResultStatusChoices.STATUS_ERRORED)
++        job_result.save()
++        DataSource.objects.filter(pk=datasource.pk).update(status=DataSourceStatusChoices.FAILED)
++        logging.error(e)
+diff --git a/netbox/core/management/__init__.py b/netbox/core/management/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/netbox/core/management/commands/__init__.py b/netbox/core/management/commands/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/netbox/core/management/commands/syncdatasource.py b/netbox/core/management/commands/syncdatasource.py
+new file mode 100644
+index 000000000..3d73f70ab
+--- /dev/null
++++ b/netbox/core/management/commands/syncdatasource.py
+@@ -0,0 +1,41 @@
++from django.core.management.base import BaseCommand, CommandError
++
++from core.models import DataSource
++
++
++class Command(BaseCommand):
++    help = "Synchronize a data source from its remote upstream"
++
++    def add_arguments(self, parser):
++        parser.add_argument('name', nargs='*', help="Data source(s) to synchronize")
++        parser.add_argument(
++            "--all", action='store_true', dest='sync_all',
++            help="Synchronize all data sources"
++        )
++
++    def handle(self, *args, **options):
++
++        # Find DataSources to sync
++        if options['sync_all']:
++            datasources = DataSource.objects.all()
++        elif options['name']:
++            datasources = DataSource.objects.filter(name__in=options['name'])
++            # Check for invalid names
++            found_names = {ds['name'] for ds in datasources.values('name')}
++            if invalid_names := set(options['name']) - found_names:
++                raise CommandError(f"Invalid data source names: {', '.join(invalid_names)}")
++        else:
++            raise CommandError(f"Must specify at least one data source, or set --all.")
++
++        if len(options['name']) > 1:
++            self.stdout.write(f"Syncing {len(datasources)} data sources.")
++
++        for i, datasource in enumerate(datasources, start=1):
++            self.stdout.write(f"[{i}] Syncing {datasource}... ", ending='')
++            self.stdout.flush()
++            datasource.sync()
++            self.stdout.write(datasource.get_status_display())
++            self.stdout.flush()
++
++        if len(options['name']) > 1:
++            self.stdout.write(f"Finished.")
+diff --git a/netbox/core/migrations/0001_initial.py b/netbox/core/migrations/0001_initial.py
+new file mode 100644
+index 000000000..803ac3b13
+--- /dev/null
++++ b/netbox/core/migrations/0001_initial.py
+@@ -0,0 +1,62 @@
++# Generated by Django 4.1.5 on 2023-02-02 02:37
++
++import django.core.validators
++from django.db import migrations, models
++import django.db.models.deletion
++import taggit.managers
++import utilities.json
++
++
++class Migration(migrations.Migration):
++
++    initial = True
++
++    dependencies = [
++        ('extras', '0084_staging'),
++    ]
++
++    operations = [
++        migrations.CreateModel(
++            name='DataSource',
++            fields=[
++                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
++                ('created', models.DateTimeField(auto_now_add=True, null=True)),
++                ('last_updated', models.DateTimeField(auto_now=True, null=True)),
++                ('custom_field_data', models.JSONField(blank=True, default=dict, encoder=utilities.json.CustomFieldJSONEncoder)),
++                ('description', models.CharField(blank=True, max_length=200)),
++                ('comments', models.TextField(blank=True)),
++                ('name', models.CharField(max_length=100, unique=True)),
++                ('type', models.CharField(default='local', max_length=50)),
++                ('source_url', models.CharField(max_length=200)),
++                ('status', models.CharField(default='new', editable=False, max_length=50)),
++                ('enabled', models.BooleanField(default=True)),
++                ('ignore_rules', models.TextField(blank=True)),
++                ('parameters', models.JSONField(blank=True, null=True)),
++                ('last_synced', models.DateTimeField(blank=True, editable=False, null=True)),
++                ('tags', taggit.managers.TaggableManager(through='extras.TaggedItem', to='extras.Tag')),
++            ],
++            options={
++                'ordering': ('name',),
++            },
++        ),
++        migrations.CreateModel(
++            name='DataFile',
++            fields=[
++                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
++                ('created', models.DateTimeField(auto_now_add=True, null=True)),
++                ('path', models.CharField(editable=False, max_length=1000)),
++                ('last_updated', models.DateTimeField(editable=False)),
++                ('size', models.PositiveIntegerField(editable=False)),
++                ('hash', models.CharField(editable=False, max_length=64, validators=[django.core.validators.RegexValidator(message='Length must be 64 hexadecimal characters.', regex='^[0-9a-f]{64}$')])),
++                ('data', models.BinaryField()),
++                ('source', models.ForeignKey(editable=False, on_delete=django.db.models.deletion.CASCADE, related_name='datafiles', to='core.datasource')),
++            ],
++            options={
++                'ordering': ('source', 'path'),
++            },
++        ),
++        migrations.AddConstraint(
++            model_name='datafile',
++            constraint=models.UniqueConstraint(fields=('source', 'path'), name='core_datafile_unique_source_path'),
++        ),
++    ]
+diff --git a/netbox/core/migrations/__init__.py b/netbox/core/migrations/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/netbox/core/models/__init__.py b/netbox/core/models/__init__.py
+new file mode 100644
+index 000000000..df22d8bbb
+--- /dev/null
++++ b/netbox/core/models/__init__.py
+@@ -0,0 +1 @@
++from .data import *
+diff --git a/netbox/core/models/data.py b/netbox/core/models/data.py
+new file mode 100644
+index 000000000..5ad048b0f
+--- /dev/null
++++ b/netbox/core/models/data.py
+@@ -0,0 +1,302 @@
++import logging
++import os
++from fnmatch import fnmatchcase
++from urllib.parse import urlparse
++
++from django.conf import settings
++from django.contrib.contenttypes.models import ContentType
++from django.core.exceptions import ValidationError
++from django.core.validators import RegexValidator
++from django.db import models
++from django.urls import reverse
++from django.utils import timezone
++from django.utils.module_loading import import_string
++from django.utils.translation import gettext as _
++
++from extras.models import JobResult
++from netbox.models import PrimaryModel
++from netbox.models.features import ChangeLoggingMixin
++from netbox.registry import registry
++from utilities.files import sha256_hash
++from utilities.querysets import RestrictedQuerySet
++from ..choices import *
++from ..exceptions import SyncError
++from ..signals import post_sync, pre_sync
++
++__all__ = (
++    'DataFile',
++    'DataSource',
++)
++
++logger = logging.getLogger('netbox.core.data')
++
++
++class DataSource(PrimaryModel):
++    """
++    A remote source, such as a git repository, from which DataFiles are synchronized.
++    """
++    name = models.CharField(
++        max_length=100,
++        unique=True
++    )
++    type = models.CharField(
++        max_length=50,
++        choices=DataSourceTypeChoices,
++        default=DataSourceTypeChoices.LOCAL
++    )
++    source_url = models.CharField(
++        max_length=200,
++        verbose_name=_('URL')
++    )
++    status = models.CharField(
++        max_length=50,
++        choices=DataSourceStatusChoices,
++        default=DataSourceStatusChoices.NEW,
++        editable=False
++    )
++    enabled = models.BooleanField(
++        default=True
++    )
++    ignore_rules = models.TextField(
++        blank=True,
++        help_text=_("Patterns (one per line) matching files to ignore when syncing")
++    )
++    parameters = models.JSONField(
++        blank=True,
++        null=True
++    )
++    last_synced = models.DateTimeField(
++        blank=True,
++        null=True,
++        editable=False
++    )
++
++    class Meta:
++        ordering = ('name',)
++
++    def __str__(self):
++        return f'{self.name}'
++
++    def get_absolute_url(self):
++        return reverse('core:datasource', args=[self.pk])
++
++    @property
++    def docs_url(self):
++        return f'{settings.STATIC_URL}docs/models/{self._meta.app_label}/{self._meta.model_name}/'
++
++    def get_type_color(self):
++        return DataSourceTypeChoices.colors.get(self.type)
++
++    def get_status_color(self):
++        return DataSourceStatusChoices.colors.get(self.status)
++
++    @property
++    def url_scheme(self):
++        return urlparse(self.source_url).scheme.lower()
++
++    @property
++    def ready_for_sync(self):
++        return self.enabled and self.status not in (
++            DataSourceStatusChoices.QUEUED,
++            DataSourceStatusChoices.SYNCING
++        )
++
++    def clean(self):
++
++        # Ensure URL scheme matches selected type
++        if self.type == DataSourceTypeChoices.LOCAL and self.url_scheme not in ('file', ''):
++            raise ValidationError({
++                'url': f"URLs for local sources must start with file:// (or omit the scheme)"
++            })
++
++    def enqueue_sync_job(self, request):
++        """
++        Enqueue a background job to synchronize the DataSource by calling sync().
++        """
++        # Set the status to "syncing"
++        self.status = DataSourceStatusChoices.QUEUED
++
++        # Enqueue a sync job
++        job_result = JobResult.enqueue_job(
++            import_string('core.jobs.sync_datasource'),
++            name=self.name,
++            obj_type=ContentType.objects.get_for_model(DataSource),
++            user=request.user,
++        )
++
++        return job_result
++
++    def get_backend(self):
++        backend_cls = registry['data_backends'].get(self.type)
++        backend_params = self.parameters or {}
++
++        return backend_cls(self.source_url, **backend_params)
++
++    def sync(self):
++        """
++        Create/update/delete child DataFiles as necessary to synchronize with the remote source.
++        """
++        if not self.ready_for_sync:
++            raise SyncError(f"Cannot initiate sync; data source not ready/enabled")
++
++        # Emit the pre_sync signal
++        pre_sync.send(sender=self.__class__, instance=self)
++
++        self.status = DataSourceStatusChoices.SYNCING
++        DataSource.objects.filter(pk=self.pk).update(status=self.status)
++
++        # Replicate source data locally
++        backend = self.get_backend()
++        with backend.fetch() as local_path:
++
++            logger.debug(f'Syncing files from source root {local_path}')
++            data_files = self.datafiles.all()
++            known_paths = {df.path for df in data_files}
++            logger.debug(f'Starting with {len(known_paths)} known files')
++
++            # Check for any updated/deleted files
++            updated_files = []
++            deleted_file_ids = []
++            for datafile in data_files:
++
++                try:
++                    if datafile.refresh_from_disk(source_root=local_path):
++                        updated_files.append(datafile)
++                except FileNotFoundError:
++                    # File no longer exists
++                    deleted_file_ids.append(datafile.pk)
++                    continue
++
++            # Bulk update modified files
++            updated_count = DataFile.objects.bulk_update(updated_files, ['hash'])
++            logger.debug(f"Updated {updated_count} files")
++
++            # Bulk delete deleted files
++            deleted_count, _ = DataFile.objects.filter(pk__in=deleted_file_ids).delete()
++            logger.debug(f"Deleted {updated_count} files")
++
++            # Walk the local replication to find new files
++            new_paths = self._walk(local_path) - known_paths
++
++            # Bulk create new files
++            new_datafiles = []
++            for path in new_paths:
++                datafile = DataFile(source=self, path=path)
++                datafile.refresh_from_disk(source_root=local_path)
++                datafile.full_clean()
++                new_datafiles.append(datafile)
++            created_count = len(DataFile.objects.bulk_create(new_datafiles, batch_size=100))
++            logger.debug(f"Created {created_count} data files")
++
++        # Update status & last_synced time
++        self.status = DataSourceStatusChoices.COMPLETED
++        self.last_synced = timezone.now()
++        DataSource.objects.filter(pk=self.pk).update(status=self.status, last_synced=self.last_synced)
++
++        # Emit the post_sync signal
++        post_sync.send(sender=self.__class__, instance=self)
++
++    def _walk(self, root):
++        """
++        Return a set of all non-excluded files within the root path.
++        """
++        logger.debug(f"Walking {root}...")
++        paths = set()
++
++        for path, dir_names, file_names in os.walk(root):
++            path = path.split(root)[1].lstrip('/')  # Strip root path
++            if path.startswith('.'):
++                continue
++            for file_name in file_names:
++                if not self._ignore(file_name):
++                    paths.add(os.path.join(path, file_name))
++
++        logger.debug(f"Found {len(paths)} files")
++        return paths
++
++    def _ignore(self, filename):
++        """
++        Returns a boolean indicating whether the file should be ignored per the DataSource's configured
++        ignore rules.
++        """
++        if filename.startswith('.'):
++            return True
++        for rule in self.ignore_rules.splitlines():
++            if fnmatchcase(filename, rule):
++                return True
++        return False
++
++
++class DataFile(ChangeLoggingMixin, models.Model):
++    """
++    The database representation of a remote file fetched from a remote DataSource. DataFile instances should be created,
++    updated, or deleted only by calling DataSource.sync().
++    """
++    source = models.ForeignKey(
++        to='core.DataSource',
++        on_delete=models.CASCADE,
++        related_name='datafiles',
++        editable=False
++    )
++    path = models.CharField(
++        max_length=1000,
++        editable=False,
++        help_text=_("File path relative to the data source's root")
++    )
++    last_updated = models.DateTimeField(
++        editable=False
++    )
++    size = models.PositiveIntegerField(
++        editable=False
++    )
++    hash = models.CharField(
++        max_length=64,
++        editable=False,
++        validators=[
++            RegexValidator(regex='^[0-9a-f]{64}$', message=_("Length must be 64 hexadecimal characters."))
++        ],
++        help_text=_("SHA256 hash of the file data")
++    )
++    data = models.BinaryField()
++
++    objects = RestrictedQuerySet.as_manager()
++
++    class Meta:
++        ordering = ('source', 'path')
++        constraints = (
++            models.UniqueConstraint(
++                fields=('source', 'path'),
++                name='%(app_label)s_%(class)s_unique_source_path'
++            ),
++        )
++
++    def __str__(self):
++        return self.path
++
++    def get_absolute_url(self):
++        return reverse('core:datafile', args=[self.pk])
++
++    @property
++    def data_as_string(self):
++        try:
++            return self.data.tobytes().decode('utf-8')
++        except UnicodeDecodeError:
++            return None
++
++    def refresh_from_disk(self, source_root):
++        """
++        Update instance attributes from the file on disk. Returns True if any attribute
++        has changed.
++        """
++        file_path = os.path.join(source_root, self.path)
++        file_hash = sha256_hash(file_path).hexdigest()
++
++        # Update instance file attributes & data
++        if is_modified := file_hash != self.hash:
++            self.last_updated = timezone.now()
++            self.size = os.path.getsize(file_path)
++            self.hash = file_hash
++            with open(file_path, 'rb') as f:
++                self.data = f.read()
++
++        return is_modified
+diff --git a/netbox/core/search.py b/netbox/core/search.py
+new file mode 100644
+index 000000000..e6d3005e6
+--- /dev/null
++++ b/netbox/core/search.py
+@@ -0,0 +1,21 @@
++from netbox.search import SearchIndex, register_search
++from . import models
++
++
++@register_search
++class DataSourceIndex(SearchIndex):
++    model = models.DataSource
++    fields = (
++        ('name', 100),
++        ('source_url', 300),
++        ('description', 500),
++        ('comments', 5000),
++    )
++
++
++@register_search
++class DataFileIndex(SearchIndex):
++    model = models.DataFile
++    fields = (
++        ('path', 200),
++    )
+diff --git a/netbox/core/signals.py b/netbox/core/signals.py
+new file mode 100644
+index 000000000..65ca293f5
+--- /dev/null
++++ b/netbox/core/signals.py
+@@ -0,0 +1,10 @@
++import django.dispatch
++
++__all__ = (
++    'post_sync',
++    'pre_sync',
++)
++
++# DataSource signals
++pre_sync = django.dispatch.Signal()
++post_sync = django.dispatch.Signal()
+diff --git a/netbox/core/tables/__init__.py b/netbox/core/tables/__init__.py
+new file mode 100644
+index 000000000..df22d8bbb
+--- /dev/null
++++ b/netbox/core/tables/__init__.py
+@@ -0,0 +1 @@
++from .data import *
+diff --git a/netbox/core/tables/data.py b/netbox/core/tables/data.py
+new file mode 100644
+index 000000000..8409e3b82
+--- /dev/null
++++ b/netbox/core/tables/data.py
+@@ -0,0 +1,52 @@
++import django_tables2 as tables
++
++from core.models import *
++from netbox.tables import NetBoxTable, columns
++
++__all__ = (
++    'DataFileTable',
++    'DataSourceTable',
++)
++
++
++class DataSourceTable(NetBoxTable):
++    name = tables.Column(
++        linkify=True
++    )
++    type = columns.ChoiceFieldColumn()
++    status = columns.ChoiceFieldColumn()
++    enabled = columns.BooleanColumn()
++    tags = columns.TagColumn(
++        url_name='core:datasource_list'
++    )
++    file_count = tables.Column(
++        verbose_name='Files'
++    )
++
++    class Meta(NetBoxTable.Meta):
++        model = DataSource
++        fields = (
++            'pk', 'id', 'name', 'type', 'status', 'enabled', 'source_url', 'description', 'comments', 'parameters', 'created',
++            'last_updated', 'file_count',
++        )
++        default_columns = ('pk', 'name', 'type', 'status', 'enabled', 'description', 'file_count')
++
++
++class DataFileTable(NetBoxTable):
++    source = tables.Column(
++        linkify=True
++    )
++    path = tables.Column(
++        linkify=True
++    )
++    last_updated = columns.DateTimeColumn()
++    actions = columns.ActionsColumn(
++        actions=('delete',)
++    )
++
++    class Meta(NetBoxTable.Meta):
++        model = DataFile
++        fields = (
++            'pk', 'id', 'source', 'path', 'last_updated', 'size', 'hash',
++        )
++        default_columns = ('pk', 'source', 'path', 'size', 'last_updated')
+diff --git a/netbox/core/tests/__init__.py b/netbox/core/tests/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/netbox/core/tests/test_api.py b/netbox/core/tests/test_api.py
+new file mode 100644
+index 000000000..dc6d6a5ce
+--- /dev/null
++++ b/netbox/core/tests/test_api.py
+@@ -0,0 +1,93 @@
++from django.urls import reverse
++from django.utils import timezone
++
++from utilities.testing import APITestCase, APIViewTestCases
++from ..choices import *
++from ..models import *
++
++
++class AppTest(APITestCase):
++
++    def test_root(self):
++        url = reverse('core-api:api-root')
++        response = self.client.get('{}?format=api'.format(url), **self.header)
++
++        self.assertEqual(response.status_code, 200)
++
++
++class DataSourceTest(APIViewTestCases.APIViewTestCase):
++    model = DataSource
++    brief_fields = ['display', 'id', 'name', 'url']
++    bulk_update_data = {
++        'enabled': False,
++        'description': 'foo bar baz',
++    }
++
++    @classmethod
++    def setUpTestData(cls):
++        data_sources = (
++            DataSource(name='Data Source 1', type=DataSourceTypeChoices.LOCAL, source_url='file:///var/tmp/source1/'),
++            DataSource(name='Data Source 2', type=DataSourceTypeChoices.LOCAL, source_url='file:///var/tmp/source2/'),
++            DataSource(name='Data Source 3', type=DataSourceTypeChoices.LOCAL, source_url='file:///var/tmp/source3/'),
++        )
++        DataSource.objects.bulk_create(data_sources)
++
++        cls.create_data = [
++            {
++                'name': 'Data Source 4',
++                'type': DataSourceTypeChoices.GIT,
++                'source_url': 'https://example.com/git/source4'
++            },
++            {
++                'name': 'Data Source 5',
++                'type': DataSourceTypeChoices.GIT,
++                'source_url': 'https://example.com/git/source5'
++            },
++            {
++                'name': 'Data Source 6',
++                'type': DataSourceTypeChoices.GIT,
++                'source_url': 'https://example.com/git/source6'
++            },
++        ]
++
++
++class DataFileTest(
++    APIViewTestCases.GetObjectViewTestCase,
++    APIViewTestCases.ListObjectsViewTestCase,
++    APIViewTestCases.GraphQLTestCase
++):
++    model = DataFile
++    brief_fields = ['display', 'id', 'path', 'url']
++
++    @classmethod
++    def setUpTestData(cls):
++        datasource = DataSource.objects.create(
++            name='Data Source 1',
++            type=DataSourceTypeChoices.LOCAL,
++            source_url='file:///var/tmp/source1/'
++        )
++
++        data_files = (
++            DataFile(
++                source=datasource,
++                path='dir1/file1.txt',
++                last_updated=timezone.now(),
++                size=1000,
++                hash='442da078f0111cbdf42f21903724f6597c692535f55bdfbbea758a1ae99ad9e1'
++            ),
++            DataFile(
++                source=datasource,
++                path='dir1/file2.txt',
++                last_updated=timezone.now(),
++                size=2000,
++                hash='a78168c7c97115bafd96450ed03ea43acec495094c5caa28f0d02e20e3a76cc2'
++            ),
++            DataFile(
++                source=datasource,
++                path='dir1/file3.txt',
++                last_updated=timezone.now(),
++                size=3000,
++                hash='12b8827a14c4d5a2f30b6c6e2b7983063988612391c6cbe8ee7493b59054827a'
++            ),
++        )
++        DataFile.objects.bulk_create(data_files)
+diff --git a/netbox/core/tests/test_filtersets.py b/netbox/core/tests/test_filtersets.py
+new file mode 100644
+index 000000000..e1e916f70
+--- /dev/null
++++ b/netbox/core/tests/test_filtersets.py
+@@ -0,0 +1,120 @@
++from datetime import datetime
++
++from django.test import TestCase
++from django.utils import timezone
++
++from utilities.testing import ChangeLoggedFilterSetTests
++from ..choices import *
++from ..filtersets import *
++from ..models import *
++
++
++class DataSourceTestCase(TestCase, ChangeLoggedFilterSetTests):
++    queryset = DataSource.objects.all()
++    filterset = DataSourceFilterSet
++
++    @classmethod
++    def setUpTestData(cls):
++        data_sources = (
++            DataSource(
++                name='Data Source 1',
++                type=DataSourceTypeChoices.LOCAL,
++                source_url='file:///var/tmp/source1/',
++                status=DataSourceStatusChoices.NEW,
++                enabled=True
++            ),
++            DataSource(
++                name='Data Source 2',
++                type=DataSourceTypeChoices.LOCAL,
++                source_url='file:///var/tmp/source2/',
++                status=DataSourceStatusChoices.SYNCING,
++                enabled=True
++            ),
++            DataSource(
++                name='Data Source 3',
++                type=DataSourceTypeChoices.GIT,
++                source_url='https://example.com/git/source3',
++                status=DataSourceStatusChoices.COMPLETED,
++                enabled=False
++            ),
++        )
++        DataSource.objects.bulk_create(data_sources)
++
++    def test_name(self):
++        params = {'name': ['Data Source 1', 'Data Source 2']}
++        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
++
++    def test_type(self):
++        params = {'type': [DataSourceTypeChoices.LOCAL]}
++        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
++
++    def test_enabled(self):
++        params = {'enabled': 'true'}
++        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
++        params = {'enabled': 'false'}
++        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
++
++    def test_status(self):
++        params = {'status': [DataSourceStatusChoices.NEW, DataSourceStatusChoices.SYNCING]}
++        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
++
++
++class DataFileTestCase(TestCase, ChangeLoggedFilterSetTests):
++    queryset = DataFile.objects.all()
++    filterset = DataFileFilterSet
++
++    @classmethod
++    def setUpTestData(cls):
++        data_sources = (
++            DataSource(name='Data Source 1', type=DataSourceTypeChoices.LOCAL, source_url='file:///var/tmp/source1/'),
++            DataSource(name='Data Source 2', type=DataSourceTypeChoices.LOCAL, source_url='file:///var/tmp/source2/'),
++            DataSource(name='Data Source 3', type=DataSourceTypeChoices.LOCAL, source_url='file:///var/tmp/source3/'),
++        )
++        DataSource.objects.bulk_create(data_sources)
++
++        data_files = (
++            DataFile(
++                source=data_sources[0],
++                path='dir1/file1.txt',
++                last_updated=datetime(2023, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
++                size=1000,
++                hash='442da078f0111cbdf42f21903724f6597c692535f55bdfbbea758a1ae99ad9e1'
++            ),
++            DataFile(
++                source=data_sources[1],
++                path='dir1/file2.txt',
++                last_updated=datetime(2023, 1, 2, 0, 0, 0, tzinfo=timezone.utc),
++                size=2000,
++                hash='a78168c7c97115bafd96450ed03ea43acec495094c5caa28f0d02e20e3a76cc2'
++            ),
++            DataFile(
++                source=data_sources[2],
++                path='dir1/file3.txt',
++                last_updated=datetime(2023, 1, 3, 0, 0, 0, tzinfo=timezone.utc),
++                size=3000,
++                hash='12b8827a14c4d5a2f30b6c6e2b7983063988612391c6cbe8ee7493b59054827a'
++            ),
++        )
++        DataFile.objects.bulk_create(data_files)
++
++    def test_source(self):
++        sources = DataSource.objects.all()
++        params = {'source_id': [sources[0].pk, sources[1].pk]}
++        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
++        params = {'source': [sources[0].name, sources[1].name]}
++        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
++
++    def test_path(self):
++        params = {'path': ['dir1/file1.txt', 'dir1/file2.txt']}
++        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
++
++    def test_size(self):
++        params = {'size': [1000, 2000]}
++        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
++
++    def test_hash(self):
++        params = {'hash': [
++            '442da078f0111cbdf42f21903724f6597c692535f55bdfbbea758a1ae99ad9e1',
++            'a78168c7c97115bafd96450ed03ea43acec495094c5caa28f0d02e20e3a76cc2',
++        ]}
++        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+diff --git a/netbox/core/tests/test_views.py b/netbox/core/tests/test_views.py
+new file mode 100644
+index 000000000..fbee031ed
+--- /dev/null
++++ b/netbox/core/tests/test_views.py
+@@ -0,0 +1,91 @@
++from django.utils import timezone
++
++from utilities.testing import ViewTestCases, create_tags
++from ..choices import *
++from ..models import *
++
++
++class DataSourceTestCase(ViewTestCases.PrimaryObjectViewTestCase):
++    model = DataSource
++
++    @classmethod
++    def setUpTestData(cls):
++        data_sources = (
++            DataSource(name='Data Source 1', type=DataSourceTypeChoices.LOCAL, source_url='file:///var/tmp/source1/'),
++            DataSource(name='Data Source 2', type=DataSourceTypeChoices.LOCAL, source_url='file:///var/tmp/source2/'),
++            DataSource(name='Data Source 3', type=DataSourceTypeChoices.LOCAL, source_url='file:///var/tmp/source3/'),
++        )
++        DataSource.objects.bulk_create(data_sources)
++
++        tags = create_tags('Alpha', 'Bravo', 'Charlie')
++
++        cls.form_data = {
++            'name': 'Data Source X',
++            'type': DataSourceTypeChoices.GIT,
++            'source_url': 'http:///exmaple/com/foo/bar/',
++            'description': 'Something',
++            'comments': 'Foo bar baz',
++            'tags': [t.pk for t in tags],
++        }
++
++        cls.csv_data = (
++            f"name,type,source_url,enabled",
++            f"Data Source 4,{DataSourceTypeChoices.LOCAL},file:///var/tmp/source4/,true",
++            f"Data Source 5,{DataSourceTypeChoices.LOCAL},file:///var/tmp/source4/,true",
++            f"Data Source 6,{DataSourceTypeChoices.GIT},http:///exmaple/com/foo/bar/,false",
++        )
++
++        cls.csv_update_data = (
++            "id,name,description",
++            f"{data_sources[0].pk},Data Source 7,New description7",
++            f"{data_sources[1].pk},Data Source 8,New description8",
++            f"{data_sources[2].pk},Data Source 9,New description9",
++        )
++
++        cls.bulk_edit_data = {
++            'enabled': False,
++            'description': 'New description',
++        }
++
++
++class DataFileTestCase(
++    ViewTestCases.GetObjectViewTestCase,
++    ViewTestCases.GetObjectChangelogViewTestCase,
++    ViewTestCases.DeleteObjectViewTestCase,
++    ViewTestCases.ListObjectsViewTestCase,
++    ViewTestCases.BulkDeleteObjectsViewTestCase,
++):
++    model = DataFile
++
++    @classmethod
++    def setUpTestData(cls):
++        datasource = DataSource.objects.create(
++            name='Data Source 1',
++            type=DataSourceTypeChoices.LOCAL,
++            source_url='file:///var/tmp/source1/'
++        )
++
++        data_files = (
++            DataFile(
++                source=datasource,
++                path='dir1/file1.txt',
++                last_updated=timezone.now(),
++                size=1000,
++                hash='442da078f0111cbdf42f21903724f6597c692535f55bdfbbea758a1ae99ad9e1'
++            ),
++            DataFile(
++                source=datasource,
++                path='dir1/file2.txt',
++                last_updated=timezone.now(),
++                size=2000,
++                hash='a78168c7c97115bafd96450ed03ea43acec495094c5caa28f0d02e20e3a76cc2'
++            ),
++            DataFile(
++                source=datasource,
++                path='dir1/file3.txt',
++                last_updated=timezone.now(),
++                size=3000,
++                hash='12b8827a14c4d5a2f30b6c6e2b7983063988612391c6cbe8ee7493b59054827a'
++            ),
++        )
++        DataFile.objects.bulk_create(data_files)
+diff --git a/netbox/core/urls.py b/netbox/core/urls.py
+new file mode 100644
+index 000000000..128020890
+--- /dev/null
++++ b/netbox/core/urls.py
+@@ -0,0 +1,22 @@
++from django.urls import include, path
++
++from utilities.urls import get_model_urls
++from . import views
++
++app_name = 'core'
++urlpatterns = (
++
++    # Data sources
++    path('data-sources/', views.DataSourceListView.as_view(), name='datasource_list'),
++    path('data-sources/add/', views.DataSourceEditView.as_view(), name='datasource_add'),
++    path('data-sources/import/', views.DataSourceBulkImportView.as_view(), name='datasource_import'),
++    path('data-sources/edit/', views.DataSourceBulkEditView.as_view(), name='datasource_bulk_edit'),
++    path('data-sources/delete/', views.DataSourceBulkDeleteView.as_view(), name='datasource_bulk_delete'),
++    path('data-sources/<int:pk>/', include(get_model_urls('core', 'datasource'))),
++
++    # Data files
++    path('data-files/', views.DataFileListView.as_view(), name='datafile_list'),
++    path('data-files/delete/', views.DataFileBulkDeleteView.as_view(), name='datafile_bulk_delete'),
++    path('data-files/<int:pk>/', include(get_model_urls('core', 'datafile'))),
++
++)
+diff --git a/netbox/core/views.py b/netbox/core/views.py
+new file mode 100644
+index 000000000..63905228e
+--- /dev/null
++++ b/netbox/core/views.py
+@@ -0,0 +1,118 @@
++from django.contrib import messages
++from django.shortcuts import get_object_or_404, redirect
++
++from netbox.views import generic
++from netbox.views.generic.base import BaseObjectView
++from utilities.utils import count_related
++from utilities.views import register_model_view
++from . import filtersets, forms, tables
++from .models import *
++
++
++#
++# Data sources
++#
++
++class DataSourceListView(generic.ObjectListView):
++    queryset = DataSource.objects.annotate(
++        file_count=count_related(DataFile, 'source')
++    )
++    filterset = filtersets.DataSourceFilterSet
++    filterset_form = forms.DataSourceFilterForm
++    table = tables.DataSourceTable
++
++
++@register_model_view(DataSource)
++class DataSourceView(generic.ObjectView):
++    queryset = DataSource.objects.all()
++
++    def get_extra_context(self, request, instance):
++        related_models = (
++            (DataFile.objects.restrict(request.user, 'view').filter(source=instance), 'source_id'),
++        )
++
++        return {
++            'related_models': related_models,
++        }
++
++
++@register_model_view(DataSource, 'sync')
++class DataSourceSyncView(BaseObjectView):
++    queryset = DataSource.objects.all()
++
++    def get_required_permission(self):
++        return 'core.sync_datasource'
++
++    def get(self, request, pk):
++        # Redirect GET requests to the object view
++        datasource = get_object_or_404(self.queryset, pk=pk)
++        return redirect(datasource.get_absolute_url())
++
++    def post(self, request, pk):
++        datasource = get_object_or_404(self.queryset, pk=pk)
++        job_result = datasource.enqueue_sync_job(request)
++
++        messages.success(request, f"Queued job #{job_result.pk} to sync {datasource}")
++        return redirect(datasource.get_absolute_url())
++
++
++@register_model_view(DataSource, 'edit')
++class DataSourceEditView(generic.ObjectEditView):
++    queryset = DataSource.objects.all()
++    form = forms.DataSourceForm
++
++
++@register_model_view(DataSource, 'delete')
++class DataSourceDeleteView(generic.ObjectDeleteView):
++    queryset = DataSource.objects.all()
++
++
++class DataSourceBulkImportView(generic.BulkImportView):
++    queryset = DataSource.objects.all()
++    model_form = forms.DataSourceImportForm
++    table = tables.DataSourceTable
++
++
++class DataSourceBulkEditView(generic.BulkEditView):
++    queryset = DataSource.objects.annotate(
++        count_files=count_related(DataFile, 'source')
++    )
++    filterset = filtersets.DataSourceFilterSet
++    table = tables.DataSourceTable
++    form = forms.DataSourceBulkEditForm
++
++
++class DataSourceBulkDeleteView(generic.BulkDeleteView):
++    queryset = DataSource.objects.annotate(
++        count_files=count_related(DataFile, 'source')
++    )
++    filterset = filtersets.DataSourceFilterSet
++    table = tables.DataSourceTable
++
++
++#
++# Data files
++#
++
++class DataFileListView(generic.ObjectListView):
++    queryset = DataFile.objects.defer('data')
++    filterset = filtersets.DataFileFilterSet
++    filterset_form = forms.DataFileFilterForm
++    table = tables.DataFileTable
++    actions = ('bulk_delete',)
++
++
++@register_model_view(DataFile)
++class DataFileView(generic.ObjectView):
++    queryset = DataFile.objects.all()
++
++
++@register_model_view(DataFile, 'delete')
++class DataFileDeleteView(generic.ObjectDeleteView):
++    queryset = DataFile.objects.all()
++
++
++class DataFileBulkDeleteView(generic.BulkDeleteView):
++    queryset = DataFile.objects.defer('data')
++    filterset = filtersets.DataFileFilterSet
++    table = tables.DataFileTable
+diff --git a/netbox/extras/management/commands/nbshell.py b/netbox/extras/management/commands/nbshell.py
+index 07f943d15..04a67eb49 100644
+--- a/netbox/extras/management/commands/nbshell.py
++++ b/netbox/extras/management/commands/nbshell.py
+@@ -9,7 +9,7 @@ from django.contrib.auth.models import User
+ from django.contrib.contenttypes.models import ContentType
+ from django.core.management.base import BaseCommand
+ 
+-APPS = ('circuits', 'dcim', 'extras', 'ipam', 'tenancy', 'users', 'virtualization', 'wireless')
++APPS = ('circuits', 'core', 'dcim', 'extras', 'ipam', 'tenancy', 'users', 'virtualization', 'wireless')
+ 
+ BANNER_TEXT = """### NetBox interactive shell ({node})
+ ### Python {python} | Django {django} | NetBox {netbox}
+diff --git a/netbox/extras/models/models.py b/netbox/extras/models/models.py
+index e608f81b1..df32d6ac4 100644
+--- a/netbox/extras/models/models.py
++++ b/netbox/extras/models/models.py
+@@ -11,6 +11,7 @@ from django.core.validators import MinValueValidator, ValidationError
+ from django.db import models
+ from django.http import HttpResponse, QueryDict
+ from django.urls import reverse
++from django.urls.exceptions import NoReverseMatch
+ from django.utils import timezone
+ from django.utils.formats import date_format
+ from django.utils.translation import gettext as _
+@@ -634,7 +635,7 @@ class JobResult(models.Model):
+     def delete(self, *args, **kwargs):
+         super().delete(*args, **kwargs)
+ 
+-        rq_queue_name = get_config().QUEUE_MAPPINGS.get(self.obj_type.name, RQ_QUEUE_DEFAULT)
++        rq_queue_name = get_config().QUEUE_MAPPINGS.get(self.obj_type.model, RQ_QUEUE_DEFAULT)
+         queue = django_rq.get_queue(rq_queue_name)
+         job = queue.fetch_job(str(self.job_id))
+ 
+@@ -642,7 +643,10 @@ class JobResult(models.Model):
+             job.cancel()
+ 
+     def get_absolute_url(self):
+-        return reverse(f'extras:{self.obj_type.name}_result', args=[self.pk])
++        try:
++            return reverse(f'extras:{self.obj_type.model}_result', args=[self.pk])
++        except NoReverseMatch:
++            return None
+ 
+     def get_status_color(self):
+         return JobResultStatusChoices.colors.get(self.status)
+@@ -693,7 +697,7 @@ class JobResult(models.Model):
+             schedule_at: Schedule the job to be executed at the passed date and time
+             interval: Recurrence interval (in minutes)
+         """
+-        rq_queue_name = get_config().QUEUE_MAPPINGS.get(obj_type.name, RQ_QUEUE_DEFAULT)
++        rq_queue_name = get_config().QUEUE_MAPPINGS.get(obj_type.model, RQ_QUEUE_DEFAULT)
+         queue = django_rq.get_queue(rq_queue_name)
+         status = JobResultStatusChoices.STATUS_SCHEDULED if schedule_at else JobResultStatusChoices.STATUS_PENDING
+         job_result: JobResult = JobResult.objects.create(
+diff --git a/netbox/netbox/api/views.py b/netbox/netbox/api/views.py
+index 6c6083959..023843bca 100644
+--- a/netbox/netbox/api/views.py
++++ b/netbox/netbox/api/views.py
+@@ -27,6 +27,7 @@ class APIRootView(APIView):
+ 
+         return Response({
+             'circuits': reverse('circuits-api:api-root', request=request, format=format),
++            'core': reverse('core-api:api-root', request=request, format=format),
+             'dcim': reverse('dcim-api:api-root', request=request, format=format),
+             'extras': reverse('extras-api:api-root', request=request, format=format),
+             'ipam': reverse('ipam-api:api-root', request=request, format=format),
+diff --git a/netbox/netbox/graphql/schema.py b/netbox/netbox/graphql/schema.py
+index 82abfb4d5..7224f3c38 100644
+--- a/netbox/netbox/graphql/schema.py
++++ b/netbox/netbox/graphql/schema.py
+@@ -1,6 +1,7 @@
+ import graphene
+ 
+ from circuits.graphql.schema import CircuitsQuery
++from core.graphql.schema import CoreQuery
+ from dcim.graphql.schema import DCIMQuery
+ from extras.graphql.schema import ExtrasQuery
+ from ipam.graphql.schema import IPAMQuery
+@@ -14,6 +15,7 @@ from wireless.graphql.schema import WirelessQuery
+ class Query(
+     UsersQuery,
+     CircuitsQuery,
++    CoreQuery,
+     DCIMQuery,
+     ExtrasQuery,
+     IPAMQuery,
+diff --git a/netbox/netbox/navigation/menu.py b/netbox/netbox/navigation/menu.py
+index 83a81690f..6fce7dfe6 100644
+--- a/netbox/netbox/navigation/menu.py
++++ b/netbox/netbox/navigation/menu.py
+@@ -287,6 +287,7 @@ OTHER_MENU = Menu(
+         MenuGroup(
+             label=_('Integrations'),
+             items=(
++                get_model_item('core', 'datasource', _('Data Sources')),
+                 get_model_item('extras', 'webhook', _('Webhooks')),
+                 MenuItem(
+                     link='extras:report_list',
+diff --git a/netbox/netbox/registry.py b/netbox/netbox/registry.py
+index 76886e791..670bca683 100644
+--- a/netbox/netbox/registry.py
++++ b/netbox/netbox/registry.py
+@@ -25,9 +25,10 @@ class Registry(dict):
+ 
+ # Initialize the global registry
+ registry = Registry()
++registry['data_backends'] = dict()
++registry['denormalized_fields'] = collections.defaultdict(list)
+ registry['model_features'] = {
+     feature: collections.defaultdict(set) for feature in EXTRAS_FEATURES
+ }
+-registry['denormalized_fields'] = collections.defaultdict(list)
+ registry['search'] = dict()
+ registry['views'] = collections.defaultdict(dict)
+diff --git a/netbox/netbox/settings.py b/netbox/netbox/settings.py
+index 7f55463df..22849e6ba 100644
+--- a/netbox/netbox/settings.py
++++ b/netbox/netbox/settings.py
+@@ -332,6 +332,7 @@ INSTALLED_APPS = [
+     'social_django',
+     'taggit',
+     'timezone_field',
++    'core',
+     'circuits',
+     'dcim',
+     'ipam',
+diff --git a/netbox/netbox/urls.py b/netbox/netbox/urls.py
+index 84e899ed2..22c47f7bb 100644
+--- a/netbox/netbox/urls.py
++++ b/netbox/netbox/urls.py
+@@ -42,6 +42,7 @@ _patterns = [
+ 
+     # Apps
+     path('circuits/', include('circuits.urls')),
++    path('core/', include('core.urls')),
+     path('dcim/', include('dcim.urls')),
+     path('extras/', include('extras.urls')),
+     path('ipam/', include('ipam.urls')),
+@@ -53,6 +54,7 @@ _patterns = [
+     # API
+     path('api/', APIRootView.as_view(), name='api-root'),
+     path('api/circuits/', include('circuits.api.urls')),
++    path('api/core/', include('core.api.urls')),
+     path('api/dcim/', include('dcim.api.urls')),
+     path('api/extras/', include('extras.api.urls')),
+     path('api/ipam/', include('ipam.api.urls')),
+diff --git a/netbox/project-static/src/htmx.ts b/netbox/project-static/src/htmx.ts
+index 70ed4f534..bd80a0c49 100644
+--- a/netbox/project-static/src/htmx.ts
++++ b/netbox/project-static/src/htmx.ts
+@@ -1,8 +1,10 @@
+ import { getElements, isTruthy } from './util';
+ import { initButtons } from './buttons';
++import { initSelect } from './select';
+ 
+ function initDepedencies(): void {
+-  for (const init of [initButtons]) {
++  console.log('initDepedencies()');
++  for (const init of [initButtons, initSelect]) {
+     init();
+   }
+ }
+diff --git a/netbox/templates/core/datafile.html b/netbox/templates/core/datafile.html
+new file mode 100644
+index 000000000..a10f5039d
+--- /dev/null
++++ b/netbox/templates/core/datafile.html
+@@ -0,0 +1,81 @@
++{% extends 'generic/object.html' %}
++{% load buttons %}
++{% load custom_links %}
++{% load helpers %}
++{% load perms %}
++{% load plugins %}
++
++{% block breadcrumbs %}
++  {{ block.super }}
++  <li class="breadcrumb-item"><a href="{% url 'core:datafile_list' %}?source_id={{ object.source.pk }}">{{ object.source }}</a></li>
++{% endblock %}
++
++{% block controls %}
++  <div class="controls">
++    <div class="control-group">
++      {% plugin_buttons object %}
++    </div>
++    {% if request.user|can_delete:object %}
++      {% delete_button object %}
++    {% endif %}
++    <div class="control-group">
++      {% custom_links object %}
++    </div>
++  </div>
++{% endblock controls %}
++
++{% block content %}
++  <div class="row mb-3">
++    <div class="col">
++      <div class="card">
++        <h5 class="card-header">Data File</h5>
++        <div class="card-body">
++          <table class="table table-hover attr-table">
++            <tr>
++              <th scope="row">Source</th>
++              <td><a href="{{ object.source.get_absolute_url }}">{{ object.source }}</a></td>
++            </tr>
++            <tr>
++              <th scope="row">Path</th>
++              <td>
++                <span class="font-monospace" id="datafile_path">{{ object.path }}</span>
++                <a class="btn btn-sm btn-primary copy-token" data-clipboard-target="#datafile_path" title="Copy to clipboard">
++                  <i class="mdi mdi-content-copy"></i>
++                </a>
++              </td>
++            </tr>
++            <tr>
++              <th scope="row">Last Updated</th>
++              <td>{{ object.last_updated }}</td>
++            </tr>
++            <tr>
++              <th scope="row">Size</th>
++              <td>{{ object.size }} byte{{ object.size|pluralize }}</td>
++            </tr>
++            <tr>
++              <th scope="row">SHA256 Hash</th>
++              <td>
++              <span class="font-monospace" id="datafile_hash">{{ object.hash }}</span>
++                <a class="btn btn-sm btn-primary copy-token" data-clipboard-target="#datafile_hash" title="Copy to clipboard">
++                  <i class="mdi mdi-content-copy"></i>
++                </a>
++              </td>
++            </tr>
++          </table>
++        </div>
++      </div>
++      <div class="card">
++        <h5 class="card-header">Content</h5>
++        <div class="card-body">
++          <pre>{{ object.data_as_string }}</pre>
++        </div>
++      </div>
++      {% plugin_left_page object %}
++    </div>
++  </div>
++  <div class="row mb-3">
++    <div class="col col-md-12">
++      {% plugin_full_width_page object %}
++    </div>
++  </div>
++{% endblock %}
+diff --git a/netbox/templates/core/datasource.html b/netbox/templates/core/datasource.html
+new file mode 100644
+index 000000000..168ced700
+--- /dev/null
++++ b/netbox/templates/core/datasource.html
+@@ -0,0 +1,114 @@
++{% extends 'generic/object.html' %}
++{% load static %}
++{% load helpers %}
++{% load plugins %}
++{% load render_table from django_tables2 %}
++
++{% block extra_controls %}
++  {% if perms.core.sync_datasource %}
++    {% if object.ready_for_sync %}
++      <form action="{% url 'core:datasource_sync' pk=object.pk %}" method="post">
++        {% csrf_token %}
++        <button type="submit" class="btn btn-sm btn-primary">
++          <i class="mdi mdi-sync" aria-hidden="true"></i> Sync
++        </button>
++      </form>
++    {% else %}
++      <button class="btn btn-sm btn-primary" disabled>
++        <i class="mdi mdi-sync" aria-hidden="true"></i> Sync
++      </button>
++    {% endif %}
++  {% endif %}
++{% endblock %}
++
++{% block content %}
++  <div class="row mb-3">
++    <div class="col col-md-6">
++      <div class="card">
++        <h5 class="card-header">Data Source</h5>
++        <div class="card-body">
++          <table class="table table-hover attr-table">
++            <tr>
++              <th scope="row">Name</th>
++              <td>{{ object.name }}</td>
++            </tr>
++            <tr>
++              <th scope="row">Type</th>
++              <td>{{ object.get_type_display }}</td>
++            </tr>
++            <tr>
++              <th scope="row">Enabled</th>
++              <td>{% checkmark object.enabled %}</td>
++            </tr>
++            <tr>
++              <th scope="row">Status</th>
++              <td>{% badge object.get_status_display bg_color=object.get_status_color %}</td>
++            </tr>
++            <tr>
++              <th scope="row">Last synced</th>
++              <td>{{ object.last_synced|placeholder }}</td>
++            </tr>
++            <tr>
++              <th scope="row">Description</th>
++              <td>{{ object.description|placeholder }}</td>
++            </tr>
++            <tr>
++              <th scope="row">URL</th>
++              <td>
++                <a href="{{ object.url }}">{{ object.url }}</a>
++              </td>
++            </tr>
++            <tr>
++              <th scope="row">Ignore rules</th>
++              <td>
++                {% if object.ignore_rules %}
++                  <pre>{{ object.ignore_rules }}</pre>
++                {% else %}
++                  {{ ''|placeholder }}
++                {% endif %}</td>
++            </tr>
++          </table>
++        </div>
++      </div>
++      {% include 'inc/panels/tags.html' %}
++      {% include 'inc/panels/comments.html' %}
++      {% plugin_left_page object %}
++    </div>
++    <div class="col col-md-6">
++      <div class="card">
++        <h5 class="card-header">Backend</h5>
++        <div class="card-body">
++          <table class="table table-hover attr-table">
++            {% for name, field in object.get_backend.parameters.items %}
++              <tr>
++                <th scope="row">{{ field.label }}</th>
++                <td>{{ object.parameters|get_key:name|placeholder }}</td>
++              </tr>
++            {% empty %}
++              <tr>
++                <td colspan="2" class="text-muted">
++                  No parameters defined
++                </td>
++              </tr>
++            {% endfor %}
++          </table>
++        </div>
++      </div>
++      {% include 'inc/panels/related_objects.html' %}
++      {% include 'inc/panels/custom_fields.html' %}
++      {% plugin_right_page object %}
++    </div>
++  </div>
++  <div class="row mb-3">
++    <div class="col col-md-12">
++      <div class="card">
++        <h5 class="card-header">Files</h5>
++        <div class="card-body htmx-container table-responsive"
++          hx-get="{% url 'core:datafile_list' %}?source_id={{ object.pk }}"
++          hx-trigger="load"
++        ></div>
++      </div>
++      {% plugin_full_width_page object %}
++    </div>
++  </div>
++{% endblock %}
+diff --git a/netbox/utilities/files.py b/netbox/utilities/files.py
+new file mode 100644
+index 000000000..68afe2962
+--- /dev/null
++++ b/netbox/utilities/files.py
+@@ -0,0 +1,9 @@
++import hashlib
++
++
++def sha256_hash(filepath):
++    """
++    Return the SHA256 hash of the file at the specified path.
++    """
++    with open(filepath, 'rb') as f:
++        return hashlib.sha256(f.read())

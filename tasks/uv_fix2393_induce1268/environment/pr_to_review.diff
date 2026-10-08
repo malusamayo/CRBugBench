@@ -1,0 +1,1157 @@
+commit a37b08808e044a6a0c4a2a7b6db3eaaf6d18213d
+Author: Zanie Blue <contact@zanie.dev>
+Date:   Sun Feb 11 19:31:41 2024 -0600
+
+    Implement pip compatible `--no-binary` and `--only-binary` options (#1268)
+    
+    Updates our `--no-binary` option and adds a `--only-binary` option for
+    compatibility with `pip` which uses `:all:`, `:none:` and `<name>` for
+    specifying packages.
+    
+    This required adding support for `--only-binary <name>` into our
+    resolver, previously it was only a boolean toggle.
+    
+    Retains`--no-build` which is equivalent to `--only-binary :all:`. This
+    is common enough for safety that I would prefer it is available without
+    pip's awkward `:all:` syntax.
+    
+    ---------
+    
+    Co-authored-by: konsti <konstin@mailbox.org>
+
+diff --git a/crates/distribution-types/src/lib.rs b/crates/distribution-types/src/lib.rs
+index 3b3ace72e..dce614487 100644
+--- a/crates/distribution-types/src/lib.rs
++++ b/crates/distribution-types/src/lib.rs
+@@ -132,7 +132,7 @@ pub enum BuiltDist {
+     Path(PathBuiltDist),
+ }
+ 
+-/// A source distribution, with its three possible origins (index, url, path, git)
++/// A source distribution, with its possible origins (index, url, path, git)
+ #[derive(Debug, Clone)]
+ #[allow(clippy::large_enum_variant)]
+ pub enum SourceDist {
+diff --git a/crates/puffin-dev/src/build.rs b/crates/puffin-dev/src/build.rs
+index 719f467a7..44fb06859 100644
+--- a/crates/puffin-dev/src/build.rs
++++ b/crates/puffin-dev/src/build.rs
+@@ -14,7 +14,7 @@ use puffin_dispatch::BuildDispatch;
+ use puffin_installer::NoBinary;
+ use puffin_interpreter::Virtualenv;
+ use puffin_resolver::InMemoryIndex;
+-use puffin_traits::{BuildContext, BuildKind, InFlight, SetupPyStrategy};
++use puffin_traits::{BuildContext, BuildKind, InFlight, NoBuild, SetupPyStrategy};
+ 
+ #[derive(Parser)]
+ pub(crate) struct BuildArgs {
+@@ -72,7 +72,7 @@ pub(crate) async fn build(args: BuildArgs) -> Result<PathBuf> {
+         &in_flight,
+         venv.python_executable(),
+         setup_py,
+-        false,
++        &NoBuild::None,
+         &NoBinary::None,
+     );
+ 
+diff --git a/crates/puffin-dev/src/install_many.rs b/crates/puffin-dev/src/install_many.rs
+index 5872cb47b..092e24311 100644
+--- a/crates/puffin-dev/src/install_many.rs
++++ b/crates/puffin-dev/src/install_many.rs
+@@ -25,7 +25,7 @@ use puffin_installer::{Downloader, NoBinary};
+ use puffin_interpreter::Virtualenv;
+ use puffin_normalize::PackageName;
+ use puffin_resolver::{DistFinder, InMemoryIndex};
+-use puffin_traits::{BuildContext, InFlight, SetupPyStrategy};
++use puffin_traits::{BuildContext, InFlight, NoBuild, SetupPyStrategy};
+ 
+ #[derive(Parser)]
+ pub(crate) struct InstallManyArgs {
+@@ -66,6 +66,12 @@ pub(crate) async fn install_many(args: InstallManyArgs) -> Result<()> {
+     let in_flight = InFlight::default();
+     let tags = venv.interpreter().tags()?;
+ 
++    let no_build = if args.no_build {
++        NoBuild::All
++    } else {
++        NoBuild::None
++    };
++
+     let build_dispatch = BuildDispatch::new(
+         &client,
+         &cache,
+@@ -76,7 +82,7 @@ pub(crate) async fn install_many(args: InstallManyArgs) -> Result<()> {
+         &in_flight,
+         venv.python_executable(),
+         setup_py,
+-        args.no_build,
++        &no_build,
+         &NoBinary::None,
+     );
+ 
+@@ -129,7 +135,9 @@ async fn install_chunk(
+         info!("Failed to find {} wheel(s)", failures.len());
+     }
+     let wheels_and_source_dist = resolution.len();
+-    let resolution = if build_dispatch.no_build() {
++    let resolution = if build_dispatch.no_build().is_none() {
++        resolution
++    } else {
+         let only_wheels: FxHashMap<_, _> = resolution
+             .into_iter()
+             .filter(|(_, dist)| match dist {
+@@ -142,9 +150,8 @@ async fn install_chunk(
+             wheels_and_source_dist - only_wheels.len()
+         );
+         only_wheels
+-    } else {
+-        resolution
+     };
++
+     let dists = Resolution::new(resolution)
+         .into_distributions()
+         .collect::<Vec<_>>();
+diff --git a/crates/puffin-dev/src/resolve_cli.rs b/crates/puffin-dev/src/resolve_cli.rs
+index 5153b149d..a515ad62a 100644
+--- a/crates/puffin-dev/src/resolve_cli.rs
++++ b/crates/puffin-dev/src/resolve_cli.rs
+@@ -18,7 +18,7 @@ use puffin_dispatch::BuildDispatch;
+ use puffin_installer::NoBinary;
+ use puffin_interpreter::Virtualenv;
+ use puffin_resolver::{InMemoryIndex, Manifest, Options, Resolver};
+-use puffin_traits::{InFlight, SetupPyStrategy};
++use puffin_traits::{InFlight, NoBuild, SetupPyStrategy};
+ 
+ #[derive(ValueEnum, Default, Clone)]
+ pub(crate) enum ResolveCliFormat {
+@@ -69,6 +69,12 @@ pub(crate) async fn resolve_cli(args: ResolveCliArgs) -> Result<()> {
+     let index = InMemoryIndex::default();
+     let in_flight = InFlight::default();
+ 
++    let no_build = if args.no_build {
++        NoBuild::All
++    } else {
++        NoBuild::None
++    };
++
+     let build_dispatch = BuildDispatch::new(
+         &client,
+         &cache,
+@@ -79,7 +85,7 @@ pub(crate) async fn resolve_cli(args: ResolveCliArgs) -> Result<()> {
+         &in_flight,
+         venv.python_executable(),
+         SetupPyStrategy::default(),
+-        args.no_build,
++        &no_build,
+         &NoBinary::None,
+     );
+ 
+diff --git a/crates/puffin-dev/src/resolve_many.rs b/crates/puffin-dev/src/resolve_many.rs
+index 3f510a8fa..40a14050d 100644
+--- a/crates/puffin-dev/src/resolve_many.rs
++++ b/crates/puffin-dev/src/resolve_many.rs
+@@ -21,7 +21,7 @@ use puffin_installer::NoBinary;
+ use puffin_interpreter::Virtualenv;
+ use puffin_normalize::PackageName;
+ use puffin_resolver::InMemoryIndex;
+-use puffin_traits::{BuildContext, InFlight, SetupPyStrategy};
++use puffin_traits::{BuildContext, InFlight, NoBuild, SetupPyStrategy};
+ 
+ #[derive(Parser)]
+ pub(crate) struct ResolveManyArgs {
+@@ -82,6 +82,12 @@ pub(crate) async fn resolve_many(args: ResolveManyArgs) -> Result<()> {
+     header_span.pb_set_length(total as u64);
+     let _header_span_enter = header_span.enter();
+ 
++    let no_build = if args.no_build {
++        NoBuild::All
++    } else {
++        NoBuild::None
++    };
++
+     let mut tasks = futures::stream::iter(requirements)
+         .map(|requirement| {
+             async {
+@@ -102,7 +108,7 @@ pub(crate) async fn resolve_many(args: ResolveManyArgs) -> Result<()> {
+                     &in_flight,
+                     venv.python_executable(),
+                     setup_py,
+-                    args.no_build,
++                    &no_build,
+                     &NoBinary::None,
+                 );
+ 
+diff --git a/crates/puffin-dispatch/src/lib.rs b/crates/puffin-dispatch/src/lib.rs
+index 69486c632..8b51bf1be 100644
+--- a/crates/puffin-dispatch/src/lib.rs
++++ b/crates/puffin-dispatch/src/lib.rs
+@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
+ use itertools::Itertools;
+ use tracing::{debug, instrument};
+ 
+-use distribution_types::{IndexLocations, Name, Resolution};
++use distribution_types::{IndexLocations, Name, Resolution, SourceDist};
+ use futures::FutureExt;
+ use pep508_rs::Requirement;
+ use puffin_build::{SourceBuild, SourceBuildContext};
+@@ -18,7 +18,7 @@ use puffin_client::{FlatIndex, RegistryClient};
+ use puffin_installer::{Downloader, Installer, NoBinary, Plan, Planner, Reinstall, SitePackages};
+ use puffin_interpreter::{Interpreter, Virtualenv};
+ use puffin_resolver::{InMemoryIndex, Manifest, Options, Resolver};
+-use puffin_traits::{BuildContext, BuildKind, InFlight, SetupPyStrategy};
++use puffin_traits::{BuildContext, BuildKind, InFlight, NoBuild, SetupPyStrategy};
+ 
+ /// The main implementation of [`BuildContext`], used by the CLI, see [`BuildContext`]
+ /// documentation.
+@@ -32,7 +32,7 @@ pub struct BuildDispatch<'a> {
+     in_flight: &'a InFlight,
+     base_python: PathBuf,
+     setup_py: SetupPyStrategy,
+-    no_build: bool,
++    no_build: &'a NoBuild,
+     no_binary: &'a NoBinary,
+     source_build_context: SourceBuildContext,
+     options: Options,
+@@ -50,7 +50,7 @@ impl<'a> BuildDispatch<'a> {
+         in_flight: &'a InFlight,
+         base_python: PathBuf,
+         setup_py: SetupPyStrategy,
+-        no_build: bool,
++        no_build: &'a NoBuild,
+         no_binary: &'a NoBinary,
+     ) -> Self {
+         Self {
+@@ -92,7 +92,7 @@ impl<'a> BuildContext for BuildDispatch<'a> {
+         &self.base_python
+     }
+ 
+-    fn no_build(&self) -> bool {
++    fn no_build(&self) -> &NoBuild {
+         self.no_build
+     }
+ 
+@@ -246,10 +246,29 @@ impl<'a> BuildContext for BuildDispatch<'a> {
+         source: &'data Path,
+         subdirectory: Option<&'data Path>,
+         package_id: &'data str,
++        dist: Option<&'data SourceDist>,
+         build_kind: BuildKind,
+     ) -> Result<SourceBuild> {
+-        if self.no_build {
+-            bail!("Building source distributions is disabled");
++        match self.no_build {
++            NoBuild::All => bail!("Building source distributions is disabled"),
++            NoBuild::None => {}
++            NoBuild::Packages(packages) => {
++                if let Some(dist) = dist {
++                    // We can only prevent builds by name for packages with names
++                    // which is unknown before build of editable source distributions
++                    if packages.contains(dist.name()) {
++                        bail!(
++                            "Building source distributions for {} is disabled",
++                            dist.name()
++                        );
++                    }
++                } else {
++                    debug_assert!(
++                        matches!(build_kind, BuildKind::Editable),
++                        "Only editable builds are exempt from 'no build' checks"
++                    );
++                }
++            }
+         }
+ 
+         let builder = SourceBuild::setup(
+diff --git a/crates/puffin-distribution/src/distribution_database.rs b/crates/puffin-distribution/src/distribution_database.rs
+index 39ef1473a..032759696 100644
+--- a/crates/puffin-distribution/src/distribution_database.rs
++++ b/crates/puffin-distribution/src/distribution_database.rs
+@@ -16,7 +16,7 @@ use puffin_cache::{Cache, CacheBucket, Timestamp, WheelCache};
+ use puffin_client::{CacheControl, CachedClientError, RegistryClient};
+ use puffin_fs::metadata_if_exists;
+ use puffin_git::GitSource;
+-use puffin_traits::{BuildContext, NoBinary};
++use puffin_traits::{BuildContext, NoBinary, NoBuild};
+ use pypi_types::Metadata21;
+ 
+ use crate::download::{BuiltWheel, UnzippedWheel};
+@@ -340,8 +340,13 @@ impl<'a, Context: BuildContext + Send + Sync> DistributionDatabase<'a, Context>
+                 Ok((self.client.wheel_metadata(built_dist).boxed().await?, None))
+             }
+             Dist::Source(source_dist) => {
++                let no_build = match self.build_context.no_build() {
++                    NoBuild::All => true,
++                    NoBuild::None => false,
++                    NoBuild::Packages(packages) => packages.contains(source_dist.name()),
++                };
+                 // Optimization: Skip source dist download when we must not build them anyway.
+-                if self.build_context.no_build() {
++                if no_build {
+                     return Err(Error::NoBuild);
+                 }
+ 
+diff --git a/crates/puffin-distribution/src/source/mod.rs b/crates/puffin-distribution/src/source/mod.rs
+index b7013d857..850c1cc95 100644
+--- a/crates/puffin-distribution/src/source/mod.rs
++++ b/crates/puffin-distribution/src/source/mod.rs
+@@ -27,7 +27,7 @@ use puffin_cache::{
+ use puffin_client::{CacheControl, CachedClient, CachedClientError, DataWithCachePolicy};
+ use puffin_fs::{write_atomic, LockedFile};
+ use puffin_git::{Fetch, GitSource};
+-use puffin_traits::{BuildContext, BuildKind, SourceBuildTrait};
++use puffin_traits::{BuildContext, BuildKind, NoBuild, SourceBuildTrait};
+ use pypi_types::Metadata21;
+ 
+ use crate::error::Error;
+@@ -823,7 +823,13 @@ impl<'a, T: BuildContext> SourceDistCachedBuilder<'a, T> {
+     ) -> Result<(String, WheelFilename, Metadata21), Error> {
+         debug!("Building: {dist}");
+ 
+-        if self.build_context.no_build() {
++        // Guard against build of source distributions when disabled
++        let no_build = match self.build_context.no_build() {
++            NoBuild::All => true,
++            NoBuild::None => false,
++            NoBuild::Packages(packages) => packages.contains(dist.name()),
++        };
++        if no_build {
+             return Err(Error::NoBuild);
+         }
+ 
+@@ -837,6 +843,7 @@ impl<'a, T: BuildContext> SourceDistCachedBuilder<'a, T> {
+                 source_dist,
+                 subdirectory,
+                 &dist.to_string(),
++                Some(dist),
+                 BuildKind::Wheel,
+             )
+             .await
+@@ -878,6 +885,7 @@ impl<'a, T: BuildContext> SourceDistCachedBuilder<'a, T> {
+                 source_dist,
+                 subdirectory,
+                 &dist.to_string(),
++                Some(dist),
+                 BuildKind::Wheel,
+             )
+             .await
+@@ -923,6 +931,7 @@ impl<'a, T: BuildContext> SourceDistCachedBuilder<'a, T> {
+                 &editable.path,
+                 None,
+                 &editable.to_string(),
++                None,
+                 BuildKind::Editable,
+             )
+             .await
+diff --git a/crates/puffin-resolver/tests/resolver.rs b/crates/puffin-resolver/tests/resolver.rs
+index 5313e9471..7cf2bd7be 100644
+--- a/crates/puffin-resolver/tests/resolver.rs
++++ b/crates/puffin-resolver/tests/resolver.rs
+@@ -10,7 +10,7 @@ use anyhow::Result;
+ use chrono::{DateTime, Utc};
+ use once_cell::sync::Lazy;
+ 
+-use distribution_types::{IndexLocations, Resolution};
++use distribution_types::{IndexLocations, Resolution, SourceDist};
+ use pep508_rs::{MarkerEnvironment, Requirement, StringVersion};
+ use platform_host::{Arch, Os, Platform};
+ use platform_tags::Tags;
+@@ -21,7 +21,9 @@ use puffin_resolver::{
+     DisplayResolutionGraph, InMemoryIndex, Manifest, Options, OptionsBuilder, PreReleaseMode,
+     ResolutionGraph, ResolutionMode, Resolver,
+ };
+-use puffin_traits::{BuildContext, BuildKind, NoBinary, SetupPyStrategy, SourceBuildTrait};
++use puffin_traits::{
++    BuildContext, BuildKind, NoBinary, NoBuild, SetupPyStrategy, SourceBuildTrait,
++};
+ 
+ // Exclude any packages uploaded after this date.
+ static EXCLUDE_NEWER: Lazy<DateTime<Utc>> = Lazy::new(|| {
+@@ -61,8 +63,8 @@ impl BuildContext for DummyContext {
+         panic!("The test should not need to build source distributions")
+     }
+ 
+-    fn no_build(&self) -> bool {
+-        false
++    fn no_build(&self) -> &NoBuild {
++        &NoBuild::None
+     }
+ 
+     fn no_binary(&self) -> &NoBinary {
+@@ -94,6 +96,7 @@ impl BuildContext for DummyContext {
+         _source: &'a Path,
+         _subdirectory: Option<&'a Path>,
+         _package_id: &'a str,
++        _dist: Option<&'a SourceDist>,
+         _build_kind: BuildKind,
+     ) -> Result<Self::SourceDistBuilder> {
+         Ok(DummyBuilder)
+diff --git a/crates/puffin-traits/src/lib.rs b/crates/puffin-traits/src/lib.rs
+index 624d286b1..b8f2e0381 100644
+--- a/crates/puffin-traits/src/lib.rs
++++ b/crates/puffin-traits/src/lib.rs
+@@ -3,10 +3,11 @@
+ use std::fmt::{Display, Formatter};
+ use std::future::Future;
+ use std::path::{Path, PathBuf};
++use std::str::FromStr;
+ 
+ use anyhow::Result;
+ 
+-use distribution_types::{CachedDist, DistributionId, IndexLocations, Resolution};
++use distribution_types::{CachedDist, DistributionId, IndexLocations, Resolution, SourceDist};
+ use once_map::OnceMap;
+ use pep508_rs::Requirement;
+ use puffin_cache::Cache;
+@@ -67,7 +68,7 @@ pub trait BuildContext: Sync {
+     /// Whether source distribution building is disabled. This [`BuildContext::setup_build`] calls
+     /// will fail in this case. This method exists to avoid fetching source distributions if we know
+     /// we can't build them
+-    fn no_build(&self) -> bool;
++    fn no_build(&self) -> &NoBuild;
+ 
+     /// Whether using pre-built wheels is disabled.
+     fn no_binary(&self) -> &NoBinary;
+@@ -98,11 +99,13 @@ pub trait BuildContext: Sync {
+     /// For PEP 517 builds, this calls `get_requires_for_build_wheel`.
+     ///
+     /// `package_id` is for error reporting only.
++    /// `dist` is for safety checks and may be null for editable builds.
+     fn setup_build<'a>(
+         &'a self,
+         source: &'a Path,
+         subdirectory: Option<&'a Path>,
+         package_id: &'a str,
++        dist: Option<&'a SourceDist>,
+         build_kind: BuildKind,
+     ) -> impl Future<Output = Result<Self::SourceDistBuilder>> + Send + 'a;
+ }
+@@ -163,6 +166,62 @@ impl Display for BuildKind {
+     }
+ }
+ 
++#[derive(Debug, Clone)]
++pub enum PackageNameSpecifier {
++    All,
++    None,
++    Package(PackageName),
++}
++
++impl FromStr for PackageNameSpecifier {
++    type Err = puffin_normalize::InvalidNameError;
++
++    fn from_str(name: &str) -> Result<Self, Self::Err> {
++        match name {
++            ":all:" => Ok(Self::All),
++            ":none:" => Ok(Self::None),
++            _ => Ok(Self::Package(PackageName::from_str(name)?)),
++        }
++    }
++}
++
++#[derive(Debug, Clone)]
++pub enum PackageNameSpecifiers {
++    All,
++    None,
++    Packages(Vec<PackageName>),
++}
++
++impl PackageNameSpecifiers {
++    fn from_iter(specifiers: impl Iterator<Item = PackageNameSpecifier>) -> Self {
++        let mut packages = Vec::new();
++        let mut all: bool = false;
++
++        for specifier in specifiers {
++            match specifier {
++                PackageNameSpecifier::None => {
++                    packages.clear();
++                    all = false;
++                }
++                PackageNameSpecifier::All => {
++                    all = true;
++                }
++                PackageNameSpecifier::Package(name) => {
++                    packages.push(name);
++                }
++            }
++        }
++
++        if all {
++            Self::All
++        } else if packages.is_empty() {
++            Self::None
++        } else {
++            Self::Packages(packages)
++        }
++    }
++}
++
+ #[derive(Debug, Clone)]
+ pub enum NoBinary {
+     /// Allow installation of any wheel.
+@@ -177,13 +236,117 @@ pub enum NoBinary {
+ 
+ impl NoBinary {
+     /// Determine the binary installation strategy to use.
+-    pub fn from_args(no_binary: bool, no_binary_package: Vec<PackageName>) -> Self {
+-        if no_binary {
++    pub fn from_args(no_binary: Vec<PackageNameSpecifier>) -> Self {
++        let combined = PackageNameSpecifiers::from_iter(no_binary.into_iter());
++        match combined {
++            PackageNameSpecifiers::All => Self::All,
++            PackageNameSpecifiers::None => Self::None,
++            PackageNameSpecifiers::Packages(packages) => Self::Packages(packages),
++        }
++    }
++}
++
++impl NoBinary {
++    /// Returns `true` if all wheels are allowed.
++    pub fn is_none(&self) -> bool {
++        matches!(self, Self::None)
++    }
++}
++
++#[derive(Debug, Clone, PartialEq)]
++pub enum NoBuild {
++    /// Allow building wheels from any source distribution.
++    None,
++
++    /// Do not allow building wheels from any source distribution.
++    All,
++
++    /// Do not allow building wheels from the given package's source distributions.
++    Packages(Vec<PackageName>),
++}
++
++impl NoBuild {
++    /// Determine the build strategy to use.
++    pub fn from_args(only_binary: Vec<PackageNameSpecifier>, no_build: bool) -> Self {
++        if no_build {
+             Self::All
+-        } else if !no_binary_package.is_empty() {
+-            Self::Packages(no_binary_package)
+         } else {
+-            Self::None
++            let combined = PackageNameSpecifiers::from_iter(only_binary.into_iter());
++            match combined {
++                PackageNameSpecifiers::All => Self::All,
++                PackageNameSpecifiers::None => Self::None,
++                PackageNameSpecifiers::Packages(packages) => Self::Packages(packages),
++            }
+         }
+     }
+ }
++
++impl NoBuild {
++    /// Returns `true` if all builds are allowed.
++    pub fn is_none(&self) -> bool {
++        matches!(self, Self::None)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use anyhow::Error;
++
++    use super::*;
++
++    #[test]
++    fn no_build_from_args() -> Result<(), Error> {
++        assert_eq!(
++            NoBuild::from_args(vec![PackageNameSpecifier::from_str(":all:")?], false),
++            NoBuild::All,
++        );
++        assert_eq!(
++            NoBuild::from_args(vec![PackageNameSpecifier::from_str(":all:")?], true),
++            NoBuild::All,
++        );
++        assert_eq!(
++            NoBuild::from_args(vec![PackageNameSpecifier::from_str(":none:")?], true),
++            NoBuild::All,
++        );
++        assert_eq!(
++            NoBuild::from_args(vec![PackageNameSpecifier::from_str(":none:")?], false),
++            NoBuild::None,
++        );
++        assert_eq!(
++            NoBuild::from_args(
++                vec![
++                    PackageNameSpecifier::from_str("foo")?,
++                    PackageNameSpecifier::from_str("bar")?
++                ],
++                false
++            ),
++            NoBuild::Packages(vec![
++                PackageName::from_str("foo")?,
++                PackageName::from_str("bar")?
++            ]),
++        );
++        assert_eq!(
++            NoBuild::from_args(
++                vec![
++                    PackageNameSpecifier::from_str("test")?,
++                    PackageNameSpecifier::All
++                ],
++                false
++            ),
++            NoBuild::All,
++        );
++        assert_eq!(
++            NoBuild::from_args(
++                vec![
++                    PackageNameSpecifier::from_str("foo")?,
++                    PackageNameSpecifier::from_str(":none:")?,
++                    PackageNameSpecifier::from_str("bar")?
++                ],
++                false
++            ),
++            NoBuild::Packages(vec![PackageName::from_str("bar")?]),
++        );
++
++        Ok(())
++    }
++}
+diff --git a/crates/puffin/src/commands/pip_compile.rs b/crates/puffin/src/commands/pip_compile.rs
+index 86fa2db34..ccdc742d2 100644
+--- a/crates/puffin/src/commands/pip_compile.rs
++++ b/crates/puffin/src/commands/pip_compile.rs
+@@ -30,7 +30,7 @@ use puffin_resolver::{
+     DisplayResolutionGraph, InMemoryIndex, Manifest, OptionsBuilder, PreReleaseMode,
+     ResolutionMode, Resolver,
+ };
+-use puffin_traits::{InFlight, SetupPyStrategy};
++use puffin_traits::{InFlight, NoBuild, SetupPyStrategy};
+ use puffin_warnings::warn_user;
+ use requirements_txt::EditableRequirement;
+ 
+@@ -59,7 +59,7 @@ pub(crate) async fn pip_compile(
+     include_find_links: bool,
+     index_locations: IndexLocations,
+     setup_py: SetupPyStrategy,
+-    no_build: bool,
++    no_build: &NoBuild,
+     python_version: Option<PythonVersion>,
+     exclude_newer: Option<DateTime<Utc>>,
+     cache: Cache,
+@@ -152,7 +152,7 @@ pub(crate) async fn pip_compile(
+             python_version.major() == interpreter.python_major()
+                 && python_version.minor() == interpreter.python_minor()
+         };
+-        if !no_build
++        if no_build.is_none()
+             && python_version.version() != interpreter.python_version()
+             && (python_version.patch().is_some() || !matches_without_patch)
+         {
+diff --git a/crates/puffin/src/commands/pip_install.rs b/crates/puffin/src/commands/pip_install.rs
+index f95956922..ae68d4b81 100644
+--- a/crates/puffin/src/commands/pip_install.rs
++++ b/crates/puffin/src/commands/pip_install.rs
+@@ -29,7 +29,7 @@ use puffin_resolver::{
+     DependencyMode, InMemoryIndex, Manifest, Options, OptionsBuilder, PreReleaseMode,
+     ResolutionGraph, ResolutionMode, Resolver,
+ };
+-use puffin_traits::{InFlight, SetupPyStrategy};
++use puffin_traits::{InFlight, NoBuild, SetupPyStrategy};
+ use pypi_types::Yanked;
+ use requirements_txt::EditableRequirement;
+ 
+@@ -52,7 +52,7 @@ pub(crate) async fn pip_install(
+     reinstall: &Reinstall,
+     link_mode: LinkMode,
+     setup_py: SetupPyStrategy,
+-    no_build: bool,
++    no_build: &NoBuild,
+     no_binary: &NoBinary,
+     strict: bool,
+     exclude_newer: Option<DateTime<Utc>>,
+diff --git a/crates/puffin/src/commands/pip_sync.rs b/crates/puffin/src/commands/pip_sync.rs
+index 79a1e5459..5bd8d1e48 100644
+--- a/crates/puffin/src/commands/pip_sync.rs
++++ b/crates/puffin/src/commands/pip_sync.rs
+@@ -18,7 +18,7 @@ use puffin_installer::{
+ };
+ use puffin_interpreter::Virtualenv;
+ use puffin_resolver::InMemoryIndex;
+-use puffin_traits::{InFlight, SetupPyStrategy};
++use puffin_traits::{InFlight, NoBuild, SetupPyStrategy};
+ use pypi_types::Yanked;
+ use requirements_txt::EditableRequirement;
+ 
+@@ -35,7 +35,7 @@ pub(crate) async fn pip_sync(
+     link_mode: LinkMode,
+     index_locations: IndexLocations,
+     setup_py: SetupPyStrategy,
+-    no_build: bool,
++    no_build: &NoBuild,
+     no_binary: &NoBinary,
+     strict: bool,
+     cache: Cache,
+diff --git a/crates/puffin/src/commands/venv.rs b/crates/puffin/src/commands/venv.rs
+index e280b064c..e4cff1754 100644
+--- a/crates/puffin/src/commands/venv.rs
++++ b/crates/puffin/src/commands/venv.rs
+@@ -18,7 +18,7 @@ use puffin_fs::Normalized;
+ use puffin_installer::NoBinary;
+ use puffin_interpreter::{find_default_python, find_requested_python, Error};
+ use puffin_resolver::InMemoryIndex;
+-use puffin_traits::{BuildContext, InFlight, SetupPyStrategy};
++use puffin_traits::{BuildContext, InFlight, NoBuild, SetupPyStrategy};
+ 
+ use crate::commands::ExitStatus;
+ use crate::printer::Printer;
+@@ -135,7 +135,7 @@ async fn venv_impl(
+             &in_flight,
+             venv.python_executable(),
+             SetupPyStrategy::default(),
+-            true,
++            &NoBuild::All,
+             &NoBinary::None,
+         );
+ 
+diff --git a/crates/puffin/src/main.rs b/crates/puffin/src/main.rs
+index 98243cdc6..23f62dbd1 100644
+--- a/crates/puffin/src/main.rs
++++ b/crates/puffin/src/main.rs
+@@ -17,7 +17,7 @@ use puffin_installer::{NoBinary, Reinstall};
+ use puffin_interpreter::PythonVersion;
+ use puffin_normalize::{ExtraName, PackageName};
+ use puffin_resolver::{DependencyMode, PreReleaseMode, ResolutionMode};
+-use puffin_traits::SetupPyStrategy;
++use puffin_traits::{NoBuild, PackageNameSpecifier, SetupPyStrategy};
+ use requirements::ExtrasSpecification;
+ 
+ use crate::commands::{extra_name_with_clap_error, ExitStatus, Upgrade};
+@@ -259,9 +259,22 @@ struct PipCompileArgs {
+     /// When enabled, resolving will not run arbitrary code. The cached wheels of already-built
+     /// source distributions will be reused, but operations that require building distributions will
+     /// exit with an error.
+-    #[clap(long)]
++    ///
++    /// Alias for `--only-binary :all:`.
++    #[clap(long, conflicts_with = "only_binary")]
+     no_build: bool,
+ 
++    /// Only use pre-built wheels; don't build source distributions.
++    ///
++    /// When enabled, resolving will not run code from the given packages. The cached wheels of already-built
++    /// source distributions will be reused, but operations that require building distributions will
++    /// exit with an error.
++    ///
++    /// Multiple packages may be provided. Disable binaries for all packages with `:all:`.
++    /// Clear previously specified packages with `:none:`.
++    #[clap(long, conflicts_with = "no_build")]
++    only_binary: Vec<PackageNameSpecifier>,
++
+     /// The minimum Python version that should be supported by the compiled requirements (e.g.,
+     /// `3.7` or `3.7.9`).
+     ///
+@@ -353,22 +366,31 @@ struct PipSyncArgs {
+     /// When enabled, resolving will not run arbitrary code. The cached wheels of already-built
+     /// source distributions will be reused, but operations that require building distributions will
+     /// exit with an error.
+-    #[clap(long)]
++    ///
++    /// Alias for `--only-binary :all:`.
++    #[clap(long, conflicts_with = "no_binary", conflicts_with = "only_binary")]
+     no_build: bool,
+ 
+     /// Don't install pre-built wheels.
+     ///
+-    /// When enabled, all installed packages will be installed from a source distribution. The resolver
++    /// The given packages will be installed from a source distribution. The resolver
+     /// will still use pre-built wheels for metadata.
+-    #[clap(long)]
+-    no_binary: bool,
++    ///
++    /// Multiple packages may be provided. Disable binaries for all packages with `:all:`.
++    /// Clear previously specified packages with `:none:`.
++    #[clap(long, conflicts_with = "no_build")]
++    no_binary: Vec<PackageNameSpecifier>,
+ 
+-    /// Don't install pre-built wheels for a specific package.
++    /// Only use pre-built wheels; don't build source distributions.
+     ///
+-    /// When enabled, the specified packages will be installed from a source distribution. The resolver
+-    /// will still use pre-built wheels for metadata.
+-    #[clap(long)]
+-    no_binary_package: Vec<PackageName>,
++    /// When enabled, resolving will not run code from the given packages. The cached wheels of already-built
++    /// source distributions will be reused, but operations that require building distributions will
++    /// exit with an error.
++    ///
++    /// Multiple packages may be provided. Disable binaries for all packages with `:all:`.
++    /// Clear previously specified packages with `:none:`.
++    #[clap(long, conflicts_with = "no_build")]
++    only_binary: Vec<PackageNameSpecifier>,
+ 
+     /// Validate the virtual environment after completing the installation, to detect packages with
+     /// missing dependencies or other issues.
+@@ -492,22 +514,31 @@ struct PipInstallArgs {
+     /// When enabled, resolving will not run arbitrary code. The cached wheels of already-built
+     /// source distributions will be reused, but operations that require building distributions will
+     /// exit with an error.
+-    #[clap(long)]
++    ///
++    /// Alias for `--only-binary :all:`.
++    #[clap(long, conflicts_with = "no_binary", conflicts_with = "only_binary")]
+     no_build: bool,
+ 
+     /// Don't install pre-built wheels.
+     ///
+-    /// When enabled, all installed packages will be installed from a source distribution. The resolver
++    /// The given packages will be installed from a source distribution. The resolver
+     /// will still use pre-built wheels for metadata.
+-    #[clap(long)]
+-    no_binary: bool,
++    ///
++    /// Multiple packages may be provided. Disable binaries for all packages with `:all:`.
++    /// Clear previously specified packages with `:none:`.
++    #[clap(long, conflicts_with = "no_build")]
++    no_binary: Vec<PackageNameSpecifier>,
+ 
+-    /// Don't install pre-built wheels for a specific package.
++    /// Only use pre-built wheels; don't build source distributions.
+     ///
+-    /// When enabled, the specified packages will be installed from a source distribution. The resolver
+-    /// will still use pre-built wheels for metadata.
+-    #[clap(long)]
+-    no_binary_package: Vec<PackageName>,
++    /// When enabled, resolving will not run code from the given packages. The cached wheels of already-built
++    /// source distributions will be reused, but operations that require building distributions will
++    /// exit with an error.
++    ///
++    /// Multiple packages may be provided. Disable binaries for all packages with `:all:`.
++    /// Clear previously specified packages with `:none:`.
++    #[clap(long, conflicts_with = "no_build")]
++    only_binary: Vec<PackageNameSpecifier>,
+ 
+     /// Validate the virtual environment after completing the installation, to detect packages with
+     /// missing dependencies or other issues.
+@@ -741,6 +772,7 @@ async fn run() -> Result<ExitStatus> {
+                 ExtrasSpecification::Some(&args.extra)
+             };
+             let upgrade = Upgrade::from_args(args.upgrade, args.upgrade_package);
++            let no_build = NoBuild::from_args(args.only_binary, args.no_build);
+             commands::pip_compile(
+                 &requirements,
+                 &constraints,
+@@ -761,7 +793,7 @@ async fn run() -> Result<ExitStatus> {
+                 } else {
+                     SetupPyStrategy::Pep517
+                 },
+-                args.no_build,
++                &no_build,
+                 args.python_version,
+                 args.exclude_newer,
+                 cache,
+@@ -787,7 +819,8 @@ async fn run() -> Result<ExitStatus> {
+                 .map(RequirementsSource::from_path)
+                 .collect::<Vec<_>>();
+             let reinstall = Reinstall::from_args(args.reinstall, args.reinstall_package);
+-            let no_binary = NoBinary::from_args(args.no_binary, args.no_binary_package);
++            let no_binary = NoBinary::from_args(args.no_binary);
++            let no_build = NoBuild::from_args(args.only_binary, args.no_build);
+             commands::pip_sync(
+                 &sources,
+                 &reinstall,
+@@ -798,7 +831,7 @@ async fn run() -> Result<ExitStatus> {
+                 } else {
+                     SetupPyStrategy::Pep517
+                 },
+-                args.no_build,
++                &no_build,
+                 &no_binary,
+                 args.strict,
+                 cache,
+@@ -845,7 +878,8 @@ async fn run() -> Result<ExitStatus> {
+                 ExtrasSpecification::Some(&args.extra)
+             };
+             let reinstall = Reinstall::from_args(args.reinstall, args.reinstall_package);
+-            let no_binary = NoBinary::from_args(args.no_binary, args.no_binary_package);
++            let no_binary = NoBinary::from_args(args.no_binary);
++            let no_build = NoBuild::from_args(args.only_binary, args.no_build);
+             let dependency_mode = if args.no_deps {
+                 DependencyMode::Direct
+             } else {
+@@ -867,7 +901,7 @@ async fn run() -> Result<ExitStatus> {
+                 } else {
+                     SetupPyStrategy::Pep517
+                 },
+-                args.no_build,
++                &no_build,
+                 &no_binary,
+                 args.strict,
+                 args.exclude_newer,
+diff --git a/crates/puffin/tests/pip_install.rs b/crates/puffin/tests/pip_install.rs
+index 33a81bca0..7d6dc797f 100644
+--- a/crates/puffin/tests/pip_install.rs
++++ b/crates/puffin/tests/pip_install.rs
+@@ -668,32 +668,31 @@ fn install_no_binary() {
+     let context = TestContext::new("3.12");
+ 
+     let mut command = command(&context);
+-    command.arg("Flask").arg("--no-binary").arg("--strict");
++    command
++        .arg("jinja2")
++        .arg("--no-binary")
++        .arg(":all:")
++        .arg("--strict");
+     if cfg!(all(windows, debug_assertions)) {
+         // TODO(konstin): Reduce stack usage in debug mode enough that the tests pass with the
+         // default windows stack of 1MB
+         command.env("PUFFIN_STACK_SIZE", (2 * 1024 * 1024).to_string());
+     }
+     puffin_snapshot!(command, @r###"
+-        success: true
+-        exit_code: 0
+-        ----- stdout -----
++    success: true
++    exit_code: 0
++    ----- stdout -----
+ 
+-        ----- stderr -----
+-        Resolved 7 packages in [TIME]
+-        Downloaded 7 packages in [TIME]
+-        Installed 7 packages in [TIME]
+-         + blinker==1.7.0
+-         + click==8.1.7
+-         + flask==3.0.0
+-         + itsdangerous==2.1.2
+-         + jinja2==3.1.2
+-         + markupsafe==2.1.3
+-         + werkzeug==3.0.1
+-        "###
++    ----- stderr -----
++    Resolved 2 packages in [TIME]
++    Downloaded 2 packages in [TIME]
++    Installed 2 packages in [TIME]
++     + jinja2==3.1.2
++     + markupsafe==2.1.3
++    "###
+     );
+ 
+-    context.assert_command("import flask").success();
++    context.assert_command("import jinja2").success();
+ }
+ 
+ /// Install a package without using pre-built wheels for a subset of packages.
+@@ -702,31 +701,78 @@ fn install_no_binary_subset() {
+     let context = TestContext::new("3.12");
+ 
+     puffin_snapshot!(command(&context)
+-        .arg("Flask")
+-        .arg("--no-binary-package")
+-        .arg("click")
+-        .arg("--no-binary-package")
+-        .arg("flask")
++        .arg("jinja2")
++        .arg("--no-binary")
++        .arg("jinja2")
++        .arg("--no-binary")
++        .arg("markupsafe")
+         .arg("--strict"), @r###"
+-        success: true
+-        exit_code: 0
+-        ----- stdout -----
++    success: true
++    exit_code: 0
++    ----- stdout -----
+ 
+-        ----- stderr -----
+-        Resolved 7 packages in [TIME]
+-        Downloaded 7 packages in [TIME]
+-        Installed 7 packages in [TIME]
+-         + blinker==1.7.0
+-         + click==8.1.7
+-         + flask==3.0.0
+-         + itsdangerous==2.1.2
+-         + jinja2==3.1.2
+-         + markupsafe==2.1.3
+-         + werkzeug==3.0.1
+-        "###
++    ----- stderr -----
++    Resolved 2 packages in [TIME]
++    Downloaded 2 packages in [TIME]
++    Installed 2 packages in [TIME]
++     + jinja2==3.1.2
++     + markupsafe==2.1.3
++    "###
+     );
+ 
+-    context.assert_command("import flask").success();
++    context.assert_command("import jinja2").success();
++}
++
++/// Install a package only using pre-built wheels.
++#[test]
++fn install_only_binary() {
++    let context = TestContext::new("3.12");
++
++    puffin_snapshot!(command(&context)
++        .arg("jinja2")
++        .arg("--only-binary")
++        .arg(":all:")
++        .arg("--strict"), @r###"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++
++    ----- stderr -----
++    Resolved 2 packages in [TIME]
++    Downloaded 2 packages in [TIME]
++    Installed 2 packages in [TIME]
++     + jinja2==3.1.2
++     + markupsafe==2.1.3
++    "###
++    );
++
++    context.assert_command("import jinja2").success();
++}
++
++/// Install a package only using pre-built wheels for a subset of packages.
++#[test]
++fn install_only_binary_subset() {
++    let context = TestContext::new("3.12");
++
++    puffin_snapshot!(command(&context)
++        .arg("jinja2")
++        .arg("--only-binary")
++        .arg("markupsafe")
++        .arg("--strict"), @r###"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++
++    ----- stderr -----
++    Resolved 2 packages in [TIME]
++    Downloaded 2 packages in [TIME]
++    Installed 2 packages in [TIME]
++     + jinja2==3.1.2
++     + markupsafe==2.1.3
++    "###
++    );
++
++    context.assert_command("import jinja2").success();
+ }
+ 
+ /// Install a package without using pre-built wheels.
+@@ -736,37 +782,36 @@ fn reinstall_no_binary() {
+ 
+     // The first installation should use a pre-built wheel
+     let mut command = command(&context);
+-    command.arg("Flask").arg("--strict");
++    command.arg("jinja2").arg("--strict");
+     if cfg!(all(windows, debug_assertions)) {
+         // TODO(konstin): Reduce stack usage in debug mode enough that the tests pass with the
+         // default windows stack of 1MB
+         command.env("PUFFIN_STACK_SIZE", (2 * 1024 * 1024).to_string());
+     }
+     puffin_snapshot!(command, @r###"
+-        success: true
+-        exit_code: 0
+-        ----- stdout -----
++    success: true
++    exit_code: 0
++    ----- stdout -----
+ 
+-        ----- stderr -----
+-        Resolved 7 packages in [TIME]
+-        Downloaded 7 packages in [TIME]
+-        Installed 7 packages in [TIME]
+-         + blinker==1.7.0
+-         + click==8.1.7
+-         + flask==3.0.0
+-         + itsdangerous==2.1.2
+-         + jinja2==3.1.2
+-         + markupsafe==2.1.3
+-         + werkzeug==3.0.1
+-        "###
++    ----- stderr -----
++    Resolved 2 packages in [TIME]
++    Downloaded 2 packages in [TIME]
++    Installed 2 packages in [TIME]
++     + jinja2==3.1.2
++     + markupsafe==2.1.3
++    "###
+     );
+ 
+-    context.assert_command("import flask").success();
++    context.assert_command("import jinja2").success();
+ 
+     // Running installation again with `--no-binary` should be a no-op
+     // The first installation should use a pre-built wheel
+     let mut command = crate::command(&context);
+-    command.arg("Flask").arg("--no-binary").arg("--strict");
++    command
++        .arg("jinja2")
++        .arg("--no-binary")
++        .arg(":all:")
++        .arg("--strict");
+     if cfg!(all(windows, debug_assertions)) {
+         // TODO(konstin): Reduce stack usage in debug mode enough that the tests pass with the
+         // default windows stack of 1MB
+@@ -782,7 +827,7 @@ fn reinstall_no_binary() {
+         "###
+     );
+ 
+-    context.assert_command("import flask").success();
++    context.assert_command("import jinja2").success();
+ 
+     // With `--reinstall`, `--no-binary` should have an affect
+     let filters = if cfg!(windows) {
+@@ -797,10 +842,11 @@ fn reinstall_no_binary() {
+     };
+     let mut command = crate::command(&context);
+     command
+-        .arg("Flask")
++        .arg("jinja2")
+         .arg("--no-binary")
++        .arg(":all:")
+         .arg("--reinstall-package")
+-        .arg("Flask")
++        .arg("jinja2")
+         .arg("--strict");
+     if cfg!(all(windows, debug_assertions)) {
+         // TODO(konstin): Reduce stack usage in debug mode enough that the tests pass with the
+@@ -808,19 +854,19 @@ fn reinstall_no_binary() {
+         command.env("PUFFIN_STACK_SIZE", (2 * 1024 * 1024).to_string());
+     }
+     puffin_snapshot!(filters, command, @r###"
+-        success: true
+-        exit_code: 0
+-        ----- stdout -----
++    success: true
++    exit_code: 0
++    ----- stdout -----
+ 
+-        ----- stderr -----
+-        Resolved 7 packages in [TIME]
+-        Installed 1 package in [TIME]
+-         - flask==3.0.0
+-         + flask==3.0.0
+-        "###
++    ----- stderr -----
++    Resolved 2 packages in [TIME]
++    Installed 1 package in [TIME]
++     - jinja2==3.1.2
++     + jinja2==3.1.2
++    "###
+     );
+ 
+-    context.assert_command("import flask").success();
++    context.assert_command("import jinja2").success();
+ }
+ 
+ /// Install a package into a virtual environment, and ensuring that the executable permissions
+diff --git a/crates/puffin/tests/pip_sync.rs b/crates/puffin/tests/pip_sync.rs
+index e914dedd1..8b729f102 100644
+--- a/crates/puffin/tests/pip_sync.rs
++++ b/crates/puffin/tests/pip_sync.rs
+@@ -821,6 +821,7 @@ fn install_no_binary() -> Result<()> {
+     command
+         .arg("requirements.txt")
+         .arg("--no-binary")
++        .arg(":all:")
+         .arg("--strict");
+     if cfg!(all(windows, debug_assertions)) {
+         // TODO(konstin): Reduce stack usage in debug mode enough that the tests pass with the

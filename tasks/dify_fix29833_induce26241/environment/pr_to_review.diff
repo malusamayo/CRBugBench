@@ -1,0 +1,968 @@
+commit 820925a86602dd4e8882222e5c7cc8da39ca2eef
+Author: CrabSAMA <40541269+CrabSAMA@users.noreply.github.com>
+Date:   Thu Nov 27 16:50:48 2025 +0800
+
+    feat(workflow): workflow as tool output schema (#26241)
+    
+    Co-authored-by: autofix-ci[bot] <114827586+autofix-ci[bot]@users.noreply.github.com>
+    Co-authored-by: crazywoola <100913391+crazywoola@users.noreply.github.com>
+    Co-authored-by: Novice <novice12185727@gmail.com>
+
+diff --git a/api/core/tools/entities/tool_bundle.py b/api/core/tools/entities/tool_bundle.py
+index eba20b07f0..10710c4376 100644
+--- a/api/core/tools/entities/tool_bundle.py
++++ b/api/core/tools/entities/tool_bundle.py
+@@ -1,4 +1,6 @@
+-from pydantic import BaseModel
++from collections.abc import Mapping
++
++from pydantic import BaseModel, Field
+ 
+ from core.tools.entities.tool_entities import ToolParameter
+ 
+@@ -25,3 +27,5 @@ class ApiToolBundle(BaseModel):
+     icon: str | None = None
+     # openapi operation
+     openapi: dict
++    # output schema
++    output_schema: Mapping[str, object] = Field(default_factory=dict)
+diff --git a/api/core/tools/utils/workflow_configuration_sync.py b/api/core/tools/utils/workflow_configuration_sync.py
+index d16d6fc576..188da0c32d 100644
+--- a/api/core/tools/utils/workflow_configuration_sync.py
++++ b/api/core/tools/utils/workflow_configuration_sync.py
+@@ -3,6 +3,7 @@ from typing import Any
+ 
+ from core.app.app_config.entities import VariableEntity
+ from core.tools.entities.tool_entities import WorkflowToolParameterConfiguration
++from core.workflow.nodes.base.entities import OutputVariableEntity
+ 
+ 
+ class WorkflowToolConfigurationUtils:
+@@ -24,6 +25,31 @@ class WorkflowToolConfigurationUtils:
+ 
+         return [VariableEntity.model_validate(variable) for variable in start_node.get("data", {}).get("variables", [])]
+ 
++    @classmethod
++    def get_workflow_graph_output(cls, graph: Mapping[str, Any]) -> Sequence[OutputVariableEntity]:
++        """
++        get workflow graph output
++        """
++        nodes = graph.get("nodes", [])
++        outputs_by_variable: dict[str, OutputVariableEntity] = {}
++        variable_order: list[str] = []
++
++        for node in nodes:
++            if node.get("data", {}).get("type") != "end":
++                continue
++
++            for output in node.get("data", {}).get("outputs", []):
++                entity = OutputVariableEntity.model_validate(output)
++                variable = entity.variable
++
++                if variable not in variable_order:
++                    variable_order.append(variable)
++
++                # Later end nodes override duplicated variable definitions.
++                outputs_by_variable[variable] = entity
++
++        return [outputs_by_variable[variable] for variable in variable_order]
++
+     @classmethod
+     def check_is_synced(
+         cls, variables: list[VariableEntity], tool_configurations: list[WorkflowToolParameterConfiguration]
+diff --git a/api/core/tools/workflow_as_tool/provider.py b/api/core/tools/workflow_as_tool/provider.py
+index cee41ba90f..4852e9d2d8 100644
+--- a/api/core/tools/workflow_as_tool/provider.py
++++ b/api/core/tools/workflow_as_tool/provider.py
+@@ -162,6 +162,20 @@ class WorkflowToolProviderController(ToolProviderController):
+             else:
+                 raise ValueError("variable not found")
+ 
++        # get output schema from workflow
++        outputs = WorkflowToolConfigurationUtils.get_workflow_graph_output(graph)
++
++        reserved_keys = {"json", "text", "files"}
++
++        properties = {}
++        for output in outputs:
++            if output.variable not in reserved_keys:
++                properties[output.variable] = {
++                    "type": output.value_type,
++                    "description": "",
++                }
++        output_schema = {"type": "object", "properties": properties}
++
+         return WorkflowTool(
+             workflow_as_tool_id=db_provider.id,
+             entity=ToolEntity(
+@@ -177,6 +191,7 @@ class WorkflowToolProviderController(ToolProviderController):
+                     llm=db_provider.description,
+                 ),
+                 parameters=workflow_tool_parameters,
++                output_schema=output_schema,
+             ),
+             runtime=ToolRuntime(
+                 tenant_id=db_provider.tenant_id,
+diff --git a/api/core/tools/workflow_as_tool/tool.py b/api/core/tools/workflow_as_tool/tool.py
+index 5703c19c88..1751b45d9b 100644
+--- a/api/core/tools/workflow_as_tool/tool.py
++++ b/api/core/tools/workflow_as_tool/tool.py
+@@ -114,6 +114,11 @@ class WorkflowTool(Tool):
+             for file in files:
+                 yield self.create_file_message(file)  # type: ignore
+ 
++        # traverse `outputs` field and create variable messages
++        for key, value in outputs.items():
++            if key not in {"text", "json", "files"}:
++                yield self.create_variable_message(variable_name=key, variable_value=value)
++
+         self._latest_usage = self._derive_usage_from_result(data)
+ 
+         yield self.create_text_message(json.dumps(outputs, ensure_ascii=False))
+diff --git a/api/core/workflow/nodes/base/entities.py b/api/core/workflow/nodes/base/entities.py
+index 94b0d1d8bc..e816e16d74 100644
+--- a/api/core/workflow/nodes/base/entities.py
++++ b/api/core/workflow/nodes/base/entities.py
+@@ -5,7 +5,7 @@ from collections.abc import Sequence
+ from enum import StrEnum
+ from typing import Any, Union
+ 
+-from pydantic import BaseModel, model_validator
++from pydantic import BaseModel, field_validator, model_validator
+ 
+ from core.workflow.enums import ErrorStrategy
+ 
+@@ -35,6 +35,45 @@ class VariableSelector(BaseModel):
+     value_selector: Sequence[str]
+ 
+ 
++class OutputVariableType(StrEnum):
++    STRING = "string"
++    NUMBER = "number"
++    INTEGER = "integer"
++    SECRET = "secret"
++    BOOLEAN = "boolean"
++    OBJECT = "object"
++    FILE = "file"
++    ARRAY = "array"
++    ARRAY_STRING = "array[string]"
++    ARRAY_NUMBER = "array[number]"
++    ARRAY_OBJECT = "array[object]"
++    ARRAY_BOOLEAN = "array[boolean]"
++    ARRAY_FILE = "array[file]"
++    ANY = "any"
++    ARRAY_ANY = "array[any]"
++
++
++class OutputVariableEntity(BaseModel):
++    """
++    Output Variable Entity.
++    """
++
++    variable: str
++    value_type: OutputVariableType
++    value_selector: Sequence[str]
++
++    @field_validator("value_type", mode="before")
++    @classmethod
++    def normalize_value_type(cls, v: Any) -> Any:
++        """
++        Normalize value_type to handle case-insensitive array types.
++        Converts 'Array[...]' to 'array[...]' for backward compatibility.
++        """
++        if isinstance(v, str) and v.startswith("Array["):
++            return v.lower()
++        return v
++
++
+ class DefaultValueType(StrEnum):
+     STRING = "string"
+     NUMBER = "number"
+diff --git a/api/core/workflow/nodes/end/entities.py b/api/core/workflow/nodes/end/entities.py
+index 79a6928bc6..87a221b5f6 100644
+--- a/api/core/workflow/nodes/end/entities.py
++++ b/api/core/workflow/nodes/end/entities.py
+@@ -1,7 +1,6 @@
+ from pydantic import BaseModel, Field
+ 
+-from core.workflow.nodes.base import BaseNodeData
+-from core.workflow.nodes.base.entities import VariableSelector
++from core.workflow.nodes.base.entities import BaseNodeData, OutputVariableEntity
+ 
+ 
+ class EndNodeData(BaseNodeData):
+@@ -9,7 +8,7 @@ class EndNodeData(BaseNodeData):
+     END Node Data.
+     """
+ 
+-    outputs: list[VariableSelector]
++    outputs: list[OutputVariableEntity]
+ 
+ 
+ class EndStreamParam(BaseModel):
+diff --git a/api/services/tools/tools_transform_service.py b/api/services/tools/tools_transform_service.py
+index 3e976234ba..81872e3ebc 100644
+--- a/api/services/tools/tools_transform_service.py
++++ b/api/services/tools/tools_transform_service.py
+@@ -405,6 +405,7 @@ class ToolTransformService:
+                 name=tool.operation_id or "",
+                 label=I18nObject(en_US=tool.operation_id, zh_Hans=tool.operation_id),
+                 description=I18nObject(en_US=tool.summary or "", zh_Hans=tool.summary or ""),
++                output_schema=tool.output_schema,
+                 parameters=tool.parameters,
+                 labels=labels or [],
+             )
+diff --git a/api/services/tools/workflow_tools_manage_service.py b/api/services/tools/workflow_tools_manage_service.py
+index 5413725798..b743cc1105 100644
+--- a/api/services/tools/workflow_tools_manage_service.py
++++ b/api/services/tools/workflow_tools_manage_service.py
+@@ -291,6 +291,10 @@ class WorkflowToolManageService:
+         if len(workflow_tools) == 0:
+             raise ValueError(f"Tool {db_tool.id} not found")
+ 
++        tool_entity = workflow_tools[0].entity
++        # get output schema from workflow tool entity
++        output_schema = tool_entity.output_schema
++
+         return {
+             "name": db_tool.name,
+             "label": db_tool.label,
+@@ -299,6 +303,7 @@ class WorkflowToolManageService:
+             "icon": json.loads(db_tool.icon),
+             "description": db_tool.description,
+             "parameters": jsonable_encoder(db_tool.parameter_configurations),
++            "output_schema": output_schema,
+             "tool": ToolTransformService.convert_tool_entity_to_api_entity(
+                 tool=tool.get_tools(db_tool.tenant_id)[0],
+                 labels=ToolLabelManager.get_tool_labels(tool),
+diff --git a/api/tests/test_containers_integration_tests/services/tools/test_workflow_tools_manage_service.py b/api/tests/test_containers_integration_tests/services/tools/test_workflow_tools_manage_service.py
+index cb1e79d507..71cedd26c4 100644
+--- a/api/tests/test_containers_integration_tests/services/tools/test_workflow_tools_manage_service.py
++++ b/api/tests/test_containers_integration_tests/services/tools/test_workflow_tools_manage_service.py
+@@ -257,7 +257,6 @@ class TestWorkflowToolManageService:
+ 
+         # Attempt to create second workflow tool with same name
+         second_tool_parameters = self._create_test_workflow_tool_parameters()
+-
+         with pytest.raises(ValueError) as exc_info:
+             WorkflowToolManageService.create_workflow_tool(
+                 user_id=account.id,
+@@ -309,7 +308,6 @@ class TestWorkflowToolManageService:
+ 
+         # Attempt to create workflow tool with non-existent app
+         tool_parameters = self._create_test_workflow_tool_parameters()
+-
+         with pytest.raises(ValueError) as exc_info:
+             WorkflowToolManageService.create_workflow_tool(
+                 user_id=account.id,
+@@ -365,7 +363,6 @@ class TestWorkflowToolManageService:
+                 "required": True,
+             }
+         ]
+-
+         # Attempt to create workflow tool with invalid parameters
+         with pytest.raises(ValueError) as exc_info:
+             WorkflowToolManageService.create_workflow_tool(
+@@ -416,7 +413,6 @@ class TestWorkflowToolManageService:
+         # Create first workflow tool
+         first_tool_name = fake.word()
+         first_tool_parameters = self._create_test_workflow_tool_parameters()
+-
+         WorkflowToolManageService.create_workflow_tool(
+             user_id=account.id,
+             tenant_id=account.current_tenant.id,
+@@ -431,7 +427,6 @@ class TestWorkflowToolManageService:
+         # Attempt to create second workflow tool with same app_id but different name
+         second_tool_name = fake.word()
+         second_tool_parameters = self._create_test_workflow_tool_parameters()
+-
+         with pytest.raises(ValueError) as exc_info:
+             WorkflowToolManageService.create_workflow_tool(
+                 user_id=account.id,
+@@ -486,7 +481,6 @@ class TestWorkflowToolManageService:
+ 
+         # Attempt to create workflow tool for app without workflow
+         tool_parameters = self._create_test_workflow_tool_parameters()
+-
+         with pytest.raises(ValueError) as exc_info:
+             WorkflowToolManageService.create_workflow_tool(
+                 user_id=account.id,
+@@ -534,7 +528,6 @@ class TestWorkflowToolManageService:
+         # Create initial workflow tool
+         initial_tool_name = fake.word()
+         initial_tool_parameters = self._create_test_workflow_tool_parameters()
+-
+         WorkflowToolManageService.create_workflow_tool(
+             user_id=account.id,
+             tenant_id=account.current_tenant.id,
+@@ -621,7 +614,6 @@ class TestWorkflowToolManageService:
+ 
+         # Attempt to update non-existent workflow tool
+         tool_parameters = self._create_test_workflow_tool_parameters()
+-
+         with pytest.raises(ValueError) as exc_info:
+             WorkflowToolManageService.update_workflow_tool(
+                 user_id=account.id,
+@@ -671,7 +663,6 @@ class TestWorkflowToolManageService:
+         # Create first workflow tool
+         first_tool_name = fake.word()
+         first_tool_parameters = self._create_test_workflow_tool_parameters()
+-
+         WorkflowToolManageService.create_workflow_tool(
+             user_id=account.id,
+             tenant_id=account.current_tenant.id,
+diff --git a/api/tests/unit_tests/core/tools/workflow_as_tool/test_tool.py b/api/tests/unit_tests/core/tools/workflow_as_tool/test_tool.py
+index c68aad0b22..02bf8e82f1 100644
+--- a/api/tests/unit_tests/core/tools/workflow_as_tool/test_tool.py
++++ b/api/tests/unit_tests/core/tools/workflow_as_tool/test_tool.py
+@@ -3,7 +3,7 @@ import pytest
+ from core.app.entities.app_invoke_entities import InvokeFrom
+ from core.tools.__base.tool_runtime import ToolRuntime
+ from core.tools.entities.common_entities import I18nObject
+-from core.tools.entities.tool_entities import ToolEntity, ToolIdentity
++from core.tools.entities.tool_entities import ToolEntity, ToolIdentity, ToolInvokeMessage
+ from core.tools.errors import ToolInvokeError
+ from core.tools.workflow_as_tool.tool import WorkflowTool
+ 
+@@ -51,3 +51,166 @@ def test_workflow_tool_should_raise_tool_invoke_error_when_result_has_error_fiel
+         # actually `run` the tool.
+         list(tool.invoke("test_user", {}))
+     assert exc_info.value.args == ("oops",)
++
++
++def test_workflow_tool_should_generate_variable_messages_for_outputs(monkeypatch: pytest.MonkeyPatch):
++    """Test that WorkflowTool should generate variable messages when there are outputs"""
++    entity = ToolEntity(
++        identity=ToolIdentity(author="test", name="test tool", label=I18nObject(en_US="test tool"), provider="test"),
++        parameters=[],
++        description=None,
++        has_runtime_parameters=False,
++    )
++    runtime = ToolRuntime(tenant_id="test_tool", invoke_from=InvokeFrom.EXPLORE)
++    tool = WorkflowTool(
++        workflow_app_id="",
++        workflow_as_tool_id="",
++        version="1",
++        workflow_entities={},
++        workflow_call_depth=1,
++        entity=entity,
++        runtime=runtime,
++    )
++
++    # Mock workflow outputs
++    mock_outputs = {"result": "success", "count": 42, "data": {"key": "value"}}
++
++    # needs to patch those methods to avoid database access.
++    monkeypatch.setattr(tool, "_get_app", lambda *args, **kwargs: None)
++    monkeypatch.setattr(tool, "_get_workflow", lambda *args, **kwargs: None)
++
++    # Mock user resolution to avoid database access
++    from unittest.mock import Mock
++
++    mock_user = Mock()
++    monkeypatch.setattr(tool, "_resolve_user", lambda *args, **kwargs: mock_user)
++
++    # replace `WorkflowAppGenerator.generate` 's return value.
++    monkeypatch.setattr(
++        "core.app.apps.workflow.app_generator.WorkflowAppGenerator.generate",
++        lambda *args, **kwargs: {"data": {"outputs": mock_outputs}},
++    )
++    monkeypatch.setattr("libs.login.current_user", lambda *args, **kwargs: None)
++
++    # Execute tool invocation
++    messages = list(tool.invoke("test_user", {}))
++
++    # Verify generated messages
++    # Should contain: 3 variable messages + 1 text message + 1 JSON message = 5 messages
++    assert len(messages) == 5
++
++    # Verify variable messages
++    variable_messages = [msg for msg in messages if msg.type == ToolInvokeMessage.MessageType.VARIABLE]
++    assert len(variable_messages) == 3
++
++    # Verify content of each variable message
++    variable_dict = {msg.message.variable_name: msg.message.variable_value for msg in variable_messages}
++    assert variable_dict["result"] == "success"
++    assert variable_dict["count"] == 42
++    assert variable_dict["data"] == {"key": "value"}
++
++    # Verify text message
++    text_messages = [msg for msg in messages if msg.type == ToolInvokeMessage.MessageType.TEXT]
++    assert len(text_messages) == 1
++    assert '{"result": "success", "count": 42, "data": {"key": "value"}}' in text_messages[0].message.text
++
++    # Verify JSON message
++    json_messages = [msg for msg in messages if msg.type == ToolInvokeMessage.MessageType.JSON]
++    assert len(json_messages) == 1
++    assert json_messages[0].message.json_object == mock_outputs
++
++
++def test_workflow_tool_should_handle_empty_outputs(monkeypatch: pytest.MonkeyPatch):
++    """Test that WorkflowTool should handle empty outputs correctly"""
++    entity = ToolEntity(
++        identity=ToolIdentity(author="test", name="test tool", label=I18nObject(en_US="test tool"), provider="test"),
++        parameters=[],
++        description=None,
++        has_runtime_parameters=False,
++    )
++    runtime = ToolRuntime(tenant_id="test_tool", invoke_from=InvokeFrom.EXPLORE)
++    tool = WorkflowTool(
++        workflow_app_id="",
++        workflow_as_tool_id="",
++        version="1",
++        workflow_entities={},
++        workflow_call_depth=1,
++        entity=entity,
++        runtime=runtime,
++    )
++
++    # needs to patch those methods to avoid database access.
++    monkeypatch.setattr(tool, "_get_app", lambda *args, **kwargs: None)
++    monkeypatch.setattr(tool, "_get_workflow", lambda *args, **kwargs: None)
++
++    # Mock user resolution to avoid database access
++    from unittest.mock import Mock
++
++    mock_user = Mock()
++    monkeypatch.setattr(tool, "_resolve_user", lambda *args, **kwargs: mock_user)
++
++    # replace `WorkflowAppGenerator.generate` 's return value.
++    monkeypatch.setattr(
++        "core.app.apps.workflow.app_generator.WorkflowAppGenerator.generate",
++        lambda *args, **kwargs: {"data": {}},
++    )
++    monkeypatch.setattr("libs.login.current_user", lambda *args, **kwargs: None)
++
++    # Execute tool invocation
++    messages = list(tool.invoke("test_user", {}))
++
++    # Verify generated messages
++    # Should contain: 0 variable messages + 1 text message + 1 JSON message = 2 messages
++    assert len(messages) == 2
++
++    # Verify no variable messages
++    variable_messages = [msg for msg in messages if msg.type == ToolInvokeMessage.MessageType.VARIABLE]
++    assert len(variable_messages) == 0
++
++    # Verify text message
++    text_messages = [msg for msg in messages if msg.type == ToolInvokeMessage.MessageType.TEXT]
++    assert len(text_messages) == 1
++    assert text_messages[0].message.text == "{}"
++
++    # Verify JSON message
++    json_messages = [msg for msg in messages if msg.type == ToolInvokeMessage.MessageType.JSON]
++    assert len(json_messages) == 1
++    assert json_messages[0].message.json_object == {}
++
++
++def test_create_variable_message():
++    """Test the functionality of creating variable messages"""
++    entity = ToolEntity(
++        identity=ToolIdentity(author="test", name="test tool", label=I18nObject(en_US="test tool"), provider="test"),
++        parameters=[],
++        description=None,
++        has_runtime_parameters=False,
++    )
++    runtime = ToolRuntime(tenant_id="test_tool", invoke_from=InvokeFrom.EXPLORE)
++    tool = WorkflowTool(
++        workflow_app_id="",
++        workflow_as_tool_id="",
++        version="1",
++        workflow_entities={},
++        workflow_call_depth=1,
++        entity=entity,
++        runtime=runtime,
++    )
++
++    # Test different types of variable values
++    test_cases = [
++        ("string_var", "test string"),
++        ("int_var", 42),
++        ("float_var", 3.14),
++        ("bool_var", True),
++        ("list_var", [1, 2, 3]),
++        ("dict_var", {"key": "value"}),
++    ]
++
++    for var_name, var_value in test_cases:
++        message = tool.create_variable_message(var_name, var_value)
++
++        assert message.type == ToolInvokeMessage.MessageType.VARIABLE
++        assert message.message.variable_name == var_name
++        assert message.message.variable_value == var_value
++        assert message.message.stream is False
+diff --git a/api/tests/unit_tests/core/workflow/graph_engine/test_human_input_pause_multi_branch.py b/api/tests/unit_tests/core/workflow/graph_engine/test_human_input_pause_multi_branch.py
+index 1c50318af6..c398e4e8c1 100644
+--- a/api/tests/unit_tests/core/workflow/graph_engine/test_human_input_pause_multi_branch.py
++++ b/api/tests/unit_tests/core/workflow/graph_engine/test_human_input_pause_multi_branch.py
+@@ -14,7 +14,7 @@ from core.workflow.graph_events import (
+     NodeRunStreamChunkEvent,
+     NodeRunSucceededEvent,
+ )
+-from core.workflow.nodes.base.entities import VariableSelector
++from core.workflow.nodes.base.entities import OutputVariableEntity, OutputVariableType
+ from core.workflow.nodes.end.end_node import EndNode
+ from core.workflow.nodes.end.entities import EndNodeData
+ from core.workflow.nodes.human_input import HumanInputNode
+@@ -110,8 +110,12 @@ def _build_branching_graph(mock_config: MockConfig) -> tuple[Graph, GraphRuntime
+     end_primary_data = EndNodeData(
+         title="End Primary",
+         outputs=[
+-            VariableSelector(variable="initial_text", value_selector=["llm_initial", "text"]),
+-            VariableSelector(variable="primary_text", value_selector=["llm_primary", "text"]),
++            OutputVariableEntity(
++                variable="initial_text", value_type=OutputVariableType.STRING, value_selector=["llm_initial", "text"]
++            ),
++            OutputVariableEntity(
++                variable="primary_text", value_type=OutputVariableType.STRING, value_selector=["llm_primary", "text"]
++            ),
+         ],
+         desc=None,
+     )
+@@ -126,8 +130,14 @@ def _build_branching_graph(mock_config: MockConfig) -> tuple[Graph, GraphRuntime
+     end_secondary_data = EndNodeData(
+         title="End Secondary",
+         outputs=[
+-            VariableSelector(variable="initial_text", value_selector=["llm_initial", "text"]),
+-            VariableSelector(variable="secondary_text", value_selector=["llm_secondary", "text"]),
++            OutputVariableEntity(
++                variable="initial_text", value_type=OutputVariableType.STRING, value_selector=["llm_initial", "text"]
++            ),
++            OutputVariableEntity(
++                variable="secondary_text",
++                value_type=OutputVariableType.STRING,
++                value_selector=["llm_secondary", "text"],
++            ),
+         ],
+         desc=None,
+     )
+diff --git a/api/tests/unit_tests/core/workflow/graph_engine/test_human_input_pause_single_branch.py b/api/tests/unit_tests/core/workflow/graph_engine/test_human_input_pause_single_branch.py
+index d7de18172b..ece69b080b 100644
+--- a/api/tests/unit_tests/core/workflow/graph_engine/test_human_input_pause_single_branch.py
++++ b/api/tests/unit_tests/core/workflow/graph_engine/test_human_input_pause_single_branch.py
+@@ -13,7 +13,7 @@ from core.workflow.graph_events import (
+     NodeRunStreamChunkEvent,
+     NodeRunSucceededEvent,
+ )
+-from core.workflow.nodes.base.entities import VariableSelector
++from core.workflow.nodes.base.entities import OutputVariableEntity, OutputVariableType
+ from core.workflow.nodes.end.end_node import EndNode
+ from core.workflow.nodes.end.entities import EndNodeData
+ from core.workflow.nodes.human_input import HumanInputNode
+@@ -108,8 +108,12 @@ def _build_llm_human_llm_graph(mock_config: MockConfig) -> tuple[Graph, GraphRun
+     end_data = EndNodeData(
+         title="End",
+         outputs=[
+-            VariableSelector(variable="initial_text", value_selector=["llm_initial", "text"]),
+-            VariableSelector(variable="resume_text", value_selector=["llm_resume", "text"]),
++            OutputVariableEntity(
++                variable="initial_text", value_type=OutputVariableType.STRING, value_selector=["llm_initial", "text"]
++            ),
++            OutputVariableEntity(
++                variable="resume_text", value_type=OutputVariableType.STRING, value_selector=["llm_resume", "text"]
++            ),
+         ],
+         desc=None,
+     )
+diff --git a/api/tests/unit_tests/core/workflow/graph_engine/test_if_else_streaming.py b/api/tests/unit_tests/core/workflow/graph_engine/test_if_else_streaming.py
+index 5d2c17b9b4..9fa6ee57eb 100644
+--- a/api/tests/unit_tests/core/workflow/graph_engine/test_if_else_streaming.py
++++ b/api/tests/unit_tests/core/workflow/graph_engine/test_if_else_streaming.py
+@@ -11,7 +11,7 @@ from core.workflow.graph_events import (
+     NodeRunStreamChunkEvent,
+     NodeRunSucceededEvent,
+ )
+-from core.workflow.nodes.base.entities import VariableSelector
++from core.workflow.nodes.base.entities import OutputVariableEntity, OutputVariableType
+ from core.workflow.nodes.end.end_node import EndNode
+ from core.workflow.nodes.end.entities import EndNodeData
+ from core.workflow.nodes.if_else.entities import IfElseNodeData
+@@ -123,8 +123,12 @@ def _build_if_else_graph(branch_value: str, mock_config: MockConfig) -> tuple[Gr
+     end_primary_data = EndNodeData(
+         title="End Primary",
+         outputs=[
+-            VariableSelector(variable="initial_text", value_selector=["llm_initial", "text"]),
+-            VariableSelector(variable="primary_text", value_selector=["llm_primary", "text"]),
++            OutputVariableEntity(
++                variable="initial_text", value_type=OutputVariableType.STRING, value_selector=["llm_initial", "text"]
++            ),
++            OutputVariableEntity(
++                variable="primary_text", value_type=OutputVariableType.STRING, value_selector=["llm_primary", "text"]
++            ),
+         ],
+         desc=None,
+     )
+@@ -139,8 +143,14 @@ def _build_if_else_graph(branch_value: str, mock_config: MockConfig) -> tuple[Gr
+     end_secondary_data = EndNodeData(
+         title="End Secondary",
+         outputs=[
+-            VariableSelector(variable="initial_text", value_selector=["llm_initial", "text"]),
+-            VariableSelector(variable="secondary_text", value_selector=["llm_secondary", "text"]),
++            OutputVariableEntity(
++                variable="initial_text", value_type=OutputVariableType.STRING, value_selector=["llm_initial", "text"]
++            ),
++            OutputVariableEntity(
++                variable="secondary_text",
++                value_type=OutputVariableType.STRING,
++                value_selector=["llm_secondary", "text"],
++            ),
+         ],
+         desc=None,
+     )
+diff --git a/web/app/components/app/app-publisher/index.tsx b/web/app/components/app/app-publisher/index.tsx
+index a11af3b816..bba5ebfa21 100644
+--- a/web/app/components/app/app-publisher/index.tsx
++++ b/web/app/components/app/app-publisher/index.tsx
+@@ -38,7 +38,7 @@ import {
+   PortalToFollowElemTrigger,
+ } from '@/app/components/base/portal-to-follow-elem'
+ import WorkflowToolConfigureButton from '@/app/components/tools/workflow-tool/configure-button'
+-import type { InputVar } from '@/app/components/workflow/types'
++import type { InputVar, Variable } from '@/app/components/workflow/types'
+ import { appDefaultIconBackground } from '@/config'
+ import { useGlobalPublicStore } from '@/context/global-public-context'
+ import { useFormatTimeFromNow } from '@/hooks/use-format-time-from-now'
+@@ -103,6 +103,7 @@ export type AppPublisherProps = {
+   crossAxisOffset?: number
+   toolPublished?: boolean
+   inputs?: InputVar[]
++  outputs?: Variable[]
+   onRefreshData?: () => void
+   workflowToolAvailable?: boolean
+   missingStartNode?: boolean
+@@ -125,6 +126,7 @@ const AppPublisher = ({
+   crossAxisOffset = 0,
+   toolPublished,
+   inputs,
++  outputs,
+   onRefreshData,
+   workflowToolAvailable = true,
+   missingStartNode = false,
+@@ -457,6 +459,7 @@ const AppPublisher = ({
+                           name={appDetail?.name}
+                           description={appDetail?.description}
+                           inputs={inputs}
++                          outputs={outputs}
+                           handlePublish={handlePublish}
+                           onRefreshData={onRefreshData}
+                           disabledReason={workflowToolMessage}
+diff --git a/web/app/components/tools/types.ts b/web/app/components/tools/types.ts
+index 1b76afc5c7..652d6ac676 100644
+--- a/web/app/components/tools/types.ts
++++ b/web/app/components/tools/types.ts
+@@ -1,4 +1,5 @@
+ import type { TypeWithI18N } from '../header/account-setting/model-provider-page/declarations'
++import type { VarType } from '../workflow/types'
+ 
+ export enum LOC {
+   tools = 'tools',
+@@ -194,6 +195,21 @@ export type WorkflowToolProviderParameter = {
+   type?: string
+ }
+ 
++export type WorkflowToolProviderOutputParameter = {
++  name: string
++  description: string
++  type?: VarType
++  reserved?: boolean
++}
++
++export type WorkflowToolProviderOutputSchema = {
++  type: string
++  properties: Record<string, {
++    type: string
++    description: string
++  }>
++}
++
+ export type WorkflowToolProviderRequest = {
+   name: string
+   icon: Emoji
+@@ -218,6 +234,7 @@ export type WorkflowToolProviderResponse = {
+     description: TypeWithI18N
+     labels: string[]
+     parameters: ParamItem[]
++    output_schema: WorkflowToolProviderOutputSchema
+   }
+   privacy_policy: string
+ }
+diff --git a/web/app/components/tools/workflow-tool/configure-button.tsx b/web/app/components/tools/workflow-tool/configure-button.tsx
+index bf0d789ff9..f66a311155 100644
+--- a/web/app/components/tools/workflow-tool/configure-button.tsx
++++ b/web/app/components/tools/workflow-tool/configure-button.tsx
+@@ -11,8 +11,8 @@ import WorkflowToolModal from '@/app/components/tools/workflow-tool'
+ import Loading from '@/app/components/base/loading'
+ import Toast from '@/app/components/base/toast'
+ import { createWorkflowToolProvider, fetchWorkflowToolDetailByAppID, saveWorkflowToolProvider } from '@/service/tools'
+-import type { Emoji, WorkflowToolProviderParameter, WorkflowToolProviderRequest, WorkflowToolProviderResponse } from '@/app/components/tools/types'
+-import type { InputVar } from '@/app/components/workflow/types'
++import type { Emoji, WorkflowToolProviderOutputParameter, WorkflowToolProviderParameter, WorkflowToolProviderRequest, WorkflowToolProviderResponse } from '@/app/components/tools/types'
++import type { InputVar, Variable } from '@/app/components/workflow/types'
+ import type { PublishWorkflowParams } from '@/types/workflow'
+ import { useAppContext } from '@/context/app-context'
+ import { useInvalidateAllWorkflowTools } from '@/service/use-tools'
+@@ -26,6 +26,7 @@ type Props = {
+   name: string
+   description: string
+   inputs?: InputVar[]
++  outputs?: Variable[]
+   handlePublish: (params?: PublishWorkflowParams) => Promise<void>
+   onRefreshData?: () => void
+   disabledReason?: string
+@@ -40,6 +41,7 @@ const WorkflowToolConfigureButton = ({
+   name,
+   description,
+   inputs,
++  outputs,
+   handlePublish,
+   onRefreshData,
+   disabledReason,
+@@ -80,6 +82,8 @@ const WorkflowToolConfigureButton = ({
+ 
+   const payload = useMemo(() => {
+     let parameters: WorkflowToolProviderParameter[] = []
++    let outputParameters: WorkflowToolProviderOutputParameter[] = []
++
+     if (!published) {
+       parameters = (inputs || []).map((item) => {
+         return {
+@@ -90,6 +94,13 @@ const WorkflowToolConfigureButton = ({
+           type: item.type,
+         }
+       })
++      outputParameters = (outputs || []).map((item) => {
++        return {
++          name: item.variable,
++          description: '',
++          type: item.value_type,
++        }
++      })
+     }
+     else if (detail && detail.tool) {
+       parameters = (inputs || []).map((item) => {
+@@ -101,6 +112,14 @@ const WorkflowToolConfigureButton = ({
+           form: detail.tool.parameters.find(param => param.name === item.variable)?.form || 'llm',
+         }
+       })
++      outputParameters = (outputs || []).map((item) => {
++        const found = detail.tool.output_schema?.properties?.[item.variable]
++        return {
++          name: item.variable,
++          description: found ? found.description : '',
++          type: item.value_type,
++        }
++      })
+     }
+     return {
+       icon: detail?.icon || icon,
+@@ -108,6 +127,7 @@ const WorkflowToolConfigureButton = ({
+       name: detail?.name || '',
+       description: detail?.description || description,
+       parameters,
++      outputParameters,
+       labels: detail?.tool?.labels || [],
+       privacy_policy: detail?.privacy_policy || '',
+       ...(published
+diff --git a/web/app/components/tools/workflow-tool/index.tsx b/web/app/components/tools/workflow-tool/index.tsx
+index 78b05fb14f..7ce5acb228 100644
+--- a/web/app/components/tools/workflow-tool/index.tsx
++++ b/web/app/components/tools/workflow-tool/index.tsx
+@@ -1,9 +1,9 @@
+ 'use client'
+ import type { FC } from 'react'
+-import React, { useState } from 'react'
++import React, { useMemo, useState } from 'react'
+ import { useTranslation } from 'react-i18next'
+ import { produce } from 'immer'
+-import type { Emoji, WorkflowToolProviderParameter, WorkflowToolProviderRequest } from '../types'
++import type { Emoji, WorkflowToolProviderOutputParameter, WorkflowToolProviderParameter, WorkflowToolProviderRequest } from '../types'
+ import cn from '@/utils/classnames'
+ import Drawer from '@/app/components/base/drawer-plus'
+ import Input from '@/app/components/base/input'
+@@ -16,6 +16,8 @@ import MethodSelector from '@/app/components/tools/workflow-tool/method-selector
+ import LabelSelector from '@/app/components/tools/labels/selector'
+ import ConfirmModal from '@/app/components/tools/workflow-tool/confirm-modal'
+ import Tooltip from '@/app/components/base/tooltip'
++import { VarType } from '@/app/components/workflow/types'
++import { RiErrorWarningLine } from '@remixicon/react'
+ 
+ type Props = {
+   isAdd?: boolean
+@@ -45,7 +47,29 @@ const WorkflowToolAsModal: FC<Props> = ({
+   const [name, setName] = useState(payload.name)
+   const [description, setDescription] = useState(payload.description)
+   const [parameters, setParameters] = useState<WorkflowToolProviderParameter[]>(payload.parameters)
+-  const handleParameterChange = (key: string, value: string, index: number) => {
++  const outputParameters = useMemo<WorkflowToolProviderOutputParameter[]>(() => payload.outputParameters, [payload.outputParameters])
++  const reservedOutputParameters: WorkflowToolProviderOutputParameter[] = [
++    {
++      name: 'text',
++      description: t('workflow.nodes.tool.outputVars.text'),
++      type: VarType.string,
++      reserved: true,
++    },
++    {
++      name: 'files',
++      description: t('workflow.nodes.tool.outputVars.files.title'),
++      type: VarType.arrayFile,
++      reserved: true,
++    },
++    {
++      name: 'json',
++      description: t('workflow.nodes.tool.outputVars.json'),
++      type: VarType.arrayObject,
++      reserved: true,
++    },
++  ]
++
++  const handleParameterChange = (key: string, value: any, index: number) => {
+     const newData = produce(parameters, (draft: WorkflowToolProviderParameter[]) => {
+       if (key === 'description')
+         draft[index].description = value
+@@ -69,6 +93,10 @@ const WorkflowToolAsModal: FC<Props> = ({
+     return /^\w+$/.test(name)
+   }
+ 
++  const isOutputParameterReserved = (name: string) => {
++    return reservedOutputParameters.find(p => p.name === name)
++  }
++
+   const onConfirm = () => {
+     let errorMessage = ''
+     if (!label)
+@@ -225,6 +253,51 @@ const WorkflowToolAsModal: FC<Props> = ({
+                   </table>
+                 </div>
+               </div>
++              {/* Tool Output  */}
++              <div>
++                <div className='system-sm-medium py-2 text-text-primary'>{t('tools.createTool.toolOutput.title')}</div>
++                <div className='w-full overflow-x-auto rounded-lg border border-divider-regular'>
++                  <table className='w-full text-xs font-normal leading-[18px] text-text-secondary'>
++                    <thead className='uppercase text-text-tertiary'>
++                      <tr className='border-b border-divider-regular'>
++                        <th className="w-[156px] p-2 pl-3 font-medium">{t('tools.createTool.name')}</th>
++                        <th className="p-2 pl-3 font-medium">{t('tools.createTool.toolOutput.description')}</th>
++                      </tr>
++                    </thead>
++                    <tbody>
++                      {[...reservedOutputParameters, ...outputParameters].map((item, index) => (
++                        <tr key={index} className='border-b border-divider-regular last:border-0'>
++                          <td className="max-w-[156px] p-2 pl-3">
++                            <div className='text-[13px] leading-[18px]'>
++                              <div title={item.name} className='flex items-center'>
++                                <span className='truncate font-medium text-text-primary'>{item.name}</span>
++                                <span className='shrink-0 pl-1 text-xs leading-[18px] text-[#ec4a0a]'>{item.reserved ? t('tools.createTool.toolOutput.reserved') : ''}</span>
++                                {
++                                  !item.reserved && isOutputParameterReserved(item.name) ? (
++                                    <Tooltip
++                                      popupContent={
++                                        <div className='w-[180px]'>
++                                          {t('tools.createTool.toolOutput.reservedParameterDuplicateTip')}
++                                        </div>
++                                      }
++                                    >
++                                      <RiErrorWarningLine className='h-3 w-3 text-text-warning-secondary' />
++                                    </Tooltip>
++                                  ) : null
++                                }
++                              </div>
++                              <div className='text-text-tertiary'>{item.type}</div>
++                            </div>
++                          </td>
++                          <td className="w-[236px] p-2 pl-3 text-text-tertiary">
++                            <span className='text-[13px] font-normal leading-[18px] text-text-secondary'>{item.description}</span>
++                          </td>
++                        </tr>
++                      ))}
++                    </tbody>
++                  </table>
++                </div>
++              </div>
+               {/* Tags */}
+               <div>
+                 <div className='system-sm-medium py-2 text-text-primary'>{t('tools.createTool.toolInput.label')}</div>
+diff --git a/web/app/components/workflow-app/components/workflow-header/features-trigger.tsx b/web/app/components/workflow-app/components/workflow-header/features-trigger.tsx
+index 33aeed4edf..10e52a2c66 100644
+--- a/web/app/components/workflow-app/components/workflow-header/features-trigger.tsx
++++ b/web/app/components/workflow-app/components/workflow-header/features-trigger.tsx
+@@ -39,6 +39,7 @@ import useTheme from '@/hooks/use-theme'
+ import cn from '@/utils/classnames'
+ import { useIsChatMode } from '@/app/components/workflow/hooks'
+ import type { StartNodeType } from '@/app/components/workflow/nodes/start/types'
++import type { EndNodeType } from '@/app/components/workflow/nodes/end/types'
+ import { useProviderContext } from '@/context/provider-context'
+ import { Plan } from '@/app/components/billing/type'
+ import useNodes from '@/app/components/workflow/store/workflow/use-nodes'
+@@ -61,6 +62,7 @@ const FeaturesTrigger = () => {
+   const nodes = useNodes()
+   const hasWorkflowNodes = nodes.length > 0
+   const startNode = nodes.find(node => node.data.type === BlockEnum.Start)
++  const endNode = nodes.find(node => node.data.type === BlockEnum.End)
+   const startVariables = (startNode as Node<StartNodeType>)?.data?.variables
+   const edges = useEdges<CommonEdgeType>()
+ 
+@@ -81,6 +83,7 @@ const FeaturesTrigger = () => {
+ 
+     return data
+   }, [fileSettings?.image?.enabled, startVariables])
++  const endVariables = useMemo(() => (endNode as Node<EndNodeType>)?.data?.outputs || [], [endNode])
+ 
+   const { handleCheckBeforePublish } = useChecklistBeforePublish()
+   const { handleSyncWorkflowDraft } = useNodesSyncDraft()
+@@ -201,6 +204,7 @@ const FeaturesTrigger = () => {
+           disabled: nodesReadOnly || !hasWorkflowNodes,
+           toolPublished,
+           inputs: variables,
++          outputs: endVariables,
+           onRefreshData: handleToolConfigureUpdate,
+           onPublish,
+           onToggle: onPublisherToggle,
+diff --git a/web/app/components/workflow/nodes/tool/panel.tsx b/web/app/components/workflow/nodes/tool/panel.tsx
+index 2cfa88dcf8..3a623208e5 100644
+--- a/web/app/components/workflow/nodes/tool/panel.tsx
++++ b/web/app/components/workflow/nodes/tool/panel.tsx
+@@ -121,6 +121,7 @@ const Panel: FC<NodePanelProps<ToolNodeType>> = ({
+             />
+             {outputSchema.map((outputItem) => {
+               const schemaType = getMatchedSchemaType(outputItem.value, schemaTypeDefinitions)
++              // TODO empty object type always match `qa_structured` schema type
+               return (
+                 <div key={outputItem.name}>
+                   {outputItem.value?.type === 'object' ? (
+diff --git a/web/i18n/en-US/tools.ts b/web/i18n/en-US/tools.ts
+index 6086d9aa16..86c225c1b2 100644
+--- a/web/i18n/en-US/tools.ts
++++ b/web/i18n/en-US/tools.ts
+@@ -113,6 +113,13 @@ const translation = {
+       description: 'Description',
+       descriptionPlaceholder: 'Description of the parameter\'s meaning',
+     },
++    toolOutput: {
++      title: 'Tool Output',
++      name: 'Name',
++      reserved: 'Reserved',
++      reservedParameterDuplicateTip: 'text, json, and files are reserved variables. Variables with these names cannot appear in the output schema.',
++      description: 'Description',
++    },
+     customDisclaimer: 'Custom disclaimer',
+     customDisclaimerPlaceholder: 'Please enter custom disclaimer',
+     confirmTitle: 'Confirm to save ?',
+diff --git a/web/i18n/zh-Hans/tools.ts b/web/i18n/zh-Hans/tools.ts
+index ad046ff198..624fbb241a 100644
+--- a/web/i18n/zh-Hans/tools.ts
++++ b/web/i18n/zh-Hans/tools.ts
+@@ -113,6 +113,13 @@ const translation = {
+       description: '描述',
+       descriptionPlaceholder: '参数意义的描述',
+     },
++    toolOutput: {
++      title: '工具出参',
++      name: '名称',
++      reserved: '预留',
++      reservedParameterDuplicateTip: 'text、json、files 是预留变量，这些名称的变量不能出现在 output_schema 中。',
++      description: '描述',
++    },
+     customDisclaimer: '自定义免责声明',
+     customDisclaimerPlaceholder: '请输入自定义免责声明',
+     confirmTitle: '确认保存？',

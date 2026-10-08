@@ -1,0 +1,1584 @@
+diff --git a/examples/addons/nonblocking.py b/examples/addons/nonblocking.py
+index e6b79f87d97..2ee09298085 100644
+--- a/examples/addons/nonblocking.py
++++ b/examples/addons/nonblocking.py
+@@ -1,16 +1,26 @@
+ """
+-Make events hooks non-blocking.
+-
+-When event hooks are decorated with @concurrent, they will be run in their own thread, freeing the main event loop.
+-Please note that this generally opens the door to race conditions and decreases performance if not required.
++Make events hooks non-blocking using async or @concurrent
+ """
++import asyncio
+ import time
+ 
+ from mitmproxy.script import concurrent
++from mitmproxy import ctx
++
++
++# Hooks can be async, which allows the hook to call async functions and perform async I/O
++# without blocking other requests. This is generally preferred for new addons.
++async def request(flow):
++    ctx.log.info(f"handle request: {flow.request.host}{flow.request.path}")
++    await asyncio.sleep(5)
++    ctx.log.info(f"start  request: {flow.request.host}{flow.request.path}")
+ 
+ 
+-@concurrent  # Remove this and see what happens
+-def request(flow):
++# Another option is to use @concurrent, which launches the hook in its own thread.
++# Please note that this generally opens the door to race conditions and decreases performance if not required.
++# Rename the function below to request(flow) to try it out.
++@concurrent  # Remove this to make it synchronous and see what happens
++def request_concurrent(flow):
+     # This is ugly in mitmproxy's UI, but you don't want to use mitmproxy.ctx.log from a different thread.
+     print(f"handle request: {flow.request.host}{flow.request.path}")
+     time.sleep(5)
+diff --git a/mitmproxy/addonmanager.py b/mitmproxy/addonmanager.py
+index a0def682ca1..282e70d17a2 100644
+--- a/mitmproxy/addonmanager.py
++++ b/mitmproxy/addonmanager.py
+@@ -1,4 +1,5 @@
+ import contextlib
++import inspect
+ import pprint
+ import sys
+ import traceback
+@@ -6,7 +7,6 @@
+ import typing
+ from dataclasses import dataclass
+ 
+-from mitmproxy import controller
+ from mitmproxy import hooks
+ from mitmproxy import exceptions
+ from mitmproxy import flow
+@@ -45,6 +45,7 @@ def safecall():
+         raise
+     except Exception:
+         etype, value, tb = sys.exc_info()
++        tb = cut_traceback(tb, "invoke_addon_sync")
+         tb = cut_traceback(tb, "invoke_addon")
+         ctx.log.error(
+             "Addon error: %s" % "".join(
+@@ -141,7 +142,7 @@ def clear(self):
+             Remove all addons.
+         """
+         for a in self.chain:
+-            self.invoke_addon(a, hooks.DoneHook())
++            self.invoke_addon_sync(a, hooks.DoneHook())
+         self.lookup = {}
+         self.chain = []
+ 
+@@ -181,7 +182,7 @@ def register(self, addon):
+                     "An addon called '%s' already exists." % name
+                 )
+         l = Loader(self.master)
+-        self.invoke_addon(addon, LoadHook(l))
++        self.invoke_addon_sync(addon, LoadHook(l))
+         for a in traverse([addon]):
+             name = _get_name(a)
+             self.lookup[name] = a
+@@ -212,7 +213,7 @@ def remove(self, addon):
+                 raise exceptions.AddonManagerError("No such addon: %s" % n)
+             self.chain = [i for i in self.chain if i is not a]
+             del self.lookup[_get_name(a)]
+-        self.invoke_addon(addon, hooks.DoneHook())
++        self.invoke_addon_sync(addon, hooks.DoneHook())
+ 
+     def __len__(self):
+         return len(self.chain)
+@@ -229,39 +230,22 @@ async def handle_lifecycle(self, event: hooks.Hook):
+             Handle a lifecycle event.
+         """
+         message = event.args()[0]
+-        if not hasattr(message, "reply"):  # pragma: no cover
+-            raise exceptions.ControlException(
+-                "Message %s has no reply attribute" % message
+-            )
+-
+-        # We can use DummyReply objects multiple times. We only clear them up on
+-        # the next handler so that we can access value and state in the
+-        # meantime.
+-        if isinstance(message.reply, controller.DummyReply):
+-            message.reply.reset()
+-
+-        self.trigger(event)
+ 
+-        if message.reply.state == "start":
+-            message.reply.take()
+-            message.reply.commit()
+-
+-            if isinstance(message.reply, controller.DummyReply):
+-                message.reply.mark_reset()
++        await self.trigger_event(event)
+ 
+         if isinstance(message, flow.Flow):
+-            self.trigger(hooks.UpdateHook([message]))
++            await self.trigger_event(hooks.UpdateHook([message]))
+ 
+-    def invoke_addon(self, addon, event: hooks.Hook):
++    def _iter_hooks(self, addon, event: hooks.Hook):
+         """
+-            Invoke an event on an addon and all its children.
++            Enumerate all hook callables belonging to the given addon
+         """
+         assert isinstance(event, hooks.Hook)
+         for a in traverse([addon]):
+             func = getattr(a, event.name, None)
+             if func:
+                 if callable(func):
+-                    func(*event.args())
++                    yield a, func
+                 elif isinstance(func, types.ModuleType):
+                     # we gracefully exclude module imports with the same name as hooks.
+                     # For example, a user may have "from mitmproxy import log" in an addon,
+@@ -273,6 +257,38 @@ def invoke_addon(self, addon, event: hooks.Hook):
+                         f"Addon handler {event.name} ({a}) not callable"
+                     )
+ 
++    async def invoke_addon(self, addon, event: hooks.Hook):
++        """
++            Asynchronously invoke an event on an addon and all its children.
++        """
++        for addon, func in self._iter_hooks(addon, event):
++            res = func(*event.args())
++            # Support both async and sync hook functions
++            if inspect.isawaitable(res):
++                await res
++
++    def invoke_addon_sync(self, addon, event: hooks.Hook):
++        """
++            Invoke an event on an addon and all its children.
++        """
++        for addon, func in self._iter_hooks(addon, event):
++            if inspect.iscoroutinefunction(func):
++                raise exceptions.AddonManagerError(
++                    f"Async handler {event.name} ({addon}) cannot be called from sync context"
++                )
++            func(*event.args())
++
++    async def trigger_event(self, event: hooks.Hook):
++        """
++            Asynchronously trigger an event across all addons.
++        """
++        for i in self.chain:
++            try:
++                with safecall():
++                    await self.invoke_addon(i, event)
++            except exceptions.AddonHalt:
++                return
++
+     def trigger(self, event: hooks.Hook):
+         """
+             Trigger an event across all addons.
+@@ -280,6 +296,6 @@ def trigger(self, event: hooks.Hook):
+         for i in self.chain:
+             try:
+                 with safecall():
+-                    self.invoke_addon(i, event)
++                    self.invoke_addon_sync(i, event)
+             except exceptions.AddonHalt:
+                 return
+diff --git a/mitmproxy/addons/asgiapp.py b/mitmproxy/addons/asgiapp.py
+index 22286b302ce..9748401da40 100644
+--- a/mitmproxy/addons/asgiapp.py
++++ b/mitmproxy/addons/asgiapp.py
+@@ -5,7 +5,6 @@
+ import asgiref.compatibility
+ import asgiref.wsgi
+ from mitmproxy import ctx, http
+-from mitmproxy.controller import DummyReply
+ 
+ 
+ class ASGIApp:
+@@ -26,18 +25,14 @@ def name(self) -> str:
+         return f"asgiapp:{self.host}:{self.port}"
+ 
+     def should_serve(self, flow: http.HTTPFlow) -> bool:
+-        assert flow.reply
+         return bool(
+             (flow.request.pretty_host, flow.request.port) == (self.host, self.port)
+-            and flow.reply.state == "start" and not flow.error and not flow.response
+-            and not isinstance(flow.reply, DummyReply)  # ignore the HTTP flows of this app loaded from somewhere
++            and not flow.error and not flow.response
+         )
+ 
+-    def request(self, flow: http.HTTPFlow) -> None:
+-        assert flow.reply
++    async def request(self, flow: http.HTTPFlow) -> None:
+         if self.should_serve(flow):
+-            flow.reply.take()  # pause hook completion
+-            asyncio.ensure_future(serve(self.asgi_app, flow))
++            await serve(self.asgi_app, flow)
+ 
+ 
+ class WSGIApp(ASGIApp):
+@@ -92,7 +87,6 @@ async def serve(app, flow: http.HTTPFlow):
+     """
+     Serves app on flow.
+     """
+-    assert flow.reply
+ 
+     scope = make_scope(flow)
+     done = asyncio.Event()
+@@ -135,5 +129,4 @@ async def send(event):
+         ctx.log.error(f"Error in asgi app:\n{traceback.format_exc(limit=-5)}")
+         flow.response = http.Response.make(500, b"ASGI Error.")
+     finally:
+-        flow.reply.commit()
+         done.set()
+diff --git a/mitmproxy/addons/blocklist.py b/mitmproxy/addons/blocklist.py
+index 5a422cbbbe3..b1baa16b458 100644
+--- a/mitmproxy/addons/blocklist.py
++++ b/mitmproxy/addons/blocklist.py
+@@ -61,7 +61,7 @@ def configure(self, updated):
+                 self.items.append(spec)
+ 
+     def request(self, flow: http.HTTPFlow) -> None:
+-        if flow.response or flow.error or (flow.reply and flow.reply.state == "taken"):
++        if flow.response or flow.error:
+             return
+ 
+         for spec in self.items:
+diff --git a/mitmproxy/addons/clientplayback.py b/mitmproxy/addons/clientplayback.py
+index 3ae8abad91a..767d0706291 100644
+--- a/mitmproxy/addons/clientplayback.py
++++ b/mitmproxy/addons/clientplayback.py
+@@ -10,7 +10,6 @@
+ from mitmproxy import flow
+ from mitmproxy import http
+ from mitmproxy import io
+-from mitmproxy.addons.proxyserver import AsyncReply
+ from mitmproxy.hooks import UpdateHook
+ from mitmproxy.net import server_spec
+ from mitmproxy.options import Options
+@@ -95,9 +94,9 @@ def log(self, message: str, level: str = "info") -> None:
+ 
+     async def handle_hook(self, hook: commands.StartHook) -> None:
+         data, = hook.args()
+-        data.reply = AsyncReply(data)
+         await ctx.master.addons.handle_lifecycle(hook)
+-        await data.reply.done.wait()
++        if isinstance(data, flow.Flow):
++            await data.wait_for_resume()
+         if isinstance(hook, (layers.http.HttpResponseHook, layers.http.HttpErrorHook)):
+             if self.transports:
+                 # close server connections
+diff --git a/mitmproxy/addons/intercept.py b/mitmproxy/addons/intercept.py
+index 36f269bd46e..4b9319f00f9 100644
+--- a/mitmproxy/addons/intercept.py
++++ b/mitmproxy/addons/intercept.py
+@@ -40,9 +40,6 @@ def should_intercept(self, f: flow.Flow) -> bool:
+ 
+     def process_flow(self, f: flow.Flow) -> None:
+         if self.should_intercept(f):
+-            assert f.reply
+-            if f.reply.state != "start":
+-                return ctx.log.debug("Cannot intercept request that is already taken by another addon.")
+             f.intercept()
+ 
+     # Handlers
+diff --git a/mitmproxy/addons/maplocal.py b/mitmproxy/addons/maplocal.py
+index bcee93e03fe..17af0c461c8 100644
+--- a/mitmproxy/addons/maplocal.py
++++ b/mitmproxy/addons/maplocal.py
+@@ -105,7 +105,7 @@ def configure(self, updated):
+                 self.replacements.append(spec)
+ 
+     def request(self, flow: http.HTTPFlow) -> None:
+-        if flow.response or flow.error or (flow.reply and flow.reply.state == "taken"):
++        if flow.response or flow.error:
+             return
+ 
+         url = flow.request.pretty_url
+diff --git a/mitmproxy/addons/mapremote.py b/mitmproxy/addons/mapremote.py
+index 183a4c282d4..0a77d1daf00 100644
+--- a/mitmproxy/addons/mapremote.py
++++ b/mitmproxy/addons/mapremote.py
+@@ -48,7 +48,7 @@ def configure(self, updated):
+                 self.replacements.append(spec)
+ 
+     def request(self, flow: http.HTTPFlow) -> None:
+-        if flow.response or flow.error or (flow.reply and flow.reply.state == "taken"):
++        if flow.response or flow.error:
+             return
+         for spec in self.replacements:
+             if spec.matches(flow):
+diff --git a/mitmproxy/addons/modifybody.py b/mitmproxy/addons/modifybody.py
+index 6aa42ee41ea..bf56c09630a 100644
+--- a/mitmproxy/addons/modifybody.py
++++ b/mitmproxy/addons/modifybody.py
+@@ -31,12 +31,12 @@ def configure(self, updated):
+                 self.replacements.append(spec)
+ 
+     def request(self, flow):
+-        if flow.response or flow.error or flow.reply.state == "taken":
++        if flow.response:
+             return
+         self.run(flow)
+ 
+     def response(self, flow):
+-        if flow.error or flow.reply.state == "taken":
++        if flow.error:
+             return
+         self.run(flow)
+ 
+diff --git a/mitmproxy/addons/modifyheaders.py b/mitmproxy/addons/modifyheaders.py
+index 38545d30de5..f997fc20835 100644
+--- a/mitmproxy/addons/modifyheaders.py
++++ b/mitmproxy/addons/modifyheaders.py
+@@ -73,12 +73,12 @@ def configure(self, updated):
+                 self.replacements.append(spec)
+ 
+     def request(self, flow):
+-        if flow.response or flow.error or flow.reply.state == "taken":
++        if flow.response or flow.error:
+             return
+         self.run(flow, flow.request.headers)
+ 
+     def response(self, flow):
+-        if flow.error or flow.reply.state == "taken":
++        if flow.error:
+             return
+         self.run(flow, flow.response.headers)
+ 
+diff --git a/mitmproxy/addons/onboarding.py b/mitmproxy/addons/onboarding.py
+index b104140e6ed..702a4b68ca8 100644
+--- a/mitmproxy/addons/onboarding.py
++++ b/mitmproxy/addons/onboarding.py
+@@ -6,7 +6,7 @@
+ APP_PORT = 80
+ 
+ 
+-class Onboarding(asgiapp.WSGIApp):
++class Onboarding(asgiapp.ASGIApp):
+     name = "onboarding"
+ 
+     def __init__(self):
+@@ -34,6 +34,6 @@ def configure(self, updated):
+         self.port = ctx.options.onboarding_port
+         app.config["CONFDIR"] = ctx.options.confdir
+ 
+-    def request(self, f):
++    async def request(self, f):
+         if ctx.options.onboarding:
+-            super().request(f)
++            await super().request(f)
+diff --git a/mitmproxy/addons/proxyserver.py b/mitmproxy/addons/proxyserver.py
+index dcf8ec32af1..a05fd69c94d 100644
+--- a/mitmproxy/addons/proxyserver.py
++++ b/mitmproxy/addons/proxyserver.py
+@@ -1,9 +1,8 @@
+ import asyncio
+-import warnings
+ from typing import Dict, Optional, Tuple
+ 
+-from mitmproxy import command, controller, ctx, exceptions, flow, http, log, master, options, platform, tcp, websocket
+-from mitmproxy.flow import Error, Flow
++from mitmproxy import command, ctx, exceptions, flow, http, log, master, options, platform, tcp, websocket
++from mitmproxy.flow import Flow
+ from mitmproxy.proxy import commands, events, server_hooks
+ from mitmproxy.proxy import server
+ from mitmproxy.proxy.layers.tcp import TcpMessageInjected
+@@ -12,29 +11,6 @@
+ from wsproto.frame_protocol import Opcode
+ 
+ 
+-class AsyncReply(controller.Reply):
+-    """
+-    controller.Reply.q.get() is blocking, which we definitely want to avoid in a coroutine.
+-    This stub adds a .done asyncio.Event() that can be used instead.
+-    """
+-
+-    def __init__(self, *args):
+-        self.done = asyncio.Event()
+-        self.loop = asyncio.get_event_loop()
+-        super().__init__(*args)
+-
+-    def commit(self):
+-        super().commit()
+-        try:
+-            self.loop.call_soon_threadsafe(lambda: self.done.set())
+-        except RuntimeError:  # pragma: no cover
+-            pass  # event loop may already be closed.
+-
+-    def kill(self, force=False):  # pragma: no cover
+-        warnings.warn("reply.kill() is deprecated, set the error attribute instead.", DeprecationWarning, stacklevel=2)
+-        self.obj.error = flow.Error(Error.KILLED_MESSAGE)
+-
+-
+ class ProxyConnectionHandler(server.StreamConnectionHandler):
+     master: master.Master
+ 
+@@ -47,14 +23,12 @@ async def handle_hook(self, hook: commands.StartHook) -> None:
+         with self.timeout_watchdog.disarm():
+             # We currently only support single-argument hooks.
+             data, = hook.args()
+-            data.reply = AsyncReply(data)
+             await self.master.addons.handle_lifecycle(hook)
+-            await data.reply.done.wait()
+-            data.reply = None
++            if isinstance(data, flow.Flow):
++                await data.wait_for_resume()
+ 
+     def log(self, message: str, level: str = "info") -> None:
+         x = log.LogEntry(self.log_prefix + message, level)
+-        x.reply = controller.DummyReply()  # type: ignore
+         asyncio_utils.create_task(
+             self.master.addons.handle_lifecycle(log.AddLogHook(x)),
+             name="ProxyConnectionHandler.log"
+diff --git a/mitmproxy/addons/script.py b/mitmproxy/addons/script.py
+index 5907476c7fe..fa2cbd34f6a 100644
+--- a/mitmproxy/addons/script.py
++++ b/mitmproxy/addons/script.py
+@@ -55,7 +55,7 @@ def script_error_handler(path, exc, msg="", tb=False):
+     log_msg = f"in script {path}:{lineno} {exception}"
+     if tb:
+         etype, value, tback = sys.exc_info()
+-        tback = addonmanager.cut_traceback(tback, "invoke_addon")
++        tback = addonmanager.cut_traceback(tback, "invoke_addon_sync")
+         log_msg = log_msg + "\n" + "".join(traceback.format_exception(etype, value, tback))
+     ctx.log.error(log_msg)
+ 
+@@ -110,9 +110,9 @@ def loadscript(self):
+             # We're already running, so we have to explicitly register and
+             # configure the addon
+             if self.is_running:
+-                ctx.master.addons.invoke_addon(self.ns, hooks.RunningHook())
++                ctx.master.addons.invoke_addon_sync(self.ns, hooks.RunningHook())
+             try:
+-                ctx.master.addons.invoke_addon(
++                ctx.master.addons.invoke_addon_sync(
+                     self.ns,
+                     hooks.ConfigureHook(ctx.options.keys())
+                 )
+@@ -166,14 +166,14 @@ def script_run(self, flows: typing.Sequence[flow.Flow], path: mtypes.Path) -> No
+         mod = load_script(path)
+         if mod:
+             with addonmanager.safecall():
+-                ctx.master.addons.invoke_addon(mod, hooks.RunningHook())
+-                ctx.master.addons.invoke_addon(
++                ctx.master.addons.invoke_addon_sync(mod, hooks.RunningHook())
++                ctx.master.addons.invoke_addon_sync(
+                     mod,
+                     hooks.ConfigureHook(ctx.options.keys()),
+                 )
+                 for f in flows:
+                     for evt in eventsequence.iterate(f):
+-                        ctx.master.addons.invoke_addon(mod, evt)
++                        ctx.master.addons.invoke_addon_sync(mod, evt)
+ 
+     def configure(self, updated):
+         if "scripts" in updated:
+@@ -214,4 +214,4 @@ def configure(self, updated):
+                 if self.is_running:
+                     # If we're already running, we configure and tell the addon
+                     # we're up and running.
+-                    ctx.master.addons.invoke_addon(s, hooks.RunningHook())
++                    ctx.master.addons.invoke_addon_sync(s, hooks.RunningHook())
+diff --git a/mitmproxy/controller.py b/mitmproxy/controller.py
+deleted file mode 100644
+index f6b2a22bb07..00000000000
+--- a/mitmproxy/controller.py
++++ /dev/null
+@@ -1,95 +0,0 @@
+-import asyncio
+-import warnings
+-from typing import Any
+-
+-from mitmproxy import exceptions, flow
+-
+-
+-class Reply:
+-    """
+-    Messages sent through a channel are decorated with a "reply" attribute. This
+-    object is used to respond to the message through the return channel.
+-    """
+-
+-    def __init__(self, obj):
+-        self.obj: Any = obj
+-        self.done: asyncio.Event = asyncio.Event()
+-        self._loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
+-        self._state: str = "start"  # "start" -> "taken" -> "committed"
+-
+-    @property
+-    def state(self):
+-        """
+-        The state the reply is currently in. A normal reply object goes
+-        sequentially through the following lifecycle:
+-
+-            1. start: Initial State.
+-            2. taken: The reply object has been taken to be committed.
+-            3. committed: The reply has been sent back to the requesting party.
+-
+-        This attribute is read-only and can only be modified by calling one of
+-        state transition functions.
+-        """
+-        return self._state
+-
+-    def take(self):
+-        """
+-        Scripts or other parties make "take" a reply out of a normal flow.
+-        For example, intercepted flows are taken out so that the connection thread does not proceed.
+-        """
+-        if self.state != "start":
+-            raise exceptions.ControlException(f"Reply is {self.state}, but expected it to be start.")
+-        self._state = "taken"
+-
+-    def commit(self):
+-        """
+-        Ultimately, messages are committed. This is done either automatically by
+-        the handler if the message is not taken or manually by the entity which
+-        called .take().
+-        """
+-        if self.state != "taken":
+-            raise exceptions.ControlException(f"Reply is {self.state}, but expected it to be taken.")
+-        self._state = "committed"
+-        try:
+-            self._loop.call_soon_threadsafe(lambda: self.done.set())
+-        except RuntimeError:  # pragma: no cover
+-            pass  # event loop may already be closed.
+-
+-    def kill(self, force=False):  # pragma: no cover
+-        warnings.warn("reply.kill() is deprecated, use flow.kill() or set the error attribute instead.",
+-                      DeprecationWarning, stacklevel=2)
+-        self.obj.error = flow.Error(flow.Error.KILLED_MESSAGE)
+-
+-    def __del__(self):
+-        if self.state != "committed":
+-            # This will be ignored by the interpreter, but emit a warning
+-            raise exceptions.ControlException(f"Uncommitted reply: {self.obj}")
+-
+-    def __deepcopy__(self, memo):
+-        # some parts of the console ui may use deepcopy, see https://github.com/mitmproxy/mitmproxy/issues/4916
+-        return memo.setdefault(id(self), DummyReply())
+-
+-
+-class DummyReply(Reply):
+-    """
+-    A reply object that is not connected to anything. In contrast to regular
+-    Reply objects, DummyReply objects are reset to "start" at the end of an
+-    handler so that they can be used multiple times. Useful when we need an
+-    object to seem like it has a channel, and during testing.
+-    """
+-
+-    def __init__(self):
+-        super().__init__(None)
+-        self._should_reset = False
+-
+-    def mark_reset(self):
+-        if self.state != "committed":
+-            raise exceptions.ControlException(f"Uncommitted reply: {self.obj}")
+-        self._should_reset = True
+-
+-    def reset(self):
+-        if self._should_reset:
+-            self._state = "start"
+-
+-    def __del__(self):
+-        pass
+diff --git a/mitmproxy/eventsequence.py b/mitmproxy/eventsequence.py
+index 8cd7ce69a46..5b4ab31383b 100644
+--- a/mitmproxy/eventsequence.py
++++ b/mitmproxy/eventsequence.py
+@@ -1,6 +1,5 @@
+ from typing import Any, Callable, Dict, Iterator, Type
+ 
+-from mitmproxy import controller
+ from mitmproxy import flow
+ from mitmproxy import hooks
+ from mitmproxy import http
+@@ -32,7 +31,6 @@ def _iterate_http(f: http.HTTPFlow) -> TEventGenerator:
+ def _iterate_tcp(f: tcp.TCPFlow) -> TEventGenerator:
+     messages = f.messages
+     f.messages = []
+-    f.reply = controller.DummyReply()
+     yield layers.tcp.TcpStartHook(f)
+     while messages:
+         f.messages.append(messages.pop(0))
+diff --git a/mitmproxy/flow.py b/mitmproxy/flow.py
+index 43e21d8a576..32c4aa38690 100644
+--- a/mitmproxy/flow.py
++++ b/mitmproxy/flow.py
+@@ -1,8 +1,9 @@
++import asyncio
+ import time
+ import typing  # noqa
+ import uuid
+ 
+-from mitmproxy import controller, connection
++from mitmproxy import connection
+ from mitmproxy import exceptions
+ from mitmproxy import stateobject
+ from mitmproxy import version
+@@ -118,8 +119,8 @@ def __init__(
+         self.live = live
+ 
+         self.intercepted: bool = False
++        self._resume_event: typing.Optional[asyncio.Event] = None
+         self._backup: typing.Optional[Flow] = None
+-        self.reply: typing.Optional[controller.Reply] = None
+         self.marked: str = ""
+         self.is_replay: typing.Optional[str] = None
+         self.metadata: typing.Dict[str, typing.Any] = dict()
+@@ -162,8 +163,6 @@ def copy(self):
+         """Make a copy of this flow."""
+         f = super().copy()
+         f.live = False
+-        if self.reply is not None:
+-            f.reply = controller.DummyReply()
+         return f
+ 
+     def modified(self):
+@@ -193,11 +192,7 @@ def revert(self):
+     @property
+     def killable(self):
+         """*Read-only:* `True` if this flow can be killed, `False` otherwise."""
+-        return (
+-            self.reply and
+-            self.reply.state in {"start", "taken"} and
+-            not (self.error and self.error.msg == Error.KILLED_MESSAGE)
+-        )
++        return not (self.error and self.error.msg == Error.KILLED_MESSAGE)
+ 
+     def kill(self):
+         """
+@@ -217,7 +212,18 @@ def intercept(self):
+         if self.intercepted:
+             return
+         self.intercepted = True
+-        self.reply.take()
++        if self._resume_event is not None:
++            self._resume_event.clear()
++
++    async def wait_for_resume(self):
++        """
++        Wait until this Flow is resumed.
++        """
++        if not self.intercepted:
++            return
++        if self._resume_event is None:
++            self._resume_event = asyncio.Event()
++        await self._resume_event.wait()
+ 
+     def resume(self):
+         """
+@@ -226,9 +232,8 @@ def resume(self):
+         if not self.intercepted:
+             return
+         self.intercepted = False
+-        # If a flow is intercepted and then duplicated, the duplicated one is not taken.
+-        if self.reply.state == "taken":
+-            self.reply.commit()
++        if self._resume_event is not None:
++            self._resume_event.set()
+ 
+     @property
+     def timestamp_start(self) -> float:
+diff --git a/mitmproxy/master.py b/mitmproxy/master.py
+index ac69d5278c5..891451a3369 100644
+--- a/mitmproxy/master.py
++++ b/mitmproxy/master.py
+@@ -6,7 +6,6 @@
+ 
+ from mitmproxy import addonmanager, hooks
+ from mitmproxy import command
+-from mitmproxy import controller
+ from mitmproxy import eventsequence
+ from mitmproxy import http
+ from mitmproxy import log
+@@ -115,6 +114,5 @@ async def load_flow(self, f):
+         if isinstance(f, http.HTTPFlow):
+             self._change_reverse_host(f)
+ 
+-        f.reply = controller.DummyReply()
+         for e in eventsequence.iterate(f):
+             await self.addons.handle_lifecycle(e)
+diff --git a/mitmproxy/script/concurrent.py b/mitmproxy/script/concurrent.py
+index 39ff84b552b..9d9546568da 100644
+--- a/mitmproxy/script/concurrent.py
++++ b/mitmproxy/script/concurrent.py
+@@ -3,12 +3,9 @@
+ offload computations from mitmproxy's main master thread.
+ """
+ 
++import asyncio
++import inspect
+ from mitmproxy import hooks
+-from mitmproxy.coretypes import basethread
+-
+-
+-class ScriptThread(basethread.BaseThread):
+-    name = "ScriptThread"
+ 
+ 
+ def concurrent(fn):
+@@ -17,20 +14,18 @@ def concurrent(fn):
+             "Concurrent decorator not supported for '%s' method." % fn.__name__
+         )
+ 
+-    def _concurrent(*args):
+-        # When annotating classmethods, "self" is passed as the first argument.
+-        # To support both class and static methods, we accept a variable number of arguments
+-        # and take the last one as our actual hook object.
+-        obj = args[-1]
+-
++    async def _concurrent(*args):
+         def run():
+-            fn(*args)
+-            if obj.reply.state == "taken":
+-                obj.reply.commit()
+-        obj.reply.take()
+-        ScriptThread(
+-            f"script.concurrent {fn.__name__}",
+-            target=run
+-        ).start()
++            if inspect.iscoroutinefunction(fn):
++                # Run the async function in a new event loop
++                loop = asyncio.new_event_loop()
++                try:
++                    loop.run_until_complete(fn(*args))
++                finally:
++                    loop.close()
++            else:
++                fn(*args)
++
++        await asyncio.get_running_loop().run_in_executor(None, run)
+ 
+     return _concurrent
+diff --git a/mitmproxy/test/taddons.py b/mitmproxy/test/taddons.py
+index dc06dba4275..60737c78d5e 100644
+--- a/mitmproxy/test/taddons.py
++++ b/mitmproxy/test/taddons.py
+@@ -1,4 +1,3 @@
+-import contextlib
+ import asyncio
+ import sys
+ 
+@@ -53,6 +52,18 @@ def clear(self):
+         self.logs = []
+ 
+ 
++def run_async(coro):
++    """
++        Run the given async function in a new event loop.
++        This allows async functions to be called synchronously.
++    """
++    loop = asyncio.new_event_loop()
++    try:
++        return loop.run_until_complete(coro)
++    finally:
++        loop.close()
++
++
+ class context:
+     """
+         A context for testing addons, which sets up the mitmproxy.ctx module so
+@@ -79,19 +90,17 @@ def __enter__(self):
+     def __exit__(self, exc_type, exc_value, traceback):
+         return False
+ 
+-    @contextlib.contextmanager
+-    def cycle(self, addon, f):
++    async def cycle(self, addon, f):
+         """
+-            Cycles the flow through the events for the flow. Stops if a reply
+-            is taken (as in flow interception).
++            Cycles the flow through the events for the flow. Stops if the flow
++            is intercepted.
+         """
+-        f.reply._state = "start"
+         for evt in eventsequence.iterate(f):
+-            self.master.addons.invoke_addon(
++            await self.master.addons.invoke_addon(
+                 addon,
+                 evt
+             )
+-            if f.reply.state == "taken":
++            if f.intercepted:
+                 return
+ 
+     def configure(self, addon, **kwargs):
+@@ -106,7 +115,7 @@ def configure(self, addon, **kwargs):
+             if kwargs:
+                 self.options.update(**kwargs)
+             else:
+-                self.master.addons.invoke_addon(addon, hooks.ConfigureHook(set()))
++                self.master.addons.invoke_addon_sync(addon, hooks.ConfigureHook(set()))
+ 
+     def script(self, path):
+         """
+@@ -115,11 +124,11 @@ def script(self, path):
+         sc = script.Script(path, False)
+         return sc.addons[0] if sc.addons else None
+ 
+-    def invoke(self, addon, event: hooks.Hook):
++    async def invoke(self, addon, event: hooks.Hook):
+         """
+             Recursively invoke an event on an addon and all its children.
+         """
+-        return self.master.addons.invoke_addon(addon, event)
++        return await self.master.addons.invoke_addon(addon, event)
+ 
+     def command(self, func, *args):
+         """
+diff --git a/mitmproxy/test/tflow.py b/mitmproxy/test/tflow.py
+index d00ea395b1b..a21f8807b39 100644
+--- a/mitmproxy/test/tflow.py
++++ b/mitmproxy/test/tflow.py
+@@ -2,7 +2,6 @@
+ from typing import Optional, Union
+ 
+ from mitmproxy import connection
+-from mitmproxy import controller
+ from mitmproxy import flow
+ from mitmproxy import http
+ from mitmproxy import tcp
+@@ -27,7 +26,6 @@ def ttcpflow(client_conn=True, server_conn=True, messages=True, err=None) -> tcp
+     f = tcp.TCPFlow(client_conn, server_conn)
+     f.messages = messages
+     f.error = err
+-    f.reply = controller.DummyReply()
+     return f
+ 
+ 
+@@ -82,7 +80,6 @@ def twebsocketflow(messages=True, err=None, close_code=None, close_reason='') ->
+             # NORMAL_CLOSURE
+             flow.websocket.close_code = 1000
+ 
+-    flow.reply = controller.DummyReply()
+     return flow
+ 
+ 
+@@ -119,7 +116,6 @@ def tflow(
+     f.response = resp or None
+     f.error = err or None
+     f.websocket = ws or None
+-    f.reply = controller.DummyReply()
+     return f
+ 
+ 
+@@ -140,7 +136,6 @@ def tdummyflow(client_conn=True, server_conn=True, err=None) -> DummyFlow:
+ 
+     f = DummyFlow(client_conn, server_conn)
+     f.error = err
+-    f.reply = controller.DummyReply()
+     return f
+ 
+ 
+@@ -166,7 +161,6 @@ def tclient_conn() -> connection.Client:
+         alpn_offers=[],
+         cipher_list=[],
+     ))
+-    c.reply = controller.DummyReply()  # type: ignore
+     return c
+ 
+ 
+@@ -194,7 +188,6 @@ def tserver_conn() -> connection.Server:
+         cipher_list=[],
+         via2=None,
+     ))
+-    c.reply = controller.DummyReply()  # type: ignore
+     return c
+ 
+ 
+diff --git a/mitmproxy/tools/console/common.py b/mitmproxy/tools/console/common.py
+index fe3f6469d73..954aa31463d 100644
+--- a/mitmproxy/tools/console/common.py
++++ b/mitmproxy/tools/console/common.py
+@@ -684,9 +684,7 @@ def format_flow(
+             error_message=error_message,
+         )
+     elif isinstance(f, HTTPFlow):
+-        intercepted = (
+-                f.intercepted and not (f.reply and f.reply.state == "committed")
+-        )
++        intercepted = f.intercepted
+         response_content_length: typing.Optional[int]
+         if f.response:
+             if f.response.raw_content is not None:
+diff --git a/setup.cfg b/setup.cfg
+index 7112b48924c..22c56d67d50 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -52,7 +52,6 @@ exclude =
+     mitmproxy/connections.py
+     mitmproxy/contentviews/base.py
+     mitmproxy/contentviews/grpc.py
+-    mitmproxy/controller.py
+     mitmproxy/ctx.py
+     mitmproxy/exceptions.py
+     mitmproxy/flow.py
+diff --git a/test/helper_tools/dumperview.py b/test/helper_tools/dumperview.py
+index b672ebaf91e..bbdf97d624c 100755
+--- a/test/helper_tools/dumperview.py
++++ b/test/helper_tools/dumperview.py
+@@ -11,7 +11,7 @@ def show(flow_detail, flows):
+     with taddons.context() as ctx:
+         ctx.configure(d, flow_detail=flow_detail)
+         for f in flows:
+-            ctx.cycle(d, f)
++            taddons.run_async(ctx.cycle(d, f))
+ 
+ 
+ @click.group()
+@@ -22,14 +22,14 @@ def cli():
+ @cli.command()
+ @click.option('--level', default=1, help='Detail level')
+ def tcp(level):
+-    f1 = tflow.ttcpflow(client_conn=True, server_conn=True)
++    f1 = tflow.ttcpflow()
+     show(level, [f1])
+ 
+ 
+ @cli.command()
+ @click.option('--level', default=1, help='Detail level')
+ def large(level):
+-    f1 = tflow.tflow(client_conn=True, server_conn=True, resp=True)
++    f1 = tflow.tflow(resp=True)
+     f1.response.headers["content-type"] = "text/html"
+     f1.response.content = b"foo bar voing\n" * 100
+     show(level, [f1])
+@@ -38,11 +38,11 @@ def large(level):
+ @cli.command()
+ @click.option('--level', default=1, help='Detail level')
+ def small(level):
+-    f1 = tflow.tflow(client_conn=True, server_conn=True, resp=True)
++    f1 = tflow.tflow(resp=True)
+     f1.response.headers["content-type"] = "text/html"
+     f1.response.content = b"<html><body>Hello!</body></html>"
+ 
+-    f2 = tflow.tflow(client_conn=True, server_conn=True, err=True)
++    f2 = tflow.tflow(err=True)
+ 
+     show(
+         level,
+diff --git a/test/mitmproxy/addons/test_core.py b/test/mitmproxy/addons/test_core.py
+index ebdfbab6071..b0ab3cfe893 100644
+--- a/test/mitmproxy/addons/test_core.py
++++ b/test/mitmproxy/addons/test_core.py
+@@ -25,7 +25,7 @@ def test_resume():
+         assert not sa.resume([f])
+         f.intercept()
+         sa.resume([f])
+-        assert not f.reply.state == "taken"
++        assert not f.intercepted
+ 
+ 
+ def test_mark():
+diff --git a/test/mitmproxy/addons/test_intercept.py b/test/mitmproxy/addons/test_intercept.py
+index aad4e2c6f2a..1405c8916bb 100644
+--- a/test/mitmproxy/addons/test_intercept.py
++++ b/test/mitmproxy/addons/test_intercept.py
+@@ -2,12 +2,12 @@
+ 
+ from mitmproxy.addons import intercept
+ from mitmproxy import exceptions
+-from mitmproxy.proxy import layers
+ from mitmproxy.test import taddons
+ from mitmproxy.test import tflow
+ 
+ 
+-def test_simple():
++@pytest.mark.asyncio
++async def test_simple():
+     r = intercept.Intercept()
+     with taddons.context(r) as tctx:
+         assert not r.filt
+@@ -23,11 +23,11 @@ def test_simple():
+         tctx.configure(r, intercept="~s")
+ 
+         f = tflow.tflow(resp=True)
+-        tctx.cycle(r, f)
++        await tctx.cycle(r, f)
+         assert f.intercepted
+ 
+         f = tflow.tflow(resp=False)
+-        tctx.cycle(r, f)
++        await tctx.cycle(r, f)
+         assert not f.intercepted
+ 
+         f = tflow.tflow(resp=True)
+@@ -36,39 +36,25 @@ def test_simple():
+ 
+         tctx.configure(r, intercept_active=False)
+         f = tflow.tflow(resp=True)
+-        tctx.cycle(r, f)
++        await tctx.cycle(r, f)
+         assert not f.intercepted
+ 
+         tctx.configure(r, intercept_active=True)
+         f = tflow.tflow(resp=True)
+-        tctx.cycle(r, f)
++        await tctx.cycle(r, f)
+         assert f.intercepted
+ 
+ 
+-def test_tcp():
++@pytest.mark.asyncio
++async def test_tcp():
+     r = intercept.Intercept()
+     with taddons.context(r) as tctx:
+         tctx.configure(r, intercept="~tcp")
+         f = tflow.ttcpflow()
+-        tctx.cycle(r, f)
++        await tctx.cycle(r, f)
+         assert f.intercepted
+ 
+         tctx.configure(r, intercept_active=False)
+         f = tflow.ttcpflow()
+-        tctx.cycle(r, f)
+-        assert not f.intercepted
+-
+-
+-def test_already_taken():
+-    r = intercept.Intercept()
+-    with taddons.context(r) as tctx:
+-        tctx.configure(r, intercept="~q")
+-
+-        f = tflow.tflow()
+-        tctx.invoke(r, layers.http.HttpRequestHook(f))
+-        assert f.intercepted
+-
+-        f = tflow.tflow()
+-        f.reply.take()
+-        tctx.invoke(r, layers.http.HttpRequestHook(f))
++        await tctx.cycle(r, f)
+         assert not f.intercepted
+diff --git a/test/mitmproxy/addons/test_maplocal.py b/test/mitmproxy/addons/test_maplocal.py
+index 7e773a3214f..4fea6f29baf 100644
+--- a/test/mitmproxy/addons/test_maplocal.py
++++ b/test/mitmproxy/addons/test_maplocal.py
+@@ -168,7 +168,7 @@ async def test_nonexistent_files(self, tmpdir, monkeypatch):
+             ml.request(f)
+             await tctx.master.await_log("could not read file")
+ 
+-    def test_has_reply(self, tmpdir):
++    def test_is_killed(self, tmpdir):
+         ml = MapLocal()
+         with taddons.context(ml) as tctx:
+             tmpfile = tmpdir.join("foo.jpg")
+@@ -181,6 +181,6 @@ def test_has_reply(self, tmpdir):
+             )
+             f = tflow.tflow()
+             f.request.url = b"https://example.org/images/foo.jpg"
+-            f.reply.take()
++            f.kill()
+             ml.request(f)
+             assert not f.response
+diff --git a/test/mitmproxy/addons/test_mapremote.py b/test/mitmproxy/addons/test_mapremote.py
+index d3f4beb32a3..ecaf98890c8 100644
+--- a/test/mitmproxy/addons/test_mapremote.py
++++ b/test/mitmproxy/addons/test_mapremote.py
+@@ -28,12 +28,12 @@ def test_simple(self):
+             mr.request(f)
+             assert f.request.url == "https://mitmproxy.org/img/test.jpg"
+ 
+-    def test_has_reply(self):
++    def test_is_killed(self):
+         mr = mapremote.MapRemote()
+         with taddons.context(mr) as tctx:
+             tctx.configure(mr, map_remote=[":example.org:mitmproxy.org"])
+             f = tflow.tflow()
+             f.request.url = b"https://example.org/images/test.jpg"
+-            f.reply.take()
++            f.kill()
+             mr.request(f)
+             assert f.request.url == "https://example.org/images/test.jpg"
+diff --git a/test/mitmproxy/addons/test_modifybody.py b/test/mitmproxy/addons/test_modifybody.py
+index e82bb1e98cf..1c230ee8236 100644
+--- a/test/mitmproxy/addons/test_modifybody.py
++++ b/test/mitmproxy/addons/test_modifybody.py
+@@ -3,6 +3,7 @@
+ from mitmproxy.addons import modifybody
+ from mitmproxy.test import taddons
+ from mitmproxy.test import tflow
++from mitmproxy.test.tutils import tresp
+ 
+ 
+ class TestModifyBody:
+@@ -41,14 +42,14 @@ def test_taken(self, take):
+             f = tflow.tflow()
+             f.request.content = b"foo"
+             if take:
+-                f.reply.take()
++                f.response = tresp()
+             mb.request(f)
+             assert (f.request.content == b"bar") ^ take
+ 
+             f = tflow.tflow(resp=True)
+             f.response.content = b"foo"
+             if take:
+-                f.reply.take()
++                f.kill()
+             mb.response(f)
+             assert (f.response.content == b"bar") ^ take
+ 
+diff --git a/test/mitmproxy/addons/test_modifyheaders.py b/test/mitmproxy/addons/test_modifyheaders.py
+index 8718510ae0e..a52bba40445 100644
+--- a/test/mitmproxy/addons/test_modifyheaders.py
++++ b/test/mitmproxy/addons/test_modifyheaders.py
+@@ -3,6 +3,7 @@
+ from mitmproxy.addons.modifyheaders import parse_modify_spec, ModifyHeaders
+ from mitmproxy.test import taddons
+ from mitmproxy.test import tflow
++from mitmproxy.test.tutils import tresp
+ 
+ 
+ def test_parse_modify_spec():
+@@ -133,13 +134,13 @@ def test_taken(self, take):
+             tctx.configure(mh, modify_headers=["/content-length/42"])
+             f = tflow.tflow()
+             if take:
+-                f.reply.take()
++                f.response = tresp()
+             mh.request(f)
+             assert (f.request.headers["content-length"] == "42") ^ take
+ 
+             f = tflow.tflow(resp=True)
+             if take:
+-                f.reply.take()
++                f.kill()
+             mh.response(f)
+             assert (f.response.headers["content-length"] == "42") ^ take
+ 
+diff --git a/test/mitmproxy/addons/test_serverplayback.py b/test/mitmproxy/addons/test_serverplayback.py
+index 9e0ca156604..19d5ec53dd6 100644
+--- a/test/mitmproxy/addons/test_serverplayback.py
++++ b/test/mitmproxy/addons/test_serverplayback.py
+@@ -340,7 +340,8 @@ def test_server_playback_full():
+         assert not tf.response
+ 
+ 
+-def test_server_playback_kill():
++@pytest.mark.asyncio
++async def test_server_playback_kill():
+     s = serverplayback.ServerPlayback()
+     with taddons.context(s) as tctx:
+         tctx.configure(
+@@ -355,7 +356,7 @@ def test_server_playback_kill():
+ 
+         f = tflow.tflow()
+         f.request.host = "nonexistent"
+-        tctx.cycle(s, f)
++        await tctx.cycle(s, f)
+         assert f.error
+ 
+ 
+diff --git a/test/mitmproxy/addons/test_stickycookie.py b/test/mitmproxy/addons/test_stickycookie.py
+index 25fc085ab9b..cf65611294f 100644
+--- a/test/mitmproxy/addons/test_stickycookie.py
++++ b/test/mitmproxy/addons/test_stickycookie.py
+@@ -32,7 +32,6 @@ def test_simple(self):
+             f.response.headers["set-cookie"] = "foo=bar"
+             sc.request(f)
+ 
+-            f.reply.acked = False
+             sc.response(f)
+ 
+             assert sc.jar
+diff --git a/test/mitmproxy/data/addonscripts/concurrent_decorator.py b/test/mitmproxy/data/addonscripts/concurrent_decorator.py
+index d1ab6c6c193..141dd0be713 100644
+--- a/test/mitmproxy/data/addonscripts/concurrent_decorator.py
++++ b/test/mitmproxy/data/addonscripts/concurrent_decorator.py
+@@ -5,4 +5,8 @@
+ 
+ @concurrent
+ def request(flow):
+-    time.sleep(0.1)
++    time.sleep(0.25)
++
++@concurrent
++async def requestheaders(flow):
++    time.sleep(0.25)
+diff --git a/test/mitmproxy/data/addonscripts/concurrent_decorator_class.py b/test/mitmproxy/data/addonscripts/concurrent_decorator_class.py
+index b52f55c5633..789baafeccb 100644
+--- a/test/mitmproxy/data/addonscripts/concurrent_decorator_class.py
++++ b/test/mitmproxy/data/addonscripts/concurrent_decorator_class.py
+@@ -6,7 +6,11 @@ class ConcurrentClass:
+ 
+     @concurrent
+     def request(self, flow):
+-        time.sleep(0.1)
++        time.sleep(0.25)
++
++    @concurrent
++    async def requestheaders(self, flow):
++        time.sleep(0.25)
+ 
+ 
+ addons = [ConcurrentClass()]
+diff --git a/test/mitmproxy/script/test_concurrent.py b/test/mitmproxy/script/test_concurrent.py
+index 9743b7344af..dd2d8a0aa0c 100644
+--- a/test/mitmproxy/script/test_concurrent.py
++++ b/test/mitmproxy/script/test_concurrent.py
+@@ -1,21 +1,20 @@
++import asyncio
+ import time
+ 
+ import pytest
+ 
+-from mitmproxy import controller
+-
+ from mitmproxy.test import tflow
+ from mitmproxy.test import taddons
+ 
+ 
+ class Thing:
+     def __init__(self):
+-        self.reply = controller.DummyReply()
+         self.live = True
+ 
+ 
+ class TestConcurrent:
+-    def test_concurrent(self, tdata):
++    @pytest.mark.asyncio
++    async def test_concurrent(self, tdata):
+         with taddons.context() as tctx:
+             sc = tctx.script(
+                 tdata.path(
+@@ -23,13 +22,13 @@ def test_concurrent(self, tdata):
+                 )
+             )
+             f1, f2 = tflow.tflow(), tflow.tflow()
+-            tctx.cycle(sc, f1)
+-            tctx.cycle(sc, f2)
+             start = time.time()
+-            while time.time() - start < 5:
+-                if f1.reply.state == f2.reply.state == "committed":
+-                    return
+-            raise ValueError("Script never acked")
++            await asyncio.gather(
++                tctx.cycle(sc, f1),
++                tctx.cycle(sc, f2),
++            )
++            end = time.time()
++            assert 0.3 < end - start < 0.7
+ 
+     @pytest.mark.asyncio
+     async def test_concurrent_err(self, tdata):
+@@ -41,7 +40,8 @@ async def test_concurrent_err(self, tdata):
+             )
+             await tctx.master.await_log("decorator not supported")
+ 
+-    def test_concurrent_class(self, tdata):
++    @pytest.mark.asyncio
++    async def test_concurrent_class(self, tdata):
+         with taddons.context() as tctx:
+             sc = tctx.script(
+                 tdata.path(
+@@ -49,10 +49,10 @@ def test_concurrent_class(self, tdata):
+                 )
+             )
+             f1, f2 = tflow.tflow(), tflow.tflow()
+-            tctx.cycle(sc, f1)
+-            tctx.cycle(sc, f2)
+             start = time.time()
+-            while time.time() - start < 5:
+-                if f1.reply.state == f2.reply.state == "committed":
+-                    return
+-            raise ValueError("Script never acked")
++            await asyncio.gather(
++                tctx.cycle(sc, f1),
++                tctx.cycle(sc, f2),
++            )
++            end = time.time()
++            assert 0.3 < end - start < 0.7
+diff --git a/test/mitmproxy/test_addonmanager.py b/test/mitmproxy/test_addonmanager.py
+index 20f0b77a49b..8628ffb3f36 100644
+--- a/test/mitmproxy/test_addonmanager.py
++++ b/test/mitmproxy/test_addonmanager.py
+@@ -36,11 +36,24 @@ def running(self):
+         self.running_called = True
+ 
+ 
++class AsyncTAddon(TAddon):
++    async def done(self):
++        pass
++
++    async def running(self):
++        self.running_called = True
++
++
+ class THalt:
+     def running(self):
+         raise exceptions.AddonHalt
+ 
+ 
++class AsyncTHalt:
++    async def running(self):
++        raise exceptions.AddonHalt
++
++
+ class AOption:
+     def load(self, l):
+         l.add_option("custom_option", bool, False, "help")
+@@ -75,6 +88,25 @@ def test_halt():
+     assert end.running_called
+ 
+ 
++@pytest.mark.asyncio
++async def test_async_halt():
++    o = options.Options()
++    m = master.Master(o)
++    a = addonmanager.AddonManager(m)
++    halt = AsyncTHalt()
++    end = AsyncTAddon("end")
++    a.add(halt)
++    a.add(end)
++
++    assert not end.running_called
++    await a.trigger_event(hooks.RunningHook())
++    assert not end.running_called
++
++    a.remove(halt)
++    await a.trigger_event(hooks.RunningHook())
++    assert end.running_called
++
++
+ @pytest.mark.asyncio
+ async def test_lifecycle():
+     o = options.Options()
+@@ -97,6 +129,32 @@ def test_defaults():
+     assert addons.default_addons()
+ 
+ 
++@pytest.mark.asyncio
++async def test_mixed_async_sync():
++    with taddons.context(loadcore=False) as tctx:
++        a = tctx.master.addons
++
++        assert len(a) == 0
++        a1 = TAddon("sync")
++        a2 = AsyncTAddon("async")
++        a.add(a1)
++        a.add(a2)
++
++        # test that we can call both sync and async hooks asynchronously
++        assert not a1.running_called
++        assert not a2.running_called
++        await a.trigger_event(hooks.RunningHook())
++        assert a1.running_called
++        assert a2.running_called
++
++        # test that calling an async hook synchronously fails
++        a1.running_called = False
++        a2.running_called = False
++        a.trigger(hooks.RunningHook())
++        assert a1.running_called
++        await tctx.master.await_log("called from sync context")
++
++
+ @pytest.mark.asyncio
+ async def test_loader():
+     with taddons.context() as tctx:
+diff --git a/test/mitmproxy/test_controller.py b/test/mitmproxy/test_controller.py
+deleted file mode 100644
+index c0f677da2a4..00000000000
+--- a/test/mitmproxy/test_controller.py
++++ /dev/null
+@@ -1,80 +0,0 @@
+-import asyncio
+-
+-import pytest
+-
+-import mitmproxy.ctx
+-from mitmproxy import controller
+-from mitmproxy.exceptions import ControlException
+-from mitmproxy.test import taddons
+-
+-
+-@pytest.mark.asyncio
+-async def test_master():
+-    class tAddon:
+-        def add_log(self, _):
+-            mitmproxy.ctx.master.should_exit.set()
+-
+-    with taddons.context(tAddon()) as tctx:
+-        assert not tctx.master.should_exit.is_set()
+-
+-        async def test():
+-            mitmproxy.ctx.log("test")
+-
+-        asyncio.ensure_future(test())
+-        await tctx.master.await_log("test")
+-        assert tctx.master.should_exit.is_set()
+-
+-
+-class TestReply:
+-    @pytest.mark.asyncio
+-    async def test_simple(self):
+-        reply = controller.Reply(42)
+-        assert reply.state == "start"
+-
+-        reply.take()
+-        assert reply.state == "taken"
+-
+-        assert not reply.done.is_set()
+-        reply.commit()
+-        assert reply.state == "committed"
+-        assert await asyncio.wait_for(reply.done.wait(), 1)
+-
+-    def test_double_commit(self):
+-        reply = controller.Reply(47)
+-        reply.take()
+-        reply.commit()
+-        with pytest.raises(ControlException):
+-            reply.commit()
+-
+-    def test_del(self):
+-        reply = controller.Reply(47)
+-        with pytest.raises(ControlException):
+-            reply.__del__()
+-        reply.take()
+-        reply.commit()
+-
+-
+-class TestDummyReply:
+-    def test_simple(self):
+-        reply = controller.DummyReply()
+-        for _ in range(2):
+-            reply.take()
+-            reply.commit()
+-            reply.mark_reset()
+-            reply.reset()
+-        assert reply.state == "start"
+-
+-    def test_reset(self):
+-        reply = controller.DummyReply()
+-        reply.take()
+-        with pytest.raises(ControlException):
+-            reply.mark_reset()
+-        reply.commit()
+-        reply.mark_reset()
+-        assert reply.state == "committed"
+-        reply.reset()
+-        assert reply.state == "start"
+-
+-    def test_del(self):
+-        reply = controller.DummyReply()
+-        reply.__del__()
+diff --git a/test/mitmproxy/test_http.py b/test/mitmproxy/test_http.py
+index 2fa1b2c480a..3cfd5e83c6a 100644
+--- a/test/mitmproxy/test_http.py
++++ b/test/mitmproxy/test_http.py
+@@ -1,3 +1,4 @@
++import asyncio
+ import email
+ import time
+ import json
+@@ -7,7 +8,6 @@
+ 
+ from mitmproxy import flow
+ from mitmproxy import flowfilter
+-from mitmproxy.exceptions import ControlException
+ from mitmproxy.http import Headers, Request, Response, HTTPFlow
+ from mitmproxy.net.http.cookies import CookieAttrs
+ from mitmproxy.test.tflow import tflow
+@@ -704,10 +704,11 @@ def test_getset_state(self):
+ 
+     def test_kill(self):
+         f = tflow()
+-        with pytest.raises(ControlException):
+-            f.intercept()
+-            f.resume()
+-            f.kill()
++        f.intercept()
++        f.resume()
++        assert f.killable
++        f.kill()
++        assert not f.killable
+ 
+         f = tflow()
+         f.intercept()
+@@ -719,16 +720,46 @@ def test_kill(self):
+     def test_intercept(self):
+         f = tflow()
+         f.intercept()
+-        assert f.reply.state == "taken"
++        assert f.intercepted
+         f.intercept()
+-        assert f.reply.state == "taken"
++        assert f.intercepted
+ 
+     def test_resume(self):
+         f = tflow()
++        f.resume()
++        assert not f.intercepted
++        f.intercept()
++        assert f.intercepted
++        f.resume()
++        assert not f.intercepted
++
++    @pytest.mark.asyncio
++    async def test_wait_for_resume(self):
++        f = tflow()
++        await f.wait_for_resume()
++
++        f = tflow()
++        f.intercept()
++        f.resume()
++        await f.wait_for_resume()
++
++        f = tflow()
++        f.intercept()
++        with pytest.raises(asyncio.TimeoutError):
++            await asyncio.wait_for(f.wait_for_resume(), 0.2)
++        f.resume()
++        await f.wait_for_resume()
++
++        f = tflow()
++        f.intercept()
++        with pytest.raises(asyncio.TimeoutError):
++            await asyncio.wait_for(f.wait_for_resume(), 0.2)
++        f.resume()
+         f.intercept()
+-        assert f.reply.state == "taken"
++        with pytest.raises(asyncio.TimeoutError):
++            await asyncio.wait_for(f.wait_for_resume(), 0.2)
+         f.resume()
+-        assert f.reply.state == "committed"
++        await f.wait_for_resume()
+ 
+     def test_resume_duplicated(self):
+         f = tflow()
+diff --git a/test/mitmproxy/tools/test_dump.py b/test/mitmproxy/tools/test_dump.py
+index 9cdaf83ef8e..86e76bdb14e 100644
+--- a/test/mitmproxy/tools/test_dump.py
++++ b/test/mitmproxy/tools/test_dump.py
+@@ -2,7 +2,6 @@
+ 
+ import pytest
+ 
+-from mitmproxy import controller
+ from mitmproxy import log
+ from mitmproxy import options
+ from mitmproxy.tools import dump
+@@ -17,7 +16,6 @@ def mkmaster(self, **opts):
+     def test_has_error(self):
+         m = self.mkmaster()
+         ent = log.LogEntry("foo", "error")
+-        ent.reply = controller.DummyReply()
+         m.addons.trigger(log.AddLogHook(ent))
+         assert m.errorcheck.has_errored
+ 
+diff --git a/test/mitmproxy/tservers.py b/test/mitmproxy/tservers.py
+index 6105f12f3b8..bb0900198bf 100644
+--- a/test/mitmproxy/tservers.py
++++ b/test/mitmproxy/tservers.py
+@@ -1,6 +1,5 @@
+ from unittest import mock
+ 
+-from mitmproxy import controller
+ from mitmproxy import eventsequence
+ from mitmproxy import io
+ from mitmproxy.proxy import server_hooks
+@@ -14,7 +13,6 @@ async def cycle(self, master, content):
+         f = tflow.tflow(req=tutils.treq(content=content))
+         layer = mock.Mock("mitmproxy.proxy.protocol.base.Layer")
+         layer.client_conn = f.client_conn
+-        layer.reply = controller.DummyReply()
+         await master.addons.handle_lifecycle(server_hooks.ClientConnectedHook(layer))
+         for e in eventsequence.iterate(f):
+             await master.addons.handle_lifecycle(e)

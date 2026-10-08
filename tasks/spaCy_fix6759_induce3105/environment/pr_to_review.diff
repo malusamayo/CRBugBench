@@ -1,0 +1,196 @@
+commit 174e85439b8cb9297dcc8479d7351021f10c6662
+Author: Matthew Honnibal <honnibal+gh@gmail.com>
+Date:   Sat Dec 29 16:18:09 2018 +0100
+
+    Fix behaviour of Matcher's ? quantifier for v2.1 (#3105)
+    
+    * Add failing test for matcher bug #3009
+    
+    * Deduplicate matches from Matcher
+    
+    * Update matcher ? quantifier test
+    
+    * Fix bug with ? quantifier in Matcher
+    
+    The ? quantifier indicates a token may occur zero or one times. If the
+    token pattern fit, the matcher would fail to consider valid matches
+    where the token pattern did not fit. Consider a simple regex like:
+    
+    .?b
+    
+    If we have the string 'b', the .? part will fit --- but then the 'b' in
+    the pattern will not fit, leaving us with no match. The same bug left us
+    with too few matches in some cases. For instance, consider:
+    
+    .?.?
+    
+    If we have a string of length two, like 'ab', we actually have three
+    possible matches here: [a, b, ab]. We were only recovering 'ab'. This
+    should now be fixed. Note that the fix also uncovered another bug, where
+    we weren't deduplicating the matches. There are actually two ways we
+    might match 'a' and two ways we might match 'b': as the second token of the pattern,
+    or as the first token of the pattern. This ambiguity is spurious, so we
+    need to deduplicate.
+    
+    Closes #2464 and #3009
+    
+    * Fix Python2
+
+diff --git a/spacy/matcher.pyx b/spacy/matcher.pyx
+index 23449aa57..f408be98d 100644
+--- a/spacy/matcher.pyx
++++ b/spacy/matcher.pyx
+@@ -39,6 +39,7 @@ cdef enum action_t:
+     ADVANCE = 0100
+     RETRY = 0010
+     RETRY_EXTEND = 0011
++    RETRY_ADVANCE = 0110
+     MATCH_EXTEND = 1001
+     MATCH_REJECT = 2000
+ 
+@@ -89,8 +90,21 @@ cdef find_matches(TokenPatternC** patterns, int n, Doc doc):
+         transition_states(states, matches, &doc.c[i], extra_attrs[i])
+     # Handle matches that end in 0-width patterns
+     finish_states(matches, states)
+-    return [(matches[i].pattern_id, matches[i].start, matches[i].start+matches[i].length)
+-            for i in range(matches.size())]
++    output = []
++    seen = set()
++    for i in range(matches.size()):
++        match = (
++            matches[i].pattern_id,
++            matches[i].start,
++            matches[i].start+matches[i].length
++        )
++        # We need to deduplicate, because we could otherwise arrive at the same
++        # match through two paths, e.g. .?.? matching 'a'. Are we matching the
++        # first .?, or the second .? -- it doesn't matter, it's just one match.
++        if match not in seen:
++            output.append(match)
++            seen.add(match)
++    return output
+ 
+ 
+ cdef attr_t get_ent_id(const TokenPatternC* pattern) nogil:
+@@ -114,11 +128,17 @@ cdef void transition_states(vector[PatternStateC]& states, vector[MatchC]& match
+             continue
+         state = states[i]
+         states[q] = state
+-        while action in (RETRY, RETRY_EXTEND):
++        while action in (RETRY, RETRY_ADVANCE, RETRY_EXTEND):
+             if action == RETRY_EXTEND:
++                # This handles the 'extend'
+                 new_states.push_back(
+                     PatternStateC(pattern=state.pattern, start=state.start,
+                                   length=state.length+1))
++            if action == RETRY_ADVANCE:
++                # This handles the 'advance'
++                new_states.push_back(
++                    PatternStateC(pattern=state.pattern+1, start=state.start,
++                                  length=state.length+1))
+             states[q].pattern += 1
+             action = get_action(states[q], token, extra_attrs)
+         if action == REJECT:
+@@ -209,7 +229,7 @@ cdef action_t get_action(PatternStateC state, const TokenC* token, const attr_t*
+       No, non-final:
+         0010
+ 
+-    Possible combinations:  1000, 0100, 0000, 1001, 0011, 0010,
++    Possible combinations:  1000, 0100, 0000, 1001, 0110, 0011, 0010,
+ 
+     We'll name the bits "match", "advance", "retry", "extend"
+     REJECT = 0000
+@@ -217,6 +237,7 @@ cdef action_t get_action(PatternStateC state, const TokenC* token, const attr_t*
+     ADVANCE = 0100
+     RETRY = 0010
+     MATCH_EXTEND = 1001
++    RETRY_ADVANCE = 0110
+     RETRY_EXTEND = 0011
+     MATCH_REJECT = 2000 # Match, but don't include last token
+ 
+@@ -259,8 +280,11 @@ cdef action_t get_action(PatternStateC state, const TokenC* token, const attr_t*
+           # Yes, final: 1000
+           return MATCH
+       elif is_match and not is_final:
+-          # Yes, non-final: 0100
+-          return ADVANCE
++          # Yes, non-final: 0110
++          # We need both branches here, consider a pair like:
++          # pattern: .?b string: b
++          # If we 'ADVANCE' on the .?, we miss the match.
++          return RETRY_ADVANCE
+       elif not is_match and is_final:
+           # No, final 2000 (note: Don't include last token!)
+           return MATCH_REJECT
+diff --git a/spacy/tests/regression/test_issue3009.py b/spacy/tests/regression/test_issue3009.py
+new file mode 100644
+index 000000000..f8407741b
+--- /dev/null
++++ b/spacy/tests/regression/test_issue3009.py
+@@ -0,0 +1,66 @@
++# coding: utf-8
++from __future__ import unicode_literals
++
++import pytest
++from spacy.matcher import Matcher
++from spacy.tokens import Doc
++
++
++PATTERNS = [
++    ("1", [[{"LEMMA": "have"}, {"LOWER": "to"}, {"LOWER": "do"}, {"POS": "ADP"}]]),
++    (
++        "2",
++        [
++            [
++                {"LEMMA": "have"},
++                {"IS_ASCII": True, "IS_PUNCT": False, "OP": "*"},
++                {"LOWER": "to"},
++                {"LOWER": "do"},
++                {"POS": "ADP"},
++            ]
++        ],
++    ),
++    (
++        "3",
++        [
++            [
++                {"LEMMA": "have"},
++                {"IS_ASCII": True, "IS_PUNCT": False, "OP": "?"},
++                {"LOWER": "to"},
++                {"LOWER": "do"},
++                {"POS": "ADP"},
++            ]
++        ],
++    ),
++]
++
++
++@pytest.fixture
++def doc(en_tokenizer):
++    doc = en_tokenizer("also has to do with")
++    doc[0].tag_ = "RB"
++    doc[1].tag_ = "VBZ"
++    doc[2].tag_ = "TO"
++    doc[3].tag_ = "VB"
++    doc[4].tag_ = "IN"
++    return doc
++
++
++@pytest.fixture
++def matcher(en_tokenizer):
++    return Matcher(en_tokenizer.vocab)
++
++
++@pytest.mark.parametrize("pattern", PATTERNS)
++def test_issue3009(doc, matcher, pattern):
++    """Test problem with matcher quantifiers"""
++    matcher.add(pattern[0], None, *pattern[1])
++    matches = matcher(doc)
++    assert matches
++
++def test_issue2464(matcher):
++    """Test problem with successive ?. This is the same bug, so putting it here."""
++    doc = Doc(matcher.vocab, words=['a', 'b'])
++    matcher.add('4', None, [{'OP': '?'}, {'OP': '?'}])
++    matches = matcher(doc)
++    assert len(matches) == 3

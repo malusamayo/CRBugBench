@@ -1,0 +1,447 @@
+diff --git a/alacritty.yml b/alacritty.yml
+index e68449cb7d3..ac4477fc925 100644
+--- a/alacritty.yml
++++ b/alacritty.yml
+@@ -1,5 +1,13 @@
+ # Configuration for Alacritty, the GPU enhanced terminal emulator.
+ 
++# Import additional configuration files
++#
++# These configuration files will be loaded in order, replacing values in files
++# loaded earlier with those loaded later in the chain. The file itself will
++# always be loaded last.
++#import:
++#  - /path/to/alacritty.yml
++
+ # Any items in the `env` entry below will be added as
+ # environment variables. Some entries may override variables
+ # set by alacritty itself.
+diff --git a/alacritty/src/config/merge.rs b/alacritty/src/config/merge.rs
+new file mode 100644
+index 00000000000..87219c6d707
+--- /dev/null
++++ b/alacritty/src/config/merge.rs
+@@ -0,0 +1,85 @@
++//! Merge multiple configuration files together.
++
++use serde_yaml::mapping::Mapping;
++use serde_yaml::Value;
++
++/// Merge two serde structures.
++///
++/// This will take all values from `replacement` and use `base` whenever a value isn't present in
++/// `replacement`.
++pub fn merge(base: Value, replacement: Value) -> Value {
++    match (base, replacement) {
++        (Value::Sequence(mut base), Value::Sequence(mut replacement)) => {
++            base.append(&mut replacement);
++            Value::Sequence(base)
++        },
++        (Value::Mapping(base), Value::Mapping(replacement)) => {
++            Value::Mapping(merge_mapping(base, replacement))
++        },
++        (_, value) => value,
++    }
++}
++
++/// Merge two key/value mappings.
++fn merge_mapping(mut base: Mapping, replacement: Mapping) -> Mapping {
++    for (key, value) in replacement {
++        let value = match base.remove(&key) {
++            Some(base_value) => merge(base_value, value),
++            None => value,
++        };
++        base.insert(key, value);
++    }
++
++    base
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn merge_primitive() {
++        let base = Value::Bool(false);
++        let replacement = Value::Bool(true);
++        assert_eq!(merge(base, replacement.clone()), replacement);
++
++        let base = Value::Number(0.into());
++        let replacement = Value::Number(1.into());
++        assert_eq!(merge(base, replacement.clone()), replacement);
++
++        let base = Value::String(String::new());
++        let replacement = Value::String(String::from("test"));
++        assert_eq!(merge(base, replacement.clone()), replacement);
++    }
++
++    #[test]
++    fn merge_sequence() {
++        let base = Value::Sequence(vec![Value::Null]);
++        let replacement = Value::Sequence(vec![Value::Bool(true)]);
++        let expected = Value::Sequence(vec![Value::Null, Value::Bool(true)]);
++        assert_eq!(merge(base, replacement), expected);
++    }
++
++    #[test]
++    fn merge_mapping() {
++        let mut base_mapping = Mapping::new();
++        base_mapping.insert(Value::String(String::from("a")), Value::Bool(true));
++        base_mapping.insert(Value::String(String::from("b")), Value::Bool(false));
++        let base = Value::Mapping(base_mapping);
++
++        let mut replacement_mapping = Mapping::new();
++        replacement_mapping.insert(Value::String(String::from("a")), Value::Bool(true));
++        replacement_mapping.insert(Value::String(String::from("c")), Value::Bool(false));
++        let replacement = Value::Mapping(replacement_mapping);
++
++        let merged = merge(base, replacement);
++
++        let mut expected_mapping = Mapping::new();
++        expected_mapping.insert(Value::String(String::from("b")), Value::Bool(false));
++        expected_mapping.insert(Value::String(String::from("a")), Value::Bool(true));
++        expected_mapping.insert(Value::String(String::from("c")), Value::Bool(false));
++        let expected = Value::Mapping(expected_mapping);
++
++        assert_eq!(merged, expected);
++    }
++}
+diff --git a/alacritty/src/config/mod.rs b/alacritty/src/config/mod.rs
+index 226c67753ec..3c65829faea 100644
+--- a/alacritty/src/config/mod.rs
++++ b/alacritty/src/config/mod.rs
+@@ -1,26 +1,33 @@
+-use std::env;
+ use std::fmt::{self, Display, Formatter};
+-use std::fs;
+-use std::io;
+ use std::path::PathBuf;
++use std::{env, fs, io};
+ 
+ use log::{error, warn};
++use serde::Deserialize;
++use serde_yaml::mapping::Mapping;
++use serde_yaml::Value;
+ 
+ use alacritty_terminal::config::{Config as TermConfig, LOG_TARGET_CONFIG};
+ 
+-mod bindings;
+ pub mod debug;
+ pub mod font;
+ pub mod monitor;
+-mod mouse;
+ pub mod ui_config;
+ pub mod window;
+ 
++mod bindings;
++mod merge;
++mod mouse;
++
+ pub use crate::config::bindings::{Action, Binding, Key, ViAction};
++use crate::config::merge::merge;
+ #[cfg(test)]
+ pub use crate::config::mouse::{ClickHandler, Mouse};
+ use crate::config::ui_config::UIConfig;
+ 
++/// Maximum number of depth for the configuration file imports.
++const IMPORT_RECURSION_LIMIT: usize = 5;
++
+ pub type Config = TermConfig<UIConfig>;
+ 
+ /// Result from config loading.
+@@ -128,13 +135,7 @@ pub fn installed_config() -> Option<PathBuf> {
+     dirs::config_dir().map(|path| path.join("alacritty\\alacritty.yml")).filter(|new| new.exists())
+ }
+ 
+-pub fn load_from(path: PathBuf) -> Config {
+-    let mut config = reload_from(&path).unwrap_or_else(|_| Config::default());
+-    config.config_path = Some(path);
+-    config
+-}
+-
+-pub fn reload_from(path: &PathBuf) -> Result<Config> {
++pub fn load_from(path: &PathBuf) -> Result<Config> {
+     match read_config(path) {
+         Ok(config) => Ok(config),
+         Err(err) => {
+@@ -145,6 +146,25 @@ pub fn reload_from(path: &PathBuf) -> Result<Config> {
+ }
+ 
+ fn read_config(path: &PathBuf) -> Result<Config> {
++    let mut config_paths = Vec::new();
++    let config_value = parse_config(&path, &mut config_paths, IMPORT_RECURSION_LIMIT)?;
++
++    let mut config = Config::deserialize(config_value)?;
++    config.ui_config.config_paths = config_paths;
++
++    print_deprecation_warnings(&config);
++
++    Ok(config)
++}
++
++/// Deserialize all configuration files as generic Value.
++fn parse_config(
++    path: &PathBuf,
++    config_paths: &mut Vec<PathBuf>,
++    recursion_limit: usize,
++) -> Result<Value> {
++    config_paths.push(path.to_owned());
++
+     let mut contents = fs::read_to_string(path)?;
+ 
+     // Remove UTF-8 BOM.
+@@ -152,24 +172,54 @@ fn read_config(path: &PathBuf) -> Result<Config> {
+         contents = contents.split_off(3);
+     }
+ 
+-    parse_config(&contents)
+-}
+-
+-fn parse_config(contents: &str) -> Result<Config> {
+-    match serde_yaml::from_str(contents) {
++    // Load configuration file as Value.
++    let config: Value = match serde_yaml::from_str(&contents) {
++        Ok(config) => config,
+         Err(error) => {
+             // Prevent parsing error with an empty string and commented out file.
+             if error.to_string() == "EOF while parsing a value" {
+-                Ok(Config::default())
++                Value::Mapping(Mapping::new())
+             } else {
+-                Err(Error::Yaml(error))
++                return Err(Error::Yaml(error));
+             }
+         },
+-        Ok(config) => {
+-            print_deprecation_warnings(&config);
+-            Ok(config)
+-        },
++    };
++
++    // Merge config with imports.
++    let imports = load_imports(&config, config_paths, recursion_limit);
++    Ok(merge(imports, config))
++}
++
++/// Load all referenced configuration files.
++fn load_imports(config: &Value, config_paths: &mut Vec<PathBuf>, recursion_limit: usize) -> Value {
++    let mut merged = Value::Mapping(Mapping::new());
++
++    let imports = match config.get("import") {
++        Some(Value::Sequence(imports)) => imports,
++        _ => return merged,
++    };
++
++    // Limit recursion to prevent infinite loops.
++    if !imports.is_empty() && recursion_limit == 0 {
++        error!(target: LOG_TARGET_CONFIG, "Exceeded maximum configuration import depth");
++        return merged;
+     }
++
++    for import in imports {
++        let path = match import {
++            Value::String(path) => PathBuf::from(path),
++            _ => {
++                error!(target: LOG_TARGET_CONFIG, "Encountered invalid configuration file import");
++                continue;
++            },
++        };
++
++        if let Ok(config) = parse_config(&path, config_paths, recursion_limit - 1) {
++            merged = merge(merged, config);
++        }
++    }
++
++    merged
+ }
+ 
+ fn print_deprecation_warnings(config: &Config) {
+@@ -215,13 +265,16 @@ fn print_deprecation_warnings(config: &Config) {
+ 
+ #[cfg(test)]
+ mod tests {
+-    static DEFAULT_ALACRITTY_CONFIG: &str =
+-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../alacritty.yml"));
++    use super::*;
+ 
+-    use super::Config;
++    static DEFAULT_ALACRITTY_CONFIG: &str =
++        concat!(env!("CARGO_MANIFEST_DIR"), "/../alacritty.yml");
+ 
+     #[test]
+     fn config_read_eof() {
+-        assert_eq!(super::parse_config(DEFAULT_ALACRITTY_CONFIG).unwrap(), Config::default());
++        let config_path: PathBuf = DEFAULT_ALACRITTY_CONFIG.into();
++        let mut config = read_config(&config_path).unwrap();
++        config.ui_config.config_paths = Vec::new();
++        assert_eq!(config, Config::default());
+     }
+ }
+diff --git a/alacritty/src/config/monitor.rs b/alacritty/src/config/monitor.rs
+index 2ed0c426c91..0ebad9f6370 100644
+--- a/alacritty/src/config/monitor.rs
++++ b/alacritty/src/config/monitor.rs
+@@ -1,3 +1,4 @@
++use std::fs;
+ use std::path::PathBuf;
+ use std::sync::mpsc;
+ use std::time::Duration;
+@@ -13,28 +14,32 @@ pub struct Monitor {
+ }
+ 
+ impl Monitor {
+-    pub fn new<P>(path: P, event_proxy: EventProxy) -> Monitor
+-    where
+-        P: Into<PathBuf>,
+-    {
+-        let path = path.into();
+-
++    pub fn new(paths: Vec<PathBuf>, event_proxy: EventProxy) -> Monitor {
+         Monitor {
+             _thread: thread::spawn_named("config watcher", move || {
+                 let (tx, rx) = mpsc::channel();
+                 // The Duration argument is a debouncing period.
+                 let mut watcher =
+                     watcher(tx, Duration::from_millis(10)).expect("Unable to spawn file watcher");
+-                let config_path = ::std::fs::canonicalize(path).expect("canonicalize config path");
+-
+-                // Get directory of config.
+-                let mut parent = config_path.clone();
+-                parent.pop();
+ 
+-                // Watch directory.
+-                watcher
+-                    .watch(&parent, RecursiveMode::NonRecursive)
+-                    .expect("watch alacritty.yml dir");
++                // Get all unique parent directories.
++                let mut parents = paths
++                    .iter()
++                    .map(|path| {
++                        let mut path = fs::canonicalize(path).expect("canonicalize config path");
++                        path.pop();
++                        path
++                    })
++                    .collect::<Vec<PathBuf>>();
++                parents.sort_unstable();
++                parents.dedup();
++
++                // Watch all configuration file directories.
++                for parent in &parents {
++                    watcher
++                        .watch(&parent, RecursiveMode::NonRecursive)
++                        .expect("watch alacritty.yml dir");
++                }
+ 
+                 loop {
+                     match rx.recv().expect("watcher event") {
+@@ -42,11 +47,12 @@ impl Monitor {
+                         DebouncedEvent::Write(path)
+                         | DebouncedEvent::Create(path)
+                         | DebouncedEvent::Chmod(path) => {
+-                            if path != config_path {
++                            if !paths.contains(&path) {
+                                 continue;
+                             }
+ 
+-                            event_proxy.send_event(Event::ConfigReload(path));
++                            // Always reload the primary configuration file.
++                            event_proxy.send_event(Event::ConfigReload(paths[0].clone()));
+                         },
+                         _ => {},
+                     }
+diff --git a/alacritty/src/config/ui_config.rs b/alacritty/src/config/ui_config.rs
+index a8b1749ff2b..31654c6c6d4 100644
+--- a/alacritty/src/config/ui_config.rs
++++ b/alacritty/src/config/ui_config.rs
+@@ -1,3 +1,5 @@
++use std::path::PathBuf;
++
+ use log::error;
+ use serde::{Deserialize, Deserializer};
+ 
+@@ -46,6 +48,10 @@ pub struct UIConfig {
+     #[serde(default, deserialize_with = "failure_default")]
+     background_opacity: Percentage,
+ 
++    /// Path where config was loaded from.
++    #[serde(skip)]
++    pub config_paths: Vec<PathBuf>,
++
+     // TODO: DEPRECATED
+     #[serde(default, deserialize_with = "failure_default")]
+     pub dynamic_title: Option<bool>,
+@@ -64,6 +70,7 @@ impl Default for UIConfig {
+             background_opacity: Default::default(),
+             live_config_reload: Default::default(),
+             dynamic_title: Default::default(),
++            config_paths: Default::default(),
+         }
+     }
+ }
+diff --git a/alacritty/src/event.rs b/alacritty/src/event.rs
+index 9033049f55b..d0ce36014a0 100644
+--- a/alacritty/src/event.rs
++++ b/alacritty/src/event.rs
+@@ -1051,7 +1051,7 @@ impl<N: Notify + OnResize> Processor<N> {
+             processor.ctx.display_update_pending.dirty = true;
+         }
+ 
+-        let config = match config::reload_from(&path) {
++        let config = match config::load_from(&path) {
+             Ok(config) => config,
+             Err(_) => return,
+         };
+diff --git a/alacritty/src/main.rs b/alacritty/src/main.rs
+index e688420476a..9ff478d1ba7 100644
+--- a/alacritty/src/main.rs
++++ b/alacritty/src/main.rs
+@@ -84,7 +84,10 @@ fn main() {
+ 
+     // Load configuration file.
+     let config_path = options.config_path().or_else(config::installed_config);
+-    let config = config_path.map(config::load_from).unwrap_or_else(Config::default);
++    let config = config_path
++        .as_ref()
++        .and_then(|path| config::load_from(path).ok())
++        .unwrap_or_else(Config::default);
+     let config = options.into_config(config);
+ 
+     // Update the log level from config.
+@@ -121,9 +124,9 @@ fn main() {
+ fn run(window_event_loop: GlutinEventLoop<Event>, config: Config) -> Result<(), Box<dyn Error>> {
+     info!("Welcome to Alacritty");
+ 
+-    match &config.config_path {
+-        Some(config_path) => info!("Configuration loaded from \"{}\"", config_path.display()),
+-        None => info!("No configuration file found"),
++    info!("Configuration files loaded from:");
++    for path in &config.ui_config.config_paths {
++        info!("  \"{}\"", path.display());
+     }
+ 
+     // Set environment variables.
+@@ -179,7 +182,7 @@ fn run(window_event_loop: GlutinEventLoop<Event>, config: Config) -> Result<(),
+     // The monitor watches the config file for changes and reloads it. Pending
+     // config changes are processed in the main loop.
+     if config.ui_config.live_config_reload() {
+-        config.config_path.as_ref().map(|path| Monitor::new(path, event_proxy.clone()));
++        Monitor::new(config.ui_config.config_paths.clone(), event_proxy);
+     }
+ 
+     // Setup storage for message UI.
+diff --git a/alacritty_terminal/src/config/mod.rs b/alacritty_terminal/src/config/mod.rs
+index 98579a69b27..add38c599bf 100644
+--- a/alacritty_terminal/src/config/mod.rs
++++ b/alacritty_terminal/src/config/mod.rs
+@@ -43,10 +43,6 @@ pub struct Config<T> {
+     #[serde(default, deserialize_with = "failure_default")]
+     pub shell: Option<Program>,
+ 
+-    /// Path where config was loaded from.
+-    #[serde(default, deserialize_with = "failure_default")]
+-    pub config_path: Option<PathBuf>,
+-
+     /// Bell configuration.
+     #[serde(default, deserialize_with = "failure_default")]
+     bell: BellConfig,

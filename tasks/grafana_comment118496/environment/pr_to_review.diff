@@ -1,0 +1,1549 @@
+diff --git a/pkg/services/authz/zanzana.go b/pkg/services/authz/zanzana.go
+index 174c034ab755d..7473e3fe7fc34 100644
+--- a/pkg/services/authz/zanzana.go
++++ b/pkg/services/authz/zanzana.go
+@@ -21,9 +21,7 @@ import (
+ 	"google.golang.org/grpc/credentials"
+ 	"google.golang.org/grpc/credentials/insecure"
+ 	healthv1pb "google.golang.org/grpc/health/grpc_health_v1"
+-	clientrest "k8s.io/client-go/rest"
+ 
+-	"github.com/grafana/grafana/pkg/clientauth"
+ 	"github.com/grafana/grafana/pkg/infra/db"
+ 	"github.com/grafana/grafana/pkg/infra/log"
+ 	"github.com/grafana/grafana/pkg/infra/tracing"
+@@ -273,71 +271,12 @@ func ProvideZanzanaService(cfg *setting.Cfg, features featuremgmt.FeatureToggles
+ 		return nil, fmt.Errorf("failed to provide tracing service: %w", err)
+ 	}
+ 
+-	var clientFactory resources.ClientFactory
+-	if cfg.ZanzanaReconciler.Mode == setting.ZanzanaReconcilerModeMT {
+-		if cfg.ZanzanaReconciler.FolderAPIServerURL == "" {
+-			return nil, fmt.Errorf("reconciler_folder_apiserver_url must be set when reconciler mode is mt")
+-		}
+-		if cfg.ZanzanaReconciler.IAMAPIServerURL == "" {
+-			return nil, fmt.Errorf("reconciler_iam_apiserver_url must be set when reconciler mode is mt")
+-		}
+-
+-		grpcAuthSection := cfg.SectionWithEnvOverrides("grpc_client_authentication")
+-		token := grpcAuthSection.Key("token").MustString("")
+-		tokenExchangeURL := grpcAuthSection.Key("token_exchange_url").MustString("")
+-
+-		if token == "" || tokenExchangeURL == "" {
+-			return nil, fmt.Errorf("token and token_exchange_url must be set in [grpc_client_authentication] when reconciler is enabled")
+-		}
+-
+-		tokenExchangeClient, err := authnlib.NewTokenExchangeClient(authnlib.TokenExchangeConfig{
+-			Token:            token,
+-			TokenExchangeURL: tokenExchangeURL,
+-		})
+-		if err != nil {
+-			return nil, fmt.Errorf("failed to create token exchange client: %w", err)
+-		}
+-
+-		// Build per-group REST configs with group-specific audiences
+-		apiServerURLs := map[string]string{
+-			"folder.grafana.app": cfg.ZanzanaReconciler.FolderAPIServerURL,
+-			"iam.grafana.app":    cfg.ZanzanaReconciler.IAMAPIServerURL,
+-		}
+-
+-		configProviders := make(map[string]apiserver.RestConfigProvider)
+-		for group, url := range apiServerURLs {
+-			// Each API group gets its own audience for proper token scoping
+-			audienceProvider := clientauth.NewStaticAudienceProvider(group)
+-			namespaceProvider := clientauth.NewStaticNamespaceProvider(clientauth.WildcardNamespace)
+-
+-			restConfig := &clientrest.Config{
+-				Host:    url,
+-				APIPath: "/apis",
+-				TLSClientConfig: clientrest.TLSClientConfig{
+-					Insecure: cfg.ZanzanaReconciler.TLSInsecure,
+-				},
+-				WrapTransport: clientauth.NewTokenExchangeTransportWrapper(
+-					tokenExchangeClient,
+-					audienceProvider,
+-					namespaceProvider,
+-				),
+-			}
+-
+-			configProviders[group] = apiserver.RestConfigProviderFunc(func(_ context.Context) (*clientrest.Config, error) {
+-				return restConfig, nil
+-			})
+-		}
+-
+-		clientFactory = resources.NewClientFactoryForMultipleAPIServers(configProviders)
+-	}
+-
+ 	s := &Zanzana{
+-		cfg:           cfg,
+-		features:      features,
+-		logger:        log.New("zanzana.server"),
+-		reg:           reg,
+-		tracer:        tracer,
+-		clientFactory: clientFactory,
++		cfg:      cfg,
++		features: features,
++		logger:   log.New("zanzana.server"),
++		reg:      reg,
++		tracer:   tracer,
+ 	}
+ 
+ 	s.BasicService = services.NewBasicService(s.start, s.running, s.stopping).WithName("zanzana")
+@@ -349,13 +288,12 @@ type Zanzana struct {
+ 	*services.BasicService
+ 
+ 	cfg           *setting.Cfg
+-	zanzanaServer zanzana.Server
++	zanzanaServer zanzana.ServerInternal
+ 	logger        log.Logger
+ 	tracer        tracing.Tracer
+ 	handle        grpcserver.Provider
+ 	features      featuremgmt.FeatureToggles
+ 	reg           prometheus.Registerer
+-	clientFactory resources.ClientFactory
+ }
+ 
+ func (z *Zanzana) start(ctx context.Context) error {
+@@ -429,21 +367,8 @@ func (z *Zanzana) running(ctx context.Context) error {
+ 
+ 	if z.cfg.ZanzanaReconciler.Mode == setting.ZanzanaReconcilerModeMT {
+ 		go func() {
+-			reconcilerLogger := log.New("zanzana.mt-reconciler")
+-			rec := reconciler.NewReconciler(
+-				z.zanzanaServer.(*zServer.Server),
+-				z.clientFactory,
+-				reconciler.Config{
+-					Workers:        z.cfg.ZanzanaReconciler.Workers,
+-					Interval:       z.cfg.ZanzanaReconciler.Interval,
+-					WriteBatchSize: z.cfg.ZanzanaReconciler.WriteBatchSize,
+-					QueueSize:      z.cfg.ZanzanaReconciler.QueueSize,
+-				},
+-				reconcilerLogger,
+-				z.tracer,
+-			)
+-			if err := rec.Run(ctx); err != nil {
+-				reconcilerLogger.Error("reconciler stopped with error", "error", err)
++			if err := z.zanzanaServer.RunReconciler(ctx); err != nil {
++				z.logger.Error("reconciler stopped with error", "error", err)
+ 			}
+ 		}()
+ 	}
+diff --git a/pkg/services/authz/zanzana/server.go b/pkg/services/authz/zanzana/server.go
+index 045a8e65ccb57..4c8b06d2318c8 100644
+--- a/pkg/services/authz/zanzana/server.go
++++ b/pkg/services/authz/zanzana/server.go
+@@ -1,13 +1,38 @@
+ package zanzana
+ 
+ import (
++	"context"
++
+ 	authzv1 "github.com/grafana/authlib/authz/proto/v1"
++	openfgav1 "github.com/openfga/api/proto/openfga/v1"
+ 
+ 	authzextv1 "github.com/grafana/grafana/pkg/services/authz/proto/v1"
+ )
+ 
++type StoreInfo struct {
++	ID      string
++	Name    string
++	ModelID string
++}
++
+ type Server interface {
+ 	authzv1.AuthzServiceServer
+ 	authzextv1.AuthzExtentionServiceServer
+ 	Close()
+ }
++
++type MTReconciler interface {
++	Run(ctx context.Context) error
++	// EnsureNamespace checks if namespace is not exists, and if not, it reconciles it.
++	EnsureNamespace(ctx context.Context, namespace string) error
++}
++
++type ServerInternal interface {
++	Server
++	RunReconciler(ctx context.Context) error
++	GetStore(ctx context.Context, namespace string) (*StoreInfo, error)
++	GetStoreInfo(ctx context.Context, namespace string) (*StoreInfo, error)
++	ListAllStores(ctx context.Context) ([]StoreInfo, error)
++	WriteTuples(ctx context.Context, store *StoreInfo, writeTuples []*openfgav1.TupleKey, deleteTuples []*openfgav1.TupleKeyWithoutCondition) error
++	GetOpenFGAServer() openfgav1.OpenFGAServiceServer
++}
+diff --git a/pkg/services/authz/zanzana/server/reconciler/noop.go b/pkg/services/authz/zanzana/server/reconciler/noop.go
+new file mode 100644
+index 0000000000000..7915dec0499e4
+--- /dev/null
++++ b/pkg/services/authz/zanzana/server/reconciler/noop.go
+@@ -0,0 +1,23 @@
++package reconciler
++
++import (
++	"context"
++
++	"github.com/grafana/grafana/pkg/services/authz/zanzana"
++)
++
++var _ zanzana.MTReconciler = (*NoopReconciler)(nil)
++
++type NoopReconciler struct{}
++
++func (n *NoopReconciler) Run(ctx context.Context) error {
++	return nil
++}
++
++func (n *NoopReconciler) EnsureNamespace(ctx context.Context, namespace string) error {
++	return nil
++}
++
++func NewNoopReconciler() *NoopReconciler {
++	return &NoopReconciler{}
++}
+diff --git a/pkg/services/authz/zanzana/server/reconciler/reconciler.go b/pkg/services/authz/zanzana/server/reconciler/reconciler.go
+index 2b7d18aeedbf6..1af578afaa9c6 100644
+--- a/pkg/services/authz/zanzana/server/reconciler/reconciler.go
++++ b/pkg/services/authz/zanzana/server/reconciler/reconciler.go
+@@ -13,11 +13,13 @@ import (
+ 	"github.com/grafana/grafana/pkg/infra/log"
+ 	"github.com/grafana/grafana/pkg/infra/tracing"
+ 	"github.com/grafana/grafana/pkg/registry/apis/provisioning/resources"
+-	"github.com/grafana/grafana/pkg/services/authz/zanzana/server"
++	"github.com/grafana/grafana/pkg/services/authz/zanzana"
+ )
+ 
++var _ zanzana.MTReconciler = (*Reconciler)(nil)
++
+ type Reconciler struct {
+-	server        *server.Server
++	server        zanzana.ServerInternal
+ 	clientFactory resources.ClientFactory
+ 	cfg           Config
+ 	logger        log.Logger
+@@ -53,7 +55,7 @@ var reconcileGVRs = []schema.GroupVersionResource{
+ 
+ // NewReconciler creates a new reconciler instance.
+ func NewReconciler(
+-	srv *server.Server,
++	srv zanzana.ServerInternal,
+ 	clientFactory resources.ClientFactory,
+ 	cfg Config,
+ 	logger log.Logger,
+@@ -217,3 +219,24 @@ func (r *Reconciler) reconcileNamespace(ctx context.Context, namespace string) e
+ 
+ 	return nil
+ }
++
++func (r *Reconciler) EnsureNamespace(ctx context.Context, namespace string) error {
++	ctx, span := r.tracer.Start(ctx, "reconciler.EnsureNamespace")
++	defer span.End()
++
++	store, err := r.server.GetStore(ctx, namespace)
++	if err != nil {
++		return fmt.Errorf("failed to get store: %w", err)
++	}
++
++	if store != nil {
++		return nil
++	}
++
++	err = r.reconcileNamespace(ctx, namespace)
++	if err != nil {
++		return fmt.Errorf("failed to reconcile namespace: %w", err)
++	}
++
++	return nil
++}
+diff --git a/pkg/services/authz/zanzana/server/reconciler/translators.go b/pkg/services/authz/zanzana/server/reconciler/translators.go
+index 63f2018dc397d..f04a08e82d0cf 100644
+--- a/pkg/services/authz/zanzana/server/reconciler/translators.go
++++ b/pkg/services/authz/zanzana/server/reconciler/translators.go
+@@ -3,16 +3,17 @@ package reconciler
+ import (
+ 	"fmt"
+ 
+-	folderv1 "github.com/grafana/grafana/apps/folder/pkg/apis/folder/v1beta1"
+-	iamv0 "github.com/grafana/grafana/apps/iam/pkg/apis/iam/v0alpha1"
+-	authzextv1 "github.com/grafana/grafana/pkg/services/authz/proto/v1"
+ 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
+ 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+ 	"k8s.io/apimachinery/pkg/runtime"
+ 
++	folderv1 "github.com/grafana/grafana/apps/folder/pkg/apis/folder/v1beta1"
++	iamv0 "github.com/grafana/grafana/apps/iam/pkg/apis/iam/v0alpha1"
++	authzextv1 "github.com/grafana/grafana/pkg/services/authz/proto/v1"
++	"github.com/grafana/grafana/pkg/services/authz/zanzana"
++
+ 	"github.com/grafana/grafana/pkg/apimachinery/utils"
+ 	"github.com/grafana/grafana/pkg/services/authz/zanzana/common"
+-	"github.com/grafana/grafana/pkg/services/authz/zanzana/server"
+ )
+ 
+ // TranslateFolderToTuples converts a Folder CRD to parent relationship tuples.
+@@ -55,7 +56,7 @@ func TranslateRoleToTuples(obj *unstructured.Unstructured) ([]*openfgav1.TupleKe
+ 		})
+ 	}
+ 
+-	return server.RoleToTuples(role.Name, permissions)
++	return zanzana.RoleToTuples(role.Name, permissions)
+ }
+ 
+ // TranslateRoleBindingToTuples converts a RoleBinding CRD to assignee tuples.
+@@ -70,7 +71,7 @@ func TranslateRoleBindingToTuples(obj *unstructured.Unstructured) ([]*openfgav1.
+ 
+ 	tuples := make([]*openfgav1.TupleKey, 0, len(rb.Spec.RoleRefs))
+ 	for _, roleRef := range rb.Spec.RoleRefs {
+-		tuple, err := server.GetRoleBindingTuple(subjectKind, subjectName, roleRef.Name)
++		tuple, err := zanzana.GetRoleBindingTuple(subjectKind, subjectName, roleRef.Name)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -95,7 +96,7 @@ func TranslateResourcePermissionToTuples(obj *unstructured.Unstructured) ([]*ope
+ 
+ 	tuples := make([]*openfgav1.TupleKey, 0, len(rp.Spec.Permissions))
+ 	for _, perm := range rp.Spec.Permissions {
+-		tuple, err := server.GetResourcePermissionWriteTuple(&authzextv1.CreatePermissionOperation{
++		tuple, err := zanzana.GetResourcePermissionWriteTuple(&authzextv1.CreatePermissionOperation{
+ 			Resource: resource,
+ 			Permission: &authzextv1.Permission{
+ 				Kind: string(perm.Kind),
+@@ -120,7 +121,7 @@ func TranslateTeamBindingToTuples(obj *unstructured.Unstructured) ([]*openfgav1.
+ 	}
+ 
+ 	// Use the shared server logic to create the tuple
+-	tuple, err := server.GetTeamBindingTuple(tb.Spec.Subject.Name, tb.Spec.TeamRef.Name, string(tb.Spec.Permission))
++	tuple, err := zanzana.GetTeamBindingTuple(tb.Spec.Subject.Name, tb.Spec.TeamRef.Name, string(tb.Spec.Permission))
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/pkg/services/authz/zanzana/server/server.go b/pkg/services/authz/zanzana/server/server.go
+index a3f83008ba732..5c275de752a30 100644
+--- a/pkg/services/authz/zanzana/server/server.go
++++ b/pkg/services/authz/zanzana/server/server.go
+@@ -8,20 +8,27 @@ import (
+ 	"time"
+ 
+ 	"github.com/fullstorydev/grpchan/inprocgrpc"
++	authnlib "github.com/grafana/authlib/authn"
+ 	authzv1 "github.com/grafana/authlib/authz/proto/v1"
+ 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
+ 	"github.com/openfga/openfga/pkg/storage"
+ 	"github.com/prometheus/client_golang/prometheus"
+ 	"google.golang.org/protobuf/types/known/wrapperspb"
++	clientrest "k8s.io/client-go/rest"
+ 
+ 	dashboardV2alpha1 "github.com/grafana/grafana/apps/dashboard/pkg/apis/dashboard/v2alpha1"
+ 	dashboardV2beta1 "github.com/grafana/grafana/apps/dashboard/pkg/apis/dashboard/v2beta1"
++	"github.com/grafana/grafana/pkg/clientauth"
+ 	"github.com/grafana/grafana/pkg/infra/db"
+ 	"github.com/grafana/grafana/pkg/infra/localcache"
+ 	"github.com/grafana/grafana/pkg/infra/log"
+ 	"github.com/grafana/grafana/pkg/infra/tracing"
++	"github.com/grafana/grafana/pkg/registry/apis/provisioning/resources"
++	"github.com/grafana/grafana/pkg/services/apiserver"
+ 	authzextv1 "github.com/grafana/grafana/pkg/services/authz/proto/v1"
++	"github.com/grafana/grafana/pkg/services/authz/zanzana"
+ 	"github.com/grafana/grafana/pkg/services/authz/zanzana/common"
++	"github.com/grafana/grafana/pkg/services/authz/zanzana/server/reconciler"
+ 	zStore "github.com/grafana/grafana/pkg/services/authz/zanzana/store"
+ 	"github.com/grafana/grafana/pkg/setting"
+ )
+@@ -45,20 +52,17 @@ type Server struct {
+ 	store         storage.OpenFGADatastore
+ 
+ 	cfg      setting.ZanzanaServerSettings
+-	stores   map[string]storeInfo
++	stores   map[string]zanzana.StoreInfo
+ 	storesMU *sync.Mutex
+ 	cache    *localcache.CacheService
+ 
++	mtReconciler zanzana.MTReconciler
++
+ 	logger  log.Logger
+ 	tracer  tracing.Tracer
+ 	metrics *metrics
+ }
+ 
+-type storeInfo struct {
+-	ID      string
+-	ModelID string
+-}
+-
+ func NewEmbeddedZanzanaServer(cfg *setting.Cfg, db db.DB, logger log.Logger, tracer tracing.Tracer, reg prometheus.Registerer) (*Server, error) {
+ 	store, err := zStore.NewEmbeddedStore(cfg, db, logger)
+ 	if err != nil {
+@@ -99,7 +103,7 @@ func newServer(cfg *setting.Cfg, openfga OpenFGAServer, store storage.OpenFGADat
+ 		openFGAClient: openFGAClient,
+ 		store:         store,
+ 		storesMU:      &sync.Mutex{},
+-		stores:        make(map[string]storeInfo),
++		stores:        make(map[string]zanzana.StoreInfo),
+ 		cfg:           zanzanaCfg,
+ 		cache:         localcache.New(zanzanaCfg.CacheSettings.CheckQueryCacheTTL, cacheCleanInterval),
+ 		logger:        logger,
+@@ -107,9 +111,97 @@ func newServer(cfg *setting.Cfg, openfga OpenFGAServer, store storage.OpenFGADat
+ 		metrics:       newZanzanaServerMetrics(reg),
+ 	}
+ 
++	var clientFactory resources.ClientFactory
++	configProviders := make(map[string]apiserver.RestConfigProvider)
++	if cfg.ZanzanaReconciler.Mode == setting.ZanzanaReconcilerModeMT {
++		if cfg.ZanzanaReconciler.FolderAPIServerURL == "" {
++			return nil, fmt.Errorf("reconciler_folder_apiserver_url must be set when reconciler mode is mt")
++		}
++		if cfg.ZanzanaReconciler.IAMAPIServerURL == "" {
++			return nil, fmt.Errorf("reconciler_iam_apiserver_url must be set when reconciler mode is mt")
++		}
++
++		grpcAuthSection := cfg.SectionWithEnvOverrides("grpc_client_authentication")
++		token := grpcAuthSection.Key("token").MustString("")
++		tokenExchangeURL := grpcAuthSection.Key("token_exchange_url").MustString("")
++
++		if token == "" || tokenExchangeURL == "" {
++			return nil, fmt.Errorf("token and token_exchange_url must be set in [grpc_client_authentication] when reconciler is enabled")
++		}
++
++		tokenExchangeClient, err := authnlib.NewTokenExchangeClient(authnlib.TokenExchangeConfig{
++			Token:            token,
++			TokenExchangeURL: tokenExchangeURL,
++		})
++		if err != nil {
++			return nil, fmt.Errorf("failed to create token exchange client: %w", err)
++		}
++
++		// Build per-group REST configs with group-specific audiences
++		apiServerURLs := map[string]string{
++			"folder.grafana.app": cfg.ZanzanaReconciler.FolderAPIServerURL,
++			"iam.grafana.app":    cfg.ZanzanaReconciler.IAMAPIServerURL,
++		}
++
++		for group, url := range apiServerURLs {
++			// Each API group gets its own audience for proper token scoping
++			audienceProvider := clientauth.NewStaticAudienceProvider(group)
++			namespaceProvider := clientauth.NewStaticNamespaceProvider(clientauth.WildcardNamespace)
++
++			restConfig := &clientrest.Config{
++				Host:    url,
++				APIPath: "/apis",
++				TLSClientConfig: clientrest.TLSClientConfig{
++					Insecure: cfg.ZanzanaReconciler.TLSInsecure,
++				},
++				WrapTransport: clientauth.NewTokenExchangeTransportWrapper(
++					tokenExchangeClient,
++					audienceProvider,
++					namespaceProvider,
++				),
++			}
++
++			configProviders[group] = apiserver.RestConfigProviderFunc(func(_ context.Context) (*clientrest.Config, error) {
++				return restConfig, nil
++			})
++		}
++
++		clientFactory = resources.NewClientFactoryForMultipleAPIServers(configProviders)
++	}
++
++	var mtReconciler zanzana.MTReconciler
++	if cfg.ZanzanaReconciler.Mode == setting.ZanzanaReconcilerModeMT {
++		reconcilerLogger := log.New("zanzana.mt-reconciler")
++		mtReconciler = reconciler.NewReconciler(
++			s,
++			clientFactory,
++			reconciler.Config{
++				Workers:        cfg.ZanzanaReconciler.Workers,
++				Interval:       cfg.ZanzanaReconciler.Interval,
++				WriteBatchSize: cfg.ZanzanaReconciler.WriteBatchSize,
++				QueueSize:      cfg.ZanzanaReconciler.QueueSize,
++			},
++			reconcilerLogger,
++			tracer,
++		)
++	} else {
++		mtReconciler = reconciler.NewNoopReconciler()
++	}
++
++	s.mtReconciler = mtReconciler
++
+ 	return s, nil
+ }
+ 
++func (s *Server) RunReconciler(ctx context.Context) error {
++	if s.mtReconciler == nil {
++		s.logger.Error("mt reconciler is not initialized")
++		return nil
++	}
++
++	return s.mtReconciler.Run(ctx)
++}
++
+ func (s *Server) GetOpenFGAServer() openfgav1.OpenFGAServiceServer {
+ 	return s.openFGAServer
+ }
+@@ -123,7 +215,7 @@ func (s *Server) IsHealthy(ctx context.Context) (bool, error) {
+ 
+ // GetStoreInfo returns store information for a given namespace.
+ // This is used by the reconciler to access store IDs for direct operations.
+-func (s *Server) GetStoreInfo(ctx context.Context, namespace string) (*storeInfo, error) {
++func (s *Server) GetStoreInfo(ctx context.Context, namespace string) (*zanzana.StoreInfo, error) {
+ 	return s.getStoreInfo(ctx, namespace)
+ }
+ 
+diff --git a/pkg/services/authz/zanzana/server/server_batch_check.go b/pkg/services/authz/zanzana/server/server_batch_check.go
+index 0012ef1b033b6..a45ba04423e3b 100644
+--- a/pkg/services/authz/zanzana/server/server_batch_check.go
++++ b/pkg/services/authz/zanzana/server/server_batch_check.go
+@@ -15,6 +15,7 @@ import (
+ 	grpccodes "google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/status"
+ 
++	"github.com/grafana/grafana/pkg/services/authz/zanzana"
+ 	"github.com/grafana/grafana/pkg/services/authz/zanzana/common"
+ )
+ 
+@@ -132,7 +133,7 @@ func (s *Server) batchCheck(ctx context.Context, r *authzv1.BatchCheckRequest) (
+ // This is the broadest permission - if granted, access to all resources of that type is allowed.
+ func (s *Server) runGroupResourcePhase(
+ 	ctx context.Context,
+-	store *storeInfo,
++	store *zanzana.StoreInfo,
+ 	subject string,
+ 	items map[string]*batchCheckItem,
+ 	contextuals *openfgav1.ContextualTupleKeys,
+@@ -193,7 +194,7 @@ func (s *Server) runGroupResourcePhase(
+ // This applies to generic resources that support folder-based permissions (like dashboards).
+ func (s *Server) runFolderPermissionPhase(
+ 	ctx context.Context,
+-	store *storeInfo,
++	store *zanzana.StoreInfo,
+ 	subject string,
+ 	items map[string]*batchCheckItem,
+ 	contextuals *openfgav1.ContextualTupleKeys,
+@@ -266,7 +267,7 @@ func (s *Server) runFolderPermissionPhase(
+ // This handles cases where access is granted via folder subresource relations.
+ func (s *Server) runFolderSubresourcePhase(
+ 	ctx context.Context,
+-	store *storeInfo,
++	store *zanzana.StoreInfo,
+ 	subject string,
+ 	items map[string]*batchCheckItem,
+ 	contextuals *openfgav1.ContextualTupleKeys,
+@@ -338,7 +339,7 @@ func (s *Server) runFolderSubresourcePhase(
+ // This is the most granular check - access granted directly on the resource itself.
+ func (s *Server) runDirectResourcePhase(
+ 	ctx context.Context,
+-	store *storeInfo,
++	store *zanzana.StoreInfo,
+ 	subject string,
+ 	items map[string]*batchCheckItem,
+ 	contextuals *openfgav1.ContextualTupleKeys,
+@@ -469,7 +470,7 @@ func (s *Server) addTypedResourceDirectChecks(
+ // sub-batches if the number of checks exceeds the configured MaxChecksPerBatchCheck limit.
+ func (s *Server) doBatchCheck(
+ 	ctx context.Context,
+-	store *storeInfo,
++	store *zanzana.StoreInfo,
+ 	checks []*openfgav1.BatchCheckItem,
+ ) (map[string]*openfgav1.BatchCheckSingleResult, error) {
+ 	if len(checks) == 0 {
+@@ -505,7 +506,7 @@ func (s *Server) doBatchCheck(
+ // executeBatchCheck sends a single OpenFGA BatchCheck request.
+ func (s *Server) executeBatchCheck(
+ 	ctx context.Context,
+-	store *storeInfo,
++	store *zanzana.StoreInfo,
+ 	checks []*openfgav1.BatchCheckItem,
+ ) (map[string]*openfgav1.BatchCheckSingleResult, error) {
+ 	openfgaReq := &openfgav1.BatchCheckRequest{
+diff --git a/pkg/services/authz/zanzana/server/server_check.go b/pkg/services/authz/zanzana/server/server_check.go
+index a310ab486506c..47c371d0707f3 100644
+--- a/pkg/services/authz/zanzana/server/server_check.go
++++ b/pkg/services/authz/zanzana/server/server_check.go
+@@ -12,6 +12,7 @@ import (
+ 	"go.opentelemetry.io/otel/codes"
+ 	"google.golang.org/protobuf/types/known/structpb"
+ 
++	"github.com/grafana/grafana/pkg/services/authz/zanzana"
+ 	"github.com/grafana/grafana/pkg/services/authz/zanzana/common"
+ )
+ 
+@@ -24,6 +25,10 @@ func (s *Server) Check(ctx context.Context, r *authzv1.CheckRequest) (*authzv1.C
+ 		s.metrics.requestDurationSeconds.WithLabelValues("Check").Observe(time.Since(t).Seconds())
+ 	}(time.Now())
+ 
++	if err := s.mtReconciler.EnsureNamespace(ctx, r.GetNamespace()); err != nil {
++		return nil, fmt.Errorf("failed to reconcile namespace: %w", err)
++	}
++
+ 	res, err := s.check(ctx, r)
+ 	if err != nil {
+ 		span.RecordError(err)
+@@ -79,7 +84,7 @@ func (s *Server) check(ctx context.Context, r *authzv1.CheckRequest) (*authzv1.C
+ 
+ // checkGroupResource check if subject has access to the full "GroupResource", if they do they can access every object
+ // within it.
+-func (s *Server) checkGroupResource(ctx context.Context, subject, relation string, resource common.ResourceInfo, contextuals *openfgav1.ContextualTupleKeys, store *storeInfo) (*authzv1.CheckResponse, error) {
++func (s *Server) checkGroupResource(ctx context.Context, subject, relation string, resource common.ResourceInfo, contextuals *openfgav1.ContextualTupleKeys, store *zanzana.StoreInfo) (*authzv1.CheckResponse, error) {
+ 	ctx, span := s.tracer.Start(ctx, "server.checkGroupResource")
+ 	defer span.End()
+ 
+@@ -96,7 +101,7 @@ func (s *Server) checkGroupResource(ctx context.Context, subject, relation strin
+ }
+ 
+ // checkTyped checks on our typed resources e.g. folder.
+-func (s *Server) checkTyped(ctx context.Context, subject, relation string, resource common.ResourceInfo, contextuals *openfgav1.ContextualTupleKeys, store *storeInfo) (*authzv1.CheckResponse, error) {
++func (s *Server) checkTyped(ctx context.Context, subject, relation string, resource common.ResourceInfo, contextuals *openfgav1.ContextualTupleKeys, store *zanzana.StoreInfo) (*authzv1.CheckResponse, error) {
+ 	ctx, span := s.tracer.Start(ctx, "server.checkTyped")
+ 	defer span.End()
+ 
+@@ -144,7 +149,7 @@ func (s *Server) checkTyped(ctx context.Context, subject, relation string, resou
+ // checkGeneric check our generic "resource" type. It checks:
+ // 1. If subject has access as a sub resource for a folder.
+ // 2. If subject has direct access to resource.
+-func (s *Server) checkGeneric(ctx context.Context, subject, relation string, resource common.ResourceInfo, contextuals *openfgav1.ContextualTupleKeys, store *storeInfo) (*authzv1.CheckResponse, error) {
++func (s *Server) checkGeneric(ctx context.Context, subject, relation string, resource common.ResourceInfo, contextuals *openfgav1.ContextualTupleKeys, store *zanzana.StoreInfo) (*authzv1.CheckResponse, error) {
+ 	ctx, span := s.tracer.Start(ctx, "server.checkGeneric")
+ 	defer span.End()
+ 
+@@ -193,7 +198,7 @@ func (s *Server) checkGeneric(ctx context.Context, subject, relation string, res
+ 	return &authzv1.CheckResponse{Allowed: res.GetAllowed()}, nil
+ }
+ 
+-func (s *Server) openfgaCheck(ctx context.Context, store *storeInfo, subject, relation, object string, contextuals *openfgav1.ContextualTupleKeys, resourceCtx *structpb.Struct) (*openfgav1.CheckResponse, error) {
++func (s *Server) openfgaCheck(ctx context.Context, store *zanzana.StoreInfo, subject, relation, object string, contextuals *openfgav1.ContextualTupleKeys, resourceCtx *structpb.Struct) (*openfgav1.CheckResponse, error) {
+ 	res, err := s.openFGAClient.Check(ctx, &openfgav1.CheckRequest{
+ 		StoreId:              store.ID,
+ 		AuthorizationModelId: store.ModelID,
+diff --git a/pkg/services/authz/zanzana/server/server_list.go b/pkg/services/authz/zanzana/server/server_list.go
+index 774e2638124a5..9aa1c76760286 100644
+--- a/pkg/services/authz/zanzana/server/server_list.go
++++ b/pkg/services/authz/zanzana/server/server_list.go
+@@ -16,6 +16,7 @@ import (
+ 	"go.opentelemetry.io/otel/codes"
+ 	"google.golang.org/grpc"
+ 
++	"github.com/grafana/grafana/pkg/services/authz/zanzana"
+ 	"github.com/grafana/grafana/pkg/services/authz/zanzana/common"
+ )
+ 
+@@ -73,7 +74,7 @@ func (s *Server) list(ctx context.Context, r *authzv1.ListRequest) (*authzv1.Lis
+ 	return s.listTyped(ctx, r.GetSubject(), relation, resource, contextuals, store)
+ }
+ 
+-func (s *Server) listTyped(ctx context.Context, subject, relation string, resource common.ResourceInfo, contextuals *openfgav1.ContextualTupleKeys, store *storeInfo) (*authzv1.ListResponse, error) {
++func (s *Server) listTyped(ctx context.Context, subject, relation string, resource common.ResourceInfo, contextuals *openfgav1.ContextualTupleKeys, store *zanzana.StoreInfo) (*authzv1.ListResponse, error) {
+ 	ctx, span := s.tracer.Start(ctx, "server.listTyped")
+ 	defer span.End()
+ 
+@@ -131,7 +132,7 @@ func (s *Server) listTyped(ctx context.Context, subject, relation string, resour
+ 	}, nil
+ }
+ 
+-func (s *Server) listGeneric(ctx context.Context, subject, relation string, resource common.ResourceInfo, contextuals *openfgav1.ContextualTupleKeys, store *storeInfo) (*authzv1.ListResponse, error) {
++func (s *Server) listGeneric(ctx context.Context, subject, relation string, resource common.ResourceInfo, contextuals *openfgav1.ContextualTupleKeys, store *zanzana.StoreInfo) (*authzv1.ListResponse, error) {
+ 	ctx, span := s.tracer.Start(ctx, "server.listGeneric")
+ 	defer span.End()
+ 
+diff --git a/pkg/services/authz/zanzana/server/server_mutate.go b/pkg/services/authz/zanzana/server/server_mutate.go
+index 5a2fad3cb166b..4c19d93b541cb 100644
+--- a/pkg/services/authz/zanzana/server/server_mutate.go
++++ b/pkg/services/authz/zanzana/server/server_mutate.go
+@@ -11,6 +11,7 @@ import (
+ 	"google.golang.org/grpc/status"
+ 
+ 	authzextv1 "github.com/grafana/grafana/pkg/services/authz/proto/v1"
++	"github.com/grafana/grafana/pkg/services/authz/zanzana"
+ )
+ 
+ type OperationGroup string
+@@ -155,11 +156,11 @@ func deduplicateTupleKeys(writeTuples []*openfgav1.TupleKey, deleteTuples []*ope
+ // WriteTuples writes tuples directly to OpenFGA for a given store.
+ // This is used internally by mutate operations and the reconciler.
+ // Tuples are automatically deduplicated before writing.
+-func (s *Server) WriteTuples(ctx context.Context, store *storeInfo, writeTuples []*openfgav1.TupleKey, deleteTuples []*openfgav1.TupleKeyWithoutCondition) error {
++func (s *Server) WriteTuples(ctx context.Context, store *zanzana.StoreInfo, writeTuples []*openfgav1.TupleKey, deleteTuples []*openfgav1.TupleKeyWithoutCondition) error {
+ 	return s.writeTuples(ctx, store, writeTuples, deleteTuples)
+ }
+ 
+-func (s *Server) writeTuples(ctx context.Context, store *storeInfo, writeTuples []*openfgav1.TupleKey, deleteTuples []*openfgav1.TupleKeyWithoutCondition) error {
++func (s *Server) writeTuples(ctx context.Context, store *zanzana.StoreInfo, writeTuples []*openfgav1.TupleKey, deleteTuples []*openfgav1.TupleKeyWithoutCondition) error {
+ 	writeReq := &openfgav1.WriteRequest{
+ 		StoreId:              store.ID,
+ 		AuthorizationModelId: store.ModelID,
+diff --git a/pkg/services/authz/zanzana/server/server_mutate_folder.go b/pkg/services/authz/zanzana/server/server_mutate_folder.go
+index 20f65c78c5918..831947a5191ad 100644
+--- a/pkg/services/authz/zanzana/server/server_mutate_folder.go
++++ b/pkg/services/authz/zanzana/server/server_mutate_folder.go
+@@ -8,10 +8,11 @@ import (
+ 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
+ 
+ 	authzextv1 "github.com/grafana/grafana/pkg/services/authz/proto/v1"
+-	zanzana "github.com/grafana/grafana/pkg/services/authz/zanzana/common"
++	"github.com/grafana/grafana/pkg/services/authz/zanzana"
++	"github.com/grafana/grafana/pkg/services/authz/zanzana/common"
+ )
+ 
+-func (s *Server) mutateFolders(ctx context.Context, store *storeInfo, operations []*authzextv1.MutateOperation) error {
++func (s *Server) mutateFolders(ctx context.Context, store *zanzana.StoreInfo, operations []*authzextv1.MutateOperation) error {
+ 	ctx, span := s.tracer.Start(ctx, "server.mutateFolder")
+ 	defer span.End()
+ 
+@@ -61,7 +62,7 @@ func (s *Server) mutateFolders(ctx context.Context, store *storeInfo, operations
+ 	return nil
+ }
+ 
+-func (s *Server) getFolderWriteTuple(ctx context.Context, store *storeInfo, req *authzextv1.SetFolderParentOperation) (*openfgav1.TupleKey, error) {
++func (s *Server) getFolderWriteTuple(ctx context.Context, store *zanzana.StoreInfo, req *authzextv1.SetFolderParentOperation) (*openfgav1.TupleKey, error) {
+ 	// Folder is at the root level
+ 	if req.GetParent() == "" {
+ 		return nil, nil
+@@ -71,15 +72,15 @@ func (s *Server) getFolderWriteTuple(ctx context.Context, store *storeInfo, req
+ 		return nil, fmt.Errorf("folder UID contains invalid characters: %s", req.GetFolder())
+ 	}
+ 
+-	tuple := zanzana.NewFolderParentTuple(req.GetFolder(), req.GetParent())
++	tuple := common.NewFolderParentTuple(req.GetFolder(), req.GetParent())
+ 	return tuple, nil
+ }
+ 
+-func (s *Server) getFolderDeleteTuples(ctx context.Context, store *storeInfo, folderUID string, parentUID string, deleteExisting bool) ([]*openfgav1.TupleKeyWithoutCondition, error) {
++func (s *Server) getFolderDeleteTuples(ctx context.Context, store *zanzana.StoreInfo, folderUID string, parentUID string, deleteExisting bool) ([]*openfgav1.TupleKeyWithoutCondition, error) {
+ 	tupleKeysToDelete := make([]*openfgav1.TupleKeyWithoutCondition, 0)
+ 
+ 	if folderUID != "" && parentUID != "" && !deleteExisting {
+-		tuple := zanzana.NewFolderParentTuple(folderUID, parentUID)
++		tuple := common.NewFolderParentTuple(folderUID, parentUID)
+ 		tupleKeysToDelete = append(tupleKeysToDelete, &openfgav1.TupleKeyWithoutCondition{
+ 			User:     tuple.GetUser(),
+ 			Relation: tuple.GetRelation(),
+@@ -105,16 +106,16 @@ func (s *Server) getFolderDeleteTuples(ctx context.Context, store *storeInfo, fo
+ 	return tupleKeysToDelete, nil
+ }
+ 
+-func (s *Server) listFolderParents(ctx context.Context, store *storeInfo, folderUID string) ([]*openfgav1.Tuple, error) {
++func (s *Server) listFolderParents(ctx context.Context, store *zanzana.StoreInfo, folderUID string) ([]*openfgav1.Tuple, error) {
+ 	ctx, span := s.tracer.Start(ctx, "server.listFolderParents")
+ 	defer span.End()
+ 
+-	object := zanzana.NewFolderIdent(folderUID)
++	object := common.NewFolderIdent(folderUID)
+ 	resp, err := s.openFGAClient.Read(ctx, &openfgav1.ReadRequest{
+ 		StoreId: store.ID,
+ 		TupleKey: &openfgav1.ReadRequestTupleKey{
+ 			Object:   object,
+-			Relation: zanzana.RelationParent,
++			Relation: common.RelationParent,
+ 		},
+ 	})
+ 	if err != nil {
+diff --git a/pkg/services/authz/zanzana/server/server_mutate_org_role.go b/pkg/services/authz/zanzana/server/server_mutate_org_role.go
+index 7ba0baf303d53..9332c9c3d37a5 100644
+--- a/pkg/services/authz/zanzana/server/server_mutate_org_role.go
++++ b/pkg/services/authz/zanzana/server/server_mutate_org_role.go
+@@ -6,10 +6,11 @@ import (
+ 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
+ 
+ 	authzextv1 "github.com/grafana/grafana/pkg/services/authz/proto/v1"
+-	zanzana "github.com/grafana/grafana/pkg/services/authz/zanzana/common"
++	"github.com/grafana/grafana/pkg/services/authz/zanzana"
++	"github.com/grafana/grafana/pkg/services/authz/zanzana/common"
+ )
+ 
+-func (s *Server) mutateOrgRoles(ctx context.Context, store *storeInfo, operations []*authzextv1.MutateOperation) error {
++func (s *Server) mutateOrgRoles(ctx context.Context, store *zanzana.StoreInfo, operations []*authzextv1.MutateOperation) error {
+ 	ctx, span := s.tracer.Start(ctx, "server.mutateOrgRoles")
+ 	defer span.End()
+ 
+@@ -19,19 +20,19 @@ func (s *Server) mutateOrgRoles(ctx context.Context, store *storeInfo, operation
+ 	for _, operation := range operations {
+ 		switch op := operation.Operation.(type) {
+ 		case *authzextv1.MutateOperation_AddUserOrgRole:
+-			basicRole := zanzana.TranslateBasicRole(op.AddUserOrgRole.GetRole())
++			basicRole := common.TranslateBasicRole(op.AddUserOrgRole.GetRole())
+ 			tuple := &openfgav1.TupleKey{
+-				User:     zanzana.NewTupleEntry(zanzana.TypeUser, op.AddUserOrgRole.GetUser(), ""),
+-				Relation: zanzana.RelationAssignee,
+-				Object:   zanzana.NewTupleEntry(zanzana.TypeRole, basicRole, ""),
++				User:     common.NewTupleEntry(common.TypeUser, op.AddUserOrgRole.GetUser(), ""),
++				Relation: common.RelationAssignee,
++				Object:   common.NewTupleEntry(common.TypeRole, basicRole, ""),
+ 			}
+ 			writeTuples = append(writeTuples, tuple)
+ 		case *authzextv1.MutateOperation_DeleteUserOrgRole:
+-			basicRole := zanzana.TranslateBasicRole(op.DeleteUserOrgRole.GetRole())
++			basicRole := common.TranslateBasicRole(op.DeleteUserOrgRole.GetRole())
+ 			tuple := &openfgav1.TupleKeyWithoutCondition{
+-				User:     zanzana.NewTupleEntry(zanzana.TypeUser, op.DeleteUserOrgRole.GetUser(), ""),
+-				Relation: zanzana.RelationAssignee,
+-				Object:   zanzana.NewTupleEntry(zanzana.TypeRole, basicRole, ""),
++				User:     common.NewTupleEntry(common.TypeUser, op.DeleteUserOrgRole.GetUser(), ""),
++				Relation: common.RelationAssignee,
++				Object:   common.NewTupleEntry(common.TypeRole, basicRole, ""),
+ 			}
+ 			deleteTuples = append(deleteTuples, tuple)
+ 		case *authzextv1.MutateOperation_UpdateUserOrgRole:
+@@ -59,14 +60,14 @@ func (s *Server) mutateOrgRoles(ctx context.Context, store *storeInfo, operation
+ 	return nil
+ }
+ 
+-func (s *Server) getUserOrgRoleUpdateTuples(ctx context.Context, store *storeInfo, req *authzextv1.UpdateUserOrgRoleOperation) (*openfgav1.TupleKey, []*openfgav1.TupleKeyWithoutCondition, error) {
++func (s *Server) getUserOrgRoleUpdateTuples(ctx context.Context, store *zanzana.StoreInfo, req *authzextv1.UpdateUserOrgRoleOperation) (*openfgav1.TupleKey, []*openfgav1.TupleKeyWithoutCondition, error) {
+ 	readReq := &openfgav1.ReadRequest{
+ 		StoreId: store.ID,
+ 		TupleKey: &openfgav1.ReadRequestTupleKey{
+-			User:     zanzana.NewTupleEntry(zanzana.TypeUser, req.GetUser(), ""),
+-			Relation: zanzana.RelationAssignee,
++			User:     common.NewTupleEntry(common.TypeUser, req.GetUser(), ""),
++			Relation: common.RelationAssignee,
+ 			// read tuples by object type ("role:")
+-			Object: zanzana.NewTupleEntry(zanzana.TypeRole, "", ""),
++			Object: common.NewTupleEntry(common.TypeRole, "", ""),
+ 		},
+ 	}
+ 	res, err := s.openFGAClient.Read(ctx, readReq)
+@@ -75,8 +76,8 @@ func (s *Server) getUserOrgRoleUpdateTuples(ctx context.Context, store *storeInf
+ 	}
+ 	existingBasicRoleTuples := make([]*openfgav1.TupleKeyWithoutCondition, 0)
+ 	for _, tuple := range res.GetTuples() {
+-		_, roleName, _ := zanzana.SplitTupleObject(tuple.GetKey().GetObject())
+-		if zanzana.IsBasicRole(roleName) {
++		_, roleName, _ := common.SplitTupleObject(tuple.GetKey().GetObject())
++		if common.IsBasicRole(roleName) {
+ 			existingBasicRoleTuples = append(existingBasicRoleTuples, &openfgav1.TupleKeyWithoutCondition{
+ 				User:     tuple.GetKey().GetUser(),
+ 				Relation: tuple.GetKey().GetRelation(),
+@@ -85,11 +86,11 @@ func (s *Server) getUserOrgRoleUpdateTuples(ctx context.Context, store *storeInf
+ 		}
+ 	}
+ 
+-	basicRole := zanzana.TranslateBasicRole(req.GetRole())
++	basicRole := common.TranslateBasicRole(req.GetRole())
+ 	writeTuple := &openfgav1.TupleKey{
+-		User:     zanzana.NewTupleEntry(zanzana.TypeUser, req.GetUser(), ""),
+-		Relation: zanzana.RelationAssignee,
+-		Object:   zanzana.NewTupleEntry(zanzana.TypeRole, basicRole, ""),
++		User:     common.NewTupleEntry(common.TypeUser, req.GetUser(), ""),
++		Relation: common.RelationAssignee,
++		Object:   common.NewTupleEntry(common.TypeRole, basicRole, ""),
+ 	}
+ 
+ 	return writeTuple, existingBasicRoleTuples, nil
+diff --git a/pkg/services/authz/zanzana/server/server_mutate_resourcepermissions.go b/pkg/services/authz/zanzana/server/server_mutate_resourcepermissions.go
+index 98100c0842b45..05c1af0bc7670 100644
+--- a/pkg/services/authz/zanzana/server/server_mutate_resourcepermissions.go
++++ b/pkg/services/authz/zanzana/server/server_mutate_resourcepermissions.go
+@@ -2,26 +2,14 @@ package server
+ 
+ import (
+ 	"context"
+-	"errors"
+-	"fmt"
+-	"strings"
+-
+-	"google.golang.org/protobuf/types/known/structpb"
+ 
+ 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
+ 
+-	iamv0 "github.com/grafana/grafana/apps/iam/pkg/apis/iam/v0alpha1"
+ 	authzextv1 "github.com/grafana/grafana/pkg/services/authz/proto/v1"
+-	zanzana "github.com/grafana/grafana/pkg/services/authz/zanzana/common"
+-)
+-
+-var (
+-	errEmptyName        = errors.New("name cannot be empty")
+-	errInvalidBasicRole = errors.New("invalid basic role")
+-	errUnknownKind      = errors.New("unknown permission kind")
++	"github.com/grafana/grafana/pkg/services/authz/zanzana"
+ )
+ 
+-func (s *Server) mutateResourcePermissions(ctx context.Context, store *storeInfo, operations []*authzextv1.MutateOperation) error {
++func (s *Server) mutateResourcePermissions(ctx context.Context, store *zanzana.StoreInfo, operations []*authzextv1.MutateOperation) error {
+ 	ctx, span := s.tracer.Start(ctx, "server.mutateResourcePermissions")
+ 	defer span.End()
+ 
+@@ -31,13 +19,13 @@ func (s *Server) mutateResourcePermissions(ctx context.Context, store *storeInfo
+ 	for _, operation := range operations {
+ 		switch op := operation.Operation.(type) {
+ 		case *authzextv1.MutateOperation_CreatePermission:
+-			tuple, err := GetResourcePermissionWriteTuple(op.CreatePermission)
++			tuple, err := zanzana.GetResourcePermissionWriteTuple(op.CreatePermission)
+ 			if err != nil {
+ 				return err
+ 			}
+ 			writeTuples = append(writeTuples, tuple)
+ 		case *authzextv1.MutateOperation_DeletePermission:
+-			tuple, err := GetResourcePermissionDeleteTuple(op.DeletePermission)
++			tuple, err := zanzana.GetResourcePermissionDeleteTuple(op.DeletePermission)
+ 			if err != nil {
+ 				return err
+ 			}
+@@ -55,102 +43,3 @@ func (s *Server) mutateResourcePermissions(ctx context.Context, store *storeInfo
+ 
+ 	return nil
+ }
+-
+-func GetResourcePermissionWriteTuple(req *authzextv1.CreatePermissionOperation) (*openfgav1.TupleKey, error) {
+-	resource := req.GetResource()
+-	permission := req.GetPermission()
+-	object := zanzana.NewObjectEntry(toZanzanaType(resource.GetGroup()), resource.GetGroup(), resource.GetResource(), "", resource.GetName())
+-	tuple, err := NewResourceTuple(object, resource, permission)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return tuple, nil
+-}
+-
+-func GetResourcePermissionDeleteTuple(req *authzextv1.DeletePermissionOperation) (*openfgav1.TupleKeyWithoutCondition, error) {
+-	resource := req.GetResource()
+-	permission := req.GetPermission()
+-	object := zanzana.NewObjectEntry(toZanzanaType(resource.GetGroup()), resource.GetGroup(), resource.GetResource(), "", resource.GetName())
+-	tuple, err := NewResourceTuple(object, resource, permission)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return &openfgav1.TupleKeyWithoutCondition{
+-		User:     tuple.GetUser(),
+-		Relation: tuple.GetRelation(),
+-		Object:   tuple.GetObject(),
+-	}, nil
+-}
+-
+-func toZanzanaType(apiGroup string) string {
+-	if apiGroup == "folder.grafana.app" {
+-		return zanzana.TypeFolder
+-	}
+-	return zanzana.TypeResource
+-}
+-
+-func NewResourceTuple(object string, resource *authzextv1.Resource, perm *authzextv1.Permission) (*openfgav1.TupleKey, error) {
+-	// Typ is "folder" or "resource"
+-	typ := toZanzanaType(resource.Group)
+-
+-	// subject
+-	subject, err := toZanzanaSubject(perm.GetKind(), perm.GetName())
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	key := &openfgav1.TupleKey{
+-		// e.g. "user:{uid}", "serviceaccount:{uid}", "team:{uid}", "basicrole:{viewer|editor|admin}"
+-		User: subject,
+-		// "view", "edit", "admin"
+-		Relation: strings.ToLower(perm.Verb),
+-		// e.g. "folder:{name}" or "resource:{apiGroup}/{resource}/{name}"
+-		Object: object,
+-	}
+-
+-	// For resources we add a condition to filter by apiGroup/resource
+-	// e.g "group_filter": {"group_resource": "dashboards.grafana.app/dashboards"}
+-	if typ == zanzana.TypeResource {
+-		key.Condition = &openfgav1.RelationshipCondition{
+-			Name: "group_filter",
+-			Context: &structpb.Struct{
+-				Fields: map[string]*structpb.Value{
+-					"group_resource": structpb.NewStringValue(
+-						resource.GetGroup() + "/" + resource.GetResource(),
+-					),
+-				},
+-			},
+-		}
+-	}
+-
+-	return key, nil
+-}
+-
+-func toZanzanaSubject(kind string, name string) (string, error) {
+-	if name == "" {
+-		return "", errEmptyName
+-	}
+-	iamKind := iamv0.ResourcePermissionSpecPermissionKind(kind)
+-	switch iamKind {
+-	case iamv0.ResourcePermissionSpecPermissionKindUser:
+-		return zanzana.NewTupleEntry(zanzana.TypeUser, name, ""), nil
+-	case iamv0.ResourcePermissionSpecPermissionKindServiceAccount:
+-		return zanzana.NewTupleEntry(zanzana.TypeServiceAccount, name, ""), nil
+-	case iamv0.ResourcePermissionSpecPermissionKindTeam:
+-		return zanzana.NewTupleEntry(zanzana.TypeTeam, name, zanzana.RelationTeamMember), nil
+-	case iamv0.ResourcePermissionSpecPermissionKindBasicRole:
+-		basicRole := zanzana.TranslateBasicRole(name)
+-		if basicRole == "" {
+-			return "", fmt.Errorf("%w: %s", errInvalidBasicRole, name)
+-		}
+-
+-		// e.g role:basic_viewer#assignee
+-		return zanzana.NewTupleEntry(zanzana.TypeRole, basicRole, zanzana.RelationAssignee), nil
+-	}
+-
+-	// should not happen since we are after create
+-	// validation webhook should have caught invalid kinds
+-	return "", errUnknownKind
+-}
+diff --git a/pkg/services/authz/zanzana/server/server_mutate_rolebindings.go b/pkg/services/authz/zanzana/server/server_mutate_rolebindings.go
+index d91b0bd9fc1e1..1334b75ede020 100644
+--- a/pkg/services/authz/zanzana/server/server_mutate_rolebindings.go
++++ b/pkg/services/authz/zanzana/server/server_mutate_rolebindings.go
+@@ -2,16 +2,14 @@ package server
+ 
+ import (
+ 	"context"
+-	"fmt"
+ 
+ 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
+ 
+-	iamv0 "github.com/grafana/grafana/apps/iam/pkg/apis/iam/v0alpha1"
+ 	authzextv1 "github.com/grafana/grafana/pkg/services/authz/proto/v1"
+-	zanzana "github.com/grafana/grafana/pkg/services/authz/zanzana/common"
++	"github.com/grafana/grafana/pkg/services/authz/zanzana"
+ )
+ 
+-func (s *Server) mutateRoleBindings(ctx context.Context, store *storeInfo, operations []*authzextv1.MutateOperation) error {
++func (s *Server) mutateRoleBindings(ctx context.Context, store *zanzana.StoreInfo, operations []*authzextv1.MutateOperation) error {
+ 	ctx, span := s.tracer.Start(ctx, "server.mutateRoleBindings")
+ 	defer span.End()
+ 
+@@ -22,14 +20,14 @@ func (s *Server) mutateRoleBindings(ctx context.Context, store *storeInfo, opera
+ 		switch op := operation.Operation.(type) {
+ 		case *authzextv1.MutateOperation_CreateRoleBinding:
+ 			r := op.CreateRoleBinding
+-			tuple, err := GetRoleBindingTuple(r.SubjectKind, r.SubjectName, r.RoleName)
++			tuple, err := zanzana.GetRoleBindingTuple(r.SubjectKind, r.SubjectName, r.RoleName)
+ 			if err != nil {
+ 				return err
+ 			}
+ 			writeTuples = append(writeTuples, tuple)
+ 		case *authzextv1.MutateOperation_DeleteRoleBinding:
+ 			r := op.DeleteRoleBinding
+-			tuple, err := GetRoleBindingTuple(r.SubjectKind, r.SubjectName, r.RoleName)
++			tuple, err := zanzana.GetRoleBindingTuple(r.SubjectKind, r.SubjectName, r.RoleName)
+ 			if err != nil {
+ 				return err
+ 			}
+@@ -52,31 +50,3 @@ func (s *Server) mutateRoleBindings(ctx context.Context, store *storeInfo, opera
+ 
+ 	return nil
+ }
+-
+-func GetRoleBindingTuple(subjectKind string, subjectName string, roleName string) (*openfgav1.TupleKey, error) {
+-	zanzanaType := ""
+-	subjectRelation := ""
+-
+-	switch subjectKind {
+-	case string(iamv0.RoleBindingSpecSubjectKindUser):
+-		zanzanaType = zanzana.TypeUser
+-	case string(iamv0.RoleBindingSpecSubjectKindTeam):
+-		zanzanaType = zanzana.TypeTeam
+-		subjectRelation = zanzana.RelationTeamMember
+-	case string(iamv0.RoleBindingSpecSubjectKindServiceAccount):
+-		zanzanaType = zanzana.TypeServiceAccount
+-	case string(iamv0.RoleBindingSpecSubjectKindBasicRole):
+-		zanzanaType = zanzana.TypeRole
+-		subjectRelation = zanzana.RelationAssignee
+-	default:
+-		return nil, fmt.Errorf("invalid subject kind: %s", subjectKind)
+-	}
+-
+-	tuple := &openfgav1.TupleKey{
+-		User:     zanzana.NewTupleEntry(zanzanaType, subjectName, subjectRelation),
+-		Relation: zanzana.RelationAssignee,
+-		Object:   zanzana.NewTupleEntry(zanzana.TypeRole, roleName, ""),
+-	}
+-
+-	return tuple, nil
+-}
+diff --git a/pkg/services/authz/zanzana/server/server_mutate_roles.go b/pkg/services/authz/zanzana/server/server_mutate_roles.go
+index 178ed1bd1bcf2..92a72fdaf73e2 100644
+--- a/pkg/services/authz/zanzana/server/server_mutate_roles.go
++++ b/pkg/services/authz/zanzana/server/server_mutate_roles.go
+@@ -2,7 +2,6 @@ package server
+ 
+ import (
+ 	"context"
+-	"strings"
+ 
+ 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
+ 
+@@ -11,7 +10,7 @@ import (
+ 	"github.com/grafana/grafana/pkg/services/authz/zanzana/common"
+ )
+ 
+-func (s *Server) mutateRoles(ctx context.Context, store *storeInfo, operations []*authzextv1.MutateOperation) error {
++func (s *Server) mutateRoles(ctx context.Context, store *zanzana.StoreInfo, operations []*authzextv1.MutateOperation) error {
+ 	ctx, span := s.tracer.Start(ctx, "server.mutateRoles")
+ 	defer span.End()
+ 
+@@ -21,13 +20,13 @@ func (s *Server) mutateRoles(ctx context.Context, store *storeInfo, operations [
+ 	for _, operation := range operations {
+ 		switch op := operation.Operation.(type) {
+ 		case *authzextv1.MutateOperation_CreateRole:
+-			tuples, err := RoleToTuples(op.CreateRole.RoleName, op.CreateRole.Permissions)
++			tuples, err := zanzana.RoleToTuples(op.CreateRole.RoleName, op.CreateRole.Permissions)
+ 			if err != nil {
+ 				return err
+ 			}
+ 			writeTuples = append(writeTuples, tuples...)
+ 		case *authzextv1.MutateOperation_DeleteRole:
+-			tuples, err := RoleToTuples(op.DeleteRole.RoleName, op.DeleteRole.Permissions)
++			tuples, err := zanzana.RoleToTuples(op.DeleteRole.RoleName, op.DeleteRole.Permissions)
+ 			if err != nil {
+ 				return err
+ 			}
+@@ -49,43 +48,3 @@ func (s *Server) mutateRoles(ctx context.Context, store *storeInfo, operations [
+ 
+ 	return nil
+ }
+-
+-// RoleToTuples converts role and its permissions (action/scope) to v1 TupleKey format
+-// using the shared zanzana.ConvertRolePermissionsToTuples utility and common.ToAuthzExtTupleKeys
+-func RoleToTuples(roleUID string, permissions []*authzextv1.RolePermission) ([]*openfgav1.TupleKey, error) {
+-	// Convert to zanzana.RolePermission
+-	rolePerms := make([]zanzana.RolePermission, 0, len(permissions))
+-	for _, perm := range permissions {
+-		// Split the scope to get kind, attribute, identifier
+-		kind, _, identifier := splitScope(perm.Scope)
+-		rolePerms = append(rolePerms, zanzana.RolePermission{
+-			Action:     perm.Action,
+-			Kind:       kind,
+-			Identifier: identifier,
+-		})
+-	}
+-
+-	// Translate to Zanzana tuples
+-	tuples, err := zanzana.ConvertRolePermissionsToTuples(roleUID, rolePerms)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return tuples, nil
+-}
+-
+-func splitScope(scope string) (string, string, string) {
+-	if scope == "" {
+-		return "", "", ""
+-	}
+-
+-	fragments := strings.Split(scope, ":")
+-	switch l := len(fragments); l {
+-	case 1: // Splitting a wildcard scope "*" -> kind: "*"; attribute: "*"; identifier: "*"
+-		return fragments[0], fragments[0], fragments[0]
+-	case 2: // Splitting a wildcard scope with specified kind "dashboards:*" -> kind: "dashboards"; attribute: "*"; identifier: "*"
+-		return fragments[0], fragments[1], fragments[1]
+-	default: // Splitting a scope with all fields specified "dashboards:uid:my_dash" -> kind: "dashboards"; attribute: "uid"; identifier: "my_dash"
+-		return fragments[0], fragments[1], strings.Join(fragments[2:], ":")
+-	}
+-}
+diff --git a/pkg/services/authz/zanzana/server/server_mutate_teambindings.go b/pkg/services/authz/zanzana/server/server_mutate_teambindings.go
+index 42a489b4f3d59..59cde11136813 100644
+--- a/pkg/services/authz/zanzana/server/server_mutate_teambindings.go
++++ b/pkg/services/authz/zanzana/server/server_mutate_teambindings.go
+@@ -2,17 +2,14 @@ package server
+ 
+ import (
+ 	"context"
+-	"errors"
+-	"fmt"
+ 
+ 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
+ 
+-	iamv0 "github.com/grafana/grafana/apps/iam/pkg/apis/iam/v0alpha1"
+ 	authzextv1 "github.com/grafana/grafana/pkg/services/authz/proto/v1"
+-	zanzana "github.com/grafana/grafana/pkg/services/authz/zanzana/common"
++	"github.com/grafana/grafana/pkg/services/authz/zanzana"
+ )
+ 
+-func (s *Server) mutateTeamBindings(ctx context.Context, store *storeInfo, operations []*authzextv1.MutateOperation) error {
++func (s *Server) mutateTeamBindings(ctx context.Context, store *zanzana.StoreInfo, operations []*authzextv1.MutateOperation) error {
+ 	ctx, span := s.tracer.Start(ctx, "server.mutateTeamBindings")
+ 	defer span.End()
+ 
+@@ -22,13 +19,13 @@ func (s *Server) mutateTeamBindings(ctx context.Context, store *storeInfo, opera
+ 	for _, operation := range operations {
+ 		switch op := operation.Operation.(type) {
+ 		case *authzextv1.MutateOperation_CreateTeamBinding:
+-			tuple, err := GetTeamBindingTuple(op.CreateTeamBinding.GetSubjectName(), op.CreateTeamBinding.GetTeamName(), op.CreateTeamBinding.GetPermission())
++			tuple, err := zanzana.GetTeamBindingTuple(op.CreateTeamBinding.GetSubjectName(), op.CreateTeamBinding.GetTeamName(), op.CreateTeamBinding.GetPermission())
+ 			if err != nil {
+ 				return err
+ 			}
+ 			writeTuples = append(writeTuples, tuple)
+ 		case *authzextv1.MutateOperation_DeleteTeamBinding:
+-			tuple, err := GetTeamBindingTuple(op.DeleteTeamBinding.GetSubjectName(), op.DeleteTeamBinding.GetTeamName(), op.DeleteTeamBinding.GetPermission())
++			tuple, err := zanzana.GetTeamBindingTuple(op.DeleteTeamBinding.GetSubjectName(), op.DeleteTeamBinding.GetTeamName(), op.DeleteTeamBinding.GetPermission())
+ 			if err != nil {
+ 				return err
+ 			}
+@@ -51,33 +48,3 @@ func (s *Server) mutateTeamBindings(ctx context.Context, store *storeInfo, opera
+ 
+ 	return nil
+ }
+-
+-// GetTeamBindingTuple maps a team binding subject, team name, and permission to the corresponding
+-// Zanzana tuple. This is the canonical mapping used throughout the system.
+-func GetTeamBindingTuple(subject string, team string, permission string) (*openfgav1.TupleKey, error) {
+-	if subject == "" {
+-		return nil, errors.New("subject name cannot be empty")
+-	}
+-
+-	if team == "" {
+-		return nil, errors.New("team name cannot be empty")
+-	}
+-
+-	relation := ""
+-	switch permission {
+-	case string(iamv0.TeamBindingTeamPermissionAdmin):
+-		relation = zanzana.RelationTeamAdmin
+-	case string(iamv0.TeamBindingTeamPermissionMember):
+-		relation = zanzana.RelationTeamMember
+-	default:
+-		return nil, fmt.Errorf("unknown team permission '%s', expected member or admin", permission)
+-	}
+-
+-	tuple := &openfgav1.TupleKey{
+-		User:     zanzana.NewTupleEntry(zanzana.TypeUser, subject, ""),
+-		Relation: relation,
+-		Object:   zanzana.NewTupleEntry(zanzana.TypeTeam, team, ""),
+-	}
+-
+-	return tuple, nil
+-}
+diff --git a/pkg/services/authz/zanzana/server/server_query.go b/pkg/services/authz/zanzana/server/server_query.go
+index b35ae110fef12..b6984ee3e640f 100644
+--- a/pkg/services/authz/zanzana/server/server_query.go
++++ b/pkg/services/authz/zanzana/server/server_query.go
+@@ -10,6 +10,7 @@ import (
+ 	"go.opentelemetry.io/otel/codes"
+ 
+ 	authzextv1 "github.com/grafana/grafana/pkg/services/authz/proto/v1"
++	"github.com/grafana/grafana/pkg/services/authz/zanzana"
+ )
+ 
+ func (s *Server) Query(ctx context.Context, req *authzextv1.QueryRequest) (*authzextv1.QueryResponse, error) {
+@@ -53,7 +54,7 @@ func (s *Server) query(ctx context.Context, req *authzextv1.QueryRequest) (*auth
+ 	}
+ }
+ 
+-func (s *Server) queryFolderParents(ctx context.Context, store *storeInfo, req *authzextv1.GetFolderParentsQuery) (*authzextv1.QueryResponse, error) {
++func (s *Server) queryFolderParents(ctx context.Context, store *zanzana.StoreInfo, req *authzextv1.GetFolderParentsQuery) (*authzextv1.QueryResponse, error) {
+ 	ctx, span := s.tracer.Start(ctx, "server.queryFolderParents")
+ 	defer span.End()
+ 
+diff --git a/pkg/services/authz/zanzana/server/server_store.go b/pkg/services/authz/zanzana/server/server_store.go
+index 6b22a0cee919b..e2dace0735f53 100644
+--- a/pkg/services/authz/zanzana/server/server_store.go
++++ b/pkg/services/authz/zanzana/server/server_store.go
+@@ -8,17 +8,11 @@ import (
+ 	"github.com/openfga/language/pkg/go/transformer"
+ 	"google.golang.org/protobuf/types/known/wrapperspb"
+ 
++	"github.com/grafana/grafana/pkg/services/authz/zanzana"
+ 	"github.com/grafana/grafana/pkg/services/authz/zanzana/schema"
+ )
+ 
+-// StoreIdentity contains the basic identifying information for an OpenFGA store.
+-// This is used to minimize memory allocation when listing stores.
+-type StoreIdentity struct {
+-	ID   string
+-	Name string
+-}
+-
+-func (s *Server) getStoreInfo(ctx context.Context, namespace string) (*storeInfo, error) {
++func (s *Server) getStoreInfo(ctx context.Context, namespace string) (*zanzana.StoreInfo, error) {
+ 	s.storesMU.Lock()
+ 	defer s.storesMU.Unlock()
+ 	info, ok := s.stores[namespace]
+@@ -36,8 +30,9 @@ func (s *Server) getStoreInfo(ctx context.Context, namespace string) (*storeInfo
+ 		return nil, err
+ 	}
+ 
+-	info = storeInfo{
++	info = zanzana.StoreInfo{
+ 		ID:      store.GetId(),
++		Name:    store.GetName(),
+ 		ModelID: modelID,
+ 	}
+ 
+@@ -46,6 +41,34 @@ func (s *Server) getStoreInfo(ctx context.Context, namespace string) (*storeInfo
+ 	return &info, nil
+ }
+ 
++func (s *Server) GetStore(ctx context.Context, namespace string) (*zanzana.StoreInfo, error) {
++	s.storesMU.Lock()
++	defer s.storesMU.Unlock()
++	info, ok := s.stores[namespace]
++	if ok {
++		return &zanzana.StoreInfo{
++			ID:   info.ID,
++			Name: info.Name,
++		}, nil
++	}
++
++	res, err := s.openFGAClient.ListStores(ctx, &openfgav1.ListStoresRequest{Name: namespace})
++	if err != nil {
++		return nil, fmt.Errorf("failed to load zanzana stores: %w", err)
++	}
++
++	for _, s := range res.GetStores() {
++		if s.GetName() == namespace {
++			return &zanzana.StoreInfo{
++				ID:   s.GetId(),
++				Name: s.GetName(),
++			}, nil
++		}
++	}
++
++	return nil, fmt.Errorf("store not found")
++}
++
+ func (s *Server) getOrCreateStore(ctx context.Context, namespace string) (*openfgav1.Store, error) {
+ 	res, err := s.openFGAClient.ListStores(ctx, &openfgav1.ListStoresRequest{Name: namespace})
+ 	if err != nil {
+@@ -113,8 +136,8 @@ func (s *Server) loadModel(ctx context.Context, storeID string, modules []transf
+ // ListAllStores returns all OpenFGA stores with pagination support.
+ // Each store name corresponds to a namespace in the system.
+ // Returns only ID and Name to minimize memory allocation.
+-func (s *Server) ListAllStores(ctx context.Context) ([]StoreIdentity, error) {
+-	var stores []StoreIdentity
++func (s *Server) ListAllStores(ctx context.Context) ([]zanzana.StoreInfo, error) {
++	var stores []zanzana.StoreInfo
+ 	var continuationToken string
+ 
+ 	for {
+@@ -126,7 +149,7 @@ func (s *Server) ListAllStores(ctx context.Context) ([]StoreIdentity, error) {
+ 		}
+ 
+ 		for _, store := range res.GetStores() {
+-			stores = append(stores, StoreIdentity{
++			stores = append(stores, zanzana.StoreInfo{
+ 				ID:   store.GetId(),
+ 				Name: store.GetName(),
+ 			})
+diff --git a/pkg/services/authz/zanzana/tuple_helpers.go b/pkg/services/authz/zanzana/tuple_helpers.go
+index fece8723f9ea4..bce29417a7cb8 100644
+--- a/pkg/services/authz/zanzana/tuple_helpers.go
++++ b/pkg/services/authz/zanzana/tuple_helpers.go
+@@ -1,8 +1,23 @@
+ package zanzana
+ 
+ import (
+-	"github.com/grafana/grafana/pkg/infra/log"
++	"errors"
++	"fmt"
++	"strings"
++
+ 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
++	"google.golang.org/protobuf/types/known/structpb"
++
++	iamv0 "github.com/grafana/grafana/apps/iam/pkg/apis/iam/v0alpha1"
++
++	"github.com/grafana/grafana/pkg/infra/log"
++	authzextv1 "github.com/grafana/grafana/pkg/services/authz/proto/v1"
++)
++
++var (
++	errEmptyName        = errors.New("name cannot be empty")
++	errInvalidBasicRole = errors.New("invalid basic role")
++	errUnknownKind      = errors.New("unknown permission kind")
+ )
+ 
+ // TupleStringWithoutCondition returns the string representation of a tuple without its condition.
+@@ -79,3 +94,200 @@ func ConvertRolePermissionsToTuples(roleUID string, permissions []RolePermission
+ 
+ 	return tuples, nil
+ }
++
++// RoleToTuples converts role and its permissions (action/scope) to v1 TupleKey format
++// using the shared ConvertRolePermissionsToTuples utility and common.ToAuthzExtTupleKeys
++func RoleToTuples(roleUID string, permissions []*authzextv1.RolePermission) ([]*openfgav1.TupleKey, error) {
++	// Convert to RolePermission
++	rolePerms := make([]RolePermission, 0, len(permissions))
++	for _, perm := range permissions {
++		// Split the scope to get kind, attribute, identifier
++		kind, _, identifier := splitScope(perm.Scope)
++		rolePerms = append(rolePerms, RolePermission{
++			Action:     perm.Action,
++			Kind:       kind,
++			Identifier: identifier,
++		})
++	}
++
++	// Translate to Zanzana tuples
++	tuples, err := ConvertRolePermissionsToTuples(roleUID, rolePerms)
++	if err != nil {
++		return nil, err
++	}
++
++	return tuples, nil
++}
++
++func splitScope(scope string) (string, string, string) {
++	if scope == "" {
++		return "", "", ""
++	}
++
++	fragments := strings.Split(scope, ":")
++	switch l := len(fragments); l {
++	case 1: // Splitting a wildcard scope "*" -> kind: "*"; attribute: "*"; identifier: "*"
++		return fragments[0], fragments[0], fragments[0]
++	case 2: // Splitting a wildcard scope with specified kind "dashboards:*" -> kind: "dashboards"; attribute: "*"; identifier: "*"
++		return fragments[0], fragments[1], fragments[1]
++	default: // Splitting a scope with all fields specified "dashboards:uid:my_dash" -> kind: "dashboards"; attribute: "uid"; identifier: "my_dash"
++		return fragments[0], fragments[1], strings.Join(fragments[2:], ":")
++	}
++}
++
++func GetRoleBindingTuple(subjectKind string, subjectName string, roleName string) (*openfgav1.TupleKey, error) {
++	zanzanaType := ""
++	subjectRelation := ""
++
++	switch subjectKind {
++	case string(iamv0.RoleBindingSpecSubjectKindUser):
++		zanzanaType = TypeUser
++	case string(iamv0.RoleBindingSpecSubjectKindTeam):
++		zanzanaType = TypeTeam
++		subjectRelation = RelationTeamMember
++	case string(iamv0.RoleBindingSpecSubjectKindServiceAccount):
++		zanzanaType = TypeServiceAccount
++	case string(iamv0.RoleBindingSpecSubjectKindBasicRole):
++		zanzanaType = TypeRole
++		subjectRelation = RelationAssignee
++	default:
++		return nil, fmt.Errorf("invalid subject kind: %s", subjectKind)
++	}
++
++	tuple := &openfgav1.TupleKey{
++		User:     NewTupleEntry(zanzanaType, subjectName, subjectRelation),
++		Relation: RelationAssignee,
++		Object:   NewTupleEntry(TypeRole, roleName, ""),
++	}
++
++	return tuple, nil
++}
++
++func GetResourcePermissionWriteTuple(req *authzextv1.CreatePermissionOperation) (*openfgav1.TupleKey, error) {
++	resource := req.GetResource()
++	permission := req.GetPermission()
++	object := NewObjectEntry(toZanzanaType(resource.GetGroup()), resource.GetGroup(), resource.GetResource(), "", resource.GetName())
++	tuple, err := NewResourceTuple(object, resource, permission)
++	if err != nil {
++		return nil, err
++	}
++
++	return tuple, nil
++}
++
++func GetResourcePermissionDeleteTuple(req *authzextv1.DeletePermissionOperation) (*openfgav1.TupleKeyWithoutCondition, error) {
++	resource := req.GetResource()
++	permission := req.GetPermission()
++	object := NewObjectEntry(toZanzanaType(resource.GetGroup()), resource.GetGroup(), resource.GetResource(), "", resource.GetName())
++	tuple, err := NewResourceTuple(object, resource, permission)
++	if err != nil {
++		return nil, err
++	}
++
++	return &openfgav1.TupleKeyWithoutCondition{
++		User:     tuple.GetUser(),
++		Relation: tuple.GetRelation(),
++		Object:   tuple.GetObject(),
++	}, nil
++}
++
++func toZanzanaType(apiGroup string) string {
++	if apiGroup == "folder.grafana.app" {
++		return TypeFolder
++	}
++	return TypeResource
++}
++
++func NewResourceTuple(object string, resource *authzextv1.Resource, perm *authzextv1.Permission) (*openfgav1.TupleKey, error) {
++	// Typ is "folder" or "resource"
++	typ := toZanzanaType(resource.Group)
++
++	// subject
++	subject, err := toZanzanaSubject(perm.GetKind(), perm.GetName())
++	if err != nil {
++		return nil, err
++	}
++
++	key := &openfgav1.TupleKey{
++		// e.g. "user:{uid}", "serviceaccount:{uid}", "team:{uid}", "basicrole:{viewer|editor|admin}"
++		User: subject,
++		// "view", "edit", "admin"
++		Relation: strings.ToLower(perm.Verb),
++		// e.g. "folder:{name}" or "resource:{apiGroup}/{resource}/{name}"
++		Object: object,
++	}
++
++	// For resources we add a condition to filter by apiGroup/resource
++	// e.g "group_filter": {"group_resource": "dashboards.grafana.app/dashboards"}
++	if typ == TypeResource {
++		key.Condition = &openfgav1.RelationshipCondition{
++			Name: "group_filter",
++			Context: &structpb.Struct{
++				Fields: map[string]*structpb.Value{
++					"group_resource": structpb.NewStringValue(
++						resource.GetGroup() + "/" + resource.GetResource(),
++					),
++				},
++			},
++		}
++	}
++
++	return key, nil
++}
++
++func toZanzanaSubject(kind string, name string) (string, error) {
++	if name == "" {
++		return "", errEmptyName
++	}
++	iamKind := iamv0.ResourcePermissionSpecPermissionKind(kind)
++	switch iamKind {
++	case iamv0.ResourcePermissionSpecPermissionKindUser:
++		return NewTupleEntry(TypeUser, name, ""), nil
++	case iamv0.ResourcePermissionSpecPermissionKindServiceAccount:
++		return NewTupleEntry(TypeServiceAccount, name, ""), nil
++	case iamv0.ResourcePermissionSpecPermissionKindTeam:
++		return NewTupleEntry(TypeTeam, name, RelationTeamMember), nil
++	case iamv0.ResourcePermissionSpecPermissionKindBasicRole:
++		basicRole := TranslateBasicRole(name)
++		if basicRole == "" {
++			return "", fmt.Errorf("%w: %s", errInvalidBasicRole, name)
++		}
++
++		// e.g role:basic_viewer#assignee
++		return NewTupleEntry(TypeRole, basicRole, RelationAssignee), nil
++	}
++
++	// should not happen since we are after create
++	// validation webhook should have caught invalid kinds
++	return "", errUnknownKind
++}
++
++// GetTeamBindingTuple maps a team binding subject, team name, and permission to the corresponding
++// Zanzana tuple. This is the canonical mapping used throughout the system.
++func GetTeamBindingTuple(subject string, team string, permission string) (*openfgav1.TupleKey, error) {
++	if subject == "" {
++		return nil, errors.New("subject name cannot be empty")
++	}
++
++	if team == "" {
++		return nil, errors.New("team name cannot be empty")
++	}
++
++	relation := ""
++	switch permission {
++	case string(iamv0.TeamBindingTeamPermissionAdmin):
++		relation = RelationTeamAdmin
++	case string(iamv0.TeamBindingTeamPermissionMember):
++		relation = RelationTeamMember
++	default:
++		return nil, fmt.Errorf("unknown team permission '%s', expected member or admin", permission)
++	}
++
++	tuple := &openfgav1.TupleKey{
++		User:     NewTupleEntry(TypeUser, subject, ""),
++		Relation: relation,
++		Object:   NewTupleEntry(TypeTeam, team, ""),
++	}
++
++	return tuple, nil
++}

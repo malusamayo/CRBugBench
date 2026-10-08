@@ -1,0 +1,869 @@
+commit 2332df245545fae31c996f65c5aa1c50799d3be1
+Author: David Karnok <akarnokd@gmail.com>
+Date:   Fri Dec 9 18:24:31 2016 +0100
+
+    2.x: fix & update Observable.repeatWhen and redoWhen (#4911)
+
+diff --git a/src/main/java/io/reactivex/Observable.java b/src/main/java/io/reactivex/Observable.java
+index 04d569957..96de4fd6c 100644
+--- a/src/main/java/io/reactivex/Observable.java
++++ b/src/main/java/io/reactivex/Observable.java
+@@ -8884,7 +8884,7 @@ public abstract class Observable<T> implements ObservableSource<T> {
+     @SchedulerSupport(SchedulerSupport.NONE)
+     public final Observable<T> repeatWhen(final Function<? super Observable<Object>, ? extends ObservableSource<?>> handler) {
+         ObjectHelper.requireNonNull(handler, "handler is null");
+-        return RxJavaPlugins.onAssembly(new ObservableRedo<T>(this, ObservableInternalHelper.repeatWhenHandler(handler), false));
++        return RxJavaPlugins.onAssembly(new ObservableRepeatWhen<T>(this, handler));
+     }
+ 
+     /**
+@@ -9560,7 +9560,7 @@ public abstract class Observable<T> implements ObservableSource<T> {
+     public final Observable<T> retryWhen(
+             final Function<? super Observable<Throwable>, ? extends ObservableSource<?>> handler) {
+         ObjectHelper.requireNonNull(handler, "handler is null");
+-        return RxJavaPlugins.onAssembly(new ObservableRedo<T>(this, ObservableInternalHelper.retryWhenHandler(handler), true));
++        return RxJavaPlugins.onAssembly(new ObservableRetryWhen<T>(this, handler));
+     }
+ 
+     /**
+diff --git a/src/main/java/io/reactivex/internal/observers/ToNotificationObserver.java b/src/main/java/io/reactivex/internal/observers/ToNotificationObserver.java
+deleted file mode 100644
+index 00f27480b..000000000
+--- a/src/main/java/io/reactivex/internal/observers/ToNotificationObserver.java
++++ /dev/null
+@@ -1,86 +0,0 @@
+-/**
+- * Copyright 2016 Netflix, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in
+- * compliance with the License. You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software distributed under the License is
+- * distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See
+- * the License for the specific language governing permissions and limitations under the License.
+- */
+-
+-package io.reactivex.internal.observers;
+-
+-import java.util.concurrent.atomic.AtomicReference;
+-
+-import io.reactivex.*;
+-import io.reactivex.disposables.Disposable;
+-import io.reactivex.exceptions.*;
+-import io.reactivex.functions.Consumer;
+-import io.reactivex.internal.disposables.DisposableHelper;
+-import io.reactivex.plugins.RxJavaPlugins;
+-
+-public final class ToNotificationObserver<T>
+-extends AtomicReference<Disposable>
+-implements Observer<T>, Disposable {
+-    private static final long serialVersionUID = -7420197867343208289L;
+-
+-    final Consumer<? super Notification<Object>> consumer;
+-
+-    public ToNotificationObserver(Consumer<? super Notification<Object>> consumer) {
+-        this.consumer = consumer;
+-    }
+-
+-    @Override
+-    public void onSubscribe(Disposable s) {
+-        DisposableHelper.setOnce(this, s);
+-    }
+-
+-    @Override
+-    public void onNext(T t) {
+-        if (t == null) {
+-            get().dispose();
+-            onError(new NullPointerException("onNext called with null. Null values are generally not allowed in 2.x operators and sources."));
+-        } else {
+-            try {
+-                consumer.accept(Notification.<Object>createOnNext(t));
+-            } catch (Throwable ex) {
+-                Exceptions.throwIfFatal(ex);
+-                get().dispose();
+-                onError(ex);
+-            }
+-        }
+-    }
+-
+-    @Override
+-    public void onError(Throwable t) {
+-        try {
+-            consumer.accept(Notification.<Object>createOnError(t));
+-        } catch (Throwable ex) {
+-            Exceptions.throwIfFatal(ex);
+-            RxJavaPlugins.onError(new CompositeException(t, ex));
+-        }
+-    }
+-
+-    @Override
+-    public void onComplete() {
+-        try {
+-            consumer.accept(Notification.createOnComplete());
+-        } catch (Throwable ex) {
+-            Exceptions.throwIfFatal(ex);
+-            RxJavaPlugins.onError(ex);
+-        }
+-    }
+-
+-    @Override
+-    public void dispose() {
+-        DisposableHelper.dispose(this);
+-    }
+-
+-    @Override
+-    public boolean isDisposed() {
+-        return DisposableHelper.isDisposed(get());
+-    }
+-}
+diff --git a/src/main/java/io/reactivex/internal/operators/observable/ObservableRedo.java b/src/main/java/io/reactivex/internal/operators/observable/ObservableRedo.java
+deleted file mode 100644
+index 14b1cb841..000000000
+--- a/src/main/java/io/reactivex/internal/operators/observable/ObservableRedo.java
++++ /dev/null
+@@ -1,154 +0,0 @@
+-/**
+- * Copyright 2016 Netflix, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in
+- * compliance with the License. You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software distributed under the License is
+- * distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See
+- * the License for the specific language governing permissions and limitations under the License.
+- */
+-
+-package io.reactivex.internal.operators.observable;
+-
+-import java.util.concurrent.atomic.*;
+-
+-import io.reactivex.*;
+-import io.reactivex.disposables.Disposable;
+-import io.reactivex.exceptions.Exceptions;
+-import io.reactivex.functions.*;
+-import io.reactivex.internal.disposables.*;
+-import io.reactivex.internal.functions.ObjectHelper;
+-import io.reactivex.internal.observers.ToNotificationObserver;
+-import io.reactivex.subjects.*;
+-
+-public final class ObservableRedo<T> extends AbstractObservableWithUpstream<T, T> {
+-    final Function<? super Observable<Notification<Object>>, ? extends ObservableSource<?>> manager;
+-
+-    final boolean retryMode;
+-
+-    public ObservableRedo(ObservableSource<T> source,
+-            Function<? super Observable<Notification<Object>>, ? extends ObservableSource<?>> manager,
+-                    boolean retryMode) {
+-        super(source);
+-        this.manager = manager;
+-        this.retryMode = retryMode;
+-    }
+-
+-    @Override
+-    public void subscribeActual(Observer<? super T> s) {
+-
+-        Subject<Notification<Object>> subject = BehaviorSubject.<Notification<Object>>create().toSerialized();
+-
+-        final RedoObserver<T> parent = new RedoObserver<T>(s, subject, source, retryMode);
+-
+-        ToNotificationObserver<Object> actionObserver = new ToNotificationObserver<Object>(new Consumer<Notification<Object>>() {
+-            @Override
+-            public void accept(Notification<Object> o) {
+-                parent.handle(o);
+-            }
+-        });
+-        ListCompositeDisposable cd = new ListCompositeDisposable(parent.arbiter, actionObserver);
+-        s.onSubscribe(cd);
+-
+-        ObservableSource<?> action;
+-
+-        try {
+-            action = ObjectHelper.requireNonNull(manager.apply(subject), "The function returned a null ObservableSource");
+-        } catch (Throwable ex) {
+-            Exceptions.throwIfFatal(ex);
+-            s.onError(ex);
+-            return;
+-        }
+-
+-        action.subscribe(actionObserver);
+-
+-        // trigger first subscription
+-        parent.handle(Notification.<Object>createOnNext(0));
+-    }
+-
+-    static final class RedoObserver<T> extends AtomicBoolean implements Observer<T> {
+-
+-        private static final long serialVersionUID = -1151903143112844287L;
+-        final Observer<? super T> actual;
+-        final Subject<Notification<Object>> subject;
+-        final ObservableSource<? extends T> source;
+-        final SequentialDisposable arbiter;
+-
+-        final boolean retryMode;
+-
+-        final AtomicInteger wip = new AtomicInteger();
+-
+-        RedoObserver(Observer<? super T> actual, Subject<Notification<Object>> subject, ObservableSource<? extends T> source, boolean retryMode) {
+-            this.actual = actual;
+-            this.subject = subject;
+-            this.source = source;
+-            this.arbiter = new SequentialDisposable();
+-            this.retryMode = retryMode;
+-            this.lazySet(true);
+-        }
+-
+-        @Override
+-        public void onSubscribe(Disposable s) {
+-            arbiter.replace(s);
+-        }
+-
+-        @Override
+-        public void onNext(T t) {
+-            actual.onNext(t);
+-        }
+-
+-        @Override
+-        public void onError(Throwable t) {
+-            if (compareAndSet(false, true)) {
+-                if (retryMode) {
+-                    subject.onNext(Notification.createOnError(t));
+-                } else {
+-                    subject.onError(t);
+-                }
+-            }
+-        }
+-
+-        @Override
+-        public void onComplete() {
+-            if (compareAndSet(false, true)) {
+-                if (retryMode) {
+-                    subject.onComplete();
+-                } else {
+-                    subject.onNext(Notification.createOnComplete());
+-                }
+-            }
+-        }
+-
+-        void handle(Notification<Object> notification) {
+-            if (compareAndSet(true, false)) {
+-                if (notification.isOnError()) {
+-                    arbiter.dispose();
+-                    actual.onError(notification.getError());
+-                } else {
+-                    if (notification.isOnNext()) {
+-                        if (wip.getAndIncrement() == 0) {
+-                            int missed = 1;
+-                            for (;;) {
+-                                if (arbiter.isDisposed()) {
+-                                    return;
+-                                }
+-                                source.subscribe(this);
+-
+-                                missed = wip.addAndGet(-missed);
+-                                if (missed == 0) {
+-                                    break;
+-                                }
+-                            }
+-                        }
+-                    } else {
+-                        arbiter.dispose();
+-                        actual.onComplete();
+-                    }
+-                }
+-            }
+-        }
+-    }
+-}
+diff --git a/src/main/java/io/reactivex/internal/operators/observable/ObservableRepeatWhen.java b/src/main/java/io/reactivex/internal/operators/observable/ObservableRepeatWhen.java
+new file mode 100644
+index 000000000..78c9ba90b
+--- /dev/null
++++ b/src/main/java/io/reactivex/internal/operators/observable/ObservableRepeatWhen.java
+@@ -0,0 +1,181 @@
++/**
++ * Copyright 2016 Netflix, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in
++ * compliance with the License. You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License is
++ * distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See
++ * the License for the specific language governing permissions and limitations under the License.
++ */
++
++package io.reactivex.internal.operators.observable;
++
++import java.util.concurrent.atomic.*;
++
++import io.reactivex.*;
++import io.reactivex.disposables.Disposable;
++import io.reactivex.exceptions.Exceptions;
++import io.reactivex.functions.Function;
++import io.reactivex.internal.disposables.*;
++import io.reactivex.internal.functions.ObjectHelper;
++import io.reactivex.internal.util.*;
++import io.reactivex.subjects.*;
++
++/**
++ * Repeatedly subscribe to a source if a handler ObservableSource signals an item.
++ *
++ * @param <T> the value type
++ */
++public final class ObservableRepeatWhen<T> extends AbstractObservableWithUpstream<T, T> {
++
++    final Function<? super Observable<Object>, ? extends ObservableSource<?>> handler;
++
++    public ObservableRepeatWhen(ObservableSource<T> source, Function<? super Observable<Object>, ? extends ObservableSource<?>> handler) {
++        super(source);
++        this.handler = handler;
++    }
++
++    @Override
++    protected void subscribeActual(Observer<? super T> observer) {
++        Subject<Object> signaller = PublishSubject.create().toSerialized();
++
++        ObservableSource<?> other;
++
++        try {
++            other = ObjectHelper.requireNonNull(handler.apply(signaller), "The handler returned a null ObservableSource");
++        } catch (Throwable ex) {
++            Exceptions.throwIfFatal(ex);
++            EmptyDisposable.error(ex, observer);
++            return;
++        }
++
++        RepeatWhenObserver<T> parent = new RepeatWhenObserver<T>(observer, signaller, source);
++        observer.onSubscribe(parent);
++
++        other.subscribe(parent.inner);
++
++        parent.subscribeNext();
++    }
++
++    static final class RepeatWhenObserver<T> extends AtomicInteger implements Observer<T>, Disposable {
++
++        private static final long serialVersionUID = 802743776666017014L;
++
++        final Observer<? super T> actual;
++
++        final AtomicInteger wip;
++
++        final AtomicThrowable error;
++
++        final Subject<Object> signaller;
++
++        final InnerRepeatObserver inner;
++
++        final AtomicReference<Disposable> d;
++
++        final ObservableSource<T> source;
++
++        volatile boolean active;
++
++        RepeatWhenObserver(Observer<? super T> actual, Subject<Object> signaller, ObservableSource<T> source) {
++            this.actual = actual;
++            this.signaller = signaller;
++            this.source = source;
++            this.wip = new AtomicInteger();
++            this.error = new AtomicThrowable();
++            this.inner = new InnerRepeatObserver();
++            this.d = new AtomicReference<Disposable>();
++        }
++
++        @Override
++        public void onSubscribe(Disposable d) {
++            DisposableHelper.replace(this.d, d);
++        }
++
++        @Override
++        public void onNext(T t) {
++            HalfSerializer.onNext(actual, t, this, error);
++        }
++
++        @Override
++        public void onError(Throwable e) {
++            DisposableHelper.dispose(inner);
++            HalfSerializer.onError(actual, e, this, error);
++        }
++
++        @Override
++        public void onComplete() {
++            active = false;
++            signaller.onNext(0);
++        }
++
++        @Override
++        public boolean isDisposed() {
++            return DisposableHelper.isDisposed(d.get());
++        }
++
++        @Override
++        public void dispose() {
++            DisposableHelper.dispose(d);
++            DisposableHelper.dispose(inner);
++        }
++
++        void innerNext() {
++            subscribeNext();
++        }
++
++        void innerError(Throwable ex) {
++            DisposableHelper.dispose(d);
++            HalfSerializer.onError(actual, ex, this, error);
++        }
++
++        void innerComplete() {
++            DisposableHelper.dispose(d);
++            HalfSerializer.onComplete(actual, this, error);
++        }
++
++        void subscribeNext() {
++            if (wip.getAndIncrement() == 0) {
++
++                do {
++                    if (isDisposed()) {
++                        return;
++                    }
++
++                    if (!active) {
++                        active = true;
++                        source.subscribe(this);
++                    }
++                } while (wip.decrementAndGet() != 0);
++            }
++        }
++
++        final class InnerRepeatObserver extends AtomicReference<Disposable> implements Observer<Object> {
++
++            private static final long serialVersionUID = 3254781284376480842L;
++
++            @Override
++            public void onSubscribe(Disposable d) {
++                DisposableHelper.setOnce(this, d);
++            }
++
++            @Override
++            public void onNext(Object t) {
++                innerNext();
++            }
++
++            @Override
++            public void onError(Throwable e) {
++                innerError(e);
++            }
++
++            @Override
++            public void onComplete() {
++                innerComplete();
++            }
++        }
++    }
++}
+diff --git a/src/main/java/io/reactivex/internal/operators/observable/ObservableRetryWhen.java b/src/main/java/io/reactivex/internal/operators/observable/ObservableRetryWhen.java
+new file mode 100644
+index 000000000..f85b3b360
+--- /dev/null
++++ b/src/main/java/io/reactivex/internal/operators/observable/ObservableRetryWhen.java
+@@ -0,0 +1,181 @@
++/**
++ * Copyright 2016 Netflix, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in
++ * compliance with the License. You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License is
++ * distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See
++ * the License for the specific language governing permissions and limitations under the License.
++ */
++
++package io.reactivex.internal.operators.observable;
++
++import java.util.concurrent.atomic.*;
++
++import io.reactivex.*;
++import io.reactivex.disposables.Disposable;
++import io.reactivex.exceptions.Exceptions;
++import io.reactivex.functions.Function;
++import io.reactivex.internal.disposables.*;
++import io.reactivex.internal.functions.ObjectHelper;
++import io.reactivex.internal.util.*;
++import io.reactivex.subjects.*;
++
++/**
++ * Repeatedly subscribe to a source if a handler ObservableSource signals an item.
++ *
++ * @param <T> the value type
++ */
++public final class ObservableRetryWhen<T> extends AbstractObservableWithUpstream<T, T> {
++
++    final Function<? super Observable<Throwable>, ? extends ObservableSource<?>> handler;
++
++    public ObservableRetryWhen(ObservableSource<T> source, Function<? super Observable<Throwable>, ? extends ObservableSource<?>> handler) {
++        super(source);
++        this.handler = handler;
++    }
++
++    @Override
++    protected void subscribeActual(Observer<? super T> observer) {
++        Subject<Throwable> signaller = PublishSubject.<Throwable>create().toSerialized();
++
++        ObservableSource<?> other;
++
++        try {
++            other = ObjectHelper.requireNonNull(handler.apply(signaller), "The handler returned a null ObservableSource");
++        } catch (Throwable ex) {
++            Exceptions.throwIfFatal(ex);
++            EmptyDisposable.error(ex, observer);
++            return;
++        }
++
++        RepeatWhenObserver<T> parent = new RepeatWhenObserver<T>(observer, signaller, source);
++        observer.onSubscribe(parent);
++
++        other.subscribe(parent.inner);
++
++        parent.subscribeNext();
++    }
++
++    static final class RepeatWhenObserver<T> extends AtomicInteger implements Observer<T>, Disposable {
++
++        private static final long serialVersionUID = 802743776666017014L;
++
++        final Observer<? super T> actual;
++
++        final AtomicInteger wip;
++
++        final AtomicThrowable error;
++
++        final Subject<Throwable> signaller;
++
++        final InnerRepeatObserver inner;
++
++        final AtomicReference<Disposable> d;
++
++        final ObservableSource<T> source;
++
++        volatile boolean active;
++
++        RepeatWhenObserver(Observer<? super T> actual, Subject<Throwable> signaller, ObservableSource<T> source) {
++            this.actual = actual;
++            this.signaller = signaller;
++            this.source = source;
++            this.wip = new AtomicInteger();
++            this.error = new AtomicThrowable();
++            this.inner = new InnerRepeatObserver();
++            this.d = new AtomicReference<Disposable>();
++        }
++
++        @Override
++        public void onSubscribe(Disposable d) {
++            DisposableHelper.replace(this.d, d);
++        }
++
++        @Override
++        public void onNext(T t) {
++            HalfSerializer.onNext(actual, t, this, error);
++        }
++
++        @Override
++        public void onError(Throwable e) {
++            active = false;
++            signaller.onNext(e);
++        }
++
++        @Override
++        public void onComplete() {
++            DisposableHelper.dispose(inner);
++            HalfSerializer.onComplete(actual, this, error);
++        }
++
++        @Override
++        public boolean isDisposed() {
++            return DisposableHelper.isDisposed(d.get());
++        }
++
++        @Override
++        public void dispose() {
++            DisposableHelper.dispose(d);
++            DisposableHelper.dispose(inner);
++        }
++
++        void innerNext() {
++            subscribeNext();
++        }
++
++        void innerError(Throwable ex) {
++            DisposableHelper.dispose(d);
++            HalfSerializer.onError(actual, ex, this, error);
++        }
++
++        void innerComplete() {
++            DisposableHelper.dispose(d);
++            HalfSerializer.onComplete(actual, this, error);
++        }
++
++        void subscribeNext() {
++            if (wip.getAndIncrement() == 0) {
++
++                do {
++                    if (isDisposed()) {
++                        return;
++                    }
++
++                    if (!active) {
++                        active = true;
++                        source.subscribe(this);
++                    }
++                } while (wip.decrementAndGet() != 0);
++            }
++        }
++
++        final class InnerRepeatObserver extends AtomicReference<Disposable> implements Observer<Object> {
++
++            private static final long serialVersionUID = 3254781284376480842L;
++
++            @Override
++            public void onSubscribe(Disposable d) {
++                DisposableHelper.setOnce(this, d);
++            }
++
++            @Override
++            public void onNext(Object t) {
++                innerNext();
++            }
++
++            @Override
++            public void onError(Throwable e) {
++                innerError(e);
++            }
++
++            @Override
++            public void onComplete() {
++                innerComplete();
++            }
++        }
++    }
++}
+diff --git a/src/test/java/io/reactivex/internal/observers/ToNotificationObserverTest.java b/src/test/java/io/reactivex/internal/observers/ToNotificationObserverTest.java
+deleted file mode 100644
+index 3d11cae31..000000000
+--- a/src/test/java/io/reactivex/internal/observers/ToNotificationObserverTest.java
++++ /dev/null
+@@ -1,148 +0,0 @@
+-/**
+- * Copyright 2016 Netflix, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in
+- * compliance with the License. You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software distributed under the License is
+- * distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See
+- * the License for the specific language governing permissions and limitations under the License.
+- */
+-
+-package io.reactivex.internal.observers;
+-
+-import static org.junit.Assert.*;
+-
+-import java.util.*;
+-
+-import org.junit.Test;
+-
+-import io.reactivex.*;
+-import io.reactivex.disposables.*;
+-import io.reactivex.exceptions.*;
+-import io.reactivex.functions.Consumer;
+-import io.reactivex.internal.functions.Functions;
+-import io.reactivex.plugins.RxJavaPlugins;
+-
+-public class ToNotificationObserverTest {
+-
+-    @Test
+-    public void doubleOnSubscribe() {
+-        ToNotificationObserver<Integer> o = new ToNotificationObserver<Integer>(Functions.emptyConsumer());
+-
+-        Disposable d1 = Disposables.empty();
+-
+-        o.onSubscribe(d1);
+-
+-        Disposable d2 = Disposables.empty();
+-
+-        o.onSubscribe(d2);
+-
+-        assertFalse(d1.isDisposed());
+-
+-        assertTrue(d2.isDisposed());
+-    }
+-
+-    @Test
+-    public void nullOnNext() {
+-        final List<Notification<Object>> list = new ArrayList<Notification<Object>>();
+-
+-        ToNotificationObserver<Integer> o = new ToNotificationObserver<Integer>(new Consumer<Notification<Object>>() {
+-            @Override
+-            public void accept(Notification<Object> e) throws Exception {
+-                list.add(e);
+-            }
+-        });
+-
+-        Disposable d1 = Disposables.empty();
+-
+-        o.onSubscribe(d1);
+-
+-        o.onNext(null);
+-
+-        assertTrue(d1.isDisposed());
+-
+-        assertTrue(list.toString(), list.get(0).getError() instanceof NullPointerException);
+-    }
+-
+-    @Test
+-    public void onNextCrash() {
+-        final List<Notification<Object>> list = new ArrayList<Notification<Object>>();
+-
+-        ToNotificationObserver<Integer> o = new ToNotificationObserver<Integer>(new Consumer<Notification<Object>>() {
+-            @Override
+-            public void accept(Notification<Object> e) throws Exception {
+-                if (e.isOnNext()) {
+-                    throw new TestException();
+-                } else {
+-                    list.add(e);
+-                }
+-            }
+-        });
+-
+-        Disposable d1 = Disposables.empty();
+-
+-        o.onSubscribe(d1);
+-
+-        o.onNext(1);
+-
+-        assertTrue(d1.isDisposed());
+-
+-        assertTrue(list.toString(), list.get(0).getError() instanceof TestException);
+-    }
+-
+-    @Test
+-    public void onErrorCrash() {
+-        final List<Throwable> list = TestHelper.trackPluginErrors();
+-
+-        try {
+-            ToNotificationObserver<Integer> o = new ToNotificationObserver<Integer>(new Consumer<Notification<Object>>() {
+-                @Override
+-                public void accept(Notification<Object> e) throws Exception {
+-                    throw new TestException("Inner");
+-                }
+-            });
+-
+-            Disposable d1 = Disposables.empty();
+-
+-            o.onSubscribe(d1);
+-
+-            o.onError(new TestException("Outer"));
+-
+-            TestHelper.assertError(list, 0, CompositeException.class);
+-
+-            List<Throwable> ce = TestHelper.compositeList(list.get(0));
+-
+-            TestHelper.assertError(ce, 0, TestException.class, "Outer");
+-            TestHelper.assertError(ce, 1, TestException.class, "Inner");
+-        } finally {
+-            RxJavaPlugins.reset();
+-        }
+-    }
+-
+-    @Test
+-    public void onCompleteCrash() {
+-        final List<Throwable> list = TestHelper.trackPluginErrors();
+-
+-        try {
+-            ToNotificationObserver<Integer> o = new ToNotificationObserver<Integer>(new Consumer<Notification<Object>>() {
+-                @Override
+-                public void accept(Notification<Object> e) throws Exception {
+-                    throw new TestException("Inner");
+-                }
+-            });
+-
+-            Disposable d1 = Disposables.empty();
+-
+-            o.onSubscribe(d1);
+-
+-            o.onComplete();
+-
+-            TestHelper.assertError(list, 0, TestException.class, "Inner");
+-        } finally {
+-            RxJavaPlugins.reset();
+-        }
+-    }
+-}
+diff --git a/src/test/java/io/reactivex/internal/operators/flowable/FlowableRepeatTest.java b/src/test/java/io/reactivex/internal/operators/flowable/FlowableRepeatTest.java
+index 40989b536..0efd36e2c 100644
+--- a/src/test/java/io/reactivex/internal/operators/flowable/FlowableRepeatTest.java
++++ b/src/test/java/io/reactivex/internal/operators/flowable/FlowableRepeatTest.java
+@@ -343,4 +343,16 @@ public class FlowableRepeatTest {
+         .awaitDone(5, TimeUnit.SECONDS)
+         .assertFailure(TestException.class);
+     }
++
++    @Test
++    public void whenTake() {
++        Flowable.range(1, 3).repeatWhen(new Function<Flowable<Object>, Flowable<Object>>() {
++            @Override
++            public Flowable<Object> apply(Flowable<Object> handler) throws Exception {
++                return handler.take(2);
++            }
++        })
++        .test()
++        .assertResult(1, 2, 3, 1, 2, 3);
++    }
+ }
+\ No newline at end of file
+diff --git a/src/test/java/io/reactivex/internal/operators/observable/ObservableRepeatTest.java b/src/test/java/io/reactivex/internal/operators/observable/ObservableRepeatTest.java
+index 64a5e68ad..94940a809 100644
+--- a/src/test/java/io/reactivex/internal/operators/observable/ObservableRepeatTest.java
++++ b/src/test/java/io/reactivex/internal/operators/observable/ObservableRepeatTest.java
+@@ -294,4 +294,34 @@ public class ObservableRepeatTest {
+         .awaitDone(5, TimeUnit.SECONDS)
+         .assertFailure(TestException.class);
+     }
++
++    @Test
++    public void whenTake() {
++        Observable.range(1, 3).repeatWhen(new Function<Observable<Object>, ObservableSource<Object>>() {
++            @Override
++            public ObservableSource<Object> apply(Observable<Object> handler) throws Exception {
++                return handler.take(2);
++            }
++        })
++        .test()
++        .assertResult(1, 2, 3, 1, 2, 3);
++    }
++
++    @Test
++    public void handlerError() {
++        Observable.range(1, 3)
++        .repeatWhen(new Function<Observable<Object>, ObservableSource<Object>>() {
++            @Override
++            public ObservableSource<Object> apply(Observable<Object> v) throws Exception {
++                return v.map(new Function<Object, Object>() {
++                    @Override
++                    public Object apply(Object w) throws Exception {
++                        throw new TestException();
++                    }
++                });
++            }
++        })
++        .test()
++        .assertFailure(TestException.class, 1, 2, 3);
++    }
+ }

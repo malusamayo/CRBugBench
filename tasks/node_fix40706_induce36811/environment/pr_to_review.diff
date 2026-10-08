@@ -1,0 +1,1212 @@
+commit d4bea09a0a9812d28780b8afc99a2b1fed2c3015
+Author: James M Snell <jasnell@gmail.com>
+Date:   Tue Jan 5 15:39:54 2021 -0800
+
+    buffer: introduce Blob
+    
+    The `Blob` object is an immutable data buffer. This is a first step
+    towards alignment with the `Blob` Web API.
+    
+    Signed-off-by: James M Snell <jasnell@gmail.com>
+    
+    PR-URL: https://github.com/nodejs/node/pull/36811
+    Reviewed-By: Antoine du Hamel <duhamelantoine1995@gmail.com>
+    Reviewed-By: Matteo Collina <matteo.collina@gmail.com>
+    Reviewed-By: Benjamin Gruenbaum <benjamingr@gmail.com>
+
+diff --git a/doc/api/buffer.md b/doc/api/buffer.md
+index cebb9b7b975..e80c72251d7 100644
+--- a/doc/api/buffer.md
++++ b/doc/api/buffer.md
+@@ -287,6 +287,119 @@ for (const b of buf) {
+ Additionally, the [`buf.values()`][], [`buf.keys()`][], and
+ [`buf.entries()`][] methods can be used to create iterators.
+ 
++## Class: `Blob`
++<!-- YAML
++added: REPLACEME
++-->
++
++> Stability: 1 - Experimental
++
++A [`Blob`][] encapsulates immutable, raw data that can be safely shared across
++multiple worker threads.
++
++### `new buffer.Blob([sources[, options]])`
++<!-- YAML
++added: REPLACEME
++-->
++
++* `sources` {string[]|ArrayBuffer[]|TypedArray[]|DataView[]|Blob[]} An array
++  of string, {ArrayBuffer}, {TypedArray}, {DataView}, or {Blob} objects, or
++  any mix of such objects, that will be stored within the `Blob`.
++* `options` {Object}
++  * `encoding` {string} The character encoding to use for string sources.
++    **Default**: `'utf8'`.
++  * `type` {string} The Blob content-type. The intent is for `type` to convey
++    the MIME media type of the data, however no validation of the type format
++    is performed.
++
++Creates a new `Blob` object containing a concatenation of the given sources.
++
++{ArrayBuffer}, {TypedArray}, {DataView}, and {Buffer} sources are copied into
++the 'Blob' and can therefore be safely modified after the 'Blob' is created.
++
++String sources are also copied into the `Blob`.
++
++### `blob.arrayBuffer()`
++<!-- YAML
++added: REPLACEME
++-->
++
++* Returns: {Promise}
++
++Returns a promise that fulfills with an {ArrayBuffer} containing a copy of
++the `Blob` data.
++
++### `blob.size`
++<!-- YAML
++added: REPLACEME
++-->
++
++The total size of the `Blob` in bytes.
++
++### `blob.slice([start, [end, [type]]])`
++<!-- YAML
++added: REPLACEME
++-->
++
++* `start` {number} The starting index.
++* `end` {number} The ending index.
++* `type` {string} The content-type for the new `Blob`
++
++Creates and returns a new `Blob` containing a subset of this `Blob` objects
++data. The original `Blob` is not alterered.
++
++### `blob.text()`
++<!-- YAML
++added: REPLACEME
++-->
++
++* Returns: {Promise}
++
++Returns a promise that resolves the contents of the `Blob` decoded as a UTF-8
++string.
++
++### `blob.type`
++<!-- YAML
++added: REPLACEME
++-->
++
++* Type: {string}
++
++The content-type of the `Blob`.
++
++### `Blob` objects and `MessageChannel`
++
++Once a {Blob} object is created, it can be sent via `MessagePort` to multiple
++destinations without transfering or immediately copying the data. The data
++contained by the `Blob` is copied only when the `arrayBuffer()` or `text()`
++methods are called.
++
++```js
++const { Blob } = require('buffer');
++const blob = new Blob(['hello there']);
++const { setTimeout: delay } = require('timers/promises');
++
++const mc1 = new MessageChannel();
++const mc2 = new MessageChannel();
++
++mc1.port1.onmessage = async ({ data }) => {
++  console.log(await data.arrayBuffer());
++  mc1.port1.close();
++};
++
++mc2.port1.onmessage = async ({ data }) => {
++  await delay(1000);
++  console.log(await data.arrayBuffer());
++  mc2.port1.close();
++};
++
++mc1.port2.postMessage(blob);
++mc2.port2.postMessage(blob);
++
++// The Blob is still usable after posting.
++data.text().then(console.log);
++```
++
+ ## Class: `Buffer`
+ 
+ The `Buffer` class is a global type for dealing with binary data directly.
+@@ -3389,6 +3502,7 @@ introducing security vulnerabilities into an application.
+ [UTF-8]: https://en.wikipedia.org/wiki/UTF-8
+ [WHATWG Encoding Standard]: https://encoding.spec.whatwg.org/
+ [`ArrayBuffer`]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/ArrayBuffer
++[`Blob`]: https://developer.mozilla.org/en-US/docs/Web/API/Blob
+ [`Buffer.alloc()`]: #buffer_static_method_buffer_alloc_size_fill_encoding
+ [`Buffer.allocUnsafe()`]: #buffer_static_method_buffer_allocunsafe_size
+ [`Buffer.allocUnsafeSlow()`]: #buffer_static_method_buffer_allocunsafeslow_size
+diff --git a/lib/buffer.js b/lib/buffer.js
+index dcffe79deb0..c2372a55b44 100644
+--- a/lib/buffer.js
++++ b/lib/buffer.js
+@@ -115,6 +115,10 @@ const {
+   createUnsafeBuffer
+ } = require('internal/buffer');
+ 
++const {
++  Blob,
++} = require('internal/blob');
++
+ FastBuffer.prototype.constructor = Buffer;
+ Buffer.prototype = FastBuffer.prototype;
+ addBufferPrototypeMethods(Buffer.prototype);
+@@ -1210,6 +1214,7 @@ if (internalBinding('config').hasIntl) {
+ }
+ 
+ module.exports = {
++  Blob,
+   Buffer,
+   SlowBuffer,
+   transcode,
+diff --git a/lib/internal/blob.js b/lib/internal/blob.js
+new file mode 100644
+index 00000000000..e49b3710e07
+--- /dev/null
++++ b/lib/internal/blob.js
+@@ -0,0 +1,238 @@
++'use strict';
++
++const {
++  ArrayFrom,
++  ObjectSetPrototypeOf,
++  Promise,
++  PromiseResolve,
++  RegExpPrototypeTest,
++  StringPrototypeToLowerCase,
++  Symbol,
++  SymbolIterator,
++  Uint8Array,
++} = primordials;
++
++const {
++  createBlob,
++  FixedSizeBlobCopyJob,
++} = internalBinding('buffer');
++
++const {
++  JSTransferable,
++  kClone,
++  kDeserialize,
++} = require('internal/worker/js_transferable');
++
++const {
++  isAnyArrayBuffer,
++  isArrayBufferView,
++} = require('internal/util/types');
++
++const {
++  customInspectSymbol: kInspect,
++  emitExperimentalWarning,
++} = require('internal/util');
++const { inspect } = require('internal/util/inspect');
++
++const {
++  AbortError,
++  codes: {
++    ERR_INVALID_ARG_TYPE,
++    ERR_BUFFER_TOO_LARGE,
++    ERR_OUT_OF_RANGE,
++  }
++} = require('internal/errors');
++
++const {
++  validateObject,
++  validateString,
++  validateUint32,
++  isUint32,
++} = require('internal/validators');
++
++const kHandle = Symbol('kHandle');
++const kType = Symbol('kType');
++const kLength = Symbol('kLength');
++
++let Buffer;
++
++function deferred() {
++  let res, rej;
++  const promise = new Promise((resolve, reject) => {
++    res = resolve;
++    rej = reject;
++  });
++  return { promise, resolve: res, reject: rej };
++}
++
++function lazyBuffer() {
++  if (Buffer === undefined)
++    Buffer = require('buffer').Buffer;
++  return Buffer;
++}
++
++function isBlob(object) {
++  return object?.[kHandle] !== undefined;
++}
++
++function getSource(source, encoding) {
++  if (isBlob(source))
++    return [source.size, source[kHandle]];
++
++  if (typeof source === 'string') {
++    source = lazyBuffer().from(source, encoding);
++  } else if (isAnyArrayBuffer(source)) {
++    source = new Uint8Array(source);
++  } else if (!isArrayBufferView(source)) {
++    throw new ERR_INVALID_ARG_TYPE(
++      'source',
++      [
++        'string',
++        'ArrayBuffer',
++        'SharedArrayBuffer',
++        'Buffer',
++        'TypedArray',
++        'DataView'
++      ],
++      source);
++  }
++
++  // We copy into a new Uint8Array because the underlying
++  // BackingStores are going to be detached and owned by
++  // the Blob. We also don't want to have to worry about
++  // byte offsets.
++  source = new Uint8Array(source);
++  return [source.byteLength, source];
++}
++
++class InternalBlob extends JSTransferable {
++  constructor(handle, length, type = '') {
++    super();
++    this[kHandle] = handle;
++    this[kType] = type;
++    this[kLength] = length;
++  }
++}
++
++class Blob extends JSTransferable {
++  constructor(sources = [], options) {
++    emitExperimentalWarning('buffer.Blob');
++    if (sources === null ||
++        typeof sources[SymbolIterator] !== 'function' ||
++        typeof sources === 'string') {
++      throw new ERR_INVALID_ARG_TYPE('sources', 'Iterable', sources);
++    }
++    if (options !== undefined)
++      validateObject(options, 'options');
++    const {
++      encoding = 'utf8',
++      type = '',
++    } = { ...options };
++
++    let length = 0;
++    const sources_ = ArrayFrom(sources, (source) => {
++      const { 0: len, 1: src } = getSource(source, encoding);
++      length += len;
++      return src;
++    });
++
++    // This is a MIME media type but we're not actively checking the syntax.
++    // But, to be fair, neither does Chrome.
++    validateString(type, 'options.type');
++
++    if (!isUint32(length))
++      throw new ERR_BUFFER_TOO_LARGE(0xFFFFFFFF);
++
++    super();
++    this[kHandle] = createBlob(sources_, length);
++    this[kLength] = length;
++    this[kType] = RegExpPrototypeTest(/[^\u{0020}-\u{007E}]/u, type) ?
++      '' : StringPrototypeToLowerCase(type);
++  }
++
++  [kInspect](depth, options) {
++    if (depth < 0)
++      return this;
++
++    const opts = {
++      ...options,
++      depth: options.depth == null ? null : options.depth - 1
++    };
++
++    return `Blob ${inspect({
++      size: this.size,
++      type: this.type,
++    }, opts)}`;
++  }
++
++  [kClone]() {
++    const handle = this[kHandle];
++    const type = this[kType];
++    const length = this[kLength];
++    return {
++      data: { handle, type, length },
++      deserializeInfo: 'internal/blob:InternalBlob'
++    };
++  }
++
++  [kDeserialize]({ handle, type, length }) {
++    this[kHandle] = handle;
++    this[kType] = type;
++    this[kLength] = length;
++  }
++
++  get type() { return this[kType]; }
++
++  get size() { return this[kLength]; }
++
++  slice(start = 0, end = (this[kLength]), type = this[kType]) {
++    validateUint32(start, 'start');
++    if (end < 0) end = this[kLength] + end;
++    validateUint32(end, 'end');
++    validateString(type, 'type');
++    if (end < start)
++      throw new ERR_OUT_OF_RANGE('end', 'greater than start', end);
++    if (end > this[kLength])
++      throw new ERR_OUT_OF_RANGE('end', 'less than or equal to length', end);
++    return new InternalBlob(
++      this[kHandle].slice(start, end),
++      end - start, type);
++  }
++
++  async arrayBuffer() {
++    const job = new FixedSizeBlobCopyJob(this[kHandle]);
++
++    const ret = job.run();
++    if (ret !== undefined)
++      return PromiseResolve(ret);
++
++    const {
++      promise,
++      resolve,
++      reject
++    } = deferred();
++    job.ondone = (err, ab) => {
++      if (err !== undefined)
++        return reject(new AbortError());
++      resolve(ab);
++    };
++
++    return promise;
++  }
++
++  async text() {
++    const dec = new TextDecoder();
++    return dec.decode(await this.arrayBuffer());
++  }
++}
++
++InternalBlob.prototype.constructor = Blob;
++ObjectSetPrototypeOf(
++  InternalBlob.prototype,
++  Blob.prototype);
++
++module.exports = {
++  Blob,
++  InternalBlob,
++  isBlob,
++};
+diff --git a/node.gyp b/node.gyp
+index 58410ddbd57..473af0b3419 100644
+--- a/node.gyp
++++ b/node.gyp
+@@ -111,6 +111,7 @@
+       'lib/internal/assert/assertion_error.js',
+       'lib/internal/assert/calltracker.js',
+       'lib/internal/async_hooks.js',
++      'lib/internal/blob.js',
+       'lib/internal/blocklist.js',
+       'lib/internal/buffer.js',
+       'lib/internal/cli_table.js',
+@@ -609,6 +610,7 @@
+         'src/node.cc',
+         'src/node_api.cc',
+         'src/node_binding.cc',
++        'src/node_blob.cc',
+         'src/node_buffer.cc',
+         'src/node_config.cc',
+         'src/node_constants.cc',
+@@ -707,6 +709,7 @@
+         'src/node_api.h',
+         'src/node_api_types.h',
+         'src/node_binding.h',
++        'src/node_blob.h',
+         'src/node_buffer.h',
+         'src/node_constants.h',
+         'src/node_context_data.h',
+diff --git a/src/async_wrap.h b/src/async_wrap.h
+index 1a82a5bfce8..90f43f64e52 100644
+--- a/src/async_wrap.h
++++ b/src/async_wrap.h
+@@ -38,6 +38,7 @@ namespace node {
+   V(ELDHISTOGRAM)                                                             \
+   V(FILEHANDLE)                                                               \
+   V(FILEHANDLECLOSEREQ)                                                       \
++  V(FIXEDSIZEBLOBCOPY)                                                       \
+   V(FSEVENTWRAP)                                                              \
+   V(FSREQCALLBACK)                                                            \
+   V(FSREQPROMISE)                                                             \
+diff --git a/src/env.h b/src/env.h
+index 7915297514f..6d554f3fcfc 100644
+--- a/src/env.h
++++ b/src/env.h
+@@ -450,6 +450,7 @@ constexpr size_t kFsStatsBufferLength =
+   V(async_wrap_object_ctor_template, v8::FunctionTemplate)                     \
+   V(base_object_ctor_template, v8::FunctionTemplate)                           \
+   V(binding_data_ctor_template, v8::FunctionTemplate)                          \
++  V(blob_constructor_template, v8::FunctionTemplate)                           \
+   V(blocklist_instance_template, v8::ObjectTemplate)                           \
+   V(compiled_fn_entry_template, v8::ObjectTemplate)                            \
+   V(dir_instance_template, v8::ObjectTemplate)                                 \
+diff --git a/src/node_blob.cc b/src/node_blob.cc
+new file mode 100644
+index 00000000000..da78662366a
+--- /dev/null
++++ b/src/node_blob.cc
+@@ -0,0 +1,336 @@
++#include "node_blob.h"
++#include "async_wrap-inl.h"
++#include "base_object-inl.h"
++#include "env-inl.h"
++#include "memory_tracker-inl.h"
++#include "node_errors.h"
++#include "node_external_reference.h"
++#include "threadpoolwork-inl.h"
++#include "v8.h"
++
++#include <algorithm>
++
++namespace node {
++
++using v8::Array;
++using v8::ArrayBuffer;
++using v8::ArrayBufferView;
++using v8::BackingStore;
++using v8::Context;
++using v8::EscapableHandleScope;
++using v8::Function;
++using v8::FunctionCallbackInfo;
++using v8::FunctionTemplate;
++using v8::HandleScope;
++using v8::Local;
++using v8::MaybeLocal;
++using v8::Number;
++using v8::Object;
++using v8::Uint32;
++using v8::Undefined;
++using v8::Value;
++
++void Blob::Initialize(Environment* env, v8::Local<v8::Object> target) {
++  env->SetMethod(target, "createBlob", New);
++  FixedSizeBlobCopyJob::Initialize(env, target);
++}
++
++Local<FunctionTemplate> Blob::GetConstructorTemplate(Environment* env) {
++  Local<FunctionTemplate> tmpl = env->blob_constructor_template();
++  if (tmpl.IsEmpty()) {
++    tmpl = FunctionTemplate::New(env->isolate());
++    tmpl->InstanceTemplate()->SetInternalFieldCount(1);
++    tmpl->Inherit(BaseObject::GetConstructorTemplate(env));
++    tmpl->SetClassName(
++        FIXED_ONE_BYTE_STRING(env->isolate(), "Blob"));
++    env->SetProtoMethod(tmpl, "toArrayBuffer", ToArrayBuffer);
++    env->SetProtoMethod(tmpl, "slice", ToSlice);
++    env->set_blob_constructor_template(tmpl);
++  }
++  return tmpl;
++}
++
++bool Blob::HasInstance(Environment* env, v8::Local<v8::Value> object) {
++  return GetConstructorTemplate(env)->HasInstance(object);
++}
++
++BaseObjectPtr<Blob> Blob::Create(
++    Environment* env,
++    const std::vector<BlobEntry> store,
++    size_t length) {
++
++  HandleScope scope(env->isolate());
++
++  Local<Function> ctor;
++  if (!GetConstructorTemplate(env)->GetFunction(env->context()).ToLocal(&ctor))
++    return BaseObjectPtr<Blob>();
++
++  Local<Object> obj;
++  if (!ctor->NewInstance(env->context()).ToLocal(&obj))
++    return BaseObjectPtr<Blob>();
++
++  return MakeBaseObject<Blob>(env, obj, store, length);
++}
++
++void Blob::New(const FunctionCallbackInfo<Value>& args) {
++  Environment* env = Environment::GetCurrent(args);
++  CHECK(args[0]->IsArray());  // sources
++  CHECK(args[1]->IsUint32());  // length
++
++  std::vector<BlobEntry> entries;
++
++  size_t length = args[1].As<Uint32>()->Value();
++  size_t len = 0;
++  Local<Array> ary = args[0].As<Array>();
++  for (size_t n = 0; n < ary->Length(); n++) {
++    Local<Value> entry;
++    if (!ary->Get(env->context(), n).ToLocal(&entry))
++      return;
++    CHECK(entry->IsArrayBufferView() || Blob::HasInstance(env, entry));
++    if (entry->IsArrayBufferView()) {
++      Local<ArrayBufferView> view = entry.As<ArrayBufferView>();
++      CHECK_EQ(view->ByteOffset(), 0);
++      std::shared_ptr<BackingStore> store = view->Buffer()->GetBackingStore();
++      size_t byte_length = view->ByteLength();
++      view->Buffer()->Detach();  // The Blob will own the backing store now.
++      entries.emplace_back(BlobEntry{std::move(store), byte_length, 0});
++      len += byte_length;
++    } else {
++      Blob* blob;
++      ASSIGN_OR_RETURN_UNWRAP(&blob, entry);
++      auto source = blob->entries();
++      entries.insert(entries.end(), source.begin(), source.end());
++      len += blob->length();
++    }
++  }
++  CHECK_EQ(length, len);
++
++  BaseObjectPtr<Blob> blob = Create(env, entries, length);
++  if (blob)
++    args.GetReturnValue().Set(blob->object());
++}
++
++void Blob::ToArrayBuffer(const FunctionCallbackInfo<Value>& args) {
++  Environment* env = Environment::GetCurrent(args);
++  Blob* blob;
++  ASSIGN_OR_RETURN_UNWRAP(&blob, args.Holder());
++  Local<Value> ret;
++  if (blob->GetArrayBuffer(env).ToLocal(&ret))
++    args.GetReturnValue().Set(ret);
++}
++
++void Blob::ToSlice(const FunctionCallbackInfo<Value>& args) {
++  Environment* env = Environment::GetCurrent(args);
++  Blob* blob;
++  ASSIGN_OR_RETURN_UNWRAP(&blob, args.Holder());
++  CHECK(args[0]->IsUint32());
++  CHECK(args[1]->IsUint32());
++  size_t start = args[0].As<Uint32>()->Value();
++  size_t end = args[1].As<Uint32>()->Value();
++  BaseObjectPtr<Blob> slice = blob->Slice(env, start, end);
++  if (slice)
++    args.GetReturnValue().Set(slice->object());
++}
++
++void Blob::MemoryInfo(MemoryTracker* tracker) const {
++  tracker->TrackFieldWithSize("store", length_);
++}
++
++MaybeLocal<Value> Blob::GetArrayBuffer(Environment* env) {
++  EscapableHandleScope scope(env->isolate());
++  size_t len = length();
++  std::shared_ptr<BackingStore> store =
++      ArrayBuffer::NewBackingStore(env->isolate(), len);
++  if (len > 0) {
++    unsigned char* dest = static_cast<unsigned char*>(store->Data());
++    size_t total = 0;
++    for (const auto& entry : entries()) {
++      unsigned char* src = static_cast<unsigned char*>(entry.store->Data());
++      src += entry.offset;
++      memcpy(dest, src, entry.length);
++      dest += entry.length;
++      total += entry.length;
++      CHECK_LE(total, len);
++    }
++  }
++
++  return scope.Escape(ArrayBuffer::New(env->isolate(), store));
++}
++
++BaseObjectPtr<Blob> Blob::Slice(Environment* env, size_t start, size_t end) {
++  CHECK_LE(start, length());
++  CHECK_LE(end, length());
++  CHECK_LE(start, end);
++
++  std::vector<BlobEntry> slices;
++  size_t total = end - start;
++  size_t remaining = total;
++
++  if (total == 0) return Create(env, slices, 0);
++
++  for (const auto& entry : entries()) {
++    if (start + entry.offset > entry.store->ByteLength()) {
++      start -= entry.length;
++      continue;
++    }
++
++    size_t offset = entry.offset + start;
++    size_t len = std::min(remaining, entry.store->ByteLength() - offset);
++    slices.emplace_back(BlobEntry{entry.store, len, offset});
++
++    remaining -= len;
++    start = 0;
++
++    if (remaining == 0)
++      break;
++  }
++
++  return Create(env, slices, total);
++}
++
++Blob::Blob(
++    Environment* env,
++    v8::Local<v8::Object> obj,
++    const std::vector<BlobEntry>& store,
++    size_t length)
++    : BaseObject(env, obj),
++      store_(store),
++      length_(length) {
++  MakeWeak();
++}
++
++BaseObjectPtr<BaseObject>
++Blob::BlobTransferData::Deserialize(
++    Environment* env,
++    Local<Context> context,
++    std::unique_ptr<worker::TransferData> self) {
++  if (context != env->context()) {
++    THROW_ERR_MESSAGE_TARGET_CONTEXT_UNAVAILABLE(env);
++    return {};
++  }
++  return Blob::Create(env, store_, length_);
++}
++
++BaseObject::TransferMode Blob::GetTransferMode() const {
++  return BaseObject::TransferMode::kCloneable;
++}
++
++std::unique_ptr<worker::TransferData> Blob::CloneForMessaging() const {
++  return std::make_unique<BlobTransferData>(store_, length_);
++}
++
++FixedSizeBlobCopyJob::FixedSizeBlobCopyJob(
++    Environment* env,
++    Local<Object> object,
++    Blob* blob,
++    FixedSizeBlobCopyJob::Mode mode)
++    : AsyncWrap(env, object, AsyncWrap::PROVIDER_FIXEDSIZEBLOBCOPY),
++      ThreadPoolWork(env),
++      mode_(mode) {
++  if (mode == FixedSizeBlobCopyJob::Mode::SYNC) MakeWeak();
++  source_ = blob->entries();
++  length_ = blob->length();
++}
++
++void FixedSizeBlobCopyJob::AfterThreadPoolWork(int status) {
++  Environment* env = AsyncWrap::env();
++  CHECK_EQ(mode_, Mode::ASYNC);
++  CHECK(status == 0 || status == UV_ECANCELED);
++  std::unique_ptr<FixedSizeBlobCopyJob> ptr(this);
++  HandleScope handle_scope(env->isolate());
++  Context::Scope context_scope(env->context());
++  Local<Value> args[2];
++
++  if (status == UV_ECANCELED) {
++    args[0] = Number::New(env->isolate(), status),
++    args[1] = Undefined(env->isolate());
++  } else {
++    args[0] = Undefined(env->isolate());
++    args[1] = ArrayBuffer::New(env->isolate(), destination_);
++  }
++
++  ptr->MakeCallback(env->ondone_string(), arraysize(args), args);
++}
++
++void FixedSizeBlobCopyJob::DoThreadPoolWork() {
++  Environment* env = AsyncWrap::env();
++  destination_ = ArrayBuffer::NewBackingStore(env->isolate(), length_);
++  unsigned char* dest = static_cast<unsigned char*>(destination_->Data());
++  if (length_ > 0) {
++    size_t total = 0;
++    for (const auto& entry : source_) {
++      unsigned char* src = static_cast<unsigned char*>(entry.store->Data());
++      src += entry.offset;
++      memcpy(dest, src, entry.length);
++      dest += entry.length;
++      total += entry.length;
++      CHECK_LE(total, length_);
++    }
++  }
++}
++
++void FixedSizeBlobCopyJob::MemoryInfo(MemoryTracker* tracker) const {
++  tracker->TrackFieldWithSize("source", length_);
++  tracker->TrackFieldWithSize(
++      "destination",
++      destination_ ? destination_->ByteLength() : 0);
++}
++
++void FixedSizeBlobCopyJob::Initialize(Environment* env, Local<Object> target) {
++  v8::Local<v8::FunctionTemplate> job = env->NewFunctionTemplate(New);
++  job->Inherit(AsyncWrap::GetConstructorTemplate(env));
++  job->InstanceTemplate()->SetInternalFieldCount(
++      AsyncWrap::kInternalFieldCount);
++  env->SetProtoMethod(job, "run", Run);
++  env->SetConstructorFunction(target, "FixedSizeBlobCopyJob", job);
++}
++
++void FixedSizeBlobCopyJob::New(const FunctionCallbackInfo<Value>& args) {
++  static constexpr size_t kMaxSyncLength = 4096;
++  static constexpr size_t kMaxEntryCount = 4;
++
++  Environment* env = Environment::GetCurrent(args);
++  CHECK(args.IsConstructCall());
++  CHECK(args[0]->IsObject());
++  CHECK(Blob::HasInstance(env, args[0]));
++
++  Blob* blob;
++  ASSIGN_OR_RETURN_UNWRAP(&blob, args[0]);
++
++  // This is a fairly arbitrary heuristic. We want to avoid deferring to
++  // the threadpool if the amount of data being copied is small and there
++  // aren't that many entries to copy.
++  FixedSizeBlobCopyJob::Mode mode =
++      (blob->length() < kMaxSyncLength &&
++       blob->entries().size() < kMaxEntryCount) ?
++          FixedSizeBlobCopyJob::Mode::SYNC :
++          FixedSizeBlobCopyJob::Mode::ASYNC;
++
++  new FixedSizeBlobCopyJob(env, args.This(), blob, mode);
++}
++
++void FixedSizeBlobCopyJob::Run(const FunctionCallbackInfo<Value>& args) {
++  Environment* env = Environment::GetCurrent(args);
++  FixedSizeBlobCopyJob* job;
++  ASSIGN_OR_RETURN_UNWRAP(&job, args.Holder());
++  if (job->mode() == FixedSizeBlobCopyJob::Mode::ASYNC)
++    return job->ScheduleWork();
++
++  job->DoThreadPoolWork();
++  args.GetReturnValue().Set(
++      ArrayBuffer::New(env->isolate(), job->destination_));
++}
++
++void FixedSizeBlobCopyJob::RegisterExternalReferences(
++    ExternalReferenceRegistry* registry) {
++  registry->Register(New);
++  registry->Register(Run);
++}
++
++void Blob::RegisterExternalReferences(ExternalReferenceRegistry* registry) {
++  registry->Register(Blob::New);
++  registry->Register(Blob::ToArrayBuffer);
++  registry->Register(Blob::ToSlice);
++}
++
++}  // namespace node
+diff --git a/src/node_blob.h b/src/node_blob.h
+new file mode 100644
+index 00000000000..965f65390bd
+--- /dev/null
++++ b/src/node_blob.h
+@@ -0,0 +1,137 @@
++#ifndef SRC_NODE_BLOB_H_
++#define SRC_NODE_BLOB_H_
++
++#if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS
++
++#include "async_wrap.h"
++#include "base_object.h"
++#include "env.h"
++#include "memory_tracker.h"
++#include "node_internals.h"
++#include "node_worker.h"
++#include "v8.h"
++
++#include <vector>
++
++namespace node {
++
++struct BlobEntry {
++  std::shared_ptr<v8::BackingStore> store;
++  size_t length;
++  size_t offset;
++};
++
++class Blob : public BaseObject {
++ public:
++  static void RegisterExternalReferences(
++      ExternalReferenceRegistry* registry);
++  static void Initialize(Environment* env, v8::Local<v8::Object> target);
++
++  static void New(const v8::FunctionCallbackInfo<v8::Value>& args);
++  static void ToArrayBuffer(const v8::FunctionCallbackInfo<v8::Value>& args);
++  static void ToSlice(const v8::FunctionCallbackInfo<v8::Value>& args);
++
++  static v8::Local<v8::FunctionTemplate> GetConstructorTemplate(
++      Environment* env);
++
++  static BaseObjectPtr<Blob> Create(
++      Environment* env,
++      const std::vector<BlobEntry> store,
++      size_t length);
++
++  static bool HasInstance(Environment* env, v8::Local<v8::Value> object);
++
++  const std::vector<BlobEntry> entries() const {
++    return store_;
++  }
++
++  void MemoryInfo(MemoryTracker* tracker) const override;
++  SET_MEMORY_INFO_NAME(Blob);
++  SET_SELF_SIZE(Blob);
++
++  // Copies the contents of the Blob into an ArrayBuffer.
++  v8::MaybeLocal<v8::Value> GetArrayBuffer(Environment* env);
++
++  BaseObjectPtr<Blob> Slice(Environment* env, size_t start, size_t end);
++
++  inline size_t length() const { return length_; }
++
++  class BlobTransferData : public worker::TransferData {
++   public:
++    explicit BlobTransferData(
++        const std::vector<BlobEntry>& store,
++      size_t length)
++        : store_(store),
++          length_(length) {}
++
++    BaseObjectPtr<BaseObject> Deserialize(
++        Environment* env,
++        v8::Local<v8::Context> context,
++        std::unique_ptr<worker::TransferData> self) override;
++
++    SET_MEMORY_INFO_NAME(BlobTransferData)
++    SET_SELF_SIZE(BlobTransferData)
++    SET_NO_MEMORY_INFO()
++
++   private:
++    std::vector<BlobEntry> store_;
++    size_t length_ = 0;
++  };
++
++  BaseObject::TransferMode GetTransferMode() const override;
++  std::unique_ptr<worker::TransferData> CloneForMessaging() const override;
++
++  Blob(
++      Environment* env,
++      v8::Local<v8::Object> obj,
++      const std::vector<BlobEntry>& store,
++      size_t length);
++
++ private:
++  std::vector<BlobEntry> store_;
++  size_t length_ = 0;
++};
++
++class FixedSizeBlobCopyJob : public AsyncWrap, public ThreadPoolWork {
++ public:
++  enum class Mode {
++    SYNC,
++    ASYNC
++  };
++
++  static void RegisterExternalReferences(
++      ExternalReferenceRegistry* registry);
++  static void Initialize(Environment* env, v8::Local<v8::Object> target);
++  static void New(const v8::FunctionCallbackInfo<v8::Value>& args);
++  static void Run(const v8::FunctionCallbackInfo<v8::Value>& args);
++
++  bool IsNotIndicativeOfMemoryLeakAtExit() const override {
++    return true;
++  }
++
++  void DoThreadPoolWork() override;
++  void AfterThreadPoolWork(int status) override;
++
++  Mode mode() const { return mode_; }
++
++  void MemoryInfo(MemoryTracker* tracker) const override;
++  SET_MEMORY_INFO_NAME(FixedSizeBlobCopyJob)
++  SET_SELF_SIZE(FixedSizeBlobCopyJob)
++
++ private:
++  FixedSizeBlobCopyJob(
++    Environment* env,
++    v8::Local<v8::Object> object,
++    Blob* blob,
++    Mode mode = Mode::ASYNC);
++
++  Mode mode_;
++  std::vector<BlobEntry> source_;
++  std::shared_ptr<v8::BackingStore> destination_;
++  size_t length_ = 0;
++};
++
++}  // namespace node
++
++#endif  // defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS
++#endif  // SRC_NODE_BLOB_H_
+diff --git a/src/node_buffer.cc b/src/node_buffer.cc
+index 1898a41bc69..485e273f2fb 100644
+--- a/src/node_buffer.cc
++++ b/src/node_buffer.cc
+@@ -22,6 +22,7 @@
+ #include "node_buffer.h"
+ #include "allocated_buffer-inl.h"
+ #include "node.h"
++#include "node_blob.h"
+ #include "node_errors.h"
+ #include "node_external_reference.h"
+ #include "node_internals.h"
+@@ -1199,6 +1200,8 @@ void Initialize(Local<Object> target,
+   env->SetMethod(target, "utf8Write", StringWrite<UTF8>);
+ 
+   env->SetMethod(target, "getZeroFillToggle", GetZeroFillToggle);
++
++  Blob::Initialize(env, target);
+ }
+ 
+ }  // anonymous namespace
+@@ -1239,6 +1242,9 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
+   registry->Register(StringWrite<UCS2>);
+   registry->Register(StringWrite<UTF8>);
+   registry->Register(GetZeroFillToggle);
++
++  Blob::RegisterExternalReferences(registry);
++  FixedSizeBlobCopyJob::RegisterExternalReferences(registry);
+ }
+ 
+ }  // namespace Buffer
+diff --git a/test/parallel/test-blob.js b/test/parallel/test-blob.js
+new file mode 100644
+index 00000000000..795d4bb6fbd
+--- /dev/null
++++ b/test/parallel/test-blob.js
+@@ -0,0 +1,186 @@
++'use strict';
++
++const common = require('../common');
++const assert = require('assert');
++const { Blob } = require('buffer');
++
++{
++  const b = new Blob();
++  assert.strictEqual(b.size, 0);
++  assert.strictEqual(b.type, '');
++}
++
++assert.throws(() => new Blob(false), {
++  code: 'ERR_INVALID_ARG_TYPE'
++});
++
++assert.throws(() => new Blob('hello'), {
++  code: 'ERR_INVALID_ARG_TYPE'
++});
++
++assert.throws(() => new Blob({}), {
++  code: 'ERR_INVALID_ARG_TYPE'
++});
++
++assert.throws(() => new Blob(['test', 1]), {
++  code: 'ERR_INVALID_ARG_TYPE'
++});
++
++{
++  const b = new Blob([]);
++  assert(b);
++  assert.strictEqual(b.size, 0);
++  assert.strictEqual(b.type, '');
++
++  b.arrayBuffer().then(common.mustCall((ab) => {
++    assert.deepStrictEqual(ab, new ArrayBuffer(0));
++  }));
++  b.text().then(common.mustCall((text) => {
++    assert.strictEqual(text, '');
++  }));
++  const c = b.slice();
++  assert.strictEqual(c.size, 0);
++}
++
++{
++  assert.throws(() => new Blob([], { type: 1 }), {
++    code: 'ERR_INVALID_ARG_TYPE'
++  });
++  assert.throws(() => new Blob([], { type: false }), {
++    code: 'ERR_INVALID_ARG_TYPE'
++  });
++  assert.throws(() => new Blob([], { type: {} }), {
++    code: 'ERR_INVALID_ARG_TYPE'
++  });
++}
++
++{
++  const b = new Blob(['616263'], { encoding: 'hex', type: 'foo' });
++  assert.strictEqual(b.size, 3);
++  assert.strictEqual(b.type, 'foo');
++  b.text().then(common.mustCall((text) => {
++    assert.strictEqual(text, 'abc');
++  }));
++}
++
++{
++  const b = new Blob([Buffer.from('abc')]);
++  assert.strictEqual(b.size, 3);
++  b.text().then(common.mustCall((text) => {
++    assert.strictEqual(text, 'abc');
++  }));
++}
++
++{
++  const b = new Blob([new ArrayBuffer(3)]);
++  assert.strictEqual(b.size, 3);
++  b.text().then(common.mustCall((text) => {
++    assert.strictEqual(text, '\0\0\0');
++  }));
++}
++
++{
++  const b = new Blob([new Uint8Array(3)]);
++  assert.strictEqual(b.size, 3);
++  b.text().then(common.mustCall((text) => {
++    assert.strictEqual(text, '\0\0\0');
++  }));
++}
++
++{
++  const b = new Blob([new Blob(['abc'])]);
++  assert.strictEqual(b.size, 3);
++  b.text().then(common.mustCall((text) => {
++    assert.strictEqual(text, 'abc');
++  }));
++}
++
++{
++  const b = new Blob(['hello', Buffer.from('world')]);
++  assert.strictEqual(b.size, 10);
++  b.text().then(common.mustCall((text) => {
++    assert.strictEqual(text, 'helloworld');
++  }));
++}
++
++{
++  const b = new Blob(
++    [
++      'h',
++      'e',
++      'l',
++      'lo',
++      Buffer.from('world')
++    ]);
++  assert.strictEqual(b.size, 10);
++  b.text().then(common.mustCall((text) => {
++    assert.strictEqual(text, 'helloworld');
++  }));
++}
++
++{
++  const b = new Blob(['hello', Buffer.from('world')]);
++  assert.strictEqual(b.size, 10);
++  assert.strictEqual(b.type, '');
++
++  const c = b.slice(1, -1, 'foo');
++  assert.strictEqual(c.type, 'foo');
++  c.text().then(common.mustCall((text) => {
++    assert.strictEqual(text, 'elloworl');
++  }));
++
++  const d = c.slice(1, -1);
++  d.text().then(common.mustCall((text) => {
++    assert.strictEqual(text, 'llowor');
++  }));
++
++  const e = d.slice(1, -1);
++  e.text().then(common.mustCall((text) => {
++    assert.strictEqual(text, 'lowo');
++  }));
++
++  const f = e.slice(1, -1);
++  f.text().then(common.mustCall((text) => {
++    assert.strictEqual(text, 'ow');
++  }));
++
++  const g = f.slice(1, -1);
++  assert.strictEqual(g.type, 'foo');
++  g.text().then(common.mustCall((text) => {
++    assert.strictEqual(text, '');
++  }));
++
++  assert.strictEqual(b.size, 10);
++  assert.strictEqual(b.type, '');
++
++  assert.throws(() => b.slice(-1, 1), {
++    code: 'ERR_OUT_OF_RANGE'
++  });
++  assert.throws(() => b.slice(1, 100), {
++    code: 'ERR_OUT_OF_RANGE'
++  });
++
++  assert.throws(() => b.slice(1, 2, false), {
++    code: 'ERR_INVALID_ARG_TYPE'
++  });
++}
++
++{
++  const b = new Blob([Buffer.from('hello'), Buffer.from('world')]);
++  const mc = new MessageChannel();
++  mc.port1.onmessage = common.mustCall(({ data }) => {
++    data.text().then(common.mustCall((text) => {
++      assert.strictEqual(text, 'helloworld');
++    }));
++    mc.port1.close();
++  });
++  mc.port2.postMessage(b);
++  b.text().then(common.mustCall((text) => {
++    assert.strictEqual(text, 'helloworld');
++  }));
++}
++
++{
++  const b = new Blob(['hello'], { type: '\x01' });
++  assert.strictEqual(b.type, '');
++}
+diff --git a/test/parallel/test-bootstrap-modules.js b/test/parallel/test-bootstrap-modules.js
+index 0887b8a4836..105bfb10866 100644
+--- a/test/parallel/test-bootstrap-modules.js
++++ b/test/parallel/test-bootstrap-modules.js
+@@ -101,6 +101,7 @@ const expectedModules = new Set([
+   'NativeModule internal/vm/module',
+   'NativeModule internal/worker/io',
+   'NativeModule internal/worker/js_transferable',
++  'NativeModule internal/blob',
+   'NativeModule path',
+   'NativeModule stream',
+   'NativeModule timers',
+diff --git a/test/sequential/test-async-wrap-getasyncid.js b/test/sequential/test-async-wrap-getasyncid.js
+index e37e613b747..e9b2e2d2cca 100644
+--- a/test/sequential/test-async-wrap-getasyncid.js
++++ b/test/sequential/test-async-wrap-getasyncid.js
+@@ -69,6 +69,7 @@ const { getSystemErrorName } = require('util');
+     delete providers.ELDHISTOGRAM;
+     delete providers.SIGINTWATCHDOG;
+     delete providers.WORKERHEAPSNAPSHOT;
++    delete providers.FIXEDSIZEBLOBCOPY;
+ 
+     const objKeys = Object.keys(providers);
+     if (objKeys.length > 0)
+diff --git a/tools/doc/type-parser.js b/tools/doc/type-parser.js
+index 4feb4190e98..41e6086bf00 100644
+--- a/tools/doc/type-parser.js
++++ b/tools/doc/type-parser.js
+@@ -40,6 +40,8 @@ const customTypesMap = {
+   'WebAssembly.Instance':
+     `${jsDocPrefix}Reference/Global_Objects/WebAssembly/Instance`,
+ 
++  'Blob': 'buffer.html#buffer_class_blob',
++
+   'BroadcastChannel':
+     'worker_threads.html#worker_threads_class_broadcastchannel_' +
+     'extends_eventtarget',

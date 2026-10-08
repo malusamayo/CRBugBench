@@ -1,0 +1,317 @@
+commit 30350e3b40dbf699fd9d9ae1c8998e41dae2d6fb
+Author: Daniel Sheppard <dans@dansheps.com>
+Date:   Wed Jul 6 08:57:15 2022 -0500
+
+    More fixes as a result of code review
+
+diff --git a/netbox/ipam/api/serializers.py b/netbox/ipam/api/serializers.py
+index c6e0027f1..9cde08374 100644
+--- a/netbox/ipam/api/serializers.py
++++ b/netbox/ipam/api/serializers.py
+@@ -464,9 +464,7 @@ class L2VPNSerializer(NetBoxModelSerializer):
+         model = L2VPN
+         fields = [
+             'id', 'url', 'display', 'identifier', 'name', 'slug', 'type', 'import_targets', 'export_targets',
+-            'description', 'tenant',
+-            # Extra Fields
+-            'tags', 'custom_fields', 'created', 'last_updated'
++            'description', 'tenant', 'tags', 'custom_fields', 'created', 'last_updated'
+         ]
+ 
+ 
+@@ -482,8 +480,7 @@ class L2VPNTerminationSerializer(NetBoxModelSerializer):
+         model = L2VPNTermination
+         fields = [
+             'id', 'url', 'display', 'l2vpn', 'assigned_object_type', 'assigned_object_id',
+-            'assigned_object',
+-            'tags', 'custom_fields', 'created', 'last_updated'
++            'assigned_object', 'tags', 'custom_fields', 'created', 'last_updated'
+         ]
+ 
+     @swagger_serializer_method(serializer_or_field=serializers.DictField)
+diff --git a/netbox/ipam/choices.py b/netbox/ipam/choices.py
+index 72cd4ff73..298baa643 100644
+--- a/netbox/ipam/choices.py
++++ b/netbox/ipam/choices.py
+@@ -191,6 +191,14 @@ class L2VPNTypeChoices(ChoiceSet):
+             (TYPE_VPWS, 'VPWS'),
+             (TYPE_VPLS, 'VPLS'),
+         )),
++        ('VXLAN', (
++            (TYPE_VXLAN, 'VXLAN'),
++            (TYPE_VXLAN_EVPN, 'VXLAN-EVPN'),
++        )),
++        ('L2VPN E-VPN', (
++            (TYPE_MPLS_EVPN, 'MPLS EVPN'),
++            (TYPE_PBB_EVPN, 'PBB EVPN'),
++        )),
+         ('E-Line', (
+             (TYPE_EPL, 'EPL'),
+             (TYPE_EVPL, 'EVPL'),
+@@ -203,14 +211,6 @@ class L2VPNTypeChoices(ChoiceSet):
+             (TYPE_EPTREE, 'Ethernet Private Tree'),
+             (TYPE_EVPTREE, 'Ethernet Virtual Private Tree'),
+         )),
+-        ('VXLAN', (
+-            (TYPE_VXLAN, 'VXLAN'),
+-            (TYPE_VXLAN_EVPN, 'VXLAN-EVPN'),
+-        )),
+-        ('L2VPN E-VPN', (
+-            (TYPE_MPLS_EVPN, 'MPLS EVPN'),
+-            (TYPE_PBB_EVPN, 'PBB EVPN'),
+-        ))
+     )
+ 
+     P2P = (
+diff --git a/netbox/ipam/forms/models.py b/netbox/ipam/forms/models.py
+index bd1dce6fd..d2797c1cf 100644
+--- a/netbox/ipam/forms/models.py
++++ b/netbox/ipam/forms/models.py
+@@ -929,6 +929,20 @@ class L2VPNTerminationForm(NetBoxModelForm):
+         }
+     )
+ 
++    virtual_machine = DynamicModelChoiceField(
++        queryset=VirtualMachine.objects.all(),
++        required=False,
++        query_params={}
++    )
++
++    vminterface = DynamicModelChoiceField(
++        queryset=VMInterface.objects.all(),
++        required=False,
++        query_params={
++            'virtual_machine_id': '$virtual_machine'
++        }
++    )
++
+     class Meta:
+         model = L2VPNTermination
+         fields = ('l2vpn', )
+@@ -943,6 +957,8 @@ class L2VPNTerminationForm(NetBoxModelForm):
+                 initial['interface'] = instance.assigned_object
+             elif type(instance.assigned_object) is VLAN:
+                 initial['vlan'] = instance.assigned_object
++            elif type(instance.assigned_object) is VMInterface:
++                initial['vminterface'] = instance.assigned_object
+             kwargs['initial'] = initial
+ 
+         super().__init__(*args, **kwargs)
+@@ -950,11 +966,21 @@ class L2VPNTerminationForm(NetBoxModelForm):
+     def clean(self):
+         super().clean()
+ 
+-        if not (self.cleaned_data.get('interface') or self.cleaned_data.get('vlan')):
++        interface = self.cleaned_data.get('interface')
++        vlan = self.cleaned_data.get('vlan')
++        vminterface = self.cleaned_data.get('vminterface')
++
++        if not (interface or vlan or vminterface):
+             raise ValidationError('You must have either a interface or a VLAN')
+ 
+-        if self.cleaned_data.get('interface') and self.cleaned_data.get('vlan'):
++        if interface and vlan and vminterface:
++            raise ValidationError('Cannot assign a interface, vlan and vminterface')
++        elif interface and vlan:
+             raise ValidationError('Cannot assign both a interface and vlan')
++        elif interface and vminterface:
++            raise ValidationError('Cannot assign both a interface and vminterface')
++        elif vlan and vminterface:
++            raise ValidationError('Cannot assign both a vlan and vminterface')
+ 
+-        obj = self.cleaned_data.get('interface') or self.cleaned_data.get('vlan')
++        obj = interface or vlan or vminterface
+         self.instance.assigned_object = obj
+diff --git a/netbox/ipam/models/l2vpn.py b/netbox/ipam/models/l2vpn.py
+index 46cad72f8..dd8c51984 100644
+--- a/netbox/ipam/models/l2vpn.py
++++ b/netbox/ipam/models/l2vpn.py
+@@ -60,23 +60,15 @@ class L2VPNTermination(NetBoxModel):
+     l2vpn = models.ForeignKey(
+         to='ipam.L2VPN',
+         on_delete=models.CASCADE,
+-        related_name='terminations',
+-        blank=False,
+-        null=False
++        related_name='terminations'
+     )
+-
+     assigned_object_type = models.ForeignKey(
+         to=ContentType,
+         limit_choices_to=L2VPN_ASSIGNMENT_MODELS,
+         on_delete=models.PROTECT,
+-        related_name='+',
+-        blank=True,
+-        null=True
+-    )
+-    assigned_object_id = models.PositiveBigIntegerField(
+-        blank=True,
+-        null=True
++        related_name='+'
+     )
++    assigned_object_id = models.PositiveBigIntegerField()
+     assigned_object = GenericForeignKey(
+         ct_field='assigned_object_type',
+         fk_field='assigned_object_id'
+@@ -95,13 +87,13 @@ class L2VPNTermination(NetBoxModel):
+     def __str__(self):
+         if self.pk is not None:
+             return f'{self.assigned_object} <> {self.l2vpn}'
+-        return ''
++        return super().__str__()
+ 
+     def get_absolute_url(self):
+         return reverse('ipam:l2vpntermination', args=[self.pk])
+ 
+     def clean(self):
+-        # Only check is assigned_object is set
++        # Only check is assigned_object is set.  Required otherwise we have an Integrity Error thrown.
+         if self.assigned_object:
+             obj_id = self.assigned_object.pk
+             obj_type = ContentType.objects.get_for_model(self.assigned_object)
+diff --git a/netbox/ipam/tables/l2vpn.py b/netbox/ipam/tables/l2vpn.py
+index 551f692bb..a0e2f5d67 100644
+--- a/netbox/ipam/tables/l2vpn.py
++++ b/netbox/ipam/tables/l2vpn.py
+@@ -9,25 +9,44 @@ __all__ = (
+     'L2VPNTerminationTable',
+ )
+ 
++L2VPN_TARGETS = """
++{% for rt in value.all %}
++  <a href="{{ rt.get_absolute_url }}">{{ rt }}</a>{% if not forloop.last %}<br />{% endif %}
++{% endfor %}
++"""
++
+ 
+ class L2VPNTable(NetBoxTable):
+     pk = columns.ToggleColumn()
+     name = tables.Column(
+         linkify=True
+     )
++    import_targets = columns.TemplateColumn(
++        template_code=L2VPN_TARGETS,
++        orderable=False
++    )
++    export_targets = columns.TemplateColumn(
++        template_code=L2VPN_TARGETS,
++        orderable=False
++    )
+ 
+     class Meta(NetBoxTable.Meta):
+         model = L2VPN
+-        fields = ('pk', 'name', 'description', 'slug', 'type', 'tenant', 'actions')
+-        default_columns = ('pk', 'name', 'description', 'actions')
++        fields = ('pk', 'name', 'slug', 'type', 'description', 'import_targets', 'export_targets', 'tenant', 'actions')
++        default_columns = ('pk', 'name', 'type', 'description', 'actions')
+ 
+ 
+ class L2VPNTerminationTable(NetBoxTable):
+     pk = columns.ToggleColumn()
++    l2vpn = tables.Column(
++        verbose_name='L2VPN',
++        linkify=True
++    )
+     assigned_object_type = columns.ContentTypeColumn(
+         verbose_name='Object Type'
+     )
+     assigned_object = tables.Column(
++        verbose_name='Assigned Object',
+         linkify=True,
+         orderable=False
+     )
+diff --git a/netbox/ipam/urls.py b/netbox/ipam/urls.py
+index e00b0365f..d27209fd2 100644
+--- a/netbox/ipam/urls.py
++++ b/netbox/ipam/urls.py
+@@ -187,25 +187,25 @@ urlpatterns = [
+     path('services/<int:pk>/journal/', ObjectJournalView.as_view(), name='service_journal', kwargs={'model': Service}),
+ 
+     # L2VPN
+-    path('l2vpn/', views.L2VPNListView.as_view(), name='l2vpn_list'),
+-    path('l2vpn/add/', views.L2VPNEditView.as_view(), name='l2vpn_add'),
+-    path('l2vpn/import/', views.L2VPNBulkImportView.as_view(), name='l2vpn_import'),
+-    path('l2vpn/edit/', views.L2VPNBulkEditView.as_view(), name='l2vpn_bulk_edit'),
+-    path('l2vpn/delete/', views.L2VPNBulkDeleteView.as_view(), name='l2vpn_bulk_delete'),
+-    path('l2vpn/<int:pk>/', views.L2VPNView.as_view(), name='l2vpn'),
+-    path('l2vpn/<int:pk>/edit/', views.L2VPNEditView.as_view(), name='l2vpn_edit'),
+-    path('l2vpn/<int:pk>/delete/', views.L2VPNDeleteView.as_view(), name='l2vpn_delete'),
+-    path('l2vpn/<int:pk>/changelog/', ObjectChangeLogView.as_view(), name='l2vpn_changelog', kwargs={'model': L2VPN}),
+-    path('l2vpn/<int:pk>/journal/', ObjectJournalView.as_view(), name='l2vpn_journal', kwargs={'model': L2VPN}),
+-
+-    path('l2vpn-termination/', views.L2VPNTerminationListView.as_view(), name='l2vpntermination_list'),
+-    path('l2vpn-termination/add/', views.L2VPNTerminationEditView.as_view(), name='l2vpntermination_add'),
+-    path('l2vpn-termination/import/', views.L2VPNTerminationBulkImportView.as_view(), name='l2vpntermination_import'),
+-    path('l2vpn-termination/edit/', views.L2VPNTerminationBulkEditView.as_view(), name='l2vpntermination_bulk_edit'),
+-    path('l2vpn-termination/delete/', views.L2VPNTerminationBulkDeleteView.as_view(), name='l2vpntermination_bulk_delete'),
+-    path('l2vpn-termination/<int:pk>/', views.L2VPNTerminationView.as_view(), name='l2vpntermination'),
+-    path('l2vpn-termination/<int:pk>/edit/', views.L2VPNTerminationEditView.as_view(), name='l2vpntermination_edit'),
+-    path('l2vpn-termination/<int:pk>/delete/', views.L2VPNTerminationDeleteView.as_view(), name='l2vpntermination_delete'),
+-    path('l2vpn-termination/<int:pk>/changelog/', ObjectChangeLogView.as_view(), name='l2vpntermination_changelog', kwargs={'model': L2VPNTermination}),
+-    path('l2vpn-termination/<int:pk>/journal/', ObjectJournalView.as_view(), name='l2vpntermination_journal', kwargs={'model': L2VPNTermination}),
++    path('l2vpns/', views.L2VPNListView.as_view(), name='l2vpn_list'),
++    path('l2vpns/add/', views.L2VPNEditView.as_view(), name='l2vpn_add'),
++    path('l2vpns/import/', views.L2VPNBulkImportView.as_view(), name='l2vpn_import'),
++    path('l2vpns/edit/', views.L2VPNBulkEditView.as_view(), name='l2vpn_bulk_edit'),
++    path('l2vpns/delete/', views.L2VPNBulkDeleteView.as_view(), name='l2vpn_bulk_delete'),
++    path('l2vpns/<int:pk>/', views.L2VPNView.as_view(), name='l2vpn'),
++    path('l2vpns/<int:pk>/edit/', views.L2VPNEditView.as_view(), name='l2vpn_edit'),
++    path('l2vpns/<int:pk>/delete/', views.L2VPNDeleteView.as_view(), name='l2vpn_delete'),
++    path('l2vpns/<int:pk>/changelog/', ObjectChangeLogView.as_view(), name='l2vpn_changelog', kwargs={'model': L2VPN}),
++    path('l2vpns/<int:pk>/journal/', ObjectJournalView.as_view(), name='l2vpn_journal', kwargs={'model': L2VPN}),
++
++    path('l2vpn-terminations/', views.L2VPNTerminationListView.as_view(), name='l2vpntermination_list'),
++    path('l2vpn-terminations/add/', views.L2VPNTerminationEditView.as_view(), name='l2vpntermination_add'),
++    path('l2vpn-terminations/import/', views.L2VPNTerminationBulkImportView.as_view(), name='l2vpntermination_import'),
++    path('l2vpn-terminations/edit/', views.L2VPNTerminationBulkEditView.as_view(), name='l2vpntermination_bulk_edit'),
++    path('l2vpn-terminations/delete/', views.L2VPNTerminationBulkDeleteView.as_view(), name='l2vpntermination_bulk_delete'),
++    path('l2vpn-terminations/<int:pk>/', views.L2VPNTerminationView.as_view(), name='l2vpntermination'),
++    path('l2vpn-terminations/<int:pk>/edit/', views.L2VPNTerminationEditView.as_view(), name='l2vpntermination_edit'),
++    path('l2vpn-terminations/<int:pk>/delete/', views.L2VPNTerminationDeleteView.as_view(), name='l2vpntermination_delete'),
++    path('l2vpn-terminations/<int:pk>/changelog/', ObjectChangeLogView.as_view(), name='l2vpntermination_changelog', kwargs={'model': L2VPNTermination}),
++    path('l2vpn-terminations/<int:pk>/journal/', ObjectJournalView.as_view(), name='l2vpntermination_journal', kwargs={'model': L2VPNTermination}),
+ ]
+diff --git a/netbox/templates/ipam/l2vpntermination_edit.html b/netbox/templates/ipam/l2vpntermination_edit.html
+index 3fb0460b5..4ba079eb5 100644
+--- a/netbox/templates/ipam/l2vpntermination_edit.html
++++ b/netbox/templates/ipam/l2vpntermination_edit.html
+@@ -12,7 +12,7 @@
+       <div class="offset-sm-3">
+         <ul class="nav nav-pills" role="tablist">
+           <li role="presentation" class="nav-item">
+-            <button role="tab" type="button" id="vlan_tab" data-bs-toggle="tab" aria-controls="vlan" data-bs-target="#vlan" class="nav-link {% if not form.initial.interface %}active{% endif %}">
++            <button role="tab" type="button" id="vlan_tab" data-bs-toggle="tab" aria-controls="vlan" data-bs-target="#vlan" class="nav-link {% if not form.initial.interface or form.initial.vminterface %}active{% endif %}">
+               VLAN
+             </button>
+           </li>
+@@ -21,18 +21,28 @@
+               Interface
+             </button>
+           </li>
++          <li role="presentation" class="nav-item">
++            <button role="tab" type="button" id="vminterface_tab" data-bs-toggle="tab" aria-controls="vminterface" data-bs-target="#vminterface" class="nav-link {% if form.initial.vminterface %}active{% endif %}">
++              VM Interface
++            </button>
++          </li>
+         </ul>
+       </div>
+     </div>
+     <div class="row mb-3">
+       <div class="tab-content p-0 border-0">
+-        {% render_field form.device %}
+-        <div class="tab-pane {% if not form.initial.interface %}active{% endif %}" id="vlan" role="tabpanel" aria-labeled-by="vlan_tab">
++        <div class="tab-pane {% if not form.initial.interface or form.initial.vminterface %}active{% endif %}" id="vlan" role="tabpanel" aria-labeled-by="vlan_tab">
++          {% render_field form.device %}
+           {% render_field form.vlan %}
+         </div>
+         <div class="tab-pane {% if form.initial.interface %}active{% endif %}" id="interface" role="tabpanel" aria-labeled-by="interface_tab">
++          {% render_field form.device %}
+           {% render_field form.interface %}
+         </div>
++        <div class="tab-pane {% if form.initial.vminterface %}active{% endif %}" id="vminterface" role="tabpanel" aria-labeled-by="vminterface_tab">
++          {% render_field form.virtual_machine %}
++          {% render_field form.vminterface %}
++        </div>
+       </div>
+     </div>
+   </div>

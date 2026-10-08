@@ -1,0 +1,464 @@
+commit 119736b1c2ea0d404ad466e39138462453392008
+Author: Brian Vaughn <bvaughn@fb.com>
+Date:   Wed Mar 17 12:28:21 2021 -0400
+
+    [FB-only] Show which hooks (indices) changed when profiling (#20998)
+
+diff --git a/packages/react-devtools-extensions/package.json b/packages/react-devtools-extensions/package.json
+index 218e9aa799..2771c31c5a 100644
+--- a/packages/react-devtools-extensions/package.json
++++ b/packages/react-devtools-extensions/package.json
+@@ -6,7 +6,7 @@
+     "build": "cross-env NODE_ENV=production yarn run build:chrome && yarn run build:firefox && yarn run build:edge",
+     "build:dev": "cross-env NODE_ENV=development yarn run build:chrome:dev && yarn run build:firefox:dev && yarn run build:edge:dev",
+     "build:chrome": "cross-env NODE_ENV=production node ./chrome/build",
+-    "build:chrome:crx": "cross-env NODE_ENV=production node ./chrome/build --crx",
++    "build:chrome:crx": "cross-env NODE_ENV=production FEATURE_FLAG_TARGET=extension-fb node ./chrome/build --crx",
+     "build:chrome:dev": "cross-env NODE_ENV=development node ./chrome/build",
+     "build:firefox": "cross-env NODE_ENV=production node ./firefox/build",
+     "build:firefox:dev": "cross-env NODE_ENV=development node ./firefox/build",
+diff --git a/packages/react-devtools-extensions/webpack.backend.js b/packages/react-devtools-extensions/webpack.backend.js
+index 2399c10892..885d9aa03b 100644
+--- a/packages/react-devtools-extensions/webpack.backend.js
++++ b/packages/react-devtools-extensions/webpack.backend.js
+@@ -3,6 +3,7 @@
+ const {resolve} = require('path');
+ const {DefinePlugin} = require('webpack');
+ const {GITHUB_URL, getVersionString} = require('./utils');
++const {resolveFeatureFlags} = require('react-devtools-shared/buildUtils');
+ 
+ const NODE_ENV = process.env.NODE_ENV;
+ if (!NODE_ENV) {
+@@ -16,6 +17,8 @@ const __DEV__ = NODE_ENV === 'development';
+ 
+ const DEVTOOLS_VERSION = getVersionString();
+ 
++const featureFlagTarget = process.env.FEATURE_FLAG_TARGET || 'extension-oss';
++
+ module.exports = {
+   mode: __DEV__ ? 'development' : 'production',
+   devtool: __DEV__ ? 'cheap-module-eval-source-map' : false,
+@@ -34,6 +37,7 @@ module.exports = {
+     alias: {
+       react: resolve(builtModulesDir, 'react'),
+       'react-debug-tools': resolve(builtModulesDir, 'react-debug-tools'),
++      'react-devtools-feature-flags': resolveFeatureFlags(featureFlagTarget),
+       'react-dom': resolve(builtModulesDir, 'react-dom'),
+       'react-is': resolve(builtModulesDir, 'react-is'),
+       scheduler: resolve(builtModulesDir, 'scheduler'),
+diff --git a/packages/react-devtools-extensions/webpack.config.js b/packages/react-devtools-extensions/webpack.config.js
+index 4d6d00c52a..f754a99b86 100644
+--- a/packages/react-devtools-extensions/webpack.config.js
++++ b/packages/react-devtools-extensions/webpack.config.js
+@@ -17,6 +17,8 @@ const __DEV__ = NODE_ENV === 'development';
+ 
+ const DEVTOOLS_VERSION = getVersionString();
+ 
++const featureFlagTarget = process.env.FEATURE_FLAG_TARGET || 'extension-oss';
++
+ module.exports = {
+   mode: __DEV__ ? 'development' : 'production',
+   devtool: __DEV__ ? 'cheap-module-eval-source-map' : false,
+@@ -40,7 +42,7 @@ module.exports = {
+     alias: {
+       react: resolve(builtModulesDir, 'react'),
+       'react-debug-tools': resolve(builtModulesDir, 'react-debug-tools'),
+-      'react-devtools-feature-flags': resolveFeatureFlags('extension'),
++      'react-devtools-feature-flags': resolveFeatureFlags(featureFlagTarget),
+       'react-dom': resolve(builtModulesDir, 'react-dom'),
+       'react-is': resolve(builtModulesDir, 'react-is'),
+       scheduler: resolve(builtModulesDir, 'scheduler'),
+diff --git a/packages/react-devtools-shared/buildUtils.js b/packages/react-devtools-shared/buildUtils.js
+index d5f48d6342..036c94386a 100644
+--- a/packages/react-devtools-shared/buildUtils.js
++++ b/packages/react-devtools-shared/buildUtils.js
+@@ -17,8 +17,11 @@ function resolveFeatureFlags(target) {
+     case 'shell':
+       flagsPath = 'DevToolsFeatureFlags.default';
+       break;
+-    case 'extension':
+-      flagsPath = 'DevToolsFeatureFlags.extension';
++    case 'extension-oss':
++      flagsPath = 'DevToolsFeatureFlags.extension-oss';
++      break;
++    case 'extension-fb':
++      flagsPath = 'DevToolsFeatureFlags.extension-fb';
+       break;
+     default:
+       console.error(`Invalid target "${target}"`);
+diff --git a/packages/react-devtools-shared/src/backend/renderer.js b/packages/react-devtools-shared/src/backend/renderer.js
+index c2de357a1b..3bc2abe46a 100644
+--- a/packages/react-devtools-shared/src/backend/renderer.js
++++ b/packages/react-devtools-shared/src/backend/renderer.js
+@@ -79,6 +79,7 @@ import {
+   MEMO_SYMBOL_STRING,
+ } from './ReactSymbols';
+ import {format} from './utils';
++import {enableProfilerChangedHookIndices} from 'react-devtools-feature-flags';
+ 
+ import type {Fiber} from 'react-reconciler/src/ReactInternalTypes';
+ import type {
+@@ -978,12 +979,9 @@ export function attach(
+             state: null,
+           };
+         } else {
+-          return {
++          const data: ChangeDescription = {
+             context: getContextChangedKeys(nextFiber),
+-            didHooksChange: didHooksChange(
+-              prevFiber.memoizedState,
+-              nextFiber.memoizedState,
+-            ),
++            didHooksChange: false,
+             isFirstMount: false,
+             props: getChangedKeys(
+               prevFiber.memoizedProps,
+@@ -994,6 +992,23 @@ export function attach(
+               nextFiber.memoizedState,
+             ),
+           };
++
++          // Only traverse the hooks list once, depending on what info we're returning.
++          if (enableProfilerChangedHookIndices) {
++            const indices = getChangedHooksIndices(
++              prevFiber.memoizedState,
++              nextFiber.memoizedState,
++            );
++            data.hooks = indices;
++            data.didHooksChange = indices !== null && indices.length > 0;
++          } else {
++            data.didHooksChange = didHooksChange(
++              prevFiber.memoizedState,
++              nextFiber.memoizedState,
++            );
++          }
++
++          return data;
+         }
+       default:
+         return null;
+@@ -1154,6 +1169,36 @@ export function attach(
+     return false;
+   }
+ 
++  function getChangedHooksIndices(prev: any, next: any): null | Array<number> {
++    if (enableProfilerChangedHookIndices) {
++      if (prev == null || next == null) {
++        return null;
++      }
++
++      const indices = [];
++      let index = 0;
++      if (
++        next.hasOwnProperty('baseState') &&
++        next.hasOwnProperty('memoizedState') &&
++        next.hasOwnProperty('next') &&
++        next.hasOwnProperty('queue')
++      ) {
++        while (next !== null) {
++          if (didHookChange(prev, next)) {
++            indices.push(index);
++          }
++          next = next.next;
++          prev = prev.next;
++          index++;
++        }
++      }
++
++      return indices;
++    }
++
++    return null;
++  }
++
+   function getChangedKeys(prev: any, next: any): null | Array<string> {
+     if (prev == null || next == null) {
+       return null;
+diff --git a/packages/react-devtools-shared/src/backend/types.js b/packages/react-devtools-shared/src/backend/types.js
+index 627e9a4504..c0ef91021f 100644
+--- a/packages/react-devtools-shared/src/backend/types.js
++++ b/packages/react-devtools-shared/src/backend/types.js
+@@ -150,6 +150,7 @@ export type ChangeDescription = {|
+   isFirstMount: boolean,
+   props: Array<string> | null,
+   state: Array<string> | null,
++  hooks?: Array<number> | null,
+ |};
+ 
+ export type CommitDataBackend = {|
+diff --git a/packages/react-devtools-shared/src/config/DevToolsFeatureFlags.default.js b/packages/react-devtools-shared/src/config/DevToolsFeatureFlags.default.js
+index 9e2d09d630..da7784c759 100644
+--- a/packages/react-devtools-shared/src/config/DevToolsFeatureFlags.default.js
++++ b/packages/react-devtools-shared/src/config/DevToolsFeatureFlags.default.js
+@@ -13,4 +13,4 @@
+  * It should always be imported from "react-devtools-feature-flags".
+  ************************************************************************/
+ 
+-// TODO Add feature flags here...
++export const enableProfilerChangedHookIndices = false;
+diff --git a/packages/react-devtools-shared/src/config/DevToolsFeatureFlags.extension.js b/packages/react-devtools-shared/src/config/DevToolsFeatureFlags.extension-fb.js
+similarity index 94%
+rename from packages/react-devtools-shared/src/config/DevToolsFeatureFlags.extension.js
+rename to packages/react-devtools-shared/src/config/DevToolsFeatureFlags.extension-fb.js
+index a224621bb7..08fb7178c7 100644
+--- a/packages/react-devtools-shared/src/config/DevToolsFeatureFlags.extension.js
++++ b/packages/react-devtools-shared/src/config/DevToolsFeatureFlags.extension-fb.js
+@@ -13,7 +13,7 @@
+  * It should always be imported from "react-devtools-feature-flags".
+  ************************************************************************/
+ 
+-// TODO Add feature flags here...
++export const enableProfilerChangedHookIndices = true;
+ 
+ /************************************************************************
+  * Do not edit the code below.
+@@ -21,7 +21,7 @@
+  ************************************************************************/
+ 
+ import typeof * as FeatureFlagsType from './DevToolsFeatureFlags.default';
+-import typeof * as ExportsType from './DevToolsFeatureFlags.extension';
++import typeof * as ExportsType from './DevToolsFeatureFlags.extension-fb';
+ 
+ // eslint-disable-next-line no-unused-vars
+ type Check<_X, Y: _X, X: Y = _X> = null;
+diff --git a/packages/react-devtools-shared/src/config/DevToolsFeatureFlags.extension-oss.js b/packages/react-devtools-shared/src/config/DevToolsFeatureFlags.extension-oss.js
+new file mode 100644
+index 0000000000..6ad795840d
+--- /dev/null
++++ b/packages/react-devtools-shared/src/config/DevToolsFeatureFlags.extension-oss.js
+@@ -0,0 +1,29 @@
++/**
++ * Copyright (c) Facebook, Inc. and its affiliates.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ *
++ * @flow
++ */
++
++/************************************************************************
++ * This file is forked between different DevTools implementations.
++ * It should never be imported directly!
++ * It should always be imported from "react-devtools-feature-flags".
++ ************************************************************************/
++
++export const enableProfilerChangedHookIndices = false;
++
++/************************************************************************
++ * Do not edit the code below.
++ * It ensures this fork exports the same types as the default flags file.
++ ************************************************************************/
++
++import typeof * as FeatureFlagsType from './DevToolsFeatureFlags.default';
++import typeof * as ExportsType from './DevToolsFeatureFlags.extension-oss';
++
++// eslint-disable-next-line no-unused-vars
++type Check<_X, Y: _X, X: Y = _X> = null;
++// eslint-disable-next-line no-unused-expressions
++(null: Check<ExportsType, FeatureFlagsType>);
+diff --git a/packages/react-devtools-shared/src/devtools/views/Components/InspectedElementHooksTree.css b/packages/react-devtools-shared/src/devtools/views/Components/InspectedElementHooksTree.css
+index 7b381faa9f..a708593553 100644
+--- a/packages/react-devtools-shared/src/devtools/views/Components/InspectedElementHooksTree.css
++++ b/packages/react-devtools-shared/src/devtools/views/Components/InspectedElementHooksTree.css
+@@ -69,3 +69,12 @@
+   flex: 0 0 1rem;
+   width: 1rem;
+ }
++
++.PrimitiveHookNumber {
++  color: var(--color-component-badge-count-inverted);
++  background-color: var(--color-component-badge-background-inverted);
++  font-size: var(--font-size-monospace-small);
++  margin-right: 0.25rem;
++  border-radius: 0.125rem;
++  padding: 0.125rem 0.25rem;
++}
+\ No newline at end of file
+diff --git a/packages/react-devtools-shared/src/devtools/views/Components/InspectedElementHooksTree.js b/packages/react-devtools-shared/src/devtools/views/Components/InspectedElementHooksTree.js
+index 4303f8e406..7ed5290569 100644
+--- a/packages/react-devtools-shared/src/devtools/views/Components/InspectedElementHooksTree.js
++++ b/packages/react-devtools-shared/src/devtools/views/Components/InspectedElementHooksTree.js
+@@ -20,6 +20,7 @@ import Store from '../../store';
+ import styles from './InspectedElementHooksTree.css';
+ import useContextMenu from '../../ContextMenu/useContextMenu';
+ import {meta} from '../../../hydration';
++import {enableProfilerChangedHookIndices} from 'react-devtools-feature-flags';
+ 
+ import type {InspectedElement} from './types';
+ import type {HooksNode, HooksTree} from 'react-debug-tools/src/ReactDebugHooks';
+@@ -108,7 +109,7 @@ function HookView({element, hook, id, inspectedElement, path}: HookViewProps) {
+     canEditHooksAndDeletePaths,
+     canEditHooksAndRenamePaths,
+   } = inspectedElement;
+-  const {name, id: hookID, isStateEditable, subHooks, value} = hook;
++  const {id: hookID, isStateEditable, subHooks, value} = hook;
+ 
+   const isReadOnly = hookID == null || !isStateEditable;
+ 
+@@ -162,6 +163,18 @@ function HookView({element, hook, id, inspectedElement, path}: HookViewProps) {
+ 
+   const isCustomHook = subHooks.length > 0;
+ 
++  let name = hook.name;
++  if (enableProfilerChangedHookIndices) {
++    if (!isCustomHook) {
++      name = (
++        <>
++          <span className={styles.PrimitiveHookNumber}>{hookID + 1}</span>
++          {name}
++        </>
++      );
++    }
++  }
++
+   const type = typeof value;
+ 
+   let displayValue;
+diff --git a/packages/react-devtools-shared/src/devtools/views/Profiler/WhatChanged.js b/packages/react-devtools-shared/src/devtools/views/Profiler/WhatChanged.js
+index 00bdedddc9..7a2f9e5bf4 100644
+--- a/packages/react-devtools-shared/src/devtools/views/Profiler/WhatChanged.js
++++ b/packages/react-devtools-shared/src/devtools/views/Profiler/WhatChanged.js
+@@ -9,11 +9,30 @@
+ 
+ import * as React from 'react';
+ import {useContext} from 'react';
++import {enableProfilerChangedHookIndices} from 'react-devtools-feature-flags';
+ import {ProfilerContext} from '../Profiler/ProfilerContext';
+ import {StoreContext} from '../context';
+ 
+ import styles from './WhatChanged.css';
+ 
++function hookIndicesToString(indices: Array<number>): string {
++  // This is debatable but I think 1-based might ake for a nicer UX.
++  const numbers = indices.map(value => value + 1);
++
++  switch (numbers.length) {
++    case 0:
++      return 'No hooks changed';
++    case 1:
++      return `Hook ${numbers[0]} changed`;
++    case 2:
++      return `Hooks ${numbers[0]} and ${numbers[1]} changed`;
++    default:
++      return `Hooks ${numbers.slice(0, numbers.length - 1).join(', ')} and ${
++        numbers[numbers.length - 1]
++      } changed`;
++  }
++}
++
+ type Props = {|
+   fiberID: number,
+ |};
+@@ -44,7 +63,16 @@ export default function WhatChanged({fiberID}: Props) {
+     return null;
+   }
+ 
+-  if (changeDescription.isFirstMount) {
++  const {
++    context,
++    didHooksChange,
++    hooks,
++    isFirstMount,
++    props,
++    state,
++  } = changeDescription;
++
++  if (isFirstMount) {
+     return (
+       <div className={styles.Component}>
+         <label className={styles.Label}>Why did this render?</label>
+@@ -57,21 +85,21 @@ export default function WhatChanged({fiberID}: Props) {
+ 
+   const changes = [];
+ 
+-  if (changeDescription.context === true) {
++  if (context === true) {
+     changes.push(
+       <div key="context" className={styles.Item}>
+         • Context changed
+       </div>,
+     );
+   } else if (
+-    typeof changeDescription.context === 'object' &&
+-    changeDescription.context !== null &&
+-    changeDescription.context.length !== 0
++    typeof context === 'object' &&
++    context !== null &&
++    context.length !== 0
+   ) {
+     changes.push(
+       <div key="context" className={styles.Item}>
+         • Context changed:
+-        {changeDescription.context.map(key => (
++        {context.map(key => (
+           <span key={key} className={styles.Key}>
+             {key}
+           </span>
+@@ -80,22 +108,27 @@ export default function WhatChanged({fiberID}: Props) {
+     );
+   }
+ 
+-  if (changeDescription.didHooksChange) {
+-    changes.push(
+-      <div key="hooks" className={styles.Item}>
+-        • Hooks changed
+-      </div>,
+-    );
++  if (didHooksChange) {
++    if (enableProfilerChangedHookIndices && Array.isArray(hooks)) {
++      changes.push(
++        <div key="hooks" className={styles.Item}>
++          • {hookIndicesToString(hooks)}
++        </div>,
++      );
++    } else {
++      changes.push(
++        <div key="hooks" className={styles.Item}>
++          • Hooks changed
++        </div>,
++      );
++    }
+   }
+ 
+-  if (
+-    changeDescription.props !== null &&
+-    changeDescription.props.length !== 0
+-  ) {
++  if (props !== null && props.length !== 0) {
+     changes.push(
+       <div key="props" className={styles.Item}>
+         • Props changed:
+-        {changeDescription.props.map(key => (
++        {props.map(key => (
+           <span key={key} className={styles.Key}>
+             {key}
+           </span>
+@@ -104,14 +137,11 @@ export default function WhatChanged({fiberID}: Props) {
+     );
+   }
+ 
+-  if (
+-    changeDescription.state !== null &&
+-    changeDescription.state.length !== 0
+-  ) {
++  if (state !== null && state.length !== 0) {
+     changes.push(
+       <div key="state" className={styles.Item}>
+         • State changed:
+-        {changeDescription.state.map(key => (
++        {state.map(key => (
+           <span key={key} className={styles.Key}>
+             {key}
+           </span>
+diff --git a/packages/react-devtools-shared/src/devtools/views/Profiler/types.js b/packages/react-devtools-shared/src/devtools/views/Profiler/types.js
+index 803aeac6a0..11e99c05b1 100644
+--- a/packages/react-devtools-shared/src/devtools/views/Profiler/types.js
++++ b/packages/react-devtools-shared/src/devtools/views/Profiler/types.js
+@@ -46,6 +46,7 @@ export type ChangeDescription = {|
+   isFirstMount: boolean,
+   props: Array<string> | null,
+   state: Array<string> | null,
++  hooks?: Array<number> | null,
+ |};
+ 
+ export type CommitDataFrontend = {|

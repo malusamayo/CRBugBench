@@ -1,0 +1,652 @@
+commit dd5630f070db28051a3dd59a66f0a4ee6777e38f
+Author: Chethan Rao <70657455+Chethan-rao@users.noreply.github.com>
+Date:   Thu Feb 8 17:40:52 2024 +0530
+
+    refactor(payment_methods): handle card duplication (#3146)
+
+diff --git a/crates/router/src/core/payment_methods/cards.rs b/crates/router/src/core/payment_methods/cards.rs
+index 7b505e7c01..dfbd9211df 100644
+--- a/crates/router/src/core/payment_methods/cards.rs
++++ b/crates/router/src/core/payment_methods/cards.rs
+@@ -109,7 +109,10 @@ pub fn store_default_payment_method(
+     req: &api::PaymentMethodCreate,
+     customer_id: &str,
+     merchant_id: &String,
+-) -> (api::PaymentMethodResponse, bool) {
++) -> (
++    api::PaymentMethodResponse,
++    Option<payment_methods::DataDuplicationCheck>,
++) {
+     let pm_id = generate_id(consts::ID_LENGTH, "pm");
+     let payment_method_response = api::PaymentMethodResponse {
+         merchant_id: merchant_id.to_string(),
+@@ -125,7 +128,7 @@ pub fn store_default_payment_method(
+         installment_payment_enabled: false, //[#219]
+         payment_experience: Some(vec![api_models::enums::PaymentExperience::RedirectToUrl]), //[#219]
+     };
+-    (payment_method_response, false)
++    (payment_method_response, None)
+ }
+ 
+ #[instrument(skip_all)]
+@@ -136,6 +139,7 @@ pub async fn add_payment_method(
+     key_store: &domain::MerchantKeyStore,
+ ) -> errors::RouterResponse<api::PaymentMethodResponse> {
+     req.validate()?;
++    let db = &*state.store;
+     let merchant_id = &merchant_account.merchant_id;
+     let customer_id = req.customer_id.clone().get_required_value("customer_id")?;
+ 
+@@ -178,34 +182,179 @@ pub async fn add_payment_method(
+         )),
+     };
+ 
+-    let (resp, is_duplicate) = response?;
+-    if !is_duplicate {
+-        let pm_metadata = resp.metadata.as_ref().map(|data| data.peek());
++    let (resp, duplication_check) = response?;
++
++    match duplication_check {
++        Some(duplication_check) => match duplication_check {
++            payment_methods::DataDuplicationCheck::Duplicated => {
++                let existing_pm = db.find_payment_method(&resp.payment_method_id).await;
++
++                if let Err(err) = existing_pm {
++                    if err.current_context().is_db_not_found() {
++                        insert_payment_method(
++                            db,
++                            &resp,
++                            req,
++                            key_store,
++                            merchant_id,
++                            &customer_id,
++                            None,
++                        )
++                        .await
++                    } else {
++                        Err(err)
++                            .change_context(errors::ApiErrorResponse::InternalServerError)
++                            .attach_printable("Error while finding payment method")
++                    }?
++                };
++            }
+ 
+-        let pm_card_details = resp
+-            .card
+-            .as_ref()
+-            .map(|card| PaymentMethodsData::Card(CardDetailsPaymentMethod::from(card.clone())));
++            payment_methods::DataDuplicationCheck::MetaDataChanged => {
++                if let Some(card) = req.card.clone() {
++                    delete_card_from_locker(
++                        &state,
++                        &customer_id,
++                        merchant_id,
++                        &resp.payment_method_id,
++                    )
++                    .await?;
++
++                    let add_card_resp = add_card_hs(
++                        &state,
++                        req.clone(),
++                        &card,
++                        customer_id.clone(),
++                        merchant_account,
++                        api::enums::LockerChoice::Tartarus,
++                        Some(&resp.payment_method_id),
++                    )
++                    .await;
+ 
+-        let pm_data_encrypted =
+-            create_encrypted_payment_method_data(key_store, pm_card_details).await;
++                    if let Err(err) = add_card_resp {
++                        logger::error!(vault_err=?err);
++                        db.delete_payment_method_by_merchant_id_payment_method_id(
++                            merchant_id,
++                            &resp.payment_method_id,
++                        )
++                        .await
++                        .to_not_found_response(errors::ApiErrorResponse::PaymentMethodNotFound)?;
+ 
+-        create_payment_method(
+-            &*state.store,
+-            &req,
+-            &customer_id,
+-            &resp.payment_method_id,
+-            &resp.merchant_id,
+-            pm_metadata.cloned(),
+-            pm_data_encrypted,
+-            key_store,
+-        )
+-        .await?;
+-    }
++                        Err(report!(errors::ApiErrorResponse::InternalServerError)
++                            .attach_printable("Failed while updating card metadata changes"))?
++                    };
++
++                    let existing_pm = db.find_payment_method(&resp.payment_method_id).await;
++                    match existing_pm {
++                        Ok(pm) => {
++                            let updated_card = Some(api::CardDetailFromLocker {
++                                scheme: None,
++                                last4_digits: Some(
++                                    card.card_number
++                                        .to_string()
++                                        .split_off(card.card_number.to_string().len() - 4),
++                                ),
++                                issuer_country: None,
++                                card_number: Some(card.card_number),
++                                expiry_month: Some(card.card_exp_month),
++                                expiry_year: Some(card.card_exp_year),
++                                card_token: None,
++                                card_fingerprint: None,
++                                card_holder_name: card.card_holder_name,
++                                nick_name: card.nick_name,
++                                card_network: None,
++                                card_isin: None,
++                                card_issuer: None,
++                                card_type: None,
++                                saved_to_locker: true,
++                            });
++
++                            let updated_pmd = updated_card.as_ref().map(|card| {
++                                PaymentMethodsData::Card(CardDetailsPaymentMethod::from(
++                                    card.clone(),
++                                ))
++                            });
++                            let pm_data_encrypted =
++                                create_encrypted_payment_method_data(key_store, updated_pmd).await;
++
++                            let pm_update = storage::PaymentMethodUpdate::PaymentMethodDataUpdate {
++                                payment_method_data: pm_data_encrypted,
++                            };
++
++                            db.update_payment_method(pm, pm_update)
++                                .await
++                                .change_context(errors::ApiErrorResponse::InternalServerError)
++                                .attach_printable("Failed to add payment method in db")?;
++                        }
++                        Err(err) => {
++                            if err.current_context().is_db_not_found() {
++                                insert_payment_method(
++                                    db,
++                                    &resp,
++                                    req,
++                                    key_store,
++                                    merchant_id,
++                                    &customer_id,
++                                    None,
++                                )
++                                .await
++                            } else {
++                                Err(err)
++                                    .change_context(errors::ApiErrorResponse::InternalServerError)
++                                    .attach_printable("Error while finding payment method")
++                            }?;
++                        }
++                    }
++                }
++            }
++        },
++        None => {
++            let pm_metadata = resp.metadata.as_ref().map(|data| data.peek());
++
++            insert_payment_method(
++                db,
++                &resp,
++                req,
++                key_store,
++                merchant_id,
++                &customer_id,
++                pm_metadata.cloned(),
++            )
++            .await?;
++        }
++    };
+ 
+     Ok(services::ApplicationResponse::Json(resp))
+ }
+ 
++pub async fn insert_payment_method(
++    db: &dyn db::StorageInterface,
++    resp: &api::PaymentMethodResponse,
++    req: api::PaymentMethodCreate,
++    key_store: &domain::MerchantKeyStore,
++    merchant_id: &str,
++    customer_id: &str,
++    pm_metadata: Option<serde_json::Value>,
++) -> errors::RouterResult<()> {
++    let pm_card_details = resp
++        .card
++        .as_ref()
++        .map(|card| PaymentMethodsData::Card(CardDetailsPaymentMethod::from(card.clone())));
++    let pm_data_encrypted = create_encrypted_payment_method_data(key_store, pm_card_details).await;
++    create_payment_method(
++        db,
++        &req,
++        customer_id,
++        &resp.payment_method_id,
++        merchant_id,
++        pm_metadata,
++        pm_data_encrypted,
++        key_store,
++    )
++    .await?;
++
++    Ok(())
++}
++
+ #[instrument(skip_all)]
+ pub async fn update_customer_payment_method(
+     state: routes::AppState,
+@@ -264,7 +413,13 @@ pub async fn add_bank_to_locker(
+     key_store: &domain::MerchantKeyStore,
+     bank: &api::BankPayout,
+     customer_id: &String,
+-) -> errors::CustomResult<(api::PaymentMethodResponse, bool), errors::VaultError> {
++) -> errors::CustomResult<
++    (
++        api::PaymentMethodResponse,
++        Option<payment_methods::DataDuplicationCheck>,
++    ),
++    errors::VaultError,
++> {
+     let key = key_store.key.get_inner().peek();
+     let payout_method_data = api::PayoutMethodData::Bank(bank.clone());
+     let enc_data = async {
+@@ -312,7 +467,7 @@ pub async fn add_bank_to_locker(
+         req,
+         &merchant_account.merchant_id,
+     );
+-    Ok((payment_method_resp, store_resp.duplicate.unwrap_or(false)))
++    Ok((payment_method_resp, store_resp.duplication_check))
+ }
+ 
+ /// The response will be the tuple of PaymentMethodResponse and the duplication check of payment_method
+@@ -322,7 +477,13 @@ pub async fn add_card_to_locker(
+     card: &api::CardDetail,
+     customer_id: &String,
+     merchant_account: &domain::MerchantAccount,
+-) -> errors::CustomResult<(api::PaymentMethodResponse, bool), errors::VaultError> {
++) -> errors::CustomResult<
++    (
++        api::PaymentMethodResponse,
++        Option<payment_methods::DataDuplicationCheck>,
++    ),
++    errors::VaultError,
++> {
+     metrics::STORED_TO_LOCKER.add(&metrics::CONTEXT, 1, &[]);
+     let add_card_to_hs_resp = request::record_operation_time(
+         async {
+@@ -540,7 +701,13 @@ pub async fn add_card_hs(
+     merchant_account: &domain::MerchantAccount,
+     locker_choice: api_enums::LockerChoice,
+     card_reference: Option<&str>,
+-) -> errors::CustomResult<(api::PaymentMethodResponse, bool), errors::VaultError> {
++) -> errors::CustomResult<
++    (
++        api::PaymentMethodResponse,
++        Option<payment_methods::DataDuplicationCheck>,
++    ),
++    errors::VaultError,
++> {
+     let payload = payment_methods::StoreLockerReq::LockerCard(payment_methods::StoreCardReq {
+         merchant_id: &merchant_account.merchant_id,
+         merchant_customer_id: customer_id.to_owned(),
+@@ -565,11 +732,7 @@ pub async fn add_card_hs(
+         req,
+         &merchant_account.merchant_id,
+     );
+-
+-    Ok((
+-        payment_method_resp,
+-        store_card_payload.duplicate.unwrap_or(false),
+-    ))
++    Ok((payment_method_resp, store_card_payload.duplication_check))
+ }
+ 
+ #[instrument(skip_all)]
+@@ -875,7 +1038,7 @@ pub async fn mock_call_to_locker_hs<'a>(
+         .change_context(errors::VaultError::SaveCardFailed)?;
+     let payload = payment_methods::StoreCardRespPayload {
+         card_reference: response.card_id,
+-        duplicate: Some(false),
++        duplication_check: None,
+     };
+     Ok(payment_methods::StoreCardResp {
+         status: "SUCCESS".to_string(),
+diff --git a/crates/router/src/core/payment_methods/transformers.rs b/crates/router/src/core/payment_methods/transformers.rs
+index 360efb7dda..59b02d0193 100644
+--- a/crates/router/src/core/payment_methods/transformers.rs
++++ b/crates/router/src/core/payment_methods/transformers.rs
+@@ -62,7 +62,14 @@ pub struct StoreCardResp {
+ #[derive(Debug, Deserialize, Serialize)]
+ pub struct StoreCardRespPayload {
+     pub card_reference: String,
+-    pub duplicate: Option<bool>,
++    pub duplication_check: Option<DataDuplicationCheck>,
++}
++
++#[derive(Debug, Deserialize, Serialize, PartialEq)]
++#[serde(rename_all = "snake_case")]
++pub enum DataDuplicationCheck {
++    Duplicated,
++    MetaDataChanged,
+ }
+ 
+ #[derive(Debug, Deserialize, Serialize)]
+diff --git a/crates/router/src/core/payments/tokenization.rs b/crates/router/src/core/payments/tokenization.rs
+index 1b9f512d84..9691ea962f 100644
+--- a/crates/router/src/core/payments/tokenization.rs
++++ b/crates/router/src/core/payments/tokenization.rs
+@@ -1,3 +1,4 @@
++use api_models::payment_methods::PaymentMethodsData;
+ use common_utils::{ext_traits::ValueExt, pii};
+ use error_stack::{report, ResultExt};
+ use masking::ExposeInterface;
+@@ -6,7 +7,7 @@ use router_env::{instrument, tracing};
+ use super::helpers;
+ use crate::{
+     core::{
+-        errors::{self, ConnectorErrorExt, RouterResult},
++        errors::{self, ConnectorErrorExt, RouterResult, StorageErrorExt},
+         mandate, payment_methods, payments,
+     },
+     logger,
+@@ -16,7 +17,7 @@ use crate::{
+         self,
+         api::{self, CardDetailFromLocker, CardDetailsPaymentMethod, PaymentMethodCreateExt},
+         domain,
+-        storage::enums as storage_enums,
++        storage::{self, enums as storage_enums},
+     },
+     utils::OptionExt,
+ };
+@@ -99,7 +100,7 @@ where
+                     .await?
+                 };
+ 
+-                let is_duplicate = locker_response.1;
++                let duplication_check = locker_response.1;
+ 
+                 let pm_card_details = locker_response.0.card.as_ref().map(|card| {
+                     api::payment_methods::PaymentMethodsData::Card(CardDetailsPaymentMethod::from(
+@@ -114,29 +115,31 @@ where
+                     )
+                     .await;
+ 
+-                if is_duplicate {
+-                    let existing_pm = db
+-                        .find_payment_method(&locker_response.0.payment_method_id)
+-                        .await;
+-                    match existing_pm {
+-                        Ok(pm) => {
+-                            let pm_metadata = create_payment_method_metadata(
+-                                pm.metadata.as_ref(),
+-                                connector_token,
+-                            )?;
+-                            if let Some(metadata) = pm_metadata {
+-                                payment_methods::cards::update_payment_method(db, pm, metadata)
+-                                    .await
+-                                    .change_context(errors::ApiErrorResponse::InternalServerError)
+-                                    .attach_printable("Failed to add payment method in db")?;
+-                            };
+-                        }
+-                        Err(error) => {
+-                            match error.current_context() {
+-                                errors::StorageError::DatabaseError(err) => match err
+-                                    .current_context()
+-                                {
+-                                    diesel_models::errors::DatabaseError::NotFound => {
++                match duplication_check {
++                    Some(duplication_check) => match duplication_check {
++                        payment_methods::transformers::DataDuplicationCheck::Duplicated => {
++                            let existing_pm = db
++                                .find_payment_method(&locker_response.0.payment_method_id)
++                                .await;
++                            match existing_pm {
++                                Ok(pm) => {
++                                    let pm_metadata = create_payment_method_metadata(
++                                        pm.metadata.as_ref(),
++                                        connector_token,
++                                    )?;
++                                    if let Some(metadata) = pm_metadata {
++                                        payment_methods::cards::update_payment_method(
++                                            db, pm, metadata,
++                                        )
++                                        .await
++                                        .change_context(
++                                            errors::ApiErrorResponse::InternalServerError,
++                                        )
++                                        .attach_printable("Failed to add payment method in db")?;
++                                    };
++                                }
++                                Err(err) => {
++                                    if err.current_context().is_db_not_found() {
+                                         let pm_metadata =
+                                             create_payment_method_metadata(None, connector_token)?;
+                                         payment_methods::cards::create_payment_method(
+@@ -150,33 +153,149 @@ where
+                                             key_store,
+                                         )
+                                         .await
+-                                    }
+-                                    _ => {
+-                                        Err(report!(errors::ApiErrorResponse::InternalServerError)
++                                    } else {
++                                        Err(err)
++                                            .change_context(
++                                                errors::ApiErrorResponse::InternalServerError,
++                                            )
++                                            .attach_printable("Error while finding payment method")
++                                    }?;
++                                }
++                            };
++                        }
++                        payment_methods::transformers::DataDuplicationCheck::MetaDataChanged => {
++                            if let Some(card) = payment_method_create_request.card.clone() {
++                                payment_methods::cards::delete_card_from_locker(
++                                    state,
++                                    &customer.customer_id,
++                                    merchant_id,
++                                    &locker_response.0.payment_method_id,
++                                )
++                                .await?;
++
++                                let add_card_resp = payment_methods::cards::add_card_hs(
++                                    state,
++                                    payment_method_create_request.clone(),
++                                    &card,
++                                    customer.customer_id.clone(),
++                                    merchant_account,
++                                    api::enums::LockerChoice::Tartarus,
++                                    Some(&locker_response.0.payment_method_id),
++                                )
++                                .await;
++
++                                if let Err(err) = add_card_resp {
++                                    logger::error!(vault_err=?err);
++                                    db.delete_payment_method_by_merchant_id_payment_method_id(
++                                        merchant_id,
++                                        &locker_response.0.payment_method_id,
++                                    )
++                                    .await
++                                    .to_not_found_response(
++                                        errors::ApiErrorResponse::PaymentMethodNotFound,
++                                    )?;
++
++                                    Err(report!(errors::ApiErrorResponse::InternalServerError)
++                                        .attach_printable(
++                                            "Failed while updating card metadata changes",
++                                        ))?
++                                };
++
++                                let existing_pm = db
++                                    .find_payment_method(&locker_response.0.payment_method_id)
++                                    .await;
++                                match existing_pm {
++                                    Ok(pm) => {
++                                        let updated_card = Some(CardDetailFromLocker {
++                                            scheme: None,
++                                            last4_digits: Some(
++                                                card.card_number.to_string().split_off(
++                                                    card.card_number.to_string().len() - 4,
++                                                ),
++                                            ),
++                                            issuer_country: None,
++                                            card_number: Some(card.card_number),
++                                            expiry_month: Some(card.card_exp_month),
++                                            expiry_year: Some(card.card_exp_year),
++                                            card_token: None,
++                                            card_fingerprint: None,
++                                            card_holder_name: card.card_holder_name,
++                                            nick_name: card.nick_name,
++                                            card_network: None,
++                                            card_isin: None,
++                                            card_issuer: None,
++                                            card_type: None,
++                                            saved_to_locker: true,
++                                        });
++
++                                        let updated_pmd = updated_card.as_ref().map(|card| {
++                                            PaymentMethodsData::Card(
++                                                CardDetailsPaymentMethod::from(card.clone()),
++                                            )
++                                        });
++                                        let pm_data_encrypted =
++                                            payment_methods::cards::create_encrypted_payment_method_data(
++                                                key_store,
++                                                updated_pmd,
++                                            )
++                                            .await;
++
++                                        let pm_update =
++                                            storage::PaymentMethodUpdate::PaymentMethodDataUpdate {
++                                                payment_method_data: pm_data_encrypted,
++                                            };
++
++                                        db.update_payment_method(pm, pm_update)
++                                            .await
++                                            .change_context(
++                                                errors::ApiErrorResponse::InternalServerError,
++                                            )
+                                             .attach_printable(
+-                                                "Database Error while finding payment method",
+-                                            ))
++                                                "Failed to add payment method in db",
++                                            )?;
++                                    }
++                                    Err(err) => {
++                                        if err.current_context().is_db_not_found() {
++                                            payment_methods::cards::insert_payment_method(
++                                                db,
++                                                &locker_response.0,
++                                                payment_method_create_request,
++                                                key_store,
++                                                merchant_id,
++                                                &customer.customer_id,
++                                                None,
++                                            )
++                                            .await
++                                        } else {
++                                            Err(err)
++                                                .change_context(
++                                                    errors::ApiErrorResponse::InternalServerError,
++                                                )
++                                                .attach_printable(
++                                                    "Error while finding payment method",
++                                                )
++                                        }?;
+                                     }
+-                                },
+-                                _ => Err(report!(errors::ApiErrorResponse::InternalServerError)
+-                                    .attach_printable("Error while finding payment method")),
+-                            }?;
++                                }
++                            }
+                         }
+-                    };
+-                } else {
+-                    let pm_metadata = create_payment_method_metadata(None, connector_token)?;
+-                    payment_methods::cards::create_payment_method(
+-                        db,
+-                        &payment_method_create_request,
+-                        &customer.customer_id,
+-                        &locker_response.0.payment_method_id,
+-                        merchant_id,
+-                        pm_metadata,
+-                        pm_data_encrypted,
+-                        key_store,
+-                    )
+-                    .await?;
+-                };
++                    },
++                    None => {
++                        let pm_metadata = create_payment_method_metadata(None, connector_token)?;
++                        payment_methods::cards::create_payment_method(
++                            db,
++                            &payment_method_create_request,
++                            &customer.customer_id,
++                            &locker_response.0.payment_method_id,
++                            merchant_id,
++                            pm_metadata,
++                            pm_data_encrypted,
++                            key_store,
++                        )
++                        .await?;
++                    }
++                }
++
+                 Some(locker_response.0.payment_method_id)
+             } else {
+                 None
+@@ -190,7 +309,10 @@ where
+ async fn skip_saving_card_in_locker(
+     merchant_account: &domain::MerchantAccount,
+     payment_method_request: api::PaymentMethodCreate,
+-) -> RouterResult<(api_models::payment_methods::PaymentMethodResponse, bool)> {
++) -> RouterResult<(
++    api_models::payment_methods::PaymentMethodResponse,
++    Option<payment_methods::transformers::DataDuplicationCheck>,
++)> {
+     let merchant_id = &merchant_account.merchant_id;
+     let customer_id = payment_method_request
+         .clone()
+@@ -243,7 +365,7 @@ async fn skip_saving_card_in_locker(
+                 bank_transfer: None,
+             };
+ 
+-            Ok((pm_resp, false))
++            Ok((pm_resp, None))
+         }
+         None => {
+             let pm_id = common_utils::generate_id(crate::consts::ID_LENGTH, "pm");
+@@ -261,7 +383,7 @@ async fn skip_saving_card_in_locker(
+                 payment_experience: Some(vec![api_models::enums::PaymentExperience::RedirectToUrl]),
+                 bank_transfer: None,
+             };
+-            Ok((payment_method_response, false))
++            Ok((payment_method_response, None))
+         }
+     }
+ }
+@@ -270,7 +392,10 @@ pub async fn save_in_locker(
+     state: &AppState,
+     merchant_account: &domain::MerchantAccount,
+     payment_method_request: api::PaymentMethodCreate,
+-) -> RouterResult<(api_models::payment_methods::PaymentMethodResponse, bool)> {
++) -> RouterResult<(
++    api_models::payment_methods::PaymentMethodResponse,
++    Option<payment_methods::transformers::DataDuplicationCheck>,
++)> {
+     payment_method_request.validate()?;
+     let merchant_id = &merchant_account.merchant_id;
+     let customer_id = payment_method_request
+@@ -304,7 +429,7 @@ pub async fn save_in_locker(
+                 installment_payment_enabled: false, //[#219]
+                 payment_experience: Some(vec![api_models::enums::PaymentExperience::RedirectToUrl]), //[#219]
+             };
+-            Ok((payment_method_response, false))
++            Ok((payment_method_response, None))
+         }
+     }
+ }

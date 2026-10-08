@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "track": "comment",
+  "task": {
+    "pr_number": 5307,
+    "pr_title": "Parallelize bulk facets & word prefix fid/position docids",
+    "pr_url": "https://github.com/meilisearch/meilisearch/pull/5307",
+    "base_commit": "c29bdcae23ee3c0488a7ef02b66c845686de4372",
+    "reviewed_commit": "9f79ce82af6326e95db47f82e4b25e9767caa982"
+  },
+  "cases": [
+    {
+      "id": "comment:2399074224",
+      "provenance": "A human reviewer flagged this defect in an inline comment on the reviewed pull request.",
+      "summary": "Review comment 2399074224",
+      "description": "The source database is serialized as `word, 0, position -> docids`, which means it will be ordered as below:\r\n```\r\nhe, 0, 0 -> [docids]\r\nhe, 0, 1 -> [docids]\r\nhe, 0, 2 -> [docids]\r\nhell, 0, 0 -> [docids]\r\nhell, 0, 1 -> [docids]\r\nhell, 0, 2 -> [docids]\r\nhello, 0, 0 -> [docids]\r\nhello, 0, 1 -> [docids]\r\nhello, 0, 2 -> [docids]\r\nheritage, 0, 0 -> [docids]\r\nheritage, 0, 1 -> [docids]\r\nheritage, 0, 2 -> [docids]\r\n```\r\n\r\nMeaning that for the prefix `h`, it would create more than one `PrefixIntegerEntry` per position:\r\n\r\n```rust\r\nPrefixIntegerEntry { prefix: \"h\", pos: 0, .. } // he, 0, 0\r\nPrefixIntegerEntry { prefix: \"h\", pos: 1, .. } // he, 0, 1 : because we changed position\r\nPrefixIntegerEntry { prefix: \"h\", pos: 2, .. } // he, 0, 2 : because we changed position\r\nPrefixIntegerEntry { prefix: \"h\", pos: 0, .. } // hell, 0, 0 : we come back to position 0 and we push the same PrefixIntegerEntry as the first one but with different docids.\r\n...\r\n```\r\n\r\nthen when writing into the database, we iterate over the indexes `for PrefixIntegerEntry { prefix, pos, serialized_length } in index` and override the value.\r\n\r\nI think the persisted value for each prefixes will only contain the  `docids` of the last word starting with the prefix for each position.\r\nIn our example, we would only have the `heritage` docids for the `h` prefix.\r\n\r\nAm I right, or am I missing something? \ud83e\udd14",
+      "location": {
+        "path": "crates/milli/src/update/new/words_prefix_docids.rs",
+        "line": 325
+      },
+      "evidence": {
+        "attached_diff_hunk": "@@ -177,7 +185,144 @@ impl WordPrefixIntegerDocids {\n         prefix_to_delete: &BTreeSet<Prefix>,\n     ) -> Result<()> {\n         delete_prefixes(wtxn, &self.prefix_database, prefix_to_delete)?;\n-        self.recompute_modified_prefixes(wtxn, prefix_to_compute)\n+        if self.no_experimental_post_processing {\n+            self.recompute_modified_prefixes(wtxn, prefix_to_compute)\n+        } else {\n+            self.recompute_modified_prefixes_no_frozen(wtxn, prefix_to_compute)\n+        }\n+    }\n+\n+    /// Computes the same as `recompute_modified_prefixes`.\n+    ///\n+    /// ...but without aggregating the prefixes mmap pointers into a static HashMap\n+    /// beforehand and rather use an experimental LMDB feature to read the subset\n+    /// of prefixes in parallel from the uncommitted transaction.\n+    #[tracing::instrument(level = \"trace\", skip_all, target = \"indexing::prefix\")]\n+    fn recompute_modified_prefixes_no_frozen(\n+        &self,\n+        wtxn: &mut RwTxn,\n+        prefixes: &BTreeSet<Prefix>,\n+    ) -> Result<()> {\n+        let thread_count = rayon::current_num_threads();\n+        let rtxns = iter::repeat_with(|| self.index.env.nested_read_txn(wtxn))\n+            .take(thread_count)\n+            .collect::<heed::Result<Vec<_>>>()?;\n+\n+        let outputs = rtxns\n+            .into_par_iter()\n+            .enumerate()\n+            .map(|(thread_id, rtxn)| {\n+                // `indexes` represent offsets at which prefixes computations were stored in the `file`.\n+                let mut indexes = Vec::new();\n+                let mut file = BufWriter::new(spooled_tempfile(\n+                    self.max_memory_by_thread.unwrap_or(usize::MAX),\n+                ));\n+\n+                let mut buffer = Vec::new();\n+                for (prefix_index, prefix) in prefixes.iter().enumerate() {\n+                    // Is prefix for another thread?\n+                    if prefix_index % thread_count != thread_id {\n+                        continue;\n+                    }\n+\n+                    let mut bitmaps_bytes = Vec::<&[u8]>::new();\n+                    let mut prev_pos = None;\n+                    for result in self\n+                        .database\n+                        .remap_data_type::<Bytes>()\n+                        .prefix_iter(&rtxn, prefix.as_bytes())?\n+                    {\n+                        let (key, current_bitmap_bytes) = result?;\n+                        let (_word, pos) =\n+                            StrBEU16Codec::bytes_decode(key).map_err(Error::Decoding)?;\n+\n+                        if prev_pos.is_some_and(|p| p != pos) {\n+                            if bitmaps_bytes.is_empty() {\n+                                indexes.push(PrefixIntegerEntry {\n+                                    prefix,\n+                                    pos,\n+                                    serialized_length: None,\n+                                });\n+                            } else {\n+                                let output = b\n...[truncated]...\n",
+        "thread_resolution": "Kerollmops: I may be wrong but the databases we are iterating on are `word_prefix_fid_docids` and `word_position_docids` which are of type `Database<StrBEU16Codec, CboRoaringBitmapCodec>` which means that the key is not composed of the zero you are showing in the middle, right?\nKerollmops: Ok, we discussed and the bug is indeed here. What I plan to do to fix it is to collect all the bitmaps under their positions for a given prefix in an hashmap."
+      },
+      "metadata": {
+        "comment_id": 2399074224,
+        "reviewer": "ManyTheFish",
+        "url": "https://github.com/meilisearch/meilisearch/pull/5307#discussion_r2399074224",
+        "classify_confidence": null,
+        "is_outdated": false
+      }
+    }
+  ]
+}

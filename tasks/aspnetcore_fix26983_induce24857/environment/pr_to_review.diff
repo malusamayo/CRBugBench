@@ -1,0 +1,921 @@
+commit b140c09c02c3e197b8aed3e4780483523f654eb5
+Author: Sourabh Shirhatti <shirhatti@outlook.com>
+Date:   Wed Aug 19 10:27:18 2020 -0700
+
+    Add support delegating requests in HttpSysServer (#24857)
+    
+    * Add new ctors for RequestQueue and UrlGroup
+    
+    * Add DelegateRequest pinvokes
+    
+    * Add Request Transfer Feature
+    
+    * Fix accessibility of feature
+    
+    * Test cleanup
+    
+    * Update ref assembly
+    
+    * hack: Make HttpSysServer packable
+    
+    * Cleanup based on PR feedback
+    
+    * Avoid sending headers after transfer
+    
+    * Fix ref assembly
+    
+    * Fix rebase conflict
+    
+    * Switch to DelegateRequestEx
+    
+    * Add feature detection
+    
+    * Delete ref folder
+    
+    * Add server feature
+    
+    * s/RequestQueueWrapper/DelegationRule
+    
+    * Fix UrlGroup was null issue
+    
+    * Add light-up for ServerDelegationPropertyFeature
+    
+    * Revert changes to sample
+    
+    * Revert changes to sample take 2
+    
+    * PR feedback
+    
+    * s/Transfered/Transferred
+    
+    * DelegateAfterRequestBodyReadShouldThrow
+    
+    * Make DelegationRule disposable
+    
+    * More license headers
+    
+    * Incomplete XML doc
+    
+    * PR feedback
+    
+    * Fix broken test
+    
+    * PR feedback
+    
+    * Fixup test
+    
+    * s/Transfer/Delegate
+    
+    * s/transfer/delegate
+    
+    * PR feedback
+
+diff --git a/src/Servers/HttpSys/src/AsyncAcceptContext.cs b/src/Servers/HttpSys/src/AsyncAcceptContext.cs
+index f3f5bc14cd..c313f9124e 100644
+--- a/src/Servers/HttpSys/src/AsyncAcceptContext.cs
++++ b/src/Servers/HttpSys/src/AsyncAcceptContext.cs
+@@ -127,7 +127,9 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+                 statusCode = HttpApi.HttpReceiveHttpRequest(
+                     Server.RequestQueue.Handle,
+                     _nativeRequestContext.RequestId,
+-                    (uint)HttpApiTypes.HTTP_FLAGS.HTTP_RECEIVE_REQUEST_FLAG_COPY_BODY,
++                    // Small perf impact by not using HTTP_RECEIVE_REQUEST_FLAG_COPY_BODY
++                    // if the request sends header+body in a single TCP packet 
++                    (uint)HttpApiTypes.HTTP_FLAGS.NONE,
+                     _nativeRequestContext.NativeRequest,
+                     _nativeRequestContext.Size,
+                     &bytesTransferred,
+diff --git a/src/Servers/HttpSys/src/DelegationRule.cs b/src/Servers/HttpSys/src/DelegationRule.cs
+new file mode 100644
+index 0000000000..593b88456a
+--- /dev/null
++++ b/src/Servers/HttpSys/src/DelegationRule.cs
+@@ -0,0 +1,40 @@
++// Copyright (c) .NET Foundation. All rights reserved.
++// Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
++
++using System;
++using Microsoft.Extensions.Logging;
++
++namespace Microsoft.AspNetCore.Server.HttpSys
++{
++    /// <summary>
++    /// Rule that maintains a handle to the Request Queue and UrlPrefix to
++    /// delegate to.
++    /// </summary>
++    public class DelegationRule : IDisposable
++    {
++        private readonly ILogger _logger;
++        /// <summary>
++        /// The name of the Http.Sys request queue
++        /// </summary>
++        public string QueueName { get; }
++        /// <summary>
++        /// The URL of the Http.Sys Url Prefix
++        /// </summary>
++        public string UrlPrefix { get; }
++        internal RequestQueue Queue { get; }
++
++        internal DelegationRule(string queueName, string urlPrefix, ILogger logger)
++        {
++            _logger = logger;
++            QueueName = queueName;
++            UrlPrefix = urlPrefix;
++            Queue = new RequestQueue(queueName, UrlPrefix, _logger, receiver: true);
++        }
++
++        public void Dispose()
++        {
++            Queue.UrlGroup?.Dispose();
++            Queue?.Dispose();
++        }
++    }
++}
+diff --git a/src/Servers/HttpSys/src/FeatureContext.cs b/src/Servers/HttpSys/src/FeatureContext.cs
+index 4845013a6b..3d505c1578 100644
+--- a/src/Servers/HttpSys/src/FeatureContext.cs
++++ b/src/Servers/HttpSys/src/FeatureContext.cs
+@@ -37,7 +37,8 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+         IHttpBodyControlFeature,
+         IHttpSysRequestInfoFeature,
+         IHttpResponseTrailersFeature,
+-        IHttpResetFeature
++        IHttpResetFeature,
++        IHttpSysRequestDelegationFeature
+     {
+         private RequestContext _requestContext;
+         private IFeatureCollection _features;
+@@ -591,6 +592,8 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+             set => _responseTrailers = value;
+         }
+ 
++        public bool CanDelegate => Request.CanDelegate;
++
+         internal async Task OnResponseStart()
+         {
+             if (_responseStarted)
+@@ -711,5 +714,11 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+                 await actionPair.Item1(actionPair.Item2);
+             }
+         }
++
++        public void DelegateRequest(DelegationRule destination)
++        {
++            _requestContext.Delegate(destination);
++            _responseStarted = true;
++        }
+     }
+ }
+diff --git a/src/Servers/HttpSys/src/IHttpSysRequestDelegationFeature.cs b/src/Servers/HttpSys/src/IHttpSysRequestDelegationFeature.cs
+new file mode 100644
+index 0000000000..a581cc8683
+--- /dev/null
++++ b/src/Servers/HttpSys/src/IHttpSysRequestDelegationFeature.cs
+@@ -0,0 +1,20 @@
++// Copyright (c) .NET Foundation. All rights reserved.
++// Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
++
++namespace Microsoft.AspNetCore.Server.HttpSys
++{
++    public interface IHttpSysRequestDelegationFeature
++    {
++        /// <summary>
++        /// Indicates if the server can delegate this request to another HttpSys request queue.
++        /// </summary>
++        bool CanDelegate { get; }
++
++        /// <summary>
++        /// Attempt to delegate the request to another Http.Sys request queue. The request body
++        /// must not be read nor the response started before this is invoked. Check <see cref="CanDelegate"/>
++        /// before invoking.
++        /// </summary>
++        void DelegateRequest(DelegationRule destination);
++    }
++}
+diff --git a/src/Servers/HttpSys/src/IServerDelegationFeature.cs b/src/Servers/HttpSys/src/IServerDelegationFeature.cs
+new file mode 100644
+index 0000000000..7353f9f053
+--- /dev/null
++++ b/src/Servers/HttpSys/src/IServerDelegationFeature.cs
+@@ -0,0 +1,16 @@
++// Copyright (c) .NET Foundation. All rights reserved.
++// Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
++
++namespace Microsoft.AspNetCore.Server.HttpSys
++{
++    public interface IServerDelegationFeature
++    {
++        /// <summary>
++        /// Create a delegation rule on request queue owned by the server.
++        /// </summary>
++        /// <returns>
++        /// Creates a <see cref="DelegationRule"/> that can used to delegate individual requests.
++        /// </returns>
++        DelegationRule CreateDelegationRule(string queueName, string urlPrefix);
++    }
++}
+diff --git a/src/Servers/HttpSys/src/MessagePump.cs b/src/Servers/HttpSys/src/MessagePump.cs
+index 8de84fbb05..c3ccdda86f 100644
+--- a/src/Servers/HttpSys/src/MessagePump.cs
++++ b/src/Servers/HttpSys/src/MessagePump.cs
+@@ -55,6 +55,12 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+             _serverAddresses = new ServerAddressesFeature();
+             Features.Set<IServerAddressesFeature>(_serverAddresses);
+ 
++            if (HttpApi.IsFeatureSupported(HttpApiTypes.HTTP_FEATURE_ID.HttpFeatureDelegateEx))
++            {
++                var delegationProperty = new ServerDelegationPropertyFeature(Listener.RequestQueue, _logger);
++                Features.Set<IServerDelegationFeature>(delegationProperty);
++            }
++
+             _maxAccepts = _options.MaxAccepts;
+         }
+ 
+diff --git a/src/Servers/HttpSys/src/NativeInterop/HttpApi.cs b/src/Servers/HttpSys/src/NativeInterop/HttpApi.cs
+index 6781465bc2..afa2c7c2ff 100644
+--- a/src/Servers/HttpSys/src/NativeInterop/HttpApi.cs
++++ b/src/Servers/HttpSys/src/NativeInterop/HttpApi.cs
+@@ -45,6 +45,9 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+         [DllImport(HTTPAPI, ExactSpelling = true, CallingConvention = CallingConvention.StdCall, SetLastError = true)]
+         internal static extern uint HttpCreateUrlGroup(ulong serverSessionId, ulong* urlGroupId, uint reserved);
+ 
++        [DllImport(HTTPAPI, ExactSpelling = true, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Unicode, SetLastError = true)]
++        internal static extern uint HttpFindUrlGroupId(string pFullyQualifiedUrl, SafeHandle requestQueueHandle, ulong* urlGroupId);
++
+         [DllImport(HTTPAPI, ExactSpelling = true, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Unicode, SetLastError = true)]
+         internal static extern uint HttpAddUrlToUrlGroup(ulong urlGroupId, string pFullyQualifiedUrl, ulong context, uint pReserved);
+ 
+@@ -70,6 +73,13 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+         [DllImport(HTTPAPI, ExactSpelling = true, CallingConvention = CallingConvention.StdCall, SetLastError = true)]
+         internal static extern unsafe uint HttpCloseRequestQueue(IntPtr pReqQueueHandle);
+ 
++        [DllImport(HTTPAPI, ExactSpelling = true, CallingConvention = CallingConvention.StdCall, SetLastError = true)]
++        internal static extern bool HttpIsFeatureSupported(HTTP_FEATURE_ID feature);
++
++        [DllImport(HTTPAPI, ExactSpelling = true, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Unicode, SetLastError = true)]
++        internal static extern unsafe uint HttpDelegateRequestEx(SafeHandle pReqQueueHandle, SafeHandle pDelegateQueueHandle, ulong requestId,
++            ulong delegateUrlGroupId, ulong propertyInfoSetSize, HTTP_DELEGATE_REQUEST_PROPERTY_INFO* pRequestPropertyBuffer);
++
+         internal delegate uint HttpSetRequestPropertyInvoker(SafeHandle requestQueueHandle, ulong requestId, HTTP_REQUEST_PROPERTY propertyId, void* input, uint inputSize, IntPtr overlapped);
+ 
+         private static HTTPAPI_VERSION version;
+@@ -145,5 +155,16 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+                 return supported;
+             }
+         }
++
++        internal static bool IsFeatureSupported(HTTP_FEATURE_ID feature)
++        {
++            try
++            {
++                return HttpIsFeatureSupported(feature);
++            }
++            catch (EntryPointNotFoundException) { }
++
++            return false;
++        }
+     }
+ }
+diff --git a/src/Servers/HttpSys/src/NativeInterop/RequestQueue.cs b/src/Servers/HttpSys/src/NativeInterop/RequestQueue.cs
+index 4fb2d60280..ca3d2e7940 100644
+--- a/src/Servers/HttpSys/src/NativeInterop/RequestQueue.cs
++++ b/src/Servers/HttpSys/src/NativeInterop/RequestQueue.cs
+@@ -16,22 +16,44 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+             Marshal.SizeOf<HttpApiTypes.HTTP_BINDING_INFO>();
+ 
+         private readonly RequestQueueMode _mode;
+-        private readonly UrlGroup _urlGroup;
+         private readonly ILogger _logger;
+         private bool _disposed;
+ 
++        internal RequestQueue(string requestQueueName, string urlPrefix, ILogger logger, bool receiver)
++            : this(urlGroup: null, requestQueueName, RequestQueueMode.Attach, logger, receiver)
++        {
++            try
++            {
++                UrlGroup = new UrlGroup(this, UrlPrefix.Create(urlPrefix));
++            }
++            catch
++            {
++                Dispose();
++                throw;
++            }
++        }
++
+         internal RequestQueue(UrlGroup urlGroup, string requestQueueName, RequestQueueMode mode, ILogger logger)
++            : this(urlGroup, requestQueueName, mode, logger, false)
++        { }
++
++        private RequestQueue(UrlGroup urlGroup, string requestQueueName, RequestQueueMode mode, ILogger logger, bool receiver)
+         {
+             _mode = mode;
+-            _urlGroup = urlGroup;
++            UrlGroup = urlGroup;
+             _logger = logger;
+ 
+             var flags = HttpApiTypes.HTTP_CREATE_REQUEST_QUEUE_FLAG.None;
+             Created = true;
++
+             if (_mode == RequestQueueMode.Attach)
+             {
+                 flags = HttpApiTypes.HTTP_CREATE_REQUEST_QUEUE_FLAG.OpenExisting;
+                 Created = false;
++                if (receiver)
++                {
++                    flags |= HttpApiTypes.HTTP_CREATE_REQUEST_QUEUE_FLAG.Delegation;
++                }
+             }
+ 
+             var statusCode = HttpApi.HttpCreateRequestQueue(
+@@ -54,7 +76,7 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+                         out requestQueueHandle);
+             }
+ 
+-            if (flags == HttpApiTypes.HTTP_CREATE_REQUEST_QUEUE_FLAG.OpenExisting && statusCode == UnsafeNclNativeMethods.ErrorCodes.ERROR_FILE_NOT_FOUND)
++            if (flags.HasFlag(HttpApiTypes.HTTP_CREATE_REQUEST_QUEUE_FLAG.OpenExisting) && statusCode == UnsafeNclNativeMethods.ErrorCodes.ERROR_FILE_NOT_FOUND)
+             {
+                 throw new HttpSysException((int)statusCode, $"Failed to attach to the given request queue '{requestQueueName}', the queue could not be found.");
+             }
+@@ -95,6 +117,8 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+         internal SafeHandle Handle { get; }
+         internal ThreadPoolBoundHandle BoundHandle { get; }
+ 
++        internal UrlGroup UrlGroup { get; }
++
+         internal unsafe void AttachToUrlGroup()
+         {
+             Debug.Assert(Created);
+@@ -108,7 +132,7 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+ 
+             var infoptr = new IntPtr(&info);
+ 
+-            _urlGroup.SetProperty(HttpApiTypes.HTTP_SERVER_PROPERTY.HttpServerBindingProperty,
++            UrlGroup.SetProperty(HttpApiTypes.HTTP_SERVER_PROPERTY.HttpServerBindingProperty,
+                 infoptr, (uint)BindingInfoSize);
+         }
+ 
+@@ -128,7 +152,7 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+ 
+             var infoptr = new IntPtr(&info);
+ 
+-            _urlGroup.SetProperty(HttpApiTypes.HTTP_SERVER_PROPERTY.HttpServerBindingProperty,
++            UrlGroup.SetProperty(HttpApiTypes.HTTP_SERVER_PROPERTY.HttpServerBindingProperty,
+                 infoptr, (uint)BindingInfoSize, throwOnError: false);
+         }
+ 
+diff --git a/src/Servers/HttpSys/src/NativeInterop/UrlGroup.cs b/src/Servers/HttpSys/src/NativeInterop/UrlGroup.cs
+index 081c2d7e15..de348d3786 100644
+--- a/src/Servers/HttpSys/src/NativeInterop/UrlGroup.cs
++++ b/src/Servers/HttpSys/src/NativeInterop/UrlGroup.cs
+@@ -13,6 +13,8 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+     {
+         private static readonly int QosInfoSize =
+             Marshal.SizeOf<HttpApiTypes.HTTP_QOS_SETTING_INFO>();
++        private static readonly int RequestPropertyInfoSize =
++            Marshal.SizeOf<HttpApiTypes.HTTP_BINDING_INFO>();
+ 
+         private ServerSession _serverSession;
+         private ILogger _logger;
+@@ -36,6 +38,21 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+             Id = urlGroupId;
+         }
+ 
++        internal unsafe UrlGroup(RequestQueue requestQueue, UrlPrefix url)
++        {
++            ulong urlGroupId = 0;
++            var statusCode = HttpApi.HttpFindUrlGroupId(
++                url.FullPrefix, requestQueue.Handle, &urlGroupId);
++
++            if (statusCode != UnsafeNclNativeMethods.ErrorCodes.ERROR_SUCCESS)
++            {
++                throw new HttpSysException((int)statusCode);
++            }
++
++            Debug.Assert(urlGroupId != 0, "Invalid id returned by HttpCreateUrlGroup");
++            Id = urlGroupId;
++        }
++
+         internal ulong Id { get; private set; }
+ 
+         internal unsafe void SetMaxConnections(long maxConnections)
+@@ -51,6 +68,15 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+             SetProperty(HttpApiTypes.HTTP_SERVER_PROPERTY.HttpServerQosProperty, new IntPtr(&qosSettings), (uint)QosInfoSize);
+         }
+ 
++        internal unsafe void SetDelegationProperty(RequestQueue destination)
++        {
++            var propertyInfo = new HttpApiTypes.HTTP_BINDING_INFO();
++            propertyInfo.Flags = HttpApiTypes.HTTP_FLAGS.HTTP_PROPERTY_FLAG_PRESENT;
++            propertyInfo.RequestQueueHandle = destination.Handle.DangerousGetHandle();
++
++            SetProperty(HttpApiTypes.HTTP_SERVER_PROPERTY.HttpServerDelegationProperty, new IntPtr(&propertyInfo), (uint)RequestPropertyInfoSize);
++        }
++
+         internal void SetProperty(HttpApiTypes.HTTP_SERVER_PROPERTY property, IntPtr info, uint infosize, bool throwOnError = true)
+         {
+             Debug.Assert(info != IntPtr.Zero, "SetUrlGroupProperty called with invalid pointer");
+diff --git a/src/Servers/HttpSys/src/RequestProcessing/Request.cs b/src/Servers/HttpSys/src/RequestProcessing/Request.cs
+index 84fb017393..494f3e5d6d 100644
+--- a/src/Servers/HttpSys/src/RequestProcessing/Request.cs
++++ b/src/Servers/HttpSys/src/RequestProcessing/Request.cs
+@@ -61,43 +61,40 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+             var rawUrlInBytes = _nativeRequestContext.GetRawUrlInBytes();
+             var originalPath = RequestUriBuilder.DecodeAndUnescapePath(rawUrlInBytes);
+ 
++            PathBase = string.Empty;
++            Path = originalPath;
++
+             // 'OPTIONS * HTTP/1.1'
+             if (KnownMethod == HttpApiTypes.HTTP_VERB.HttpVerbOPTIONS && string.Equals(RawUrl, "*", StringComparison.Ordinal))
+             {
+                 PathBase = string.Empty;
+                 Path = string.Empty;
+             }
+-            else if (requestContext.Server.RequestQueue.Created)
++            else
+             {
+                 var prefix = requestContext.Server.Options.UrlPrefixes.GetPrefix((int)nativeRequestContext.UrlContext);
+-
+-                if (originalPath.Length == prefix.PathWithoutTrailingSlash.Length)
+-                {
+-                    // They matched exactly except for the trailing slash.
+-                    PathBase = originalPath;
+-                    Path = string.Empty;
+-                }
+-                else
++                // Prefix may be null if the requested has been transfered to our queue
++                if (!(prefix is null))
+                 {
+-                    // url: /base/path, prefix: /base/, base: /base, path: /path
+-                    // url: /, prefix: /, base: , path: /
+-                    PathBase = originalPath.Substring(0, prefix.PathWithoutTrailingSlash.Length); // Preserve the user input casing
+-                    Path = originalPath.Substring(prefix.PathWithoutTrailingSlash.Length);
++                    if (originalPath.Length == prefix.PathWithoutTrailingSlash.Length)
++                    {
++                        // They matched exactly except for the trailing slash.
++                        PathBase = originalPath;
++                        Path = string.Empty;
++                    }
++                    else
++                    {
++                        // url: /base/path, prefix: /base/, base: /base, path: /path
++                        // url: /, prefix: /, base: , path: /
++                        PathBase = originalPath.Substring(0, prefix.PathWithoutTrailingSlash.Length); // Preserve the user input casing
++                        Path = originalPath.Substring(prefix.PathWithoutTrailingSlash.Length);
++                    }
+                 }
+-            }
+-            else
+-            {
+-                // When attaching to an existing queue, the UrlContext hint may not match our configuration. Search manualy.
+-                if (requestContext.Server.Options.UrlPrefixes.TryMatchLongestPrefix(IsHttps, cookedUrl.GetHost(), originalPath, out var pathBase, out var path))
++                 else if (requestContext.Server.Options.UrlPrefixes.TryMatchLongestPrefix(IsHttps, cookedUrl.GetHost(), originalPath, out var pathBase, out var path))
+                 {
+                     PathBase = pathBase;
+                     Path = path;
+                 }
+-                else
+-                {
+-                    PathBase = string.Empty;
+-                    Path = originalPath;
+-                }
+             }
+ 
+             ProtocolVersion = _nativeRequestContext.GetVersion();
+@@ -350,6 +347,8 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+             }
+         }
+ 
++        public bool CanDelegate => !(HasRequestBodyStarted || RequestContext.Response.HasStarted);
++
+         // Populates the client certificate.  The result may be null if there is no client cert.
+         // TODO: Does it make sense for this to be invoked multiple times (e.g. renegotiate)? Client and server code appear to
+         // enable this, but it's unclear what Http.Sys would do.
+diff --git a/src/Servers/HttpSys/src/RequestProcessing/RequestContext.cs b/src/Servers/HttpSys/src/RequestProcessing/RequestContext.cs
+index 997339ac14..cc7cee0df3 100644
+--- a/src/Servers/HttpSys/src/RequestProcessing/RequestContext.cs
++++ b/src/Servers/HttpSys/src/RequestProcessing/RequestContext.cs
+@@ -2,8 +2,10 @@
+ // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
+ 
+ using System;
++using System.Collections.Concurrent;
+ using System.Diagnostics;
+ using System.IO;
++using System.Runtime.InteropServices;
+ using System.Security.Authentication.ExtendedProtection;
+ using System.Security.Principal;
+ using System.Threading;
+@@ -17,7 +19,6 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+     internal sealed class RequestContext : IDisposable, IThreadPoolWorkItem
+     {
+         private static readonly Action<object> AbortDelegate = Abort;
+-
+         private NativeRequestContext _memoryBlob;
+         private CancellationTokenSource _requestAbortSource;
+         private CancellationToken? _disconnectToken;
+@@ -322,5 +323,45 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+             Response.ContentLength = 0;
+             Dispose();
+         }
++
++        internal unsafe void Delegate(DelegationRule destination)
++        {
++            if (Request.HasRequestBodyStarted)
++            {
++                throw new InvalidOperationException("This request cannot be delegated, the request body has already started.");
++            }
++            if (Response.HasStarted)
++            {
++                throw new InvalidOperationException("This request cannot be delegated, the response has already started.");
++            }
++
++            var source = Server.RequestQueue;
++
++            uint statusCode;
++
++            fixed (char* uriPointer = destination.UrlPrefix)
++            {
++                var property = new HttpApiTypes.HTTP_DELEGATE_REQUEST_PROPERTY_INFO()
++                {
++                    ProperyId = HttpApiTypes.HTTP_DELEGATE_REQUEST_PROPERTY_ID.DelegateRequestDelegateUrlProperty,
++                    PropertyInfo = (IntPtr)uriPointer,
++                    PropertyInfoLength = (uint)System.Text.Encoding.Unicode.GetByteCount(destination.UrlPrefix)
++                };
++
++                statusCode = HttpApi.HttpDelegateRequestEx(source.Handle,
++                                                               destination.Queue.Handle,
++                                                               Request.RequestId,
++                                                               destination.Queue.UrlGroup.Id,
++                                                               propertyInfoSetSize: 1,
++                                                               &property);
++            }
++
++            if (statusCode != UnsafeNclNativeMethods.ErrorCodes.ERROR_SUCCESS)
++            {
++                throw new HttpSysException((int)statusCode);
++            }
++
++            Response.MarkDelegated();
++        }
+     }
+ }
+diff --git a/src/Servers/HttpSys/src/RequestProcessing/Response.cs b/src/Servers/HttpSys/src/RequestProcessing/Response.cs
+index 3f8dd86f7e..a6fc52bd92 100644
+--- a/src/Servers/HttpSys/src/RequestProcessing/Response.cs
++++ b/src/Servers/HttpSys/src/RequestProcessing/Response.cs
+@@ -730,6 +730,12 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+             }
+         }
+ 
++        internal void MarkDelegated()
++        {
++            Abort();
++            _nativeStream?.MarkDelegated();
++        }
++
+         internal void CancelLastWrite()
+         {
+             _nativeStream?.CancelLastWrite();
+diff --git a/src/Servers/HttpSys/src/RequestProcessing/ResponseBody.cs b/src/Servers/HttpSys/src/RequestProcessing/ResponseBody.cs
+index 6b181cc312..2e59530a9c 100644
+--- a/src/Servers/HttpSys/src/RequestProcessing/ResponseBody.cs
++++ b/src/Servers/HttpSys/src/RequestProcessing/ResponseBody.cs
+@@ -106,6 +106,11 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+             FlushInternal(endOfRequest: false);
+         }
+ 
++        public void MarkDelegated()
++        {
++            _skipWrites = true;
++        }
++
+         // We never expect endOfRequest and data at the same time
+         private unsafe void FlushInternal(bool endOfRequest, ArraySegment<byte> data = new ArraySegment<byte>())
+         {
+diff --git a/src/Servers/HttpSys/src/ServerDelegationPropertyFeature.cs b/src/Servers/HttpSys/src/ServerDelegationPropertyFeature.cs
+new file mode 100644
+index 0000000000..d9066a3dd5
+--- /dev/null
++++ b/src/Servers/HttpSys/src/ServerDelegationPropertyFeature.cs
+@@ -0,0 +1,29 @@
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++using Microsoft.AspNetCore.Hosting.Server.Features;
++using Microsoft.Extensions.Logging;
++
++namespace Microsoft.AspNetCore.Server.HttpSys
++{
++    internal class ServerDelegationPropertyFeature : IServerDelegationFeature
++    {
++        private readonly ILogger _logger;
++        private readonly RequestQueue _queue;
++
++        public ServerDelegationPropertyFeature(RequestQueue queue, ILogger logger)
++        {
++            _queue = queue;
++            _logger = logger;
++        }
++
++        public DelegationRule CreateDelegationRule(string queueName, string uri)
++        {
++            var rule = new DelegationRule(queueName, uri, _logger);
++            _queue.UrlGroup.SetDelegationProperty(rule.Queue);
++            return rule;
++        }
++    }
++}
+diff --git a/src/Servers/HttpSys/src/StandardFeatureCollection.cs b/src/Servers/HttpSys/src/StandardFeatureCollection.cs
+index 304b39b070..c8705b2ee6 100644
+--- a/src/Servers/HttpSys/src/StandardFeatureCollection.cs
++++ b/src/Servers/HttpSys/src/StandardFeatureCollection.cs
+@@ -7,6 +7,7 @@ using System.Collections.Generic;
+ using Microsoft.AspNetCore.Connections.Features;
+ using Microsoft.AspNetCore.Http.Features;
+ using Microsoft.AspNetCore.Http.Features.Authentication;
++using Microsoft.AspNetCore.HttpSys.Internal;
+ 
+ namespace Microsoft.AspNetCore.Server.HttpSys
+ {
+@@ -44,6 +45,11 @@ namespace Microsoft.AspNetCore.Server.HttpSys
+                 // Win8+
+                 _featureFuncLookup[typeof(ITlsHandshakeFeature)] = ctx => ctx.GetTlsHandshakeFeature();
+             }
++
++            if (HttpApi.IsFeatureSupported(HttpApiTypes.HTTP_FEATURE_ID.HttpFeatureDelegateEx))
++            {
++                _featureFuncLookup[typeof(IHttpSysRequestDelegationFeature)] = _identityFunc;
++            }
+         }
+ 
+         public StandardFeatureCollection(FeatureContext featureContext)
+diff --git a/src/Servers/HttpSys/test/FunctionalTests/DelegateSupportedConditionAttribute.cs b/src/Servers/HttpSys/test/FunctionalTests/DelegateSupportedConditionAttribute.cs
+new file mode 100644
+index 0000000000..b6267657e4
+--- /dev/null
++++ b/src/Servers/HttpSys/test/FunctionalTests/DelegateSupportedConditionAttribute.cs
+@@ -0,0 +1,27 @@
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++using Microsoft.AspNetCore.Testing;
++using static Microsoft.AspNetCore.HttpSys.Internal.HttpApiTypes;
++
++namespace Microsoft.AspNetCore.Server.HttpSys.FunctionalTests
++{
++    [AttributeUsage(AttributeTargets.Method, AllowMultiple = false)]
++    public class DelegateSupportedConditionAttribute : Attribute, ITestCondition
++    {
++        private readonly bool _isSupported;
++        public DelegateSupportedConditionAttribute(bool isSupported) => _isSupported = isSupported;
++
++        private readonly Lazy<bool> _isDelegateSupported = new Lazy<bool>(CanDelegate);
++        public bool IsMet => (_isDelegateSupported.Value == _isSupported);
++
++        public string SkipReason => $"Http.Sys does {(_isSupported ? "not" : "")} support delegating requests";
++
++        private static bool CanDelegate()
++        {
++            return HttpApi.IsFeatureSupported(HTTP_FEATURE_ID.HttpFeatureDelegateEx);
++        }
++    }
++}
+diff --git a/src/Servers/HttpSys/test/FunctionalTests/DelegateTests.cs b/src/Servers/HttpSys/test/FunctionalTests/DelegateTests.cs
+new file mode 100644
+index 0000000000..f94f0bf0be
+--- /dev/null
++++ b/src/Servers/HttpSys/test/FunctionalTests/DelegateTests.cs
+@@ -0,0 +1,179 @@
++// Copyright (c) .NET Foundation. All rights reserved.
++// Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
++
++using System;
++using System.IO;
++using System.Net.Http;
++using System.Threading.Tasks;
++using Microsoft.AspNetCore.Http;
++using Microsoft.AspNetCore.Testing;
++using Xunit;
++
++namespace Microsoft.AspNetCore.Server.HttpSys.FunctionalTests
++{
++    public class DelegateTests
++    {
++        private static readonly string _expectedResponseString = "Hello from delegatee";
++
++        [ConditionalFact]
++        [DelegateSupportedCondition(true)]
++        public async Task DelegateRequestTest()
++        {
++            var queueName = Guid.NewGuid().ToString();
++             using var receiver = Utilities.CreateHttpServer(out var receiverAddress, async httpContext =>
++            {
++                await httpContext.Response.WriteAsync(_expectedResponseString);
++            },
++            options =>
++            {
++                options.RequestQueueName = queueName;
++            });
++
++            DelegationRule destination = default;
++
++            using var delegator = Utilities.CreateHttpServer(out var delegatorAddress, httpContext =>
++            {
++                var delegateFeature = httpContext.Features.Get<IHttpSysRequestDelegationFeature>();
++                delegateFeature.DelegateRequest(destination);
++                return Task.CompletedTask;
++            });
++
++            var delegationProperty = delegator.Features.Get<IServerDelegationFeature>();
++            destination = delegationProperty.CreateDelegationRule(queueName, receiverAddress);
++
++            var responseString = await SendRequestAsync(delegatorAddress);
++            Assert.Equal(_expectedResponseString, responseString);
++            destination?.Dispose();
++        }
++
++        [ConditionalFact]
++        [DelegateSupportedCondition(true)]
++        public async Task DelegateAfterWriteToResponseBodyShouldThrowTest()
++        {
++            var queueName = Guid.NewGuid().ToString();
++            using var receiver = Utilities.CreateHttpServer(out var receiverAddress, httpContext =>
++            {
++                httpContext.Response.StatusCode = StatusCodes.Status418ImATeapot;
++                return Task.CompletedTask;
++            },
++            options =>
++            {
++                options.RequestQueueName = queueName;
++            });
++
++            DelegationRule destination = default;
++
++            using var delegator = Utilities.CreateHttpServer(out var delegatorAddress, async httpContext =>
++            {
++                await httpContext.Response.WriteAsync(_expectedResponseString);
++                var delegateFeature = httpContext.Features.Get<IHttpSysRequestDelegationFeature>();
++                Assert.False(delegateFeature.CanDelegate);
++                Assert.Throws<InvalidOperationException>(() => delegateFeature.DelegateRequest(destination));
++            });
++
++            var delegationProperty = delegator.Features.Get<IServerDelegationFeature>();
++            destination = delegationProperty.CreateDelegationRule(queueName, receiverAddress);
++
++            var responseString = await SendRequestAsync(delegatorAddress);
++            Assert.Equal(_expectedResponseString, responseString);
++            destination?.Dispose();
++        }
++
++        [ConditionalFact]
++        [DelegateSupportedCondition(true)]
++        public async Task WriteToBodyAfterDelegateShouldNoOp()
++        {
++            var queueName = Guid.NewGuid().ToString();
++            using var receiver = Utilities.CreateHttpServer(out var receiverAddress, async httpContext =>
++            {
++                await httpContext.Response.WriteAsync(_expectedResponseString);
++            },
++            options =>
++            {
++                options.RequestQueueName = queueName;
++            });
++
++            DelegationRule destination = default;
++
++            using var delegator = Utilities.CreateHttpServer(out var delegatorAddress, httpContext =>
++            {
++                var delegateFeature = httpContext.Features.Get<IHttpSysRequestDelegationFeature>();
++                delegateFeature.DelegateRequest(destination);
++                Assert.False(delegateFeature.CanDelegate);
++                httpContext.Response.WriteAsync(_expectedResponseString);
++                return Task.CompletedTask;
++            });
++
++            var delegationProperty = delegator.Features.Get<IServerDelegationFeature>();
++            destination = delegationProperty.CreateDelegationRule(queueName, receiverAddress);
++
++            var responseString = await SendRequestAsync(delegatorAddress);
++            Assert.Equal(_expectedResponseString, responseString);
++            destination?.Dispose();
++        }
++
++        [ConditionalFact]
++        [DelegateSupportedCondition(true)]
++        public async Task DelegateAfterRequestBodyReadShouldThrow()
++        {
++            var queueName = Guid.NewGuid().ToString();
++            using var receiver = Utilities.CreateHttpServer(out var receiverAddress, httpContext =>
++            {
++                httpContext.Response.StatusCode = StatusCodes.Status418ImATeapot;
++                return Task.CompletedTask;
++            },
++           options =>
++           {
++               options.RequestQueueName = queueName;
++           });
++
++            DelegationRule destination = default;
++
++            using var delegator = Utilities.CreateHttpServer(out var delegatorAddress, async httpContext =>
++            {
++                var memoryStream = new MemoryStream();
++                await httpContext.Request.Body.CopyToAsync(memoryStream);
++                var delegateFeature = httpContext.Features.Get<IHttpSysRequestDelegationFeature>();
++                Assert.Throws<InvalidOperationException>(() => delegateFeature.DelegateRequest(destination));
++            });
++
++            var delegationProperty = delegator.Features.Get<IServerDelegationFeature>();
++            destination = delegationProperty.CreateDelegationRule(queueName, receiverAddress);
++
++            _ = await SendRequestWithBodyAsync(delegatorAddress);
++            destination?.Dispose();
++        }
++
++        [ConditionalFact]
++        [DelegateSupportedCondition(false)]
++        public async Task DelegationFeaturesAreNull()
++        {
++            using var delegator = Utilities.CreateHttpServer(out var delegatorAddress, httpContext =>
++            {
++                var delegateFeature = httpContext.Features.Get<IHttpSysRequestDelegationFeature>();
++                Assert.Null(delegateFeature);
++                return Task.CompletedTask;
++            });
++
++            var delegationProperty = delegator.Features.Get<IServerDelegationFeature>();
++            Assert.Null(delegationProperty);
++
++            _ = await SendRequestAsync(delegatorAddress);
++        }
++
++        private async Task<string> SendRequestAsync(string uri)
++        {
++            using var client = new HttpClient();
++            return await client.GetStringAsync(uri);
++        }
++
++        private async Task<string> SendRequestWithBodyAsync(string uri)
++        {
++            using var client = new HttpClient();
++            var content = new StringContent("Sample request body");
++            var response = await client.PostAsync(uri, content);
++            response.EnsureSuccessStatusCode();
++            return await response.Content.ReadAsStringAsync();
++        }
++    }
++}
+diff --git a/src/Shared/HttpSys/NativeInterop/HttpApiTypes.cs b/src/Shared/HttpSys/NativeInterop/HttpApiTypes.cs
+index 2e69d7bc40..706fbd3d32 100644
+--- a/src/Shared/HttpSys/NativeInterop/HttpApiTypes.cs
++++ b/src/Shared/HttpSys/NativeInterop/HttpApiTypes.cs
+@@ -32,6 +32,7 @@ namespace Microsoft.AspNetCore.HttpSys.Internal
+             HttpServerListenEndpointProperty,
+             HttpServerChannelBindProperty,
+             HttpServerProtectionLevelProperty,
++            HttpServerDelegationProperty = 16
+         }
+ 
+         // Currently only one request info type is supported but the enum is for future extensibility.
+@@ -71,6 +72,28 @@ namespace Microsoft.AspNetCore.HttpSys.Internal
+             MinSendRate,
+         }
+ 
++        internal enum HTTP_DELEGATE_REQUEST_PROPERTY_ID : uint
++        {
++            DelegateRequestReservedProperty,
++            DelegateRequestDelegateUrlProperty
++        }
++
++        internal enum HTTP_FEATURE_ID
++        {
++            HttpFeatureUnknown = 0,
++            HttpFeatureResponseTrailers = 1,
++            HttpFeatureApiTimings = 2,
++            HttpFeatureDelegateEx = 3,
++        }
++
++        [StructLayout(LayoutKind.Sequential, Pack = 4)]
++        internal struct HTTP_DELEGATE_REQUEST_PROPERTY_INFO
++        {
++            internal HTTP_DELEGATE_REQUEST_PROPERTY_ID ProperyId;
++            internal uint PropertyInfoLength;
++            internal IntPtr PropertyInfo;
++        }
++
+         internal struct HTTP_REQUEST_PROPERTY_STREAM_ERROR
+         {
+             internal uint ErrorCode;
+@@ -651,6 +674,7 @@ namespace Microsoft.AspNetCore.HttpSys.Internal
+             OpenExisting = 1,
+             // The handle to the request queue created using this flag cannot be used to perform I/O operations. This flag can be set only when the request queue handle is created.
+             Controller = 2,
++            Delegation = 8
+         }
+ 
+         internal static class HTTP_RESPONSE_HEADER_ID

@@ -1,0 +1,709 @@
+diff --git a/src/main/java/io/reactivex/rxjava3/core/Flowable.java b/src/main/java/io/reactivex/rxjava3/core/Flowable.java
+index 364e83fd585..87bd687601a 100644
+--- a/src/main/java/io/reactivex/rxjava3/core/Flowable.java
++++ b/src/main/java/io/reactivex/rxjava3/core/Flowable.java
+@@ -12676,6 +12676,39 @@ public final Flowable<T> onBackpressureLatest() {
+         return RxJavaPlugins.onAssembly(new FlowableOnBackpressureLatest<>(this));
+     }
+ 
++    /**
++     * Reduces a sequence of two not emitted values via a function into a single value if the downstream is not ready to receive
++     * new items (indicated by a lack of {@link Subscription#request(long)} calls from it) and emits this latest
++     * item when the downstream becomes ready.
++     * <p>
++     * <img width="640" height="245" src="https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/bp.obp.reduce.v3.png" alt="">
++     * <p>
++     * Note that if the current {@code Flowable} does support backpressure, this operator ignores that capability
++     * and doesn't propagate any backpressure requests from downstream.
++     * <p>
++     * Note that due to the nature of how backpressure requests are propagated through subscribeOn/observeOn,
++     * requesting more than 1 from downstream doesn't guarantee a continuous delivery of {@code onNext} events.
++     * <dl>
++     *  <dt><b>Backpressure:</b></dt>
++     *  <dd>The operator honors backpressure from downstream and consumes the current {@code Flowable} in an unbounded
++     *  manner (i.e., not applying backpressure to it).</dd>
++     *  <dt><b>Scheduler:</b></dt>
++     *  <dd>{@code onBackpressureReduce} does not operate by default on a particular {@link Scheduler}.</dd>
++     * </dl>
++     * @param reducer the bi-function to call when there is more than one non-emitted value to downstream,
++     * the first argument of the bi-function is previous item and the second one is currently emitting from upstream
++     * @return the new {@code Flowable} instance
++     * @throws NullPointerException if {@code reducer} is {@code null}
++     * @since 3.1.0
++     */
++    @CheckReturnValue
++    @BackpressureSupport(BackpressureKind.UNBOUNDED_IN)
++    @SchedulerSupport(SchedulerSupport.NONE)
++    @NonNull
++    public final Flowable<T> onBackpressureReduce(@NonNull BiFunction<T, T, T> reducer) {
++        return RxJavaPlugins.onAssembly(new FlowableOnBackpressureReduce<>(this, reducer));
++    }
++
+     /**
+      * Returns a {@code Flowable} instance that if the current {@code Flowable} emits an error, it will emit an {@code onComplete}
+      * and swallow the throwable.
+diff --git a/src/main/java/io/reactivex/rxjava3/internal/operators/flowable/AbstractBackpressureThrottlingSubscriber.java b/src/main/java/io/reactivex/rxjava3/internal/operators/flowable/AbstractBackpressureThrottlingSubscriber.java
+new file mode 100644
+index 00000000000..e51d8708285
+--- /dev/null
++++ b/src/main/java/io/reactivex/rxjava3/internal/operators/flowable/AbstractBackpressureThrottlingSubscriber.java
+@@ -0,0 +1,163 @@
++/**
++ * Copyright (c) 2016-present, RxJava Contributors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in
++ * compliance with the License. You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License is
++ * distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See
++ * the License for the specific language governing permissions and limitations under the License.
++ */
++
++package io.reactivex.rxjava3.internal.operators.flowable;
++
++import io.reactivex.rxjava3.core.FlowableSubscriber;
++import io.reactivex.rxjava3.internal.subscriptions.SubscriptionHelper;
++import io.reactivex.rxjava3.internal.util.BackpressureHelper;
++import org.reactivestreams.Publisher;
++import org.reactivestreams.Subscriber;
++import org.reactivestreams.Subscription;
++
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.atomic.AtomicLong;
++import java.util.concurrent.atomic.AtomicReference;
++
++/**
++ * Abstract base class for operators that throttle excessive updates from upstream in case if
++ * downstream {@link Subscriber} is not ready to receive updates
++ *
++ * @param <T> the upstream and downstream value type
++ */
++abstract class AbstractBackpressureThrottlingSubscriber<T> extends AtomicInteger implements FlowableSubscriber<T>, Subscription {
++
++    final Subscriber<? super T> downstream;
++
++    Subscription upstream;
++
++    volatile boolean done;
++    Throwable error;
++
++    volatile boolean cancelled;
++
++    final AtomicLong requested = new AtomicLong();
++
++    final AtomicReference<T> current = new AtomicReference<>();
++
++    AbstractBackpressureThrottlingSubscriber(Subscriber<? super T> downstream) {
++        this.downstream = downstream;
++    }
++
++    @Override
++    public void onSubscribe(Subscription s) {
++        if (SubscriptionHelper.validate(this.upstream, s)) {
++            this.upstream = s;
++            downstream.onSubscribe(this);
++            s.request(Long.MAX_VALUE);
++        }
++    }
++
++    @Override
++    abstract public void onNext(T t);
++
++    @Override
++    public void onError(Throwable t) {
++        error = t;
++        done = true;
++        drain();
++    }
++
++    @Override
++    public void onComplete() {
++        done = true;
++        drain();
++    }
++
++    @Override
++    public void request(long n) {
++        if (SubscriptionHelper.validate(n)) {
++            BackpressureHelper.add(requested, n);
++            drain();
++        }
++    }
++
++    @Override
++    public void cancel() {
++        if (!cancelled) {
++            cancelled = true;
++            upstream.cancel();
++
++            if (getAndIncrement() == 0) {
++                current.lazySet(null);
++            }
++        }
++    }
++
++    void drain() {
++        if (getAndIncrement() != 0) {
++            return;
++        }
++        final Subscriber<? super T> a = downstream;
++        int missed = 1;
++        final AtomicLong r = requested;
++        final AtomicReference<T> q = current;
++
++        for (;;) {
++            long e = 0L;
++
++            while (e != r.get()) {
++                boolean d = done;
++                T v = q.getAndSet(null);
++                boolean empty = v == null;
++
++                if (checkTerminated(d, empty, a, q)) {
++                    return;
++                }
++
++                if (empty) {
++                    break;
++                }
++
++                a.onNext(v);
++
++                e++;
++            }
++
++            if (e == r.get() && checkTerminated(done, q.get() == null, a, q)) {
++                return;
++            }
++
++            if (e != 0L) {
++                BackpressureHelper.produced(r, e);
++            }
++
++            missed = addAndGet(-missed);
++            if (missed == 0) {
++                break;
++            }
++        }
++    }
++
++    boolean checkTerminated(boolean d, boolean empty, Subscriber<?> a, AtomicReference<T> q) {
++        if (cancelled) {
++            q.lazySet(null);
++            return true;
++        }
++
++        if (d) {
++            Throwable e = error;
++            if (e != null) {
++                q.lazySet(null);
++                a.onError(e);
++                return true;
++            } else
++            if (empty) {
++                a.onComplete();
++                return true;
++            }
++        }
++
++        return false;
++    }
++}
+diff --git a/src/main/java/io/reactivex/rxjava3/internal/operators/flowable/FlowableOnBackpressureLatest.java b/src/main/java/io/reactivex/rxjava3/internal/operators/flowable/FlowableOnBackpressureLatest.java
+index 6123475ef00..c28aa4c9b1a 100644
+--- a/src/main/java/io/reactivex/rxjava3/internal/operators/flowable/FlowableOnBackpressureLatest.java
++++ b/src/main/java/io/reactivex/rxjava3/internal/operators/flowable/FlowableOnBackpressureLatest.java
+@@ -13,13 +13,8 @@
+ 
+ package io.reactivex.rxjava3.internal.operators.flowable;
+ 
+-import java.util.concurrent.atomic.*;
+-
+-import org.reactivestreams.*;
+-
+-import io.reactivex.rxjava3.core.*;
+-import io.reactivex.rxjava3.internal.subscriptions.SubscriptionHelper;
+-import io.reactivex.rxjava3.internal.util.BackpressureHelper;
++import io.reactivex.rxjava3.core.Flowable;
++import org.reactivestreams.Subscriber;
+ 
+ public final class FlowableOnBackpressureLatest<T> extends AbstractFlowableWithUpstream<T, T> {
+ 
+@@ -32,34 +27,12 @@ protected void subscribeActual(Subscriber<? super T> s) {
+         source.subscribe(new BackpressureLatestSubscriber<>(s));
+     }
+ 
+-    static final class BackpressureLatestSubscriber<T> extends AtomicInteger implements FlowableSubscriber<T>, Subscription {
++    static final class BackpressureLatestSubscriber<T> extends AbstractBackpressureThrottlingSubscriber<T> {
+ 
+         private static final long serialVersionUID = 163080509307634843L;
+ 
+-        final Subscriber<? super T> downstream;
+-
+-        Subscription upstream;
+-
+-        volatile boolean done;
+-        Throwable error;
+-
+-        volatile boolean cancelled;
+-
+-        final AtomicLong requested = new AtomicLong();
+-
+-        final AtomicReference<T> current = new AtomicReference<>();
+-
+         BackpressureLatestSubscriber(Subscriber<? super T> downstream) {
+-            this.downstream = downstream;
+-        }
+-
+-        @Override
+-        public void onSubscribe(Subscription s) {
+-            if (SubscriptionHelper.validate(this.upstream, s)) {
+-                this.upstream = s;
+-                downstream.onSubscribe(this);
+-                s.request(Long.MAX_VALUE);
+-            }
++            super(downstream);
+         }
+ 
+         @Override
+@@ -67,105 +40,5 @@ public void onNext(T t) {
+             current.lazySet(t);
+             drain();
+         }
+-
+-        @Override
+-        public void onError(Throwable t) {
+-            error = t;
+-            done = true;
+-            drain();
+-        }
+-
+-        @Override
+-        public void onComplete() {
+-            done = true;
+-            drain();
+-        }
+-
+-        @Override
+-        public void request(long n) {
+-            if (SubscriptionHelper.validate(n)) {
+-                BackpressureHelper.add(requested, n);
+-                drain();
+-            }
+-        }
+-
+-        @Override
+-        public void cancel() {
+-            if (!cancelled) {
+-                cancelled = true;
+-                upstream.cancel();
+-
+-                if (getAndIncrement() == 0) {
+-                    current.lazySet(null);
+-                }
+-            }
+-        }
+-
+-        void drain() {
+-            if (getAndIncrement() != 0) {
+-                return;
+-            }
+-            final Subscriber<? super T> a = downstream;
+-            int missed = 1;
+-            final AtomicLong r = requested;
+-            final AtomicReference<T> q = current;
+-
+-            for (;;) {
+-                long e = 0L;
+-
+-                while (e != r.get()) {
+-                    boolean d = done;
+-                    T v = q.getAndSet(null);
+-                    boolean empty = v == null;
+-
+-                    if (checkTerminated(d, empty, a, q)) {
+-                        return;
+-                    }
+-
+-                    if (empty) {
+-                        break;
+-                    }
+-
+-                    a.onNext(v);
+-
+-                    e++;
+-                }
+-
+-                if (e == r.get() && checkTerminated(done, q.get() == null, a, q)) {
+-                    return;
+-                }
+-
+-                if (e != 0L) {
+-                    BackpressureHelper.produced(r, e);
+-                }
+-
+-                missed = addAndGet(-missed);
+-                if (missed == 0) {
+-                    break;
+-                }
+-            }
+-        }
+-
+-        boolean checkTerminated(boolean d, boolean empty, Subscriber<?> a, AtomicReference<T> q) {
+-            if (cancelled) {
+-                q.lazySet(null);
+-                return true;
+-            }
+-
+-            if (d) {
+-                Throwable e = error;
+-                if (e != null) {
+-                    q.lazySet(null);
+-                    a.onError(e);
+-                    return true;
+-                } else
+-                if (empty) {
+-                    a.onComplete();
+-                    return true;
+-                }
+-            }
+-
+-            return false;
+-        }
+     }
+ }
+diff --git a/src/main/java/io/reactivex/rxjava3/internal/operators/flowable/FlowableOnBackpressureReduce.java b/src/main/java/io/reactivex/rxjava3/internal/operators/flowable/FlowableOnBackpressureReduce.java
+new file mode 100644
+index 00000000000..7ef0c77bc20
+--- /dev/null
++++ b/src/main/java/io/reactivex/rxjava3/internal/operators/flowable/FlowableOnBackpressureReduce.java
+@@ -0,0 +1,68 @@
++/**
++ * Copyright (c) 2016-present, RxJava Contributors.
++ * <p>
++ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in
++ * compliance with the License. You may obtain a copy of the License at
++ * <p>
++ * http://www.apache.org/licenses/LICENSE-2.0
++ * <p>
++ * Unless required by applicable law or agreed to in writing, software distributed under the License is
++ * distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See
++ * the License for the specific language governing permissions and limitations under the License.
++ */
++
++package io.reactivex.rxjava3.internal.operators.flowable;
++
++import io.reactivex.rxjava3.core.Flowable;
++import io.reactivex.rxjava3.exceptions.Exceptions;
++import io.reactivex.rxjava3.functions.BiFunction;
++import org.reactivestreams.Subscriber;
++
++import java.util.Objects;
++
++public final class FlowableOnBackpressureReduce<T> extends AbstractFlowableWithUpstream<T, T> {
++
++    private final BiFunction<T, T, T> reducer;
++
++    public FlowableOnBackpressureReduce(Flowable<T> source, BiFunction<T, T, T> reducer) {
++        super(source);
++        this.reducer = Objects.requireNonNull(reducer, "reducer is null");
++    }
++
++    @Override
++    protected void subscribeActual(Subscriber<? super T> s) {
++        source.subscribe(new BackpressureReduceSubscriber<>(s, reducer));
++    }
++
++    static final class BackpressureReduceSubscriber<T> extends AbstractBackpressureThrottlingSubscriber<T> {
++
++        private static final long serialVersionUID = 821363947659780367L;
++
++        final BiFunction<T, T, T> reducer;
++
++        BackpressureReduceSubscriber(Subscriber<? super T> downstream, BiFunction<T, T, T> reducer) {
++            super(downstream);
++            this.reducer = reducer;
++        }
++
++        @Override
++        public void onNext(T t) {
++            T v = current.get();
++            if (v == null) {
++                current.lazySet(t);
++            } else if ((v = current.getAndSet(null)) != null) {
++                try {
++                    current.lazySet(reducer.apply(v, t));
++                } catch (Throwable throwable) {
++                    Exceptions.throwIfFatal(throwable);
++                    cancel();
++                    onError(throwable);
++                    return;
++                }
++            } else {
++                current.lazySet(t);
++            }
++            drain();
++        }
++    }
++}
+diff --git a/src/test/java/io/reactivex/rxjava3/internal/operators/flowable/FlowableOnBackpressureLatestTest.java b/src/test/java/io/reactivex/rxjava3/internal/operators/flowable/FlowableOnBackpressureLatestTest.java
+index 438ebb1415e..2b4f490bca9 100644
+--- a/src/test/java/io/reactivex/rxjava3/internal/operators/flowable/FlowableOnBackpressureLatestTest.java
++++ b/src/test/java/io/reactivex/rxjava3/internal/operators/flowable/FlowableOnBackpressureLatestTest.java
+@@ -133,6 +133,12 @@ public void onNext(Integer t) {
+         int n = ts.values().size();
+         System.out.println("testAsynchronousDrop -> " + n);
+         Assert.assertTrue("All events received?", n < m);
++        int previous = 0;
++        for (Integer current : ts.values()) {
++            Assert.assertTrue("The sequence must be increasing [current value=" + previous +
++                    ", previous value=" + current + "]", previous <= current);
++            previous = current;
++        }
+     }
+ 
+     @Test
+diff --git a/src/test/java/io/reactivex/rxjava3/internal/operators/flowable/FlowableOnBackpressureReduceTest.java b/src/test/java/io/reactivex/rxjava3/internal/operators/flowable/FlowableOnBackpressureReduceTest.java
+new file mode 100644
+index 00000000000..bd068872639
+--- /dev/null
++++ b/src/test/java/io/reactivex/rxjava3/internal/operators/flowable/FlowableOnBackpressureReduceTest.java
+@@ -0,0 +1,236 @@
++/**
++ * Copyright (c) 2016-present, RxJava Contributors.
++ * <p>
++ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in
++ * compliance with the License. You may obtain a copy of the License at
++ * <p>
++ * http://www.apache.org/licenses/LICENSE-2.0
++ * <p>
++ * Unless required by applicable law or agreed to in writing, software distributed under the License is
++ * distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See
++ * the License for the specific language governing permissions and limitations under the License.
++ */
++
++package io.reactivex.rxjava3.internal.operators.flowable;
++
++import io.reactivex.rxjava3.core.Flowable;
++import io.reactivex.rxjava3.core.RxJavaTest;
++import io.reactivex.rxjava3.exceptions.TestException;
++import io.reactivex.rxjava3.functions.BiFunction;
++import io.reactivex.rxjava3.functions.Function;
++import io.reactivex.rxjava3.processors.PublishProcessor;
++import io.reactivex.rxjava3.schedulers.Schedulers;
++import io.reactivex.rxjava3.subscribers.TestSubscriber;
++import io.reactivex.rxjava3.testsupport.TestHelper;
++import io.reactivex.rxjava3.testsupport.TestSubscriberEx;
++import org.junit.Assert;
++import org.junit.Test;
++import org.reactivestreams.Publisher;
++
++import java.util.Random;
++import java.util.concurrent.TimeUnit;
++
++public class FlowableOnBackpressureReduceTest extends RxJavaTest {
++
++    static final BiFunction<Integer, Integer, Integer> TEST_INT_REDUCER = new BiFunction<Integer, Integer, Integer>() {
++        @Override
++        public Integer apply(Integer previous, Integer current) throws Throwable {
++            return previous + current + 50;
++        }
++    };
++
++    static final BiFunction<Object, Object, Object> TEST_OBJECT_REDUCER = new BiFunction<Object, Object, Object>() {
++        @Override
++        public Object apply(Object previous, Object current) throws Throwable {
++            return current;
++        }
++    };
++
++    @Test
++    public void simple() {
++        TestSubscriberEx<Integer> ts = new TestSubscriberEx<>();
++
++        Flowable.range(1, 5).onBackpressureReduce(TEST_INT_REDUCER).subscribe(ts);
++
++        ts.assertNoErrors();
++        ts.assertTerminated();
++        ts.assertValues(1, 2, 3, 4, 5);
++    }
++
++    @Test
++    public void simpleError() {
++        TestSubscriberEx<Integer> ts = new TestSubscriberEx<>();
++
++        Flowable.range(1, 5).concatWith(Flowable.<Integer>error(new TestException()))
++                .onBackpressureReduce(TEST_INT_REDUCER).subscribe(ts);
++
++        ts.assertTerminated();
++        ts.assertError(TestException.class);
++        ts.assertValues(1, 2, 3, 4, 5);
++    }
++
++    @Test
++    public void simpleBackpressure() {
++        TestSubscriber<Integer> ts = new TestSubscriber<>(2L);
++
++        Flowable.range(1, 5).onBackpressureReduce(TEST_INT_REDUCER).subscribe(ts);
++
++        ts.assertNoErrors();
++        ts.assertValues(1, 2);
++        ts.assertNotComplete();
++    }
++
++    @Test
++    public void synchronousDrop() {
++        PublishProcessor<Integer> source = PublishProcessor.create();
++        TestSubscriberEx<Integer> ts = new TestSubscriberEx<>(0L);
++
++        source.onBackpressureReduce(TEST_INT_REDUCER).subscribe(ts);
++
++        ts.assertNoValues();
++
++        source.onNext(1);
++        ts.request(2);
++
++        ts.assertValue(1);
++
++        source.onNext(2);
++
++        ts.assertValues(1, 2);
++
++        source.onNext(3);
++        source.onNext(4);//3 + 4 + 50 == 57
++        source.onNext(5);//57 + 5 + 50 == 112
++        source.onNext(6);//112 + 6 + 50 == 168
++
++        ts.request(2);
++
++        ts.assertValues(1, 2, 168);
++
++        source.onNext(7);
++
++        ts.assertValues(1, 2, 168, 7);
++
++        source.onNext(8);
++        source.onNext(9);//8 + 9 + 50 == 67
++        source.onComplete();
++
++        ts.request(1);
++
++        ts.assertValues(1, 2, 168, 7, 67);
++        ts.assertNoErrors();
++        ts.assertTerminated();
++    }
++
++    private <T> TestSubscriberEx<T> createDelayedSubscriber() {
++        return new TestSubscriberEx<T>(1L) {
++            final Random rnd = new Random();
++
++            @Override
++            public void onNext(T t) {
++                super.onNext(t);
++                if (rnd.nextDouble() < 0.001) {
++                    try {
++                        Thread.sleep(1);
++                    } catch (InterruptedException ex) {
++                        ex.printStackTrace();
++                    }
++                }
++                request(1);
++            }
++        };
++    }
++
++    private <T> void assertValuesDropped(TestSubscriberEx<T> ts, int totalValues) {
++        int n = ts.values().size();
++        System.out.println("testAsynchronousDrop -> " + n);
++        Assert.assertTrue("All events received?", n < totalValues);
++    }
++
++    private void assertIncreasingSequence(TestSubscriberEx<Integer> ts) {
++        int previous = 0;
++        for (Integer current : ts.values()) {
++            Assert.assertTrue("The sequence must be increasing [current value=" + previous +
++                    ", previous value=" + current + "]", previous <= current);
++            previous = current;
++        }
++    }
++
++    @Test
++    public void asynchronousDrop() throws InterruptedException {
++        TestSubscriberEx<Integer> ts = createDelayedSubscriber();
++        int m = 100000;
++        Flowable.range(1, m)
++                .subscribeOn(Schedulers.computation())
++                .onBackpressureReduce(new BiFunction<Integer, Integer, Integer>() {
++                    @Override
++                    public Integer apply(Integer previous, Integer current) throws Throwable {
++                        //in that case it works like onBackpressureLatest
++                        //the output sequence of number must be increasing
++                        return current;
++                    }
++                })
++                .observeOn(Schedulers.io())
++                .subscribe(ts);
++
++        ts.awaitDone(2, TimeUnit.SECONDS);
++        ts.assertTerminated();
++        assertValuesDropped(ts, m);
++        assertIncreasingSequence(ts);
++    }
++
++    @Test
++    public void asynchronousDrop2() throws InterruptedException {
++        TestSubscriberEx<Long> ts = createDelayedSubscriber();
++        int m = 100000;
++        Flowable.rangeLong(1, m)
++                .subscribeOn(Schedulers.computation())
++                .onBackpressureReduce(new BiFunction<Long, Long, Long>() {
++                    @Override
++                    public Long apply(Long previous, Long current) throws Throwable {
++                        return previous + current;
++                    }
++                })
++                .observeOn(Schedulers.io())
++                .subscribe(ts);
++
++        ts.awaitDone(2, TimeUnit.SECONDS);
++        ts.assertTerminated();
++        assertValuesDropped(ts, m);
++        long sum = 0;
++        for (Long i : ts.values()) {
++            sum += i;
++        }
++        //sum = (A1 + An) * n / 2 = 100_001 * 50_000 = 50_000_00000 + 50_000 = 50_000_50_000
++        Assert.assertEquals("Wrong sum: " + sum, 5000050000L, sum);
++    }
++
++    @Test
++    public void doubleOnSubscribe() {
++        TestHelper.checkDoubleOnSubscribeFlowable(new Function<Flowable<Object>, Publisher<Object>>() {
++            @Override
++            public Publisher<Object> apply(Flowable<Object> f) throws Exception {
++                return f.onBackpressureReduce(TEST_OBJECT_REDUCER);
++            }
++        });
++    }
++
++    @Test
++    public void take() {
++        Flowable.just(1, 2)
++                .onBackpressureReduce(TEST_INT_REDUCER)
++                .take(1)
++                .test()
++                .assertResult(1);
++    }
++
++    @Test
++    public void dispose() {
++        TestHelper.checkDisposed(Flowable.never().onBackpressureReduce(TEST_OBJECT_REDUCER));
++    }
++
++    @Test
++    public void badRequest() {
++        TestHelper.assertBadRequestReported(Flowable.never().onBackpressureReduce(TEST_OBJECT_REDUCER));
++    }
++}

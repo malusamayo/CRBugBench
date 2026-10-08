@@ -1,0 +1,856 @@
+diff --git a/docs/content/docs/plugins/sso.mdx b/docs/content/docs/plugins/sso.mdx
+index 1932fa041fd..b0e2769e463 100644
+--- a/docs/content/docs/plugins/sso.mdx
++++ b/docs/content/docs/plugins/sso.mdx
+@@ -1426,6 +1426,50 @@ await authClient.signIn.sso({
+ 
+ The callback route supports both GET and POST methods automatically, so you don't need to create any additional route handlers in your framework.
+ 
++### Additional Provider Fields
++
++You can add custom columns to the `ssoProvider` table with `schema.ssoProvider.additionalFields`. These fields can be used to store provider metadata, such as a display name shown when an organization has multiple SSO providers.
++
++```ts title="auth.ts"
++import { betterAuth } from "better-auth";
++import { sso } from "@better-auth/sso";
++
++export const auth = betterAuth({
++  plugins: [
++    sso({
++      schema: {
++        ssoProvider: {
++          additionalFields: {
++            displayName: {
++              type: "string",
++              required: true,
++            },
++          },
++        },
++      },
++    }),
++  ],
++});
++```
++
++Then include the field when registering or updating a provider:
++
++```ts
++await auth.api.registerSSOProvider({
++  body: {
++    providerId: "okta-main",
++    displayName: "Okta",
++    issuer: "https://idp.example.com",
++    domain: "example.com",
++    oidcConfig: {
++      clientId: "client-id",
++      clientSecret: "client-secret",
++    },
++  },
++  headers,
++});
++```
++
+ ## Schema
+ 
+ The plugin requires additional fields in the `ssoProvider` table to store the provider's configuration.
+diff --git a/packages/sso/src/additional-fields.ts b/packages/sso/src/additional-fields.ts
+new file mode 100644
+index 00000000000..67480b1b4c0
+--- /dev/null
++++ b/packages/sso/src/additional-fields.ts
+@@ -0,0 +1,52 @@
++import type { DBFieldAttribute } from "@better-auth/core/db";
++import { filterOutputFields } from "@better-auth/core/utils/db";
++import { parseInputData, toZodSchema } from "better-auth/db";
++import type { SSOOptions } from "./types";
++
++function getSSOProviderAdditionalFields(options?: SSOOptions) {
++	return (options?.schema?.ssoProvider?.additionalFields ?? {}) as Record<
++		string,
++		DBFieldAttribute
++	>;
++}
++
++export function getSSOProviderAdditionalFieldsSchema(options?: SSOOptions) {
++	return toZodSchema({
++		fields: getSSOProviderAdditionalFields(options),
++		isClientSide: true,
++	});
++}
++
++export function parseSSOProviderAdditionalFields(
++	options: SSOOptions | undefined,
++	data: Record<string, unknown>,
++	action: "create" | "update",
++) {
++	return parseInputData(data, {
++		fields: getSSOProviderAdditionalFields(options),
++		action,
++	});
++}
++
++export function filterSSOProviderAdditionalFields<
++	T extends Record<string, unknown>,
++>(provider: T, options?: SSOOptions) {
++	return filterOutputFields(provider, getSSOProviderAdditionalFields(options));
++}
++
++export function getReturnedSSOProviderAdditionalFields(
++	provider: Record<string, unknown>,
++	options?: SSOOptions,
++) {
++	const additionalFields = getSSOProviderAdditionalFields(options);
++	const result: Record<string, unknown> = {};
++	for (const key in additionalFields) {
++		if (additionalFields[key]?.returned === false) {
++			continue;
++		}
++		if (key in provider) {
++			result[key] = provider[key];
++		}
++	}
++	return result;
++}
+diff --git a/packages/sso/src/client.ts b/packages/sso/src/client.ts
+index f2379d9452e..7ec3772af32 100644
+--- a/packages/sso/src/client.ts
++++ b/packages/sso/src/client.ts
+@@ -1,4 +1,5 @@
+ import type { BetterAuthClientPlugin } from "better-auth/client";
++import type { DBFieldAttribute } from "better-auth/db";
+ import type { SSOPlugin } from "./index";
+ import { PACKAGE_VERSION } from "./version";
+ 
+@@ -8,6 +9,15 @@ interface SSOClientOptions {
+ 				enabled: boolean;
+ 		  }
+ 		| undefined;
++	schema?:
++		| {
++				ssoProvider?: {
++					additionalFields?: {
++						[key: string]: DBFieldAttribute;
++					};
++				};
++		  }
++		| undefined;
+ }
+ 
+ export const ssoClient = <CO extends SSOClientOptions>(
+@@ -22,6 +32,7 @@ export const ssoClient = <CO extends SSOClientOptions>(
+ 					? true
+ 					: false;
+ 			};
++			schema: CO["schema"];
+ 		}>,
+ 		pathMethods: {
+ 			"/sso/providers": "GET",
+diff --git a/packages/sso/src/index.ts b/packages/sso/src/index.ts
+index da725dbff6c..1d903524dd2 100644
+--- a/packages/sso/src/index.ts
++++ b/packages/sso/src/index.ts
+@@ -44,7 +44,14 @@ export {
+ 	validateSAMLTimestamp,
+ } from "./saml/timestamp";
+ 
+-import type { OIDCConfig, SAMLConfig, SSOOptions, SSOProvider } from "./types";
++import type {
++	InferSSOProvider,
++	OIDCConfig,
++	SAMLConfig,
++	SSOOptions,
++	SSOProvider,
++	SSOProviderSchema,
++} from "./types";
+ import { PACKAGE_VERSION } from "./version";
+ 
+ export type { SAMLConfig, OIDCConfig, SSOOptions, SSOProvider };
+@@ -115,6 +122,11 @@ export type SSOPlugin<O extends SSOOptions> = {
+ 		(O extends { domainVerification: { enabled: true } }
+ 			? DomainVerificationEndpoints
+ 			: {});
++	schema: SSOProviderSchema<O>;
++	$Infer: {
++		SSOProvider: InferSSOProvider<O>;
++	};
++	options: NoInfer<O>;
+ };
+ 
+ /**
+@@ -137,7 +149,10 @@ export function sso<
+ 	id: "sso";
+ 	version: string;
+ 	endpoints: SSOEndpoints<O> & DomainVerificationEndpoints;
+-	schema: NonNullable<BetterAuthPlugin["schema"]>;
++	schema: SSOProviderSchema<O>;
++	$Infer: {
++		SSOProvider: InferSSOProvider<O>;
++	};
+ 	options: NoInfer<O>;
+ };
+ export function sso<O extends SSOOptions>(
+@@ -146,6 +161,10 @@ export function sso<O extends SSOOptions>(
+ 	id: "sso";
+ 	version: string;
+ 	endpoints: SSOEndpoints<O>;
++	schema: SSOProviderSchema<O>;
++	$Infer: {
++		SSOProvider: InferSSOProvider<O>;
++	};
+ 	options: NoInfer<O>;
+ };
+ 
+@@ -163,8 +182,8 @@ export function sso<O extends SSOOptions>(
+ 		acsEndpoint: acsEndpoint(optionsWithStore),
+ 		sloEndpoint: sloEndpoint(optionsWithStore),
+ 		initiateSLO: initiateSLO(optionsWithStore),
+-		listSSOProviders: listSSOProviders(),
+-		getSSOProvider: getSSOProvider(),
++		listSSOProviders: listSSOProviders(optionsWithStore),
++		getSSOProvider: getSSOProvider(optionsWithStore),
+ 		updateSSOProvider: updateSSOProvider(optionsWithStore),
+ 		deleteSSOProvider: deleteSSOProvider(),
+ 	};
+@@ -253,22 +272,34 @@ export function sso<O extends SSOOptions>(
+ 		},
+ 		schema: {
+ 			ssoProvider: {
+-				modelName: options?.modelName ?? "ssoProvider",
++				modelName:
++					options?.modelName ??
++					options?.schema?.ssoProvider?.modelName ??
++					"ssoProvider",
+ 				fields: {
+ 					issuer: {
+ 						type: "string",
+ 						required: true,
+-						fieldName: options?.fields?.issuer ?? "issuer",
++						fieldName:
++							options?.fields?.issuer ??
++							options?.schema?.ssoProvider?.fields?.issuer ??
++							"issuer",
+ 					},
+ 					oidcConfig: {
+ 						type: "string",
+ 						required: false,
+-						fieldName: options?.fields?.oidcConfig ?? "oidcConfig",
++						fieldName:
++							options?.fields?.oidcConfig ??
++							options?.schema?.ssoProvider?.fields?.oidcConfig ??
++							"oidcConfig",
+ 					},
+ 					samlConfig: {
+ 						type: "string",
+ 						required: false,
+-						fieldName: options?.fields?.samlConfig ?? "samlConfig",
++						fieldName:
++							options?.fields?.samlConfig ??
++							options?.schema?.ssoProvider?.fields?.samlConfig ??
++							"samlConfig",
+ 					},
+ 					userId: {
+ 						type: "string",
+@@ -276,29 +307,53 @@ export function sso<O extends SSOOptions>(
+ 							model: "user",
+ 							field: "id",
+ 						},
+-						fieldName: options?.fields?.userId ?? "userId",
++						fieldName:
++							options?.fields?.userId ??
++							options?.schema?.ssoProvider?.fields?.userId ??
++							"userId",
+ 					},
+ 					providerId: {
+ 						type: "string",
+ 						required: true,
+ 						unique: true,
+-						fieldName: options?.fields?.providerId ?? "providerId",
++						fieldName:
++							options?.fields?.providerId ??
++							options?.schema?.ssoProvider?.fields?.providerId ??
++							"providerId",
+ 					},
+ 					organizationId: {
+ 						type: "string",
+ 						required: false,
+-						fieldName: options?.fields?.organizationId ?? "organizationId",
++						fieldName:
++							options?.fields?.organizationId ??
++							options?.schema?.ssoProvider?.fields?.organizationId ??
++							"organizationId",
+ 					},
+ 					domain: {
+ 						type: "string",
+ 						required: true,
+-						fieldName: options?.fields?.domain ?? "domain",
++						fieldName:
++							options?.fields?.domain ??
++							options?.schema?.ssoProvider?.fields?.domain ??
++							"domain",
+ 					},
+ 					...(options?.domainVerification?.enabled
+-						? { domainVerified: { type: "boolean", required: false } }
++						? {
++								domainVerified: {
++									type: "boolean",
++									required: false,
++									fieldName:
++										options?.schema?.ssoProvider?.fields?.domainVerified ??
++										"domainVerified",
++								},
++							}
+ 						: {}),
++					...(options?.schema?.ssoProvider?.additionalFields ?? {}),
+ 				},
+ 			},
++		} as unknown as SSOProviderSchema<O>,
++		$Infer: {
++			SSOProvider: {} as InferSSOProvider<O>,
+ 		},
+ 		options: options as NoInfer<O>,
+ 	} satisfies BetterAuthPlugin;
+diff --git a/packages/sso/src/providers.test.ts b/packages/sso/src/providers.test.ts
+index f40a7922152..e369180abaa 100644
+--- a/packages/sso/src/providers.test.ts
++++ b/packages/sso/src/providers.test.ts
+@@ -3,9 +3,10 @@ import { memoryAdapter } from "better-auth/adapters/memory";
+ import { createAuthClient } from "better-auth/client";
+ import { setCookieToHeader } from "better-auth/cookies";
+ import { organization } from "better-auth/plugins";
+-import { describe, expect, it } from "vitest";
++import { describe, expect, expectTypeOf, it } from "vitest";
+ import { sso } from ".";
+ import { ssoClient } from "./client";
++import type { SSOOptions } from "./types";
+ 
+ const TEST_CERT = `MIIDXTCCAkWgAwIBAgIJAJC1HiIAZAiUMA0Gcm9markup
+ temporary cert for testing`;
+@@ -14,6 +15,7 @@ describe("SSO provider read endpoints", () => {
+ 	type TestUser = { email: string; password: string; name: string };
+ 
+ 	interface SSOProviderData {
++		[key: string]: unknown;
+ 		id: string;
+ 		providerId: string;
+ 		issuer: string;
+@@ -28,6 +30,7 @@ describe("SSO provider read endpoints", () => {
+ 	const createTestAuth = (
+ 		includeOrgPlugin = true,
+ 		enableDomainVerification = false,
++		ssoOptions: SSOOptions = {},
+ 	) => {
+ 		const data: {
+ 			user: { id: string; email: string }[];
+@@ -50,8 +53,8 @@ describe("SSO provider read endpoints", () => {
+ 		const memory = memoryAdapter(data);
+ 
+ 		const ssoPlugin = enableDomainVerification
+-			? sso({ domainVerification: { enabled: true } })
+-			: sso();
++			? sso({ ...ssoOptions, domainVerification: { enabled: true } })
++			: sso(ssoOptions);
+ 		const plugins = includeOrgPlugin
+ 			? [ssoPlugin, organization()]
+ 			: [ssoPlugin];
+@@ -121,6 +124,7 @@ describe("SSO provider read endpoints", () => {
+ 			headers: Headers,
+ 			providerId: string,
+ 			organizationId?: string,
++			additionalFields?: Record<string, unknown>,
+ 		) {
+ 			return auth.api.registerSSOProvider({
+ 				body: {
+@@ -135,7 +139,8 @@ describe("SSO provider read endpoints", () => {
+ 						spMetadata: {},
+ 					},
+ 					organizationId,
+-				},
++					...additionalFields,
++				} as any,
+ 				headers,
+ 			});
+ 		}
+@@ -1116,6 +1121,142 @@ describe("SSO provider read endpoints", () => {
+ 		});
+ 	});
+ 
++	describe("ssoProvider additionalFields", () => {
++		const ssoOptions = {
++			schema: {
++				ssoProvider: {
++					additionalFields: {
++						displayName: {
++							type: "string",
++							required: true,
++						},
++						internalCode: {
++							type: "string",
++							required: false,
++							returned: false,
++						},
++						source: {
++							type: "string",
++							required: false,
++							input: false,
++							defaultValue: "system",
++						},
++					},
++				},
++			},
++		} satisfies SSOOptions;
++
++		it("should require configured additional fields on register", async () => {
++			const { auth, getAuthHeaders } = createTestAuth(false, false, ssoOptions);
++			const headers = await getAuthHeaders({
++				email: "owner@example.com",
++				password: "password123",
++				name: "Owner",
++			});
++
++			const response = await auth.api.registerSSOProvider({
++				body: {
++					providerId: "missing-display-name",
++					issuer: "https://idp.example.com",
++					domain: "example.com",
++					samlConfig: {
++						entryPoint: "https://idp.example.com/sso",
++						cert: TEST_CERT,
++						callbackUrl: "http://localhost:3000/api/sso/callback",
++						spMetadata: {},
++					},
++				} as any,
++				headers,
++				asResponse: true,
++			});
++
++			expect(response.status).toBe(400);
++		});
++
++		it("should store and return visible additional fields", async () => {
++			const { auth, getAuthHeaders, registerSAMLProvider, data } =
++				createTestAuth(false, false, ssoOptions);
++			const headers = await getAuthHeaders({
++				email: "owner@example.com",
++				password: "password123",
++				name: "Owner",
++			});
++
++			const registered = (await registerSAMLProvider(
++				headers,
++				"okta",
++				undefined,
++				{
++					displayName: "Okta",
++					internalCode: "secret",
++					source: "client",
++				},
++			)) as any;
++
++			expect(registered.displayName).toBe("Okta");
++			expect(registered.source).toBe("system");
++			expect(registered.internalCode).toBeUndefined();
++			expect(data.ssoProvider[0]!.displayName).toBe("Okta");
++			expect(data.ssoProvider[0]!.internalCode).toBe("secret");
++			expect(data.ssoProvider[0]!.source).toBe("system");
++
++			const listed = (await auth.api.listSSOProviders({
++				headers,
++			})) as any;
++			expect(listed.providers[0].displayName).toBe("Okta");
++			expect(listed.providers[0].source).toBe("system");
++			expect(listed.providers[0].internalCode).toBeUndefined();
++
++			const fetched = (await auth.api.getSSOProvider({
++				query: { providerId: "okta" },
++				headers,
++			})) as any;
++			expect(fetched.displayName).toBe("Okta");
++			expect(fetched.source).toBe("system");
++			expect(fetched.internalCode).toBeUndefined();
++		});
++
++		it("should update additional fields", async () => {
++			const { auth, getAuthHeaders, registerSAMLProvider } = createTestAuth(
++				false,
++				false,
++				ssoOptions,
++			);
++			const headers = await getAuthHeaders({
++				email: "owner@example.com",
++				password: "password123",
++				name: "Owner",
++			});
++			await registerSAMLProvider(headers, "okta", undefined, {
++				displayName: "Okta",
++			});
++
++			const updated = (await auth.api.updateSSOProvider({
++				body: {
++					providerId: "okta",
++					displayName: "Okta Workforce",
++				} as any,
++				headers,
++			})) as any;
++
++			expect(updated.displayName).toBe("Okta Workforce");
++		});
++
++		it("should infer sso provider additional fields", () => {
++			const auth = betterAuth({
++				plugins: [sso(ssoOptions)],
++			});
++			ssoClient({ schema: ssoOptions.schema });
++
++			type Provider = typeof auth.$Infer.SSOProvider;
++			expectTypeOf<Provider>().toMatchTypeOf<{
++				providerId: string;
++				displayName: string;
++				source?: string | undefined;
++			}>();
++		});
++	});
++
+ 	describe("POST /sso/delete-provider", () => {
+ 		it("should return 401 when not authenticated", async () => {
+ 			const { auth } = createTestAuth();
+diff --git a/packages/sso/src/routes/providers.ts b/packages/sso/src/routes/providers.ts
+index 8129bec3141..fb501c0ea70 100644
+--- a/packages/sso/src/routes/providers.ts
++++ b/packages/sso/src/routes/providers.ts
+@@ -5,6 +5,11 @@ import {
+ 	sessionMiddleware,
+ } from "better-auth/api";
+ import * as z from "zod";
++import {
++	getReturnedSSOProviderAdditionalFields,
++	getSSOProviderAdditionalFieldsSchema,
++	parseSSOProviderAdditionalFields,
++} from "../additional-fields";
+ import { DEFAULT_MAX_SAML_METADATA_SIZE } from "../constants";
+ import { validateConfigAlgorithms } from "../saml";
+ import type { Member, OIDCConfig, SAMLConfig, SSOOptions } from "../types";
+@@ -12,6 +17,7 @@ import { maskClientId, parseCertificate, safeJsonParse } from "../utils";
+ import { updateSSOProviderBodySchema } from "./schemas";
+ 
+ interface SSOProviderRecord {
++	[key: string]: unknown;
+ 	id: string;
+ 	providerId: string;
+ 	issuer: string;
+@@ -83,6 +89,7 @@ async function batchCheckOrgAdmin(
+ 
+ function sanitizeProvider(
+ 	provider: {
++		[key: string]: unknown;
+ 		providerId: string;
+ 		issuer: string;
+ 		domain: string;
+@@ -92,6 +99,7 @@ function sanitizeProvider(
+ 		samlConfig?: string | SAMLConfig | null;
+ 	},
+ 	baseURL: string,
++	options?: SSOOptions,
+ ) {
+ 	let oidcConfig: OIDCConfig | null = null;
+ 	let samlConfig: SAMLConfig | null = null;
+@@ -149,10 +157,11 @@ function sanitizeProvider(
+ 				}
+ 			: undefined,
+ 		spMetadataUrl: `${baseURL}/sso/saml2/sp/metadata?providerId=${encodeURIComponent(provider.providerId)}`,
++		...getReturnedSSOProviderAdditionalFields(provider, options),
+ 	};
+ }
+ 
+-export const listSSOProviders = () => {
++export const listSSOProviders = (options?: SSOOptions) => {
+ 	return createAuthEndpoint(
+ 		"/sso/providers",
+ 		{
+@@ -224,7 +233,7 @@ export const listSSOProviders = () => {
+ 			}
+ 
+ 			const providers = accessibleProviders.map((p) =>
+-				sanitizeProvider(p, ctx.context.baseURL),
++				sanitizeProvider(p, ctx.context.baseURL, options),
+ 			);
+ 
+ 			return ctx.json({ providers });
+@@ -277,7 +286,7 @@ async function checkProviderAccess(
+ 	return provider;
+ }
+ 
+-export const getSSOProvider = () => {
++export const getSSOProvider = (options?: SSOOptions) => {
+ 	return createAuthEndpoint(
+ 		"/sso/get-provider",
+ 		{
+@@ -308,7 +317,7 @@ export const getSSOProvider = () => {
+ 
+ 			const provider = await checkProviderAccess(ctx, providerId);
+ 
+-			return ctx.json(sanitizeProvider(provider, ctx.context.baseURL));
++			return ctx.json(sanitizeProvider(provider, ctx.context.baseURL, options));
+ 		},
+ 	);
+ };
+@@ -387,6 +396,9 @@ function mergeOIDCConfig(
+ }
+ 
+ export const updateSSOProvider = (options: SSOOptions) => {
++	const additionalFieldsSchema =
++		getSSOProviderAdditionalFieldsSchema(options).partial();
++
+ 	return createAuthEndpoint(
+ 		"/sso/update-provider",
+ 		{
+@@ -394,6 +406,7 @@ export const updateSSOProvider = (options: SSOOptions) => {
+ 			use: [sessionMiddleware],
+ 			body: updateSSOProviderBodySchema.extend({
+ 				providerId: z.string(),
++				...additionalFieldsSchema.shape,
+ 			}),
+ 			metadata: {
+ 				openapi: {
+@@ -419,7 +432,18 @@ export const updateSSOProvider = (options: SSOOptions) => {
+ 			const { providerId, ...body } = ctx.body;
+ 
+ 			const { issuer, domain, samlConfig, oidcConfig } = body;
+-			if (!issuer && !domain && !samlConfig && !oidcConfig) {
++			const additionalFields = parseSSOProviderAdditionalFields(
++				options,
++				body,
++				"update",
++			);
++			if (
++				!issuer &&
++				!domain &&
++				!samlConfig &&
++				!oidcConfig &&
++				Object.keys(additionalFields).length === 0
++			) {
+ 				throw new APIError("BAD_REQUEST", {
+ 					message: "No fields provided for update",
+ 				});
+@@ -427,7 +451,9 @@ export const updateSSOProvider = (options: SSOOptions) => {
+ 
+ 			const existingProvider = await checkProviderAccess(ctx, providerId);
+ 
+-			const updateData: Partial<SSOProviderRecord> = {};
++			const updateData: Partial<SSOProviderRecord> = {
++				...additionalFields,
++			};
+ 
+ 			if (body.issuer !== undefined) {
+ 				updateData.issuer = body.issuer;
+@@ -544,7 +570,9 @@ export const updateSSOProvider = (options: SSOOptions) => {
+ 				});
+ 			}
+ 
+-			return ctx.json(sanitizeProvider(fullProvider, ctx.context.baseURL));
++			return ctx.json(
++				sanitizeProvider(fullProvider, ctx.context.baseURL, options),
++			);
+ 		},
+ 	);
+ };
+diff --git a/packages/sso/src/routes/sso.ts b/packages/sso/src/routes/sso.ts
+index e5b185ec59a..e37e887293e 100644
+--- a/packages/sso/src/routes/sso.ts
++++ b/packages/sso/src/routes/sso.ts
+@@ -24,6 +24,11 @@ import { handleOAuthUserInfo } from "better-auth/oauth2";
+ import { decodeJwt } from "jose";
+ import type { BindingContext } from "samlify/types/src/entity";
+ import * as z from "zod";
++import {
++	filterSSOProviderAdditionalFields,
++	getSSOProviderAdditionalFieldsSchema,
++	parseSSOProviderAdditionalFields,
++} from "../additional-fields";
+ import * as constants from "../constants";
+ import { assignOrganizationFromProvider } from "../linking";
+ import type { HydratedOIDCConfig } from "../oidc";
+@@ -38,11 +43,13 @@ import { SAML_ERROR_CODES } from "../saml/error-codes";
+ import { generateRelayState } from "../saml-state";
+ import type {
+ 	AuthnRequestRecord,
++	InferSSOProvider,
+ 	OIDCConfig,
+ 	SAMLConfig,
+ 	SAMLSessionRecord,
+ 	SSOOptions,
+ 	SSOProvider,
++	SSOProviderAdditionalFieldsInput,
+ } from "../types";
+ import { domainMatches, safeJsonParse, validateEmailDomain } from "../utils";
+ import { getVerificationIdentifier } from "./domain-verification";
+@@ -360,13 +367,22 @@ const ssoProviderBodySchema = z.object({
+ });
+ 
+ export const registerSSOProvider = <O extends SSOOptions>(options: O) => {
++	const additionalFieldsSchema = getSSOProviderAdditionalFieldsSchema(options);
++	type Body = z.infer<typeof ssoProviderBodySchema> &
++		SSOProviderAdditionalFieldsInput<O>;
++
+ 	return createAuthEndpoint(
+ 		"/sso/register",
+ 		{
+ 			method: "POST",
+-			body: ssoProviderBodySchema,
++			body: ssoProviderBodySchema.extend({
++				...additionalFieldsSchema.shape,
++			}),
+ 			use: [sessionMiddleware],
+ 			metadata: {
++				$Infer: {
++					body: {} as Body,
++				},
+ 				openapi: {
+ 					operationId: "registerSSOProvider",
+ 					summary: "Register an OIDC provider",
+@@ -580,6 +596,11 @@ export const registerSSOProvider = <O extends SSOOptions>(options: O) => {
+ 			}
+ 
+ 			const body = ctx.body;
++			const additionalFields = parseSSOProviderAdditionalFields(
++				options,
++				body,
++				"create",
++			);
+ 			const issuerValidator = z.string().url();
+ 			if (issuerValidator.safeParse(body.issuer).error) {
+ 				throw new APIError("BAD_REQUEST", {
+@@ -759,6 +780,7 @@ export const registerSSOProvider = <O extends SSOOptions>(options: O) => {
+ 					issuer: body.issuer,
+ 					domain: body.domain,
+ 					domainVerified: false,
++					...additionalFields,
+ 					oidcConfig: (() => {
+ 						const config = buildOIDCConfig();
+ 						if (config) {
+@@ -834,7 +856,7 @@ export const registerSSOProvider = <O extends SSOOptions>(options: O) => {
+ 				redirectURI: string;
+ 				oidcConfig: OIDCConfig | null;
+ 				samlConfig: SAMLConfig | null;
+-			} & Omit<SSOProvider<O>, "oidcConfig" | "samlConfig">;
++			} & Omit<InferSSOProvider<O>, "oidcConfig" | "samlConfig">;
+ 
+ 			type SSOProviderReturn = O["domainVerification"] extends { enabled: true }
+ 				? SSOProviderResponse & {
+@@ -844,7 +866,10 @@ export const registerSSOProvider = <O extends SSOOptions>(options: O) => {
+ 				: SSOProviderResponse;
+ 
+ 			const result = {
+-				...provider,
++				...filterSSOProviderAdditionalFields(
++					provider as unknown as Record<string, unknown>,
++					options,
++				),
+ 				oidcConfig: safeJsonParse<OIDCConfig>(
+ 					provider.oidcConfig as unknown as string,
+ 				),
+diff --git a/packages/sso/src/types.ts b/packages/sso/src/types.ts
+index 1a0bb0aee5d..77870a9af88 100644
+--- a/packages/sso/src/types.ts
++++ b/packages/sso/src/types.ts
+@@ -1,4 +1,10 @@
+ import type { Awaitable, OAuth2Tokens, User } from "better-auth";
++import type {
++	DBFieldAttribute,
++	FieldAttributeToObject,
++	InferAdditionalFieldsFromPluginOptions,
++	RemoveFieldsWithReturnedFalse,
++} from "better-auth/db";
+ import type { AlgorithmValidationOptions } from "./saml/algorithms";
+ 
+ export interface OIDCMapping {
+@@ -174,12 +180,58 @@ type BaseSSOProvider = {
+ 	domain: string;
+ };
+ 
++type SSOProviderAdditionalFields<
++	O extends SSOOptions,
++	IsClientSide extends boolean,
++> = O["schema"] extends {
++	ssoProvider?: {
++		additionalFields: infer Field extends Record<string, DBFieldAttribute>;
++	};
++}
++	? IsClientSide extends true
++		? FieldAttributeToObject<RemoveFieldsWithReturnedFalse<Field>>
++		: FieldAttributeToObject<Field>
++	: {};
++
++export type SSOProviderAdditionalFieldsInput<
++	O extends SSOOptions,
++	IsClientSide extends boolean = true,
++> = InferAdditionalFieldsFromPluginOptions<"ssoProvider", O, IsClientSide>;
++
++export type InferSSOProvider<
++	O extends SSOOptions,
++	IsClientSide extends boolean = true,
++> = (O["domainVerification"] extends { enabled: true }
++	? {
++			domainVerified: boolean;
++		} & BaseSSOProvider
++	: BaseSSOProvider) &
++	SSOProviderAdditionalFields<O, IsClientSide>;
++
+ export type SSOProvider<O extends SSOOptions> =
+ 	O["domainVerification"] extends { enabled: true }
+ 		? {
+ 				domainVerified: boolean;
+-			} & BaseSSOProvider
+-		: BaseSSOProvider;
++			} & BaseSSOProvider &
++				SSOProviderAdditionalFields<O, false>
++		: BaseSSOProvider & SSOProviderAdditionalFields<O, false>;
++
++export type SSOProviderSchema<O extends SSOOptions> = {
++	ssoProvider: {
++		modelName: string;
++		fields: Record<string, DBFieldAttribute> &
++			(O["schema"] extends {
++				ssoProvider?: {
++					additionalFields: infer Field extends Record<
++						string,
++						DBFieldAttribute
++					>;
++				};
++			}
++				? Field
++				: {});
++	};
++};
+ 
+ export interface SSOOptions {
+ 	/**
+@@ -308,6 +360,29 @@ export interface SSOOptions {
+ 		organizationId?: string | undefined;
+ 		domain?: string | undefined;
+ 	};
++	/**
++	 * The schema for the SSO plugin.
++	 */
++	schema?:
++		| {
++				ssoProvider?: {
++					modelName?: string | undefined;
++					fields?: {
++						issuer?: string | undefined;
++						oidcConfig?: string | undefined;
++						samlConfig?: string | undefined;
++						userId?: string | undefined;
++						providerId?: string | undefined;
++						organizationId?: string | undefined;
++						domain?: string | undefined;
++						domainVerified?: string | undefined;
++					};
++					additionalFields?: {
++						[key in string]: DBFieldAttribute;
++					};
++				};
++		  }
++		| undefined;
+ 	/**
+ 	 * Configure the maximum number of SSO providers a user can register.
+ 	 * You can also pass a function that returns a number.

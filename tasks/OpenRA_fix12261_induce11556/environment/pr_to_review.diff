@@ -1,0 +1,377 @@
+commit 7caf6362228a475137565ae1010094021258c9f3
+Author: Paul Chote <pchote@users.noreply.github.com>
+Date:   Sat Jul 2 10:51:55 2016 +0100
+
+    Port game speed selection to new lobby backend.
+
+diff --git a/OpenRA.Game/Network/Session.cs b/OpenRA.Game/Network/Session.cs
+index c109cada33..4464577a8e 100644
+--- a/OpenRA.Game/Network/Session.cs
++++ b/OpenRA.Game/Network/Session.cs
+@@ -192,7 +192,6 @@ namespace OpenRA.Network
+ 			public int OrderLatency = 3; // net tick frames (x 120 = ms)
+ 			public int RandomSeed = 0;
+ 			public bool AllowSpectators = true;
+-			public string GameSpeedType = "default";
+ 			public bool AllowVersionMismatch;
+ 			public string GameUid;
+ 			public bool EnableSingleplayer;
+diff --git a/OpenRA.Game/Server/Server.cs b/OpenRA.Game/Server/Server.cs
+index 70c3709c6f..f78c0d34d9 100644
+--- a/OpenRA.Game/Server/Server.cs
++++ b/OpenRA.Game/Server/Server.cs
+@@ -403,8 +403,6 @@ namespace OpenRA.Server
+ 				if (handshake.Mod == "{DEV_VERSION}")
+ 					SendMessage("{0} is running an unversioned development build, ".F(client.Name) +
+ 						"and may desynchronize the game state if they have incompatible rules.");
+-
+-				SetOrderLag();
+ 			}
+ 			catch (Exception ex)
+ 			{
+@@ -414,24 +412,6 @@ namespace OpenRA.Server
+ 			}
+ 		}
+ 
+-		void SetOrderLag()
+-		{
+-			int latency = 1;
+-			if (!LobbyInfo.IsSinglePlayer)
+-			{
+-				var gameSpeeds = ModData.Manifest.Get<GameSpeeds>();
+-				GameSpeed speed;
+-				if (gameSpeeds.Speeds.TryGetValue(LobbyInfo.GlobalSettings.GameSpeedType, out speed))
+-					latency = speed.OrderLatency;
+-				else
+-					latency = 3;
+-			}
+-
+-			LobbyInfo.GlobalSettings.OrderLatency = latency;
+-
+-			SyncLobbyGlobalSettings();
+-		}
+-
+ 		void DispatchOrdersToClient(Connection c, int client, int frame, byte[] data)
+ 		{
+ 			try
+@@ -620,8 +600,6 @@ namespace OpenRA.Server
+ 				toDrop.Socket.Disconnect(false);
+ 			}
+ 			catch { }
+-
+-			SetOrderLag();
+ 		}
+ 
+ 		public void SyncLobbyInfo()
+@@ -702,6 +680,10 @@ namespace OpenRA.Server
+ 				DropClient(c);
+ 			}
+ 
++			// HACK: Turn down the latency if there is only one real player
++			if (LobbyInfo.IsSinglePlayer)
++				LobbyInfo.GlobalSettings.OrderLatency = 1;
++
+ 			SyncLobbyInfo();
+ 			State = ServerState.GameStarted;
+ 
+diff --git a/OpenRA.Mods.Common/ServerTraits/LobbyCommands.cs b/OpenRA.Mods.Common/ServerTraits/LobbyCommands.cs
+index 1a7e642321..790c3c3846 100644
+--- a/OpenRA.Mods.Common/ServerTraits/LobbyCommands.cs
++++ b/OpenRA.Mods.Common/ServerTraits/LobbyCommands.cs
+@@ -356,7 +356,7 @@ namespace OpenRA.Mods.Common.Server
+ 								.Where(ss => ss != null)
+ 								.ToDictionary(ss => ss.PlayerReference, ss => ss);
+ 
+-							LoadMapSettings(server.LobbyInfo.GlobalSettings, server.Map.Rules);
++							LoadMapSettings(server, server.LobbyInfo.GlobalSettings, server.Map.Rules);
+ 
+ 							// Reset client states
+ 							foreach (var c in server.LobbyInfo.Clients)
+@@ -463,6 +463,13 @@ namespace OpenRA.Mods.Common.Server
+ 
+ 						oo.Value = oo.PreferredValue = split[1];
+ 
++						if (option.Id == "gamespeed")
++						{
++							var speed = server.ModData.Manifest.Get<GameSpeeds>().Speeds[oo.Value];
++							server.LobbyInfo.GlobalSettings.Timestep = speed.Timestep;
++							server.LobbyInfo.GlobalSettings.OrderLatency = speed.OrderLatency;
++						}
++
+ 						server.SyncLobbyGlobalSettings();
+ 						server.SendMessage(option.ValueChangedMessage(client.Name, split[1]));
+ 
+@@ -510,38 +517,6 @@ namespace OpenRA.Mods.Common.Server
+ 						return true;
+ 					}
+ 				},
+-				{ "gamespeed",
+-					s =>
+-					{
+-						if (server.LobbyInfo.GlobalSettings.GameSpeedType == s)
+-							return true;
+-
+-						if (!client.IsAdmin)
+-						{
+-							server.SendOrderTo(conn, "Message", "Only the host can set that option.");
+-							return true;
+-						}
+-
+-						var gameSpeeds = server.ModData.Manifest.Get<GameSpeeds>();
+-
+-						GameSpeed speed;
+-						if (!gameSpeeds.Speeds.TryGetValue(s, out speed))
+-						{
+-							server.SendOrderTo(conn, "Message", "Invalid game speed selected.");
+-							return true;
+-						}
+-
+-						server.LobbyInfo.GlobalSettings.GameSpeedType = s;
+-						server.LobbyInfo.GlobalSettings.Timestep = speed.Timestep;
+-						server.LobbyInfo.GlobalSettings.OrderLatency =
+-							server.LobbyInfo.IsSinglePlayer ? 1 : speed.OrderLatency;
+-
+-						server.SyncLobbyInfo();
+-						server.SendMessage("{0} changed Game Speed to {1}.".F(client.Name, speed.Name));
+-
+-						return true;
+-					}
+-				},
+ 				{ "kick",
+ 					s =>
+ 					{
+@@ -786,7 +761,7 @@ namespace OpenRA.Mods.Common.Server
+ 				.Where(s => s != null)
+ 				.ToDictionary(s => s.PlayerReference, s => s);
+ 
+-			LoadMapSettings(server.LobbyInfo.GlobalSettings, server.Map.Rules);
++			LoadMapSettings(server, server.LobbyInfo.GlobalSettings, server.Map.Rules);
+ 		}
+ 
+ 		static Session.Slot MakeSlotFromPlayerReference(PlayerReference pr)
+@@ -805,7 +780,7 @@ namespace OpenRA.Mods.Common.Server
+ 			};
+ 		}
+ 
+-		public static void LoadMapSettings(Session.Global gs, Ruleset rules)
++		public static void LoadMapSettings(S server, Session.Global gs, Ruleset rules)
+ 		{
+ 			var options = rules.Actors["player"].TraitInfos<ILobbyOptions>()
+ 				.Concat(rules.Actors["world"].TraitInfos<ILobbyOptions>())
+@@ -836,6 +811,13 @@ namespace OpenRA.Mods.Common.Server
+ 				state.Value = value;
+ 				state.PreferredValue = preferredValue;
+ 				gs.LobbyOptions[o.Id] = state;
++
++				if (o.Id == "gamespeed")
++				{
++					var speed = server.ModData.Manifest.Get<GameSpeeds>().Speeds[value];
++					server.LobbyInfo.GlobalSettings.Timestep = speed.Timestep;
++					server.LobbyInfo.GlobalSettings.OrderLatency = speed.OrderLatency;
++				}
+ 			}
+ 		}
+ 
+diff --git a/OpenRA.Mods.Common/ServerTraits/LobbySettingsNotification.cs b/OpenRA.Mods.Common/ServerTraits/LobbySettingsNotification.cs
+index 1ce348c8cb..a0c8b1e1a3 100644
+--- a/OpenRA.Mods.Common/ServerTraits/LobbySettingsNotification.cs
++++ b/OpenRA.Mods.Common/ServerTraits/LobbySettingsNotification.cs
+@@ -25,7 +25,7 @@ namespace OpenRA.Mods.Common.Server
+ 				return;
+ 
+ 			var defaults = new Session.Global();
+-			LobbyCommands.LoadMapSettings(defaults, server.Map.Rules);
++			LobbyCommands.LoadMapSettings(server, defaults, server.Map.Rules);
+ 
+ 			var options = server.Map.Rules.Actors["player"].TraitInfos<ILobbyOptions>()
+ 				.Concat(server.Map.Rules.Actors["world"].TraitInfos<ILobbyOptions>())
+diff --git a/OpenRA.Mods.Common/Traits/World/MapOptions.cs b/OpenRA.Mods.Common/Traits/World/MapOptions.cs
+index 114b4a0294..31100680d8 100644
+--- a/OpenRA.Mods.Common/Traits/World/MapOptions.cs
++++ b/OpenRA.Mods.Common/Traits/World/MapOptions.cs
+@@ -30,6 +30,12 @@ namespace OpenRA.Mods.Common.Traits
+ 		[Desc("Prevent the tech level from being changed in the lobby.")]
+ 		public readonly bool TechLevelLocked = false;
+ 
++		[Desc("Default game speed.")]
++		public readonly string GameSpeed = "default";
++
++		[Desc("Prevent the game speed from being changed in the lobby.")]
++		public readonly bool GameSpeedLocked = false;
++
+ 		IEnumerable<LobbyOption> ILobbyOptions.LobbyOptions(Ruleset rules)
+ 		{
+ 			yield return new LobbyBooleanOption("shortgame", "Short Game", ShortGameEnabled, ShortGameLocked);
+@@ -41,6 +47,14 @@ namespace OpenRA.Mods.Common.Traits
+ 				yield return new LobbyOption("techlevel", "Tech Level",
+ 					new ReadOnlyDictionary<string, string>(techLevels),
+ 					TechLevel, TechLevelLocked);
++
++			var gameSpeeds = Game.ModData.Manifest.Get<GameSpeeds>().Speeds
++				.ToDictionary(s => s.Key, s => s.Value.Name);
++
++			// NOTE: The server hardcodes special-case logic for this option id
++			yield return new LobbyOption("gamespeed", "Game Speed",
++				new ReadOnlyDictionary<string, string>(gameSpeeds),
++				GameSpeed, GameSpeedLocked);
+ 		}
+ 
+ 		public object Create(ActorInitializer init) { return new MapOptions(this); }
+@@ -52,6 +66,7 @@ namespace OpenRA.Mods.Common.Traits
+ 
+ 		public bool ShortGame { get; private set; }
+ 		public string TechLevel { get; private set; }
++		public GameSpeed GameSpeed { get; private set; }
+ 
+ 		public MapOptions(MapOptionsInfo info)
+ 		{
+@@ -65,6 +80,11 @@ namespace OpenRA.Mods.Common.Traits
+ 
+ 			TechLevel = self.World.LobbyInfo.GlobalSettings
+ 				.OptionOrDefault("techlevel", info.TechLevel);
++
++			var speed = self.World.LobbyInfo.GlobalSettings
++				.OptionOrDefault("gamespeed", info.GameSpeed);
++
++			GameSpeed = Game.ModData.Manifest.Get<GameSpeeds>().Speeds[speed];
+ 		}
+ 	}
+ }
+diff --git a/OpenRA.Mods.Common/Widgets/Logic/Ingame/GameTimerLogic.cs b/OpenRA.Mods.Common/Widgets/Logic/Ingame/GameTimerLogic.cs
+index 1a5d040799..de6ced17fe 100644
+--- a/OpenRA.Mods.Common/Widgets/Logic/Ingame/GameTimerLogic.cs
++++ b/OpenRA.Mods.Common/Widgets/Logic/Ingame/GameTimerLogic.cs
+@@ -10,6 +10,7 @@
+ #endregion
+ 
+ using System;
++using OpenRA.Mods.Common.Traits;
+ using OpenRA.Network;
+ using OpenRA.Widgets;
+ 
+@@ -43,12 +44,7 @@ namespace OpenRA.Mods.Common.Widgets.Logic
+ 				// Timers in replays should be synced to the effective game time, not the playback time.
+ 				var timestep = world.Timestep;
+ 				if (world.IsReplay)
+-				{
+-					GameSpeed speed;
+-					var gameSpeeds = Game.ModData.Manifest.Get<GameSpeeds>();
+-					if (gameSpeeds.Speeds.TryGetValue(world.LobbyInfo.GlobalSettings.GameSpeedType, out speed))
+-						timestep = speed.Timestep;
+-				}
++					timestep = world.WorldActor.Trait<MapOptions>().GameSpeed.Timestep;
+ 
+ 				timer.GetText = () =>
+ 				{
+diff --git a/OpenRA.Mods.Common/Widgets/Logic/Lobby/LobbyLogic.cs b/OpenRA.Mods.Common/Widgets/Logic/Lobby/LobbyLogic.cs
+index 0554338164..d243e206b0 100644
+--- a/OpenRA.Mods.Common/Widgets/Logic/Lobby/LobbyLogic.cs
++++ b/OpenRA.Mods.Common/Widgets/Logic/Lobby/LobbyLogic.cs
+@@ -372,7 +372,8 @@ namespace OpenRA.Mods.Common.Widgets.Logic
+ 				{ "TECHLEVEL", "techlevel" },
+ 				{ "STARTINGUNITS", "startingunits" },
+ 				{ "STARTINGCASH", "startingcash" },
+-				{ "DIFFICULTY", "difficulty" }
++				{ "DIFFICULTY", "difficulty" },
++				{ "GAMESPEED", "gamespeed" }
+ 			};
+ 
+ 			var allOptions = new CachedTransform<MapPreview, LobbyOption[]>(
+@@ -428,44 +429,6 @@ namespace OpenRA.Mods.Common.Widgets.Logic
+ 				}
+ 			}
+ 
+-			var gameSpeed = optionsBin.GetOrNull<DropDownButtonWidget>("GAMESPEED_DROPDOWNBUTTON");
+-			if (gameSpeed != null)
+-			{
+-				var speeds = modData.Manifest.Get<GameSpeeds>().Speeds;
+-
+-				gameSpeed.IsDisabled = configurationDisabled;
+-				gameSpeed.GetText = () =>
+-				{
+-					if (Map.Status != MapStatus.Available)
+-						return "Not Available";
+-
+-					GameSpeed speed;
+-					if (!speeds.TryGetValue(orderManager.LobbyInfo.GlobalSettings.GameSpeedType, out speed))
+-						return "Unknown";
+-
+-					return speed.Name;
+-				};
+-
+-				gameSpeed.OnMouseDown = _ =>
+-				{
+-					var options = speeds.Select(s => new DropDownOption
+-					{
+-						Title = s.Value.Name,
+-						IsSelected = () => orderManager.LobbyInfo.GlobalSettings.GameSpeedType == s.Key,
+-						OnClick = () => orderManager.IssueOrder(Order.Command("gamespeed {0}".F(s.Key)))
+-					});
+-
+-					Func<DropDownOption, ScrollItemWidget, ScrollItemWidget> setupItem = (option, template) =>
+-					{
+-						var item = ScrollItemWidget.Setup(template, option.IsSelected, option.OnClick);
+-						item.Get<LabelWidget>("LABEL").GetText = () => option.Title;
+-						return item;
+-					};
+-
+-					gameSpeed.ShowDropDown("LABEL_DROPDOWN_TEMPLATE", options.Count() * 30, options, setupItem);
+-				};
+-			}
+-
+ 			var disconnectButton = lobby.Get<ButtonWidget>("DISCONNECT_BUTTON");
+ 			disconnectButton.OnClick = () => { Ui.CloseWindow(); onExit(); };
+ 
+diff --git a/OpenRA.Mods.Common/Widgets/Logic/MissionBrowserLogic.cs b/OpenRA.Mods.Common/Widgets/Logic/MissionBrowserLogic.cs
+index 430b78d60a..ed3a19adae 100644
+--- a/OpenRA.Mods.Common/Widgets/Logic/MissionBrowserLogic.cs
++++ b/OpenRA.Mods.Common/Widgets/Logic/MissionBrowserLogic.cs
+@@ -365,7 +365,7 @@ namespace OpenRA.Mods.Common.Widgets.Logic
+ 				return;
+ 
+ 			var orders = new[] {
+-				Order.Command("gamespeed {0}".F(gameSpeed)),
++				Order.Command("option gamespeed {0}".F(gameSpeed)),
+ 				Order.Command("option difficulty {0}".F(difficulty)),
+ 				Order.Command("state {0}".F(Session.ClientState.Ready))
+ 			};
+diff --git a/OpenRA.Mods.Common/Widgets/ObserverSupportPowerIconsWidget.cs b/OpenRA.Mods.Common/Widgets/ObserverSupportPowerIconsWidget.cs
+index ed3023106f..17da43e4ec 100644
+--- a/OpenRA.Mods.Common/Widgets/ObserverSupportPowerIconsWidget.cs
++++ b/OpenRA.Mods.Common/Widgets/ObserverSupportPowerIconsWidget.cs
+@@ -44,13 +44,10 @@ namespace OpenRA.Mods.Common.Widgets
+ 			clocks = new Dictionary<string, Animation>();
+ 			icon = new Animation(world, "icon");
+ 
+-			// Timers should be synced to the effective game time, not the playback time.
+-			GameSpeed speed;
+-			var gameSpeeds = Game.ModData.Manifest.Get<GameSpeeds>();
+-			if (gameSpeeds.Speeds.TryGetValue(world.LobbyInfo.GlobalSettings.GameSpeedType, out speed))
+-				timestep = speed.Timestep;
+-			else
+-				timestep = world.Timestep;
++			// Timers in replays should be synced to the effective game time, not the playback time.
++			timestep = world.Timestep;
++			if (world.IsReplay)
++				timestep = world.WorldActor.Trait<MapOptions>().GameSpeed.Timestep;
+ 		}
+ 
+ 		protected ObserverSupportPowerIconsWidget(ObserverSupportPowerIconsWidget other)
+diff --git a/OpenRA.Mods.Common/Widgets/SupportPowerTimerWidget.cs b/OpenRA.Mods.Common/Widgets/SupportPowerTimerWidget.cs
+index a26c388f43..d1ea904049 100644
+--- a/OpenRA.Mods.Common/Widgets/SupportPowerTimerWidget.cs
++++ b/OpenRA.Mods.Common/Widgets/SupportPowerTimerWidget.cs
+@@ -39,12 +39,7 @@ namespace OpenRA.Mods.Common.Widgets
+ 			// Timers in replays should be synced to the effective game time, not the playback time.
+ 			timestep = world.Timestep;
+ 			if (world.IsReplay)
+-			{
+-				GameSpeed speed;
+-				var gameSpeeds = Game.ModData.Manifest.Get<GameSpeeds>();
+-				if (gameSpeeds.Speeds.TryGetValue(world.LobbyInfo.GlobalSettings.GameSpeedType, out speed))
+-					timestep = speed.Timestep;
+-			}
++				timestep = world.WorldActor.Trait<MapOptions>().GameSpeed.Timestep;
+ 		}
+ 
+ 		public override void Tick()

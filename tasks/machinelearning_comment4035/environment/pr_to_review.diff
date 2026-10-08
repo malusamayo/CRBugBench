@@ -1,0 +1,911 @@
+diff --git a/src/Microsoft.ML.Core/Properties/AssemblyInfo.cs b/src/Microsoft.ML.Core/Properties/AssemblyInfo.cs
+index da0471dbfe..3cdd97ebde 100644
+--- a/src/Microsoft.ML.Core/Properties/AssemblyInfo.cs
++++ b/src/Microsoft.ML.Core/Properties/AssemblyInfo.cs
+@@ -22,6 +22,7 @@
+ [assembly: InternalsVisibleTo(assemblyName: "Microsoft.ML.Data" + PublicKey.Value)]
+ [assembly: InternalsVisibleTo(assemblyName: "Microsoft.ML.Api" + PublicKey.Value)]
+ [assembly: InternalsVisibleTo(assemblyName: "Microsoft.ML.Ensemble" + PublicKey.Value)]
++[assembly: InternalsVisibleTo(assemblyName: "Microsoft.ML.Experimental" + PublicKey.Value)]
+ [assembly: InternalsVisibleTo(assemblyName: "Microsoft.ML.FastTree" + PublicKey.Value)]
+ [assembly: InternalsVisibleTo(assemblyName: "Microsoft.ML.Mkl.Components" + PublicKey.Value)]
+ [assembly: InternalsVisibleTo(assemblyName: "Microsoft.ML.KMeansClustering" + PublicKey.Value)]
+diff --git a/src/Microsoft.ML.Experimental/DataLoadSave/Database/DatabaseLoader.cs b/src/Microsoft.ML.Experimental/DataLoadSave/Database/DatabaseLoader.cs
+new file mode 100644
+index 0000000000..c315a1afd4
+--- /dev/null
++++ b/src/Microsoft.ML.Experimental/DataLoadSave/Database/DatabaseLoader.cs
+@@ -0,0 +1,372 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++// See the LICENSE file in the project root for more information.
++
++using System;
++using System.Collections.Generic;
++using System.Data;
++using System.Linq;
++using Microsoft.ML;
++using Microsoft.ML.CommandLine;
++using Microsoft.ML.Data;
++using Microsoft.ML.Internal.Utilities;
++using Microsoft.ML.Runtime;
++
++[assembly: LoadableClass(DatabaseLoader.Summary, typeof(DatabaseLoader), null, typeof(SignatureLoadModel),
++    "Database Loader", DatabaseLoader.LoaderSignature)]
++
++namespace Microsoft.ML.Data
++{
++    public sealed partial class DatabaseLoader : IDataLoader<Func<IDataReader>>
++    {
++        internal const string Summary = "Loads data from an IDataReader.";
++        internal const string LoaderSignature = "DatabaseLoader";
++
++        private static VersionInfo GetVersionInfo()
++        {
++            return new VersionInfo(
++                modelSignature: "DBLOADER",
++                verWrittenCur: 0x00010001, // Initial
++                verReadableCur: 0x00010001,
++                verWeCanReadBack: 0x00010001,
++                loaderSignature: LoaderSignature,
++                loaderAssemblyName: typeof(DatabaseLoader).Assembly.FullName);
++        }
++
++        private readonly Bindings _bindings;
++
++        private readonly IHost _host;
++        private const string RegistrationName = "DatabaseLoader";
++
++        internal DatabaseLoader(IHostEnvironment env, Options options)
++        {
++            options = options ?? new Options();
++
++            Contracts.CheckValue(env, nameof(env));
++            _host = env.Register(RegistrationName);
++            _host.CheckValue(options, nameof(options));
++
++            var cols = options.Columns;
++            if (Utils.Size(cols) == 0)
++            {
++                throw _host.Except("DatabaseLoader requires at least one Column");
++            }
++
++            _bindings = new Bindings(this, cols);
++        }
++
++        private DatabaseLoader(IHost host, ModelLoadContext ctx)
++        {
++            Contracts.AssertValue(host, "host");
++            host.AssertValue(ctx);
++
++            _host = host;
++
++            _bindings = new Bindings(ctx, this);
++        }
++
++        internal static DatabaseLoader Create(IHostEnvironment env, ModelLoadContext ctx)
++        {
++            Contracts.CheckValue(env, nameof(env));
++            IHost h = env.Register(RegistrationName);
++
++            h.CheckValue(ctx, nameof(ctx));
++            ctx.CheckAtModel(GetVersionInfo());
++
++            return h.Apply("Loading Model", ch => new DatabaseLoader(h, ctx));
++        }
++
++        void ICanSaveModel.Save(ModelSaveContext ctx)
++        {
++            _host.CheckValue(ctx, nameof(ctx));
++            ctx.CheckAtModel();
++            ctx.SetVersionInfo(GetVersionInfo());
++
++            // *** Binary format ***
++            // bindings
++            _bindings.Save(ctx);
++        }
++
++        /// <summary>
++        /// The output <see cref="DataViewSchema"/> that will be produced by the loader.
++        /// </summary>
++        public DataViewSchema GetOutputSchema() => _bindings.OutputSchema;
++
++        /// <summary>
++        /// Loads data from <paramref name="input"/> into an <see cref="IDataView"/>.
++        /// </summary>
++        /// <param name="input">A function that returns an IDataReader from which to load data.</param>
++        public IDataView Load(Func<IDataReader> input) => new BoundLoader(this, input);
++
++        /// <summary>
++        /// Describes how an input column should be mapped to an <see cref="IDataView"/> column.
++        /// </summary>
++        public sealed class Column
++        {
++            /// <summary>
++            /// Name of the column.
++            /// </summary>
++            [Argument(ArgumentType.AtMostOnce, HelpText = "Name of the column")]
++            public string Name;
++
++            /// <summary>
++            /// <see cref="DbType"/> of the items in the column.
++            /// </summary>
++            [Argument(ArgumentType.AtMostOnce, HelpText = "Type of the items in the column")]
++            public DbType Type = DbType.Single;
++
++            /// <summary>
++            /// Source index of the column.
++            /// </summary>
++            [Argument(ArgumentType.Multiple, HelpText = "Source index of the column", ShortName = "src")]
++            public int? Source;
++
++            /// <summary>
++            /// For a key column, this defines the range of values.
++            /// </summary>
++            [Argument(ArgumentType.Multiple, HelpText = "For a key column, this defines the range of values", ShortName = "key")]
++            public KeyCount KeyCount;
++        }
++
++        /// <summary>
++        /// The settings for <see cref="DatabaseLoader"/>
++        /// </summary>
++        public sealed class Options
++        {
++            /// <summary>
++            /// Specifies the input columns that should be mapped to <see cref="IDataView"/> columns.
++            /// </summary>
++            [Argument(ArgumentType.Multiple, HelpText = "Column groups. Each group is specified as name:type:numeric-ranges, eg, col=Features:R4:1-17,26,35-40",
++                Name = "Column", ShortName = "col", SortOrder = 1)]
++            public Column[] Columns;
++        }
++
++        /// <summary>
++        /// Information for an output column.
++        /// </summary>
++        private sealed class ColInfo
++        {
++            public readonly string Name;
++            public readonly int? SourceIndex;
++            public readonly DataViewType ColType;
++
++            public ColInfo(string name, int? sourceIndex, DataViewType colType)
++            {
++                Contracts.AssertNonEmpty(name);
++                Contracts.Assert(!sourceIndex.HasValue || sourceIndex >= 0);
++                Contracts.AssertValue(colType);
++
++                Name = name;
++                SourceIndex = sourceIndex;
++                ColType = colType;
++            }
++        }
++
++        private sealed class Bindings
++        {
++            /// <summary>
++            /// <see cref="Infos"/>[i] stores the i-th column's name and type. Columns are loaded from the input text file.
++            /// </summary>
++            public readonly ColInfo[] Infos;
++
++            public DataViewSchema OutputSchema { get; }
++
++            public Bindings(DatabaseLoader parent, Column[] cols)
++            {
++                Contracts.AssertNonEmpty(cols);
++
++                using (var ch = parent._host.Start("Binding"))
++                {
++                    // Make sure all columns have at least one source range.
++                    foreach (var col in cols)
++                    {
++                        if (col.Source < 0)
++                            throw ch.ExceptUserArg(nameof(Column.Source), "Source column index must be non-negative");
++                    }
++
++                    Infos = new ColInfo[cols.Length];
++
++                    // This dictionary is used only for detecting duplicated column names specified by user.
++                    var nameToInfoIndex = new Dictionary<string, int>(Infos.Length);
++
++                    for (int iinfo = 0; iinfo < Infos.Length; iinfo++)
++                    {
++                        var col = cols[iinfo];
++
++                        ch.CheckNonWhiteSpace(col.Name, nameof(col.Name));
++                        string name = col.Name.Trim();
++                        if (iinfo == nameToInfoIndex.Count && nameToInfoIndex.ContainsKey(name))
++                            ch.Info("Duplicate name(s) specified - later columns will hide earlier ones");
++
++                        PrimitiveDataViewType itemType;
++                        if (col.KeyCount != null)
++                        {
++                            itemType = ConstructKeyType(col.Type, col.KeyCount);
++                        }
++                        else
++                        {
++                            itemType = ColumnTypeExtensions.PrimitiveTypeFromType(col.Type.ToType());
++                        }
++
++                        Infos[iinfo] = new ColInfo(name, col.Source, itemType);
++
++                        nameToInfoIndex[name] = iinfo;
++                    }
++                }
++                OutputSchema = ComputeOutputSchema();
++            }
++
++            public Bindings(ModelLoadContext ctx, DatabaseLoader parent)
++            {
++                Contracts.AssertValue(ctx);
++
++                // *** Binary format ***
++                // int: number of columns
++                // foreach column:
++                //   int: id of column name
++                //   byte: DataKind
++                //   byte: bool of whether this is a key type
++                //   for a key type:
++                //     ulong: count for key range
++                //   byte: bool of whether the source index is valid
++                //   for a valid source index:
++                //     int: source index
++                int cinfo = ctx.Reader.ReadInt32();
++                Contracts.CheckDecode(cinfo > 0);
++                Infos = new ColInfo[cinfo];
++
++                for (int iinfo = 0; iinfo < cinfo; iinfo++)
++                {
++                    string name = ctx.LoadNonEmptyString();
++
++                    PrimitiveDataViewType itemType;
++                    var kind = (InternalDataKind)ctx.Reader.ReadByte();
++                    Contracts.CheckDecode(Enum.IsDefined(typeof(InternalDataKind), kind));
++                    bool isKey = ctx.Reader.ReadBoolByte();
++                    if (isKey)
++                    {
++                        ulong count;
++                        Contracts.CheckDecode(KeyDataViewType.IsValidDataType(kind.ToType()));
++
++                        count = ctx.Reader.ReadUInt64();
++                        Contracts.CheckDecode(0 < count);
++
++                        itemType = new KeyDataViewType(kind.ToType(), count);
++                    }
++                    else
++                        itemType = ColumnTypeExtensions.PrimitiveTypeFromKind(kind);
++
++                    int? sourceIndex = null;
++                    bool hasSourceIndex = ctx.Reader.ReadBoolByte();
++                    if (hasSourceIndex)
++                    {
++                        sourceIndex = ctx.Reader.ReadInt32();
++                    }
++
++                    Infos[iinfo] = new ColInfo(name, sourceIndex, itemType);
++                }
++
++                OutputSchema = ComputeOutputSchema();
++            }
++
++            internal void Save(ModelSaveContext ctx)
++            {
++                Contracts.AssertValue(ctx);
++
++                // *** Binary format ***
++                // int: number of columns
++                // foreach column:
++                //   int: id of column name
++                //   byte: DataKind
++                //   byte: bool of whether this is a key type
++                //   for a key type:
++                //     ulong: count for key range
++                //   byte: bool of whether the source index is valid
++                //   for a valid source index:
++                //     int: source index
++                ctx.Writer.Write(Infos.Length);
++                for (int iinfo = 0; iinfo < Infos.Length; iinfo++)
++                {
++                    var info = Infos[iinfo];
++                    ctx.SaveNonEmptyString(info.Name);
++                    var type = info.ColType.GetItemType();
++                    InternalDataKind rawKind = type.GetRawKind();
++                    Contracts.Assert((InternalDataKind)(byte)rawKind == rawKind);
++                    ctx.Writer.Write((byte)rawKind);
++                    ctx.Writer.WriteBoolByte(type is KeyDataViewType);
++                    if (type is KeyDataViewType key)
++                        ctx.Writer.Write(key.Count);
++                    ctx.Writer.WriteBoolByte(info.SourceIndex.HasValue);
++                    if (info.SourceIndex.HasValue)
++                        ctx.Writer.Write(info.SourceIndex.GetValueOrDefault());
++                }
++            }
++
++            private DataViewSchema ComputeOutputSchema()
++            {
++                var schemaBuilder = new DataViewSchema.Builder();
++
++                // Iterate through all loaded columns. The index i indicates the i-th column loaded.
++                for (int i = 0; i < Infos.Length; ++i)
++                {
++                    var info = Infos[i];
++                    schemaBuilder.AddColumn(info.Name, info.ColType);
++                }
++
++                return schemaBuilder.ToSchema();
++            }
++
++            /// <summary>
++            /// Construct a <see cref="KeyDataViewType"/> out of the DbType and the keyCount.
++            /// </summary>
++            private static KeyDataViewType ConstructKeyType(DbType dbType, KeyCount keyCount)
++            {
++                Contracts.CheckValue(keyCount, nameof(keyCount));
++
++                KeyDataViewType keyType;
++                Type rawType = dbType.ToType();
++                Contracts.CheckUserArg(KeyDataViewType.IsValidDataType(rawType), nameof(DatabaseLoader.Column.Type), "Bad item type for Key");
++
++                if (keyCount.Count == null)
++                    keyType = new KeyDataViewType(rawType, rawType.ToMaxInt());
++                else
++                    keyType = new KeyDataViewType(rawType, keyCount.Count.GetValueOrDefault());
++
++                return keyType;
++            }
++        }
++
++        private sealed class BoundLoader : IDataView
++        {
++            private readonly DatabaseLoader _loader;
++            private readonly IHost _host;
++            private readonly Func<IDataReader> _input;
++
++            public BoundLoader(DatabaseLoader loader, Func<IDataReader> input)
++            {
++                _loader = loader;
++                _host = loader._host.Register(nameof(BoundLoader));
++
++                _host.CheckValue(input, nameof(input));
++                _input = input;
++            }
++
++            public long? GetRowCount() => null;
++            public bool CanShuffle => false;
++
++            public DataViewSchema Schema => _loader._bindings.OutputSchema;
++
++            public DataViewRowCursor GetRowCursor(IEnumerable<DataViewSchema.Column> columnsNeeded, Random rand = null)
++            {
++                _host.CheckValueOrNull(rand);
++                var active = Utils.BuildArray(_loader._bindings.OutputSchema.Count, columnsNeeded);
++                return Cursor.Create(_loader, _input, active);
++            }
++
++            public DataViewRowCursor[] GetRowCursorSet(IEnumerable<DataViewSchema.Column> columnsNeeded, int n, Random rand = null)
++            {
++                return new DataViewRowCursor[] { GetRowCursor(columnsNeeded, rand) };
++            }
++        }
++    }
++}
+diff --git a/src/Microsoft.ML.Experimental/DataLoadSave/Database/DatabaseLoaderCatalog.cs b/src/Microsoft.ML.Experimental/DataLoadSave/Database/DatabaseLoaderCatalog.cs
+new file mode 100644
+index 0000000000..e1177082d0
+--- /dev/null
++++ b/src/Microsoft.ML.Experimental/DataLoadSave/Database/DatabaseLoaderCatalog.cs
+@@ -0,0 +1,30 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++// See the LICENSE file in the project root for more information.
++
++using Microsoft.ML.Data;
++
++namespace Microsoft.ML
++{
++    /// <summary>
++    /// Collection of extension methods for the <see cref="DataOperationsCatalog"/> to read from databases.
++    /// </summary>
++    public static class DatabaseLoaderCatalog
++    {
++        /// <summary>
++        /// Create a database loader <see cref="DatabaseLoader"/>.
++        /// </summary>
++        /// <param name="catalog">The <see cref="DataOperationsCatalog"/> catalog.</param>
++        /// <param name="columns">Array of columns <see cref="DatabaseLoader.Column"/> defining the schema.</param>
++        public static DatabaseLoader CreateDatabaseLoader(this DataOperationsCatalog catalog,
++            params DatabaseLoader.Column[] columns)
++        {
++            var options = new DatabaseLoader.Options
++            {
++                Columns = columns,
++            };
++
++            return new DatabaseLoader(CatalogUtils.GetEnvironment(catalog), options);
++        }
++    }
++}
+diff --git a/src/Microsoft.ML.Experimental/DataLoadSave/Database/DatabaseLoaderCursor.cs b/src/Microsoft.ML.Experimental/DataLoadSave/Database/DatabaseLoaderCursor.cs
+new file mode 100644
+index 0000000000..dc0f2ee151
+--- /dev/null
++++ b/src/Microsoft.ML.Experimental/DataLoadSave/Database/DatabaseLoaderCursor.cs
+@@ -0,0 +1,275 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++// See the LICENSE file in the project root for more information.
++
++using System;
++using System.Data;
++using Microsoft.ML.Internal.Utilities;
++using Microsoft.ML.Runtime;
++
++namespace Microsoft.ML.Data
++{
++    public sealed partial class DatabaseLoader
++    {
++        private sealed class Cursor : RootCursorBase
++        {
++            private readonly Bindings _bindings;
++            private readonly bool[] _active; // Which columns are active.
++            private readonly IDataReader _input;
++            private readonly Delegate[] _getters;
++
++            // This holds the overall count of rows currently served up in the cursor.
++            private long _total;
++            private bool _disposed;
++
++            public override long Batch => 0;
++
++            private Cursor(DatabaseLoader parent, IDataReader input, bool[] active)
++                : base(parent._host)
++            {
++                Ch.Assert(active == null || active.Length == parent._bindings.OutputSchema.Count);
++                Ch.CheckValue(input, nameof(input));
++
++                _total = -1;
++                _bindings = parent._bindings;
++                _active = active;
++                _input = input;
++
++                _getters = new Delegate[_bindings.Infos.Length];
++                for (int i = 0; i < _getters.Length; i++)
++                {
++                    if (_active != null && !_active[i])
++                        continue;
++                    _getters[i] = CreateGetterDelegate(i);
++                    Ch.Assert(_getters[i] != null);
++                }
++        }
++
++            public static DataViewRowCursor Create(DatabaseLoader parent, Func<IDataReader> input, bool[] active)
++            {
++                Contracts.AssertValue(parent);
++                Contracts.AssertValue(input);
++                Contracts.Assert(active == null || active.Length == parent._bindings.OutputSchema.Count);
++
++                return new Cursor(parent, input(), active);
++            }
++
++            public override ValueGetter<DataViewRowId> GetIdGetter()
++            {
++                return
++                    (ref DataViewRowId val) =>
++                    {
++                        Ch.Check(IsGood, RowCursorUtils.FetchValueStateError);
++                        val = new DataViewRowId((ulong)_total, 0);
++                    };
++            }
++
++            public override DataViewSchema Schema => _bindings.OutputSchema;
++
++            protected override void Dispose(bool disposing)
++            {
++                if (_disposed)
++                    return;
++                if (disposing)
++                {
++                    _input.Dispose();
++                }
++                _disposed = true;
++                base.Dispose(disposing);
++            }
++
++            protected override bool MoveNextCore()
++            {
++                if (_input.Read())
++                {
++                    _total++;
++                    return true;
++                }
++
++                return false;
++            }
++
++            /// <summary>
++            /// Returns whether the given column is active in this row.
++            /// </summary>
++            public override bool IsColumnActive(DataViewSchema.Column column)
++            {
++                Ch.Check(column.Index < _bindings.Infos.Length);
++                return _active == null || _active[column.Index];
++            }
++
++            /// <summary>
++            /// Returns a value getter delegate to fetch the value of column with the given columnIndex, from the row.
++            /// This throws if the column is not active in this row, or if the type
++            /// <typeparamref name="TValue"/> differs from this column's type.
++            /// </summary>
++            /// <typeparam name="TValue"> is the column's content type.</typeparam>
++            /// <param name="column"> is the output column whose getter should be returned.</param>
++            public override ValueGetter<TValue> GetGetter<TValue>(DataViewSchema.Column column)
++            {
++                Ch.CheckParam(column.Index < _getters.Length, nameof(column), "requested column not valid.");
++                Ch.Check(IsColumnActive(column));
++
++                var fn = _getters[column.Index] as ValueGetter<TValue>;
++                if (fn == null)
++                    throw Ch.Except("Invalid TValue in GetGetter: '{0}'", typeof(TValue));
++                return fn;
++            }
++
++            private Delegate CreateGetterDelegate(int col)
++            {
++                return Utils.MarshalInvoke(CreateGetterDelegate<int>, _bindings.Infos[col].ColType.RawType, col);
++            }
++
++            private Delegate CreateGetterDelegate<TValue>(int col)
++            {
++                Delegate getterDelegate;
++
++                var colInfo = _bindings.Infos[col];
++                Ch.Assert(colInfo.ColType.RawType == typeof(TValue));
++
++                if (typeof(TValue) == typeof(bool))
++                {
++                    getterDelegate = CreateBooleanGetterDelegate(colInfo);
++                }
++                else if (typeof(TValue) == typeof(byte))
++                {
++                    getterDelegate = CreateByteGetterDelegate(colInfo);
++                }
++                else if (typeof(TValue) == typeof(DateTime))
++                {
++                    getterDelegate = CreateDateTimeGetterDelegate(colInfo);
++                }
++                else if (typeof(TValue) == typeof(double))
++                {
++                    getterDelegate = CreateDoubleGetterDelegate(colInfo);
++                }
++                else if (typeof(TValue) == typeof(short))
++                {
++                    getterDelegate = CreateInt16GetterDelegate(colInfo);
++                }
++                else if (typeof(TValue) == typeof(int))
++                {
++                    getterDelegate = CreateInt32GetterDelegate(colInfo);
++                }
++                else if (typeof(TValue) == typeof(long))
++                {
++                    getterDelegate = CreateInt64GetterDelegate(colInfo);
++                }
++                else if (typeof(TValue) == typeof(sbyte))
++                {
++                    getterDelegate = CreateSByteGetterDelegate(colInfo);
++                }
++                else if (typeof(TValue) == typeof(float))
++                {
++                    getterDelegate = CreateSingleGetterDelegate(colInfo);
++                }
++                else if (typeof(TValue) == typeof(string))
++                {
++                    getterDelegate = CreateStringGetterDelegate(colInfo);
++                }
++                else if (typeof(TValue) == typeof(ushort))
++                {
++                    getterDelegate = CreateUInt16GetterDelegate(colInfo);
++                }
++                else if (typeof(TValue) == typeof(uint))
++                {
++                    getterDelegate = CreateUInt32GetterDelegate(colInfo);
++                }
++                else if (typeof(TValue) == typeof(ulong))
++                {
++                    getterDelegate = CreateUInt64GetterDelegate(colInfo);
++                }
++                else
++                {
++                    throw new NotSupportedException();
++                }
++
++                return getterDelegate as ValueGetter<TValue>;
++            }
++
++            private ValueGetter<bool> CreateBooleanGetterDelegate(ColInfo colInfo)
++            {
++                int columnIndex = GetColumnIndex(colInfo);
++                return (ref bool value) => value = _input.GetBoolean(columnIndex);
++            }
++
++            private ValueGetter<byte> CreateByteGetterDelegate(ColInfo colInfo)
++            {
++                int columnIndex = GetColumnIndex(colInfo);
++                return (ref byte value) => value = _input.GetByte(columnIndex);
++            }
++
++            private ValueGetter<DateTime> CreateDateTimeGetterDelegate(ColInfo colInfo)
++            {
++                int columnIndex = GetColumnIndex(colInfo);
++                return (ref DateTime value) => value = _input.GetDateTime(columnIndex);
++            }
++
++            private ValueGetter<double> CreateDoubleGetterDelegate(ColInfo colInfo)
++            {
++                int columnIndex = GetColumnIndex(colInfo);
++                return (ref double value) => value = _input.GetDouble(columnIndex);
++            }
++
++            private ValueGetter<short> CreateInt16GetterDelegate(ColInfo colInfo)
++            {
++                int columnIndex = GetColumnIndex(colInfo);
++                return (ref short value) => value = _input.GetInt16(columnIndex);
++            }
++
++            private ValueGetter<int> CreateInt32GetterDelegate(ColInfo colInfo)
++            {
++                int columnIndex = GetColumnIndex(colInfo);
++                return (ref int value) => value = _input.GetInt32(columnIndex);
++            }
++
++            private ValueGetter<long> CreateInt64GetterDelegate(ColInfo colInfo)
++            {
++                int columnIndex = GetColumnIndex(colInfo);
++                return (ref long value) => value = _input.GetInt64(columnIndex);
++            }
++
++            private ValueGetter<sbyte> CreateSByteGetterDelegate(ColInfo colInfo)
++            {
++                int columnIndex = GetColumnIndex(colInfo);
++                return (ref sbyte value) => value = (sbyte)_input.GetByte(columnIndex);
++            }
++
++            private ValueGetter<float> CreateSingleGetterDelegate(ColInfo colInfo)
++            {
++                int columnIndex = GetColumnIndex(colInfo);
++                return (ref float value) => value = _input.GetFloat(columnIndex);
++            }
++
++            private ValueGetter<string> CreateStringGetterDelegate(ColInfo colInfo)
++            {
++                int columnIndex = GetColumnIndex(colInfo);
++                return (ref string value) => value = _input.GetString(columnIndex);
++            }
++
++            private ValueGetter<ushort> CreateUInt16GetterDelegate(ColInfo colInfo)
++            {
++                int columnIndex = GetColumnIndex(colInfo);
++                return (ref ushort value) => value = (ushort)_input.GetInt16(columnIndex);
++            }
++
++            private ValueGetter<uint> CreateUInt32GetterDelegate(ColInfo colInfo)
++            {
++                int columnIndex = GetColumnIndex(colInfo);
++                return (ref uint value) => value = (uint)_input.GetInt32(columnIndex);
++            }
++
++            private ValueGetter<ulong> CreateUInt64GetterDelegate(ColInfo colInfo)
++            {
++                int columnIndex = GetColumnIndex(colInfo);
++                return (ref ulong value) => value = (ulong)_input.GetInt64(columnIndex);
++            }
++
++            private int GetColumnIndex(ColInfo colInfo)
++            {
++                return colInfo.SourceIndex ?? _input.GetOrdinal(colInfo.Name);
++            }
++        }
++    }
++}
+diff --git a/src/Microsoft.ML.Experimental/DataLoadSave/Database/DbExtensions.cs b/src/Microsoft.ML.Experimental/DataLoadSave/Database/DbExtensions.cs
+new file mode 100644
+index 0000000000..acbf4e1c84
+--- /dev/null
++++ b/src/Microsoft.ML.Experimental/DataLoadSave/Database/DbExtensions.cs
+@@ -0,0 +1,70 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++// See the LICENSE file in the project root for more information.
++
++using System;
++using System.Data;
++
++namespace Microsoft.ML.Data
++{
++    internal static class DbExtensions
++    {
++        /// <summary>
++        /// Maps a <see cref="DbType"/> to the associated .Net representation type.
++        /// </summary>
++        public static Type ToType(this DbType dbType)
++        {
++            switch (dbType)
++            {
++                case DbType.AnsiString:
++                case DbType.AnsiStringFixedLength:
++                case DbType.String:
++                case DbType.StringFixedLength:
++                    return typeof(string);
++                case DbType.Binary:
++                    return typeof(byte[]);
++                case DbType.Boolean:
++                    return typeof(bool);
++                case DbType.Byte:
++                    return typeof(byte);
++                case DbType.Date:
++                case DbType.DateTime:
++                case DbType.DateTime2:
++                    return typeof(DateTime);
++                case DbType.DateTimeOffset:
++                    return typeof(DateTimeOffset);
++                case DbType.Decimal:
++                    return typeof(decimal);
++                case DbType.Double:
++                    return typeof(double);
++                case DbType.Guid:
++                    return typeof(Guid);
++                case DbType.Int16:
++                    return typeof(short);
++                case DbType.Int32:
++                    return typeof(int);
++                case DbType.Int64:
++                    return typeof(long);
++                case DbType.Object:
++                    return typeof(object);
++                case DbType.SByte:
++                    return typeof(sbyte);
++                case DbType.Single:
++                    return typeof(float);
++                case DbType.Time:
++                    return typeof(TimeSpan);
++                case DbType.UInt16:
++                    return typeof(ushort);
++                case DbType.UInt32:
++                    return typeof(uint);
++                case DbType.UInt64:
++                    return typeof(ulong);
++                case DbType.Currency:
++                case DbType.VarNumeric:
++                case DbType.Xml:
++                default:
++                    return null;
++            }
++        }
++    }
++}
+diff --git a/src/Microsoft.ML.Experimental/Properties/AssemblyInfo.cs b/src/Microsoft.ML.Experimental/Properties/AssemblyInfo.cs
+new file mode 100644
+index 0000000000..734f2f357d
+--- /dev/null
++++ b/src/Microsoft.ML.Experimental/Properties/AssemblyInfo.cs
+@@ -0,0 +1,10 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++// See the LICENSE file in the project root for more information.
++
++using System.Runtime.CompilerServices;
++using Microsoft.ML;
++
++[assembly: InternalsVisibleTo(assemblyName: "Microsoft.ML.Tests" + PublicKey.TestValue)]
++
++[assembly: WantsToBeBestFriends]
+diff --git a/test/Microsoft.ML.Tests/DatabaseLoaderTests.cs b/test/Microsoft.ML.Tests/DatabaseLoaderTests.cs
+new file mode 100644
+index 0000000000..107afdea21
+--- /dev/null
++++ b/test/Microsoft.ML.Tests/DatabaseLoaderTests.cs
+@@ -0,0 +1,95 @@
++﻿// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++// See the LICENSE file in the project root for more information.
++
++using System.Data;
++using System.Data.SqlClient;
++using Microsoft.ML.Data;
++using Microsoft.ML.TestFramework;
++using Xunit;
++using Xunit.Abstractions;
++
++namespace Microsoft.ML.Tests
++{
++    public class DatabaseLoaderTests : BaseTestClass
++    {
++        public DatabaseLoaderTests(ITestOutputHelper output)
++            : base(output)
++        {
++        }
++
++        [Fact]
++        public void TryItOut()
++        {
++            var mlContext = new MLContext(seed: 1);
++
++            var connectionString = @"Server=(localdb)\mssqllocaldb;Database=EFGetStarted.AspNetCore.NewDb;Trusted_Connection=True;ConnectRetryCount=0";
++            using (SqlConnection connection = new SqlConnection(connectionString))
++            {
++                connection.Open();
++
++                using (SqlCommand command = new SqlCommand(
++                    "SELECT SepalLength, SepalWidth, PetalLength, PetalWidth, Label FROM IrisData",
++                    connection))
++                {
++                    DatabaseLoader loader = new DatabaseLoader(mlContext, new DatabaseLoader.Options()
++                    {
++                        Columns = new[]
++                        {
++                            new DatabaseLoader.Column() { Name = "SepalLength", Type = DbType.Single },
++                            new DatabaseLoader.Column() { Name = "SepalWidth", Type = DbType.Single },
++                            new DatabaseLoader.Column() { Name = "PetalLength", Type = DbType.Single },
++                            new DatabaseLoader.Column() { Name = "PetalWidth", Type = DbType.Single },
++                            new DatabaseLoader.Column() { Name = "Label", Type = DbType.Int32 },
++                        }
++                    });
++
++                    IDataView trainingData = loader.Load(() => command.ExecuteReader());
++                    //trainingData = mlContext.Data.Cache(trainingData, "SepalLength", "SepalWidth", "PetalLength", "PetalWidth", "Label");
++
++
++                    var pipeline = mlContext.Transforms.Conversion.MapValueToKey("Label")
++                        .Append(mlContext.Transforms.Concatenate("Features", "SepalLength", "SepalWidth", "PetalLength", "PetalWidth"))
++                        //.AppendCacheCheckpoint(mlContext)
++                        .Append(mlContext.MulticlassClassification.Trainers.LightGbm())
++                        .Append(mlContext.Transforms.Conversion.MapKeyToValue("PredictedLabel"));
++
++                    var model = pipeline.Fit(trainingData);
++
++                    var engine = mlContext.Model.CreatePredictionEngine<IrisData, IrisPrediction>(model);
++
++                    Assert.Equal(1, engine.Predict(new IrisData()
++                    {
++                        SepalLength = 4.5f,
++                        SepalWidth = 5.6f,
++                        PetalLength = 0.5f,
++                        PetalWidth = 0.5f,
++                    }).PredictedLabel);
++                    Assert.Equal(2, engine.Predict(new IrisData()
++                    {
++                        SepalLength = 4.9f,
++                        SepalWidth = 2.4f,
++                        PetalLength = 3.3f,
++                        PetalWidth = 1.0f,
++                    }).PredictedLabel);
++                }
++            }
++        }
++
++        public class IrisData
++        {
++            public float SepalLength;
++            public float SepalWidth;
++            public float PetalLength;
++            public float PetalWidth;
++            public int Label;
++        }
++
++        public class IrisPrediction
++        {
++            public int PredictedLabel;
++            public float[] Score;
++        }
++
++    }
++}
+diff --git a/test/Microsoft.ML.Tests/Microsoft.ML.Tests.csproj b/test/Microsoft.ML.Tests/Microsoft.ML.Tests.csproj
+index 7f257530c1..19c6889ca7 100644
+--- a/test/Microsoft.ML.Tests/Microsoft.ML.Tests.csproj
++++ b/test/Microsoft.ML.Tests/Microsoft.ML.Tests.csproj
+@@ -54,5 +54,6 @@
+     <PackageReference Include="Microsoft.ML.TensorFlow.TestModels" Version="$(MicrosoftMLTensorFlowTestModelsVersion)" />
+     <PackageReference Include="Microsoft.ML.Onnx.TestModels" Version="$(MicrosoftMLOnnxTestModelsVersion)" />
+     <PackageReference Include="Microsoft.ML.TestModels" Version="$(MicrosoftMLTestModelsPackageVersion)" />
++    <PackageReference Include="System.Data.SqlClient" Version="4.6.1" />
+   </ItemGroup>
+ </Project>

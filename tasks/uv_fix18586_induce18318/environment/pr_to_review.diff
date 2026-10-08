@@ -1,0 +1,313 @@
+commit 499cc82b359084f18622d541ee88d04038279956
+Author: Mikaël Barbero <mikael.barbero@gmail.com>
+Date:   Sun Mar 8 17:20:19 2026 +0100
+
+    Add `--outdated` flag to `uv tool list` (#18318)
+    
+    ## Summary
+    
+    Add a `--outdated` flag that queries PyPI for the latest version of each
+    installed tool and filters the output to only show tools with available
+    updates. Each outdated tool is displayed with its installed version and
+    a `[latest: X.Y.Z]` annotation.
+    
+    The implementation reuses the existing `LatestClient` infrastructure
+    from `pip list --outdated`, fetching versions concurrently with progress
+    reporting. Up-to-date tools are omitted from the output. A
+    `--no-outdated` hidden flag is included for flag negation consistency.
+    
+    Fixes #9309
+    
+    ## Test Plan
+    
+    A new integration test has been created in
+    `crates/uv/tests/it/tool_list.rs`, and the feature has also been tested
+    locally.
+    
+    Signed-off-by: Mikaël Barbero <mikael.barbero@eclipse-foundation.org>
+    Co-authored-by: Claude Opus 4.6 <noreply@anthropic.com>
+
+diff --git a/crates/uv-cli/src/lib.rs b/crates/uv-cli/src/lib.rs
+index a9d4f17bf..fea9b5a84 100644
+--- a/crates/uv-cli/src/lib.rs
++++ b/crates/uv-cli/src/lib.rs
+@@ -5787,6 +5787,16 @@ pub struct ToolListArgs {
+     #[arg(long)]
+     pub show_python: bool,
+ 
++    /// List outdated tools.
++    ///
++    /// The latest version of each tool will be shown alongside the installed version. Up-to-date
++    /// tools will be omitted from the output.
++    #[arg(long, overrides_with("no_outdated"))]
++    pub outdated: bool,
++
++    #[arg(long, overrides_with("outdated"), hide = true)]
++    pub no_outdated: bool,
++
+     // Hide unused global Python options.
+     #[arg(long, hide = true)]
+     pub python_preference: Option<PythonPreference>,
+diff --git a/crates/uv/src/commands/tool/list.rs b/crates/uv/src/commands/tool/list.rs
+index 40f1f860a..cd1972894 100644
+--- a/crates/uv/src/commands/tool/list.rs
++++ b/crates/uv/src/commands/tool/list.rs
+@@ -1,16 +1,27 @@
+ use std::fmt::Write;
+ 
+ use anyhow::Result;
++use futures::StreamExt;
+ use itertools::Itertools;
+ use owo_colors::OwoColorize;
++use rustc_hash::FxHashMap;
+ 
+-use uv_cache::Cache;
++use uv_cache::{Cache, Refresh};
++use uv_cache_info::Timestamp;
++use uv_client::{BaseClientBuilder, RegistryClientBuilder};
++use uv_configuration::Concurrency;
++use uv_distribution_filename::DistFilename;
++use uv_distribution_types::IndexCapabilities;
+ use uv_fs::Simplified;
++use uv_normalize::PackageName;
+ use uv_python::LenientImplementationName;
++use uv_resolver::{ExcludeNewer, PrereleaseMode};
+ use uv_tool::InstalledTools;
+ use uv_warnings::warn_user;
+ 
+ use crate::commands::ExitStatus;
++use crate::commands::pip::latest::LatestClient;
++use crate::commands::reporters::LatestVersionReporter;
+ use crate::printer::Printer;
+ 
+ /// List installed tools.
+@@ -21,6 +32,9 @@ pub(crate) async fn list(
+     show_with: bool,
+     show_extras: bool,
+     show_python: bool,
++    outdated: bool,
++    client_builder: BaseClientBuilder<'_>,
++    concurrency: Concurrency,
+     cache: &Cache,
+     printer: Printer,
+ ) -> Result<ExitStatus> {
+@@ -46,6 +60,8 @@ pub(crate) async fn list(
+         return Ok(ExitStatus::Success);
+     }
+ 
++    // Collect valid tools (skip invalid ones) before checking for outdated versions.
++    let mut valid_tools = Vec::new();
+     for (name, tool) in tools {
+         // Skip invalid tools
+         let Ok(tool) = tool else {
+@@ -91,6 +107,72 @@ pub(crate) async fn list(
+             }
+         };
+ 
++        valid_tools.push((name, tool, tool_env, version));
++    }
++
++    // Determine the latest version for each tool when `--outdated` is requested.
++    let latest: FxHashMap<PackageName, Option<DistFilename>> = if outdated
++        && !valid_tools.is_empty()
++    {
++        let capabilities = IndexCapabilities::default();
++
++        // Initialize the registry client.
++        let client = RegistryClientBuilder::new(
++            client_builder,
++            cache.clone().with_refresh(Refresh::All(Timestamp::now())),
++        )
++        .build();
++        let download_concurrency = concurrency.downloads_semaphore.clone();
++
++        // Initialize the client to fetch the latest version of each package.
++        let latest_client = LatestClient {
++            client: &client,
++            capabilities: &capabilities,
++            prerelease: PrereleaseMode::default(),
++            exclude_newer: &ExcludeNewer::default(),
++            tags: None,
++            requires_python: None,
++        };
++
++        let reporter = LatestVersionReporter::from(printer).with_length(valid_tools.len() as u64);
++
++        // Fetch the latest version for each tool.
++        let mut fetches = futures::stream::iter(&valid_tools)
++            .map(async |(name, _tool, _tool_env, _version)| {
++                let latest = latest_client
++                    .find_latest(name, None, &download_concurrency)
++                    .await?;
++                Ok::<(&PackageName, Option<DistFilename>), uv_client::Error>((name, latest))
++            })
++            .buffer_unordered(concurrency.downloads);
++
++        let mut map = FxHashMap::default();
++        while let Some((name, version)) = fetches.next().await.transpose()? {
++            if let Some(version) = version.as_ref() {
++                reporter.on_fetch_version(name, version.version());
++            } else {
++                reporter.on_fetch_progress();
++            }
++            map.insert(name.clone(), version);
++        }
++        reporter.on_fetch_complete();
++        map
++    } else {
++        FxHashMap::default()
++    };
++
++    for (name, tool, tool_env, version) in valid_tools {
++        // If `--outdated` is set, skip tools that are up-to-date.
++        if outdated {
++            let is_outdated = latest
++                .get(&name)
++                .and_then(Option::as_ref)
++                .is_some_and(|filename| filename.version() > &version);
++            if !is_outdated {
++                continue;
++            }
++        }
++
+         let version_specifier = show_version_specifiers
+             .then(|| {
+                 tool.requirements()
+@@ -150,12 +232,22 @@ pub(crate) async fn list(
+             })
+             .unwrap_or_default();
+ 
++        let latest_version = if outdated {
++            latest
++                .get(&name)
++                .and_then(Option::as_ref)
++                .map(|filename| format!(" [latest: {}]", filename.version()))
++                .unwrap_or_default()
++        } else {
++            String::new()
++        };
++
+         if show_paths {
+             writeln!(
+                 printer.stdout(),
+                 "{} ({})",
+                 format!(
+-                    "{name} v{version}{version_specifier}{extra_requirements}{with_requirements}{python_version}"
++                    "{name} v{version}{version_specifier}{extra_requirements}{with_requirements}{python_version}{latest_version}"
+                 )
+                 .bold(),
+                 installed_tools.tool_dir(&name).simplified_display().cyan(),
+@@ -165,7 +257,7 @@ pub(crate) async fn list(
+                 printer.stdout(),
+                 "{}",
+                 format!(
+-                    "{name} v{version}{version_specifier}{extra_requirements}{with_requirements}{python_version}"
++                    "{name} v{version}{version_specifier}{extra_requirements}{with_requirements}{python_version}{latest_version}"
+                 )
+                 .bold()
+             )?;
+diff --git a/crates/uv/src/lib.rs b/crates/uv/src/lib.rs
+index 645e50943..43e3a20ca 100644
+--- a/crates/uv/src/lib.rs
++++ b/crates/uv/src/lib.rs
+@@ -1583,6 +1583,9 @@ async fn run(mut cli: Cli) -> Result<ExitStatus> {
+                 args.show_with,
+                 args.show_extras,
+                 args.show_python,
++                args.outdated,
++                client_builder.subcommand(vec!["tool".to_owned(), "list".to_owned()]),
++                globals.concurrency,
+                 &cache,
+                 printer,
+             )
+diff --git a/crates/uv/src/settings.rs b/crates/uv/src/settings.rs
+index 842ba909b..7c0c2b851 100644
+--- a/crates/uv/src/settings.rs
++++ b/crates/uv/src/settings.rs
+@@ -1092,6 +1092,7 @@ pub(crate) struct ToolListSettings {
+     pub(crate) show_with: bool,
+     pub(crate) show_extras: bool,
+     pub(crate) show_python: bool,
++    pub(crate) outdated: bool,
+ }
+ 
+ impl ToolListSettings {
+@@ -1104,6 +1105,8 @@ impl ToolListSettings {
+             show_with,
+             show_extras,
+             show_python,
++            outdated,
++            no_outdated,
+             python_preference: _,
+             no_python_downloads: _,
+         } = args;
+@@ -1114,6 +1117,7 @@ impl ToolListSettings {
+             show_with,
+             show_extras,
+             show_python,
++            outdated: flag(outdated, no_outdated, "outdated").unwrap_or(false),
+         }
+     }
+ }
+diff --git a/crates/uv/tests/it/tool_list.rs b/crates/uv/tests/it/tool_list.rs
+index a76fb27c7..54f0417ca 100644
+--- a/crates/uv/tests/it/tool_list.rs
++++ b/crates/uv/tests/it/tool_list.rs
+@@ -114,6 +114,57 @@ fn tool_list_empty() {
+     ");
+ }
+ 
++#[test]
++fn tool_list_outdated_empty() {
++    let context = uv_test::test_context!("3.12").with_filtered_exe_suffix();
++    let tool_dir = context.temp_dir.child("tools");
++    let bin_dir = context.temp_dir.child("bin");
++
++    // With no tools installed, `--outdated` should produce the same output as the base case.
++    uv_snapshot!(context.filters(), context.tool_list()
++    .arg("--outdated")
++    .env(EnvVars::UV_TOOL_DIR, tool_dir.as_os_str())
++    .env(EnvVars::XDG_BIN_HOME, bin_dir.as_os_str()), @"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++
++    ----- stderr -----
++    No tools installed
++    ");
++}
++
++#[test]
++fn tool_list_outdated() {
++    let context = uv_test::test_context!("3.12").with_filtered_exe_suffix();
++    let tool_dir = context.temp_dir.child("tools");
++    let bin_dir = context.temp_dir.child("bin");
++
++    // Install an older version of `black`.
++    context
++        .tool_install()
++        .arg("black==24.2.0")
++        .env(EnvVars::UV_TOOL_DIR, tool_dir.as_os_str())
++        .env(EnvVars::XDG_BIN_HOME, bin_dir.as_os_str())
++        .assert()
++        .success();
++
++    // With `--outdated`, the installed (older) version should be listed with the latest version.
++    let result = context
++        .tool_list()
++        .arg("--outdated")
++        .env(EnvVars::UV_TOOL_DIR, tool_dir.as_os_str())
++        .env(EnvVars::XDG_BIN_HOME, bin_dir.as_os_str())
++        .assert()
++        .success();
++
++    let stdout = String::from_utf8(result.get_output().stdout.clone()).unwrap();
++    assert!(
++        stdout.contains("black v24.2.0") && stdout.contains("[latest:"),
++        "Expected outdated output with latest version, got: {stdout}"
++    );
++}
++
+ #[test]
+ fn tool_list_missing_receipt() {
+     let context = uv_test::test_context!("3.12").with_filtered_exe_suffix();

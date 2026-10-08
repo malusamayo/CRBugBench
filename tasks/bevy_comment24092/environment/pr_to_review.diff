@@ -1,0 +1,1273 @@
+diff --git a/crates/bevy_feathers/src/controls/listview.rs b/crates/bevy_feathers/src/controls/listview.rs
+new file mode 100644
+index 00000000000000..66836d6412e2ec
+--- /dev/null
++++ b/crates/bevy_feathers/src/controls/listview.rs
+@@ -0,0 +1,333 @@
++use accesskit::Role;
++use bevy_a11y::AccessibilityNode;
++use bevy_app::{Plugin, PostUpdate, PreUpdate};
++use bevy_ecs::{
++    change_detection::DetectChanges,
++    component::Component,
++    entity::Entity,
++    hierarchy::{ChildOf, Children},
++    lifecycle::RemovedComponents,
++    query::{Added, Changed, Has, Or, With},
++    reflect::ReflectComponent,
++    schedule::IntoScheduleConfigs as _,
++    system::{Commands, Query, Res},
++};
++use bevy_input_focus::{tab_navigation::TabIndex, InputFocus, InputFocusVisible};
++use bevy_picking::{hover::Hovered, PickingSystems};
++use bevy_reflect::{prelude::ReflectDefault, Reflect};
++use bevy_scene::{bsn, bsn_list, Scene, SceneComponent, SceneList};
++use bevy_text::{FontSize, FontWeight};
++use bevy_ui::{
++    px, AlignItems, BorderRadius, Display, FlexDirection, InteractionDisabled, JustifyContent,
++    Node, Overflow, PositionType, Selected, UiRect,
++};
++use bevy_ui_widgets::{ActiveDescendant, ControlOrientation, ListBox, ListItem, ScrollArea};
++
++use crate::{
++    constants::{fonts, size},
++    controls::FeathersScrollbar,
++    cursor::EntityCursor,
++    font_styles::InheritableFont,
++    theme::{InheritableThemeTextColor, ThemeBackgroundColor, ThemeBorderColor},
++    tokens,
++};
++
++/// A container that displays a scrolling list of items
++#[derive(SceneComponent, Default, Clone, Reflect)]
++#[scene(FeathersListViewProps)]
++#[reflect(Component, Clone, Default)]
++pub struct FeathersListView;
++
++/// Props used to construct a [`FeathersListView`] scene.
++pub struct FeathersListViewProps {
++    /// The list of items to be displayed in the list view.
++    pub rows: Box<dyn SceneList>,
++}
++
++impl Default for FeathersListViewProps {
++    fn default() -> Self {
++        Self {
++            rows: Box::new(bsn_list!()),
++        }
++    }
++}
++
++impl FeathersListView {
++    /// Scene function for list view.
++    pub fn scene(props: FeathersListViewProps) -> impl Scene {
++        bsn! {
++            // Outer frame that holds the scrollbar
++            Node {
++                display: Display::Flex,
++                flex_direction: FlexDirection::Column,
++                align_items: AlignItems::Stretch,
++                justify_content: JustifyContent::Start,
++                padding: UiRect {
++                    right: px(10) // Room for scrollbar
++                }
++            }
++            ListBox
++            AccessibilityNode(accesskit::Node::new(Role::ListBox))
++            TabIndex(0)
++            Children [
++                // Inner part that scrolls
++                (
++                    #inner
++                    Node {
++                        display: Display::Flex,
++                        flex_direction: FlexDirection::Column,
++                        align_items: AlignItems::Stretch,
++                        justify_content: JustifyContent::Start,
++                        overflow: Overflow::scroll_y(),
++                    }
++                    ScrollArea
++                    Children [
++                        {props.rows}
++                    ]
++                ),
++
++                @FeathersScrollbar {
++                    @target: #inner,
++                    @orientation: {ControlOrientation::Vertical}
++                }
++                Node {
++                    position_type: PositionType::Absolute,
++                    right: px(0),
++                    top: px(0),
++                    bottom: px(0),
++                    width: px(6),
++                }
++            ]
++        }
++    }
++}
++
++/// A selectable row in a list of items
++#[derive(SceneComponent, Default, Clone, Reflect)]
++#[reflect(Component, Clone, Default)]
++pub struct FeathersListRow;
++
++impl FeathersListRow {
++    /// Scene function for list row.
++    pub fn scene() -> impl Scene {
++        bsn! {
++            Node {
++                min_height: size::ROW_HEIGHT,
++                min_width: size::ROW_HEIGHT,
++                display: Display::Flex,
++                flex_direction: FlexDirection::Row,
++                justify_content: JustifyContent::Start,
++                align_items: AlignItems::Center,
++                padding: UiRect::axes(px(8), px(2)),
++            }
++            AccessibilityNode(accesskit::Node::new(Role::ListItem))
++            InheritableThemeTextColor(tokens::LISTROW_TEXT)
++            ThemeBackgroundColor(tokens::LISTROW_BG)
++            InheritableFont {
++                font: fonts::REGULAR,
++                font_size: FontSize::Px(14.0),
++                weight: FontWeight::NORMAL,
++            }
++            Hovered
++            ListItem
++        }
++    }
++}
++
++/// Marker for the listrow check mark
++#[derive(Component, Default, Clone, Reflect)]
++#[reflect(Component, Clone, Default)]
++struct ActiveRowOutline;
++
++fn update_listrow_styles(
++    q_listrows: Query<
++        (
++            Entity,
++            Has<InteractionDisabled>,
++            Has<Selected>,
++            &Hovered,
++            &ThemeBackgroundColor,
++            &InheritableThemeTextColor,
++        ),
++        (
++            With<FeathersListRow>,
++            Or<(
++                Changed<Hovered>,
++                Added<Selected>,
++                Added<InteractionDisabled>,
++            )>,
++        ),
++    >,
++    mut commands: Commands,
++) {
++    for (listrow_ent, disabled, selected, hovered, bg_color, font_color) in q_listrows.iter() {
++        set_listrow_styles(
++            listrow_ent,
++            disabled,
++            selected,
++            hovered.0,
++            bg_color,
++            font_color,
++            &mut commands,
++        );
++    }
++}
++
++fn update_listrow_styles_remove(
++    q_listrows: Query<
++        (
++            Entity,
++            Has<InteractionDisabled>,
++            Has<Selected>,
++            &Hovered,
++            &ThemeBackgroundColor,
++            &InheritableThemeTextColor,
++        ),
++        With<FeathersListRow>,
++    >,
++    mut removed_disabled: RemovedComponents<InteractionDisabled>,
++    mut removed_selected: RemovedComponents<Selected>,
++    mut commands: Commands,
++) {
++    removed_disabled
++        .read()
++        .chain(removed_selected.read())
++        .for_each(|ent| {
++            if let Ok((listrow_ent, disabled, selected, hovered, bg_color, font_color)) =
++                q_listrows.get(ent)
++            {
++                set_listrow_styles(
++                    listrow_ent,
++                    disabled,
++                    selected,
++                    hovered.0,
++                    bg_color,
++                    font_color,
++                    &mut commands,
++                );
++            }
++        });
++}
++
++fn set_listrow_styles(
++    listrow_ent: Entity,
++    disabled: bool,
++    selected: bool,
++    hovered: bool,
++    bg_color: &ThemeBackgroundColor,
++    font_color: &InheritableThemeTextColor,
++    commands: &mut Commands,
++) {
++    let outline_bg_token = match (disabled, selected, hovered) {
++        (false, true, _) => tokens::LISTROW_BG_SELECTED,
++        (false, false, true) => tokens::LISTROW_BG_HOVER,
++        _ => tokens::LISTROW_BG,
++    };
++
++    let font_color_token = match disabled {
++        true => tokens::LISTROW_TEXT_DISABLED,
++        false => tokens::LISTROW_TEXT,
++    };
++
++    let cursor_shape = match disabled {
++        true => bevy_window::SystemCursorIcon::NotAllowed,
++        false => bevy_window::SystemCursorIcon::Pointer,
++    };
++
++    // Change outline background
++    if bg_color.0 != outline_bg_token {
++        commands
++            .entity(listrow_ent)
++            .insert(ThemeBackgroundColor(outline_bg_token));
++    }
++
++    // Change font color
++    if font_color.0 != font_color_token {
++        commands
++            .entity(listrow_ent)
++            .insert(InheritableThemeTextColor(font_color_token));
++    }
++
++    // Change cursor shape
++    commands
++        .entity(listrow_ent)
++        .insert(EntityCursor::System(cursor_shape));
++}
++
++fn on_change_focus(
++    focus: Res<InputFocus>,
++    focus_visible: Res<InputFocusVisible>,
++    q_listbox: Query<&ActiveDescendant, With<ListBox>>,
++    q_row_outline: Query<(Entity, &ChildOf), With<ActiveRowOutline>>,
++    mut commands: Commands,
++) {
++    if focus.is_changed() || focus_visible.is_changed() {
++        if let Some(focus_entity) = focus.get()
++            && let Ok(active_descendant) = q_listbox.get(focus_entity)
++        {
++            // Highlight the active descendant of the current focused listbox, clear all others.
++            highlight_active(
++                &q_row_outline,
++                &mut commands,
++                active_descendant.0,
++                focus_visible.0,
++            );
++        } else {
++            // Clear all highlights
++            highlight_active(&q_row_outline, &mut commands, None, focus_visible.0);
++        }
++    }
++}
++
++fn highlight_active(
++    q_row_outline: &Query<'_, '_, (Entity, &ChildOf), With<ActiveRowOutline>>,
++    commands: &mut Commands<'_, '_>,
++    active_row: Option<Entity>,
++    show_highlight: bool,
++) {
++    // Despawn all active outlines that aren't the current active descendant.
++    let mut needs_spawn = show_highlight;
++    for (outline_id, ChildOf(outline_parent)) in q_row_outline.iter() {
++        let is_active = Some(*outline_parent) == active_row;
++        if is_active && show_highlight {
++            // If we already have a highlight for the active element, then do nothing.
++            needs_spawn = false;
++        } else if !is_active || !show_highlight {
++            // If this isn't the active highlight, or we are not showing highlights, then
++            // despawn any highlight entities.
++            commands.entity(outline_id).despawn();
++        }
++    }
++
++    if let Some(active_item) = active_row
++        && needs_spawn
++    {
++        commands.entity(active_item).with_child((
++            Node {
++                position_type: PositionType::Absolute,
++                left: px(0),
++                right: px(0),
++                top: px(0),
++                bottom: px(0),
++                border: UiRect::all(px(2)),
++                border_radius: BorderRadius::all(px(3)),
++                ..Default::default()
++            },
++            ThemeBorderColor(tokens::FOCUS_RING),
++            ActiveRowOutline,
++        ));
++    }
++}
++
++/// Plugin which registers the systems for updating the listrow styles.
++pub struct ListViewPlugin;
++
++impl Plugin for ListViewPlugin {
++    fn build(&self, app: &mut bevy_app::App) {
++        app.add_systems(
++            PreUpdate,
++            (update_listrow_styles, update_listrow_styles_remove).in_set(PickingSystems::Last),
++        );
++        app.add_systems(PostUpdate, on_change_focus);
++    }
++}
+diff --git a/crates/bevy_feathers/src/controls/mod.rs b/crates/bevy_feathers/src/controls/mod.rs
+index af2656a859a676..96ad23edcf6c53 100644
+--- a/crates/bevy_feathers/src/controls/mod.rs
++++ b/crates/bevy_feathers/src/controls/mod.rs
+@@ -7,9 +7,11 @@ mod color_plane;
+ mod color_slider;
+ mod color_swatch;
+ mod disclosure_toggle;
++mod listview;
+ mod menu;
+ mod number_input;
+ mod radio;
++mod scrollbar;
+ mod slider;
+ mod text_input;
+ mod toggle_switch;
+@@ -21,9 +23,11 @@ pub use color_plane::*;
+ pub use color_slider::*;
+ pub use color_swatch::*;
+ pub use disclosure_toggle::*;
++pub use listview::*;
+ pub use menu::*;
+ pub use number_input::*;
+ pub use radio::*;
++pub use scrollbar::*;
+ pub use slider::*;
+ pub use text_input::*;
+ pub use toggle_switch::*;
+@@ -45,8 +49,10 @@ impl Plugin for ControlsPlugin {
+             ColorSliderPlugin,
+             ColorSwatchPlugin,
+             DisclosureTogglePlugin,
++            ListViewPlugin,
+             MenuPlugin,
+             RadioPlugin,
++            ScrollbarPlugin,
+             SliderPlugin,
+             TextInputPlugin,
+             ToggleSwitchPlugin,
+diff --git a/crates/bevy_feathers/src/controls/scrollbar.rs b/crates/bevy_feathers/src/controls/scrollbar.rs
+new file mode 100644
+index 00000000000000..f8c25b9eaaace4
+--- /dev/null
++++ b/crates/bevy_feathers/src/controls/scrollbar.rs
+@@ -0,0 +1,101 @@
++use bevy_app::{Plugin, PreUpdate};
++use bevy_ecs::{
++    component::Component,
++    entity::Entity,
++    hierarchy::Children,
++    query::{Changed, Or, With},
++    reflect::ReflectComponent,
++    schedule::IntoScheduleConfigs,
++    system::{Commands, Query},
++    template::EntityTemplate,
++};
++use bevy_picking::{hover::Hovered, PickingSystems};
++use bevy_reflect::{prelude::ReflectDefault, Reflect};
++use bevy_scene::prelude::*;
++use bevy_ui::{px, BorderRadius, Node};
++use bevy_ui_widgets::{ControlOrientation, Scrollbar, ScrollbarDragState, ScrollbarThumb};
++
++use crate::{cursor::EntityCursor, theme::ThemeBackgroundColor, tokens};
++
++/// A scrollbar. The `target` property should point to an entity whose
++/// [`ScrollPosition`](bevy_ui::ScrollPosition) will be synchronized with the scrollbar.
++#[derive(SceneComponent, Default, Clone, Reflect)]
++#[scene(FeathersScrollbarProps)]
++#[reflect(Component, Clone, Default)]
++pub struct FeathersScrollbar;
++
++/// Props used to construct a [`FeathersScrollbar`] scene.
++#[derive(Default, Clone)]
++pub struct FeathersScrollbarProps {
++    /// The entity whose scroll position will be synchronized with this scrollbar.
++    pub target: EntityTemplate,
++    /// Whether this is a vertical or horizontal scrollbar.
++    pub orientation: ControlOrientation,
++}
++
++#[derive(Component, Default, Clone, Reflect)]
++#[reflect(Component, Clone, Default)]
++struct FeathersScrollbarThumb;
++
++impl FeathersScrollbar {
++    /// Scene function for scrollbar.
++    pub fn scene(props: FeathersScrollbarProps) -> impl Scene {
++        bsn! {
++            Scrollbar {
++                target: {props.target},
++                orientation: {props.orientation},
++                min_thumb_length: 8.0
++            }
++            Node {
++                border_radius: BorderRadius::all(px(3))
++            }
++            ThemeBackgroundColor(tokens::SCROLLBAR_BG)
++            Children [(
++                Hovered
++                ThemeBackgroundColor(tokens::SCROLLBAR_THUMB)
++                ScrollbarThumb {
++                    border_radius: BorderRadius::all(px(3))
++                }
++                FeathersScrollbarThumb
++                EntityCursor::System(bevy_window::SystemCursorIcon::Pointer)
++            )]
++        }
++    }
++}
++
++fn update_scrollbar_thumb_styles(
++    q_thumbs: Query<
++        (Entity, &Hovered, &ThemeBackgroundColor, &ScrollbarDragState),
++        (
++            With<FeathersScrollbarThumb>,
++            Or<(Changed<Hovered>, Changed<ScrollbarDragState>)>,
++        ),
++    >,
++    mut commands: Commands,
++) {
++    for (scrollbar_ent, hovered, bg_color, drag_state) in q_thumbs.iter() {
++        let bg_token = if hovered.0 || drag_state.dragging {
++            tokens::SCROLLBAR_THUMB_HOVER
++        } else {
++            tokens::SCROLLBAR_THUMB
++        };
++
++        if bg_token != bg_color.0 {
++            commands
++                .entity(scrollbar_ent)
++                .insert(ThemeBackgroundColor(bg_token));
++        }
++    }
++}
++
++/// Plugin which registers the systems for updating the scrollbar styles.
++pub struct ScrollbarPlugin;
++
++impl Plugin for ScrollbarPlugin {
++    fn build(&self, app: &mut bevy_app::App) {
++        app.add_systems(
++            PreUpdate,
++            update_scrollbar_thumb_styles.in_set(PickingSystems::Last),
++        );
++    }
++}
+diff --git a/crates/bevy_feathers/src/dark_theme.rs b/crates/bevy_feathers/src/dark_theme.rs
+index e0c6c44864ef76..8618cc0a58a2aa 100644
+--- a/crates/bevy_feathers/src/dark_theme.rs
++++ b/crates/bevy_feathers/src/dark_theme.rs
+@@ -281,6 +281,15 @@ pub fn create_dark_theme() -> ThemeProps {
+             (tokens::GROUP_HEADER_TEXT, palette::LIGHT_GRAY_1),
+             (tokens::GROUP_BODY_BG, palette::GRAY_2),
+             (tokens::GROUP_BODY_BORDER, palette::GRAY_3),
++            // Listview
++            (tokens::LISTROW_BG, Color::NONE),
++            (tokens::LISTROW_BG_HOVER, palette::GRAY_3.with_alpha(0.5)),
++            (tokens::LISTROW_BG_SELECTED, palette::GRAY_3),
++            (tokens::LISTROW_TEXT, palette::WHITE),
++            (
++                tokens::LISTROW_TEXT_DISABLED,
++                palette::WHITE.with_alpha(0.5),
++            ),
+         ]),
+     }
+ }
+diff --git a/crates/bevy_feathers/src/tokens.rs b/crates/bevy_feathers/src/tokens.rs
+index 45a9b3d0fb8d61..d15906a4fd4d48 100644
+--- a/crates/bevy_feathers/src/tokens.rs
++++ b/crates/bevy_feathers/src/tokens.rs
+@@ -370,3 +370,17 @@ pub const GROUP_HEADER_TEXT: ThemeToken = ThemeToken::new_static("feathers.group
+ pub const GROUP_BODY_BG: ThemeToken = ThemeToken::new_static("feathers.group.body.bg");
+ /// Group body border
+ pub const GROUP_BODY_BORDER: ThemeToken = ThemeToken::new_static("feathers.group.body.border");
++
++// Listview
++
++/// Listview row background
++pub const LISTROW_BG: ThemeToken = ThemeToken::new_static("feathers.listrow.bg");
++/// Listview row background (hovered)
++pub const LISTROW_BG_HOVER: ThemeToken = ThemeToken::new_static("feathers.listrow.bg.hover");
++/// Listview row background (selected)
++pub const LISTROW_BG_SELECTED: ThemeToken = ThemeToken::new_static("feathers.listrow.bg.selected");
++/// Listview row text
++pub const LISTROW_TEXT: ThemeToken = ThemeToken::new_static("feathers.listrow.text");
++/// Listview row text (disabled)
++pub const LISTROW_TEXT_DISABLED: ThemeToken =
++    ThemeToken::new_static("feathers.listrow.text.disabled");
+diff --git a/crates/bevy_ui/src/interaction_states.rs b/crates/bevy_ui/src/interaction_states.rs
+index 3fa2387e2ca23c..24dcc90d3403b1 100644
+--- a/crates/bevy_ui/src/interaction_states.rs
++++ b/crates/bevy_ui/src/interaction_states.rs
+@@ -80,3 +80,42 @@ pub(crate) fn on_remove_checked(remove: On<Remove, Checked>, mut world: Deferred
+         accessibility.set_toggled(accesskit::Toggled::False);
+     }
+ }
++
++/// Component that indicates that a widget can be selected. Similar to [`Checkable`], but works for
++/// the ARIA "selected" state instead of "checked".
++#[derive(Component, Default, Debug)]
++pub struct Selectable;
++
++/// Similar to [`Checked`], but works for the ARIA "selected" state instead of "checked".
++#[derive(Component, Default, Debug, Clone)]
++pub struct Selected;
++
++pub(crate) fn on_add_selectable(add: On<Add, Selected>, mut world: DeferredWorld) {
++    let mut entity = world.entity_mut(add.entity);
++    let selected = entity.get::<Selected>().is_some();
++    if let Some(mut accessibility) = entity.get_mut::<AccessibilityNode>() {
++        accessibility.set_selected(selected);
++    }
++}
++
++pub(crate) fn on_remove_selectable(add: On<Add, Selected>, mut world: DeferredWorld) {
++    // Remove the 'toggled' attribute entirely.
++    let mut entity = world.entity_mut(add.entity);
++    if let Some(mut accessibility) = entity.get_mut::<AccessibilityNode>() {
++        accessibility.clear_selected();
++    }
++}
++
++pub(crate) fn on_add_selected(add: On<Add, Selected>, mut world: DeferredWorld) {
++    let mut entity = world.entity_mut(add.entity);
++    if let Some(mut accessibility) = entity.get_mut::<AccessibilityNode>() {
++        accessibility.set_selected(true);
++    }
++}
++
++pub(crate) fn on_remove_selected(remove: On<Remove, Selected>, mut world: DeferredWorld) {
++    let mut entity = world.entity_mut(remove.entity);
++    if let Some(mut accessibility) = entity.get_mut::<AccessibilityNode>() {
++        accessibility.set_selected(false);
++    }
++}
+diff --git a/crates/bevy_ui/src/lib.rs b/crates/bevy_ui/src/lib.rs
+index a93fa491f11c94..f49c5255ae3bed 100644
+--- a/crates/bevy_ui/src/lib.rs
++++ b/crates/bevy_ui/src/lib.rs
+@@ -41,7 +41,9 @@ use bevy_text::{detect_text_needs_rerender, EditableTextSystems};
+ pub use focus::*;
+ pub use geometry::*;
+ pub use gradients::*;
+-pub use interaction_states::{Checkable, Checked, InteractionDisabled, Pressed};
++pub use interaction_states::{
++    Checkable, Checked, InteractionDisabled, Pressed, Selectable, Selected,
++};
+ pub use layout::*;
+ pub use measurement::*;
+ pub use ui_node::*;
+@@ -213,6 +215,20 @@ impl Plugin for UiPlugin {
+             ),
+         );
+ 
++        app.add_plugins(accessibility::AccessibilityPlugin);
++
++        app.add_observer(interaction_states::on_add_disabled)
++            .add_observer(interaction_states::on_remove_disabled)
++            .add_observer(interaction_states::on_add_checkable)
++            .add_observer(interaction_states::on_remove_checkable)
++            .add_observer(interaction_states::on_add_checked)
++            .add_observer(interaction_states::on_remove_checked)
++            .add_observer(interaction_states::on_remove_checked)
++            .add_observer(interaction_states::on_add_selectable)
++            .add_observer(interaction_states::on_remove_selectable)
++            .add_observer(interaction_states::on_add_selected)
++            .add_observer(interaction_states::on_remove_selected);
++
+         build_text_interop(app);
+     }
+ }
+@@ -272,15 +288,6 @@ fn build_text_interop(app: &mut App) {
+         ),
+     );
+ 
+-    app.add_plugins(accessibility::AccessibilityPlugin);
+-
+-    app.add_observer(interaction_states::on_add_disabled)
+-        .add_observer(interaction_states::on_remove_disabled)
+-        .add_observer(interaction_states::on_add_checkable)
+-        .add_observer(interaction_states::on_remove_checkable)
+-        .add_observer(interaction_states::on_add_checked)
+-        .add_observer(interaction_states::on_remove_checked);
+-
+     app.configure_sets(
+         PostUpdate,
+         AmbiguousWithText.ambiguous_with(widget::text_system),
+diff --git a/crates/bevy_ui_widgets/src/lib.rs b/crates/bevy_ui_widgets/src/lib.rs
+index ca1b10b0f533c4..5d26c7b8d47c81 100644
+--- a/crates/bevy_ui_widgets/src/lib.rs
++++ b/crates/bevy_ui_widgets/src/lib.rs
+@@ -28,19 +28,23 @@
+ 
+ mod button;
+ mod checkbox;
++mod list;
+ mod menu;
+ mod observe;
+ pub mod popover;
+ mod radio;
++mod scrollarea;
+ mod scrollbar;
+ mod slider;
+ mod text_input;
+ 
+ pub use button::*;
+ pub use checkbox::*;
++pub use list::*;
+ pub use menu::*;
+ pub use observe::*;
+ pub use radio::*;
++pub use scrollarea::*;
+ pub use scrollbar::*;
+ pub use slider::*;
+ pub use text_input::*;
+@@ -61,8 +65,10 @@ impl PluginGroup for UiWidgetsPlugins {
+             .add(PopoverPlugin)
+             .add(ButtonPlugin)
+             .add(CheckboxPlugin)
++            .add(ListBoxPlugin)
+             .add(MenuPlugin)
+             .add(RadioGroupPlugin)
++            .add(ScrollAreaPlugin)
+             .add(ScrollbarPlugin)
+             .add(SliderPlugin)
+             .add(EditableTextInputPlugin)
+diff --git a/crates/bevy_ui_widgets/src/list.rs b/crates/bevy_ui_widgets/src/list.rs
+new file mode 100644
+index 00000000000000..3f316d17b1fb6e
+--- /dev/null
++++ b/crates/bevy_ui_widgets/src/list.rs
+@@ -0,0 +1,384 @@
++use accesskit::Role;
++use bevy_a11y::AccessibilityNode;
++use bevy_app::{App, Plugin};
++use bevy_ecs::{
++    component::Component,
++    entity::Entity,
++    hierarchy::{ChildOf, Children},
++    observer::On,
++    query::{Has, With},
++    reflect::ReflectComponent,
++    system::{Commands, Query, ResMut},
++};
++use bevy_input::keyboard::{KeyCode, KeyboardInput};
++use bevy_input::ButtonState;
++use bevy_input_focus::{FocusGained, FocusLost, FocusedInput, InputFocusVisible};
++use bevy_picking::events::{Click, Pointer};
++use bevy_reflect::Reflect;
++use bevy_ui::{InteractionDisabled, Selectable, Selected};
++
++use crate::{ScrollIntoView, ValueChange};
++
++/// Headless widget implementation for a list box. This component contains multiple [`ListItem`]
++/// entities. It implements the tab navigation logic and keyboard shortcuts for list items.
++#[derive(Component, Debug, Clone, Default)]
++#[require(
++    AccessibilityNode(accesskit::Node::new(Role::ListBox)),
++    ActiveDescendant
++)]
++pub struct ListBox;
++
++/// Marker component that indicates we want to support multiple selection of list items.
++#[derive(Component, Debug, Clone, Default)]
++pub struct ListBoxMultiSelect;
++
++/// Headless widget implementation for listbox items. These should be enclosed within a
++/// [`ListBox`] widget, which is responsible for the mutual exclusion logic.
++#[derive(Component, Debug, Clone, Default)]
++#[require(AccessibilityNode(accesskit::Node::new(Role::ListItem)), Selectable)]
++#[derive(Reflect)]
++#[reflect(Component)]
++pub struct ListItem;
++
++/// Component used for keyboard navigation. Individual rows should not be focusable in
++/// the normal way, as this would make tabbing through a long list tedious. Instead, we track
++/// the current "active" row separately using a component on the list box. The active row
++/// will be displayed with an outline.
++///
++/// Based on the ARIA `active-descendant` attribute.
++#[derive(Component, Debug, Clone, Default, Reflect)]
++#[reflect(Component)]
++#[component(immutable)]
++pub struct ActiveDescendant(pub Option<Entity>);
++
++fn listbox_on_key_input(
++    mut ev: On<FocusedInput<KeyboardInput>>,
++    q_listbox: Query<&ActiveDescendant, With<ListBox>>,
++    q_listitems: Query<(Has<Selected>, Has<InteractionDisabled>), With<ListItem>>,
++    q_children: Query<&Children>,
++    mut commands: Commands,
++    mut focus_visible: ResMut<InputFocusVisible>,
++) {
++    if q_listbox.contains(ev.focused_entity) {
++        let listbox = ev.focused_entity;
++        let Ok(active_descendant) = q_listbox.get(listbox) else {
++            return;
++        };
++        let event = &ev.event().input;
++        if event.state == ButtonState::Pressed
++            && !event.repeat
++            && matches!(
++                event.key_code,
++                KeyCode::ArrowUp
++                    | KeyCode::ArrowDown
++                    | KeyCode::ArrowLeft
++                    | KeyCode::ArrowRight
++                    | KeyCode::Home
++                    | KeyCode::End
++                    | KeyCode::Space
++                    | KeyCode::Enter
++            )
++        {
++            let key_code = event.key_code;
++            ev.propagate(false);
++
++            // Find all listbox descendants that are not disabled
++            let list_items = q_children
++                .iter_descendants(listbox)
++                .filter_map(|child_id| match q_listitems.get(child_id) {
++                    Ok((selected, disabled)) => Some((child_id, selected, disabled)),
++                    Err(_) => None,
++                })
++                .collect::<Vec<_>>();
++            if list_items.is_empty() {
++                return; // No enabled rows in the group
++            }
++
++            // Prefer the current active descendant if it exists
++            let prev_active = list_items
++                .iter()
++                .position(|(id, _, _)| Some(*id) == active_descendant.0)
++                .or_else(|| {
++                    // Fallback to the first selected row if the active descendant isn't in list_items
++                    list_items.iter().position(|(_, selected, _)| *selected)
++                })
++                .unwrap_or(usize::MAX);
++
++            let next_active = match key_code {
++                KeyCode::ArrowUp | KeyCode::ArrowLeft => {
++                    // Navigate to the previous list row in the group
++                    if prev_active == 0 || prev_active >= list_items.len() {
++                        // If we're at the first one, wrap around to the last
++                        list_items.len() - 1
++                    } else {
++                        // Move to the previous one
++                        prev_active - 1
++                    }
++                }
++                KeyCode::ArrowDown | KeyCode::ArrowRight => {
++                    // Navigate to the next list row in the group
++                    if prev_active >= list_items.len() - 1 {
++                        // If we're at the last one, wrap around to the first
++                        0
++                    } else {
++                        // Move to the next one
++                        prev_active + 1
++                    }
++                }
++                KeyCode::Home => {
++                    // Navigate to the first list row in the group
++                    0
++                }
++                KeyCode::End => {
++                    // Navigate to the last list row in the group
++                    list_items.len() - 1
++                }
++
++                KeyCode::Space | KeyCode::Enter => {
++                    // Toggle selected state of active row
++                    if prev_active < list_items.len() {
++                        let (active_id, selected, disabled) = list_items[prev_active];
++                        if !selected && !disabled {
++                            commands.trigger(ValueChange::<Entity> {
++                                source: listbox,
++                                value: active_id,
++                                is_final: true,
++                            });
++                        }
++                    }
++                    return;
++                }
++
++                _ => {
++                    return;
++                }
++            };
++
++            // Change active descendant
++            let (next_id, _, _) = list_items[next_active];
++
++            // If the next index is the same as the current, do nothing
++            if prev_active != next_active {
++                focus_visible.0 = true;
++                commands
++                    .entity(listbox)
++                    .insert(ActiveDescendant(Some(next_id)));
++            }
++
++            // Scroll active descendant into view
++            commands.trigger(ScrollIntoView { entity: next_id });
++        }
++    }
++}
++
++fn listbox_on_row_click(
++    mut ev: On<Pointer<Click>>,
++    q_listbox: Query<(), With<ListBox>>,
++    q_listitems: Query<(Has<Selected>, Has<InteractionDisabled>), With<ListItem>>,
++    q_parents: Query<&ChildOf>,
++    q_children: Query<&Children>,
++    mut commands: Commands,
++) {
++    if q_listbox.contains(ev.entity) {
++        // Processing clicks at the listbox level, not the list item level, so that we can
++        // do exclusion. Starting with the original target, search upward for a list row.
++        let row_id = if q_listitems.contains(ev.original_event_target()) {
++            ev.original_event_target()
++        } else {
++            // Search ancestors for the first list row
++            let mut found_row = None;
++            for ancestor in q_parents.iter_ancestors(ev.original_event_target()) {
++                if q_listbox.contains(ancestor) {
++                    // We reached a list box before finding a list row, bail out
++                    return;
++                }
++                if q_listitems.contains(ancestor) {
++                    found_row = Some(ancestor);
++                    break;
++                }
++            }
++
++            match found_row {
++                Some(row) => row,
++                None => return, // No list row found in the ancestor chain
++            }
++        };
++
++        // Clicking sets the active descendant, even if disabled
++        commands
++            .entity(ev.entity)
++            .insert(ActiveDescendant(Some(row_id)));
++
++        // List row is disabled.
++        if let (_, disabled) = q_listitems.get(row_id).unwrap()
++            && disabled
++        {
++            return;
++        }
++
++        // Gather all the enabled list box descendants for exclusion.
++        let all_rows = q_children
++            .iter_descendants(ev.entity)
++            .filter_map(|child_id| match q_listitems.get(child_id) {
++                Ok((selected, false)) => Some((child_id, selected)),
++                Ok((_, true)) | Err(_) => None,
++            })
++            .collect::<Vec<_>>();
++
++        if all_rows.is_empty() {
++            return; // No enabled list rows in the group
++        }
++
++        // Pick out the list row that is currently checked.
++        ev.propagate(false);
++        let current_row = all_rows
++            .iter()
++            .find(|(_, checked)| *checked)
++            .map(|(id, _)| *id);
++
++        if current_row == Some(row_id) {
++            // If they clicked the currently checked list row, do nothing
++            return;
++        }
++
++        // Trigger the on_change event for the newly checked list row
++        commands.trigger(ValueChange::<Entity> {
++            source: ev.entity,
++            value: row_id,
++            is_final: true,
++        });
++    }
++}
++
++/// Update the active descendant on focus changes. Whenever a listbox has focus, it should have
++/// an active descendant, which represents the focus row; when a widget loses focus, the active
++/// descendant should be cleared.
++fn listbox_focus_gained(
++    focus: On<FocusGained>,
++    q_listbox: Query<(Entity, &ActiveDescendant), With<ListBox>>,
++    q_listitems: Query<(Has<Selected>, Has<InteractionDisabled>), With<ListItem>>,
++    q_children: Query<&Children>,
++    mut commands: Commands,
++) {
++    if let Ok((listbox, active_descendant)) = q_listbox.get(focus.entity) {
++        // If the listbox is focused, make sure we have an active descendant
++        if active_descendant.0.is_none() {
++            // Find all listbox descendants that are not disabled
++            let list_items = q_children
++                .iter_descendants(listbox)
++                .filter_map(|child_id| match q_listitems.get(child_id) {
++                    Ok((selected, false)) => Some((child_id, selected)),
++                    Ok((_, true)) | Err(_) => None,
++                })
++                .collect::<Vec<_>>();
++            if list_items.is_empty() {
++                return; // No enabled rows in the group
++            }
++
++            // Prefer the current active descendant if it exists, otherwise first element
++            let first_selected = list_items
++                .iter()
++                .position(|(_, selected)| *selected)
++                .unwrap_or(0);
++
++            commands
++                .entity(listbox)
++                .insert(ActiveDescendant(Some(list_items[first_selected].0)));
++        }
++    }
++}
++
++fn listbox_focus_lost(
++    focus: On<FocusLost>,
++    q_listbox: Query<Entity, With<ListBox>>,
++    mut commands: Commands,
++) {
++    if let Ok(listbox) = q_listbox.get(focus.entity) {
++        // Listbox is not focused, clear active descendant
++        commands.entity(listbox).insert(ActiveDescendant::default());
++    }
++}
++
++/// Plugin that adds the observers for the [`ListBox`] widget.
++pub struct ListBoxPlugin;
++
++impl Plugin for ListBoxPlugin {
++    fn build(&self, app: &mut App) {
++        app.add_observer(listbox_on_key_input)
++            .add_observer(listbox_on_row_click)
++            .add_observer(listbox_focus_gained)
++            .add_observer(listbox_focus_lost);
++    }
++}
++
++/// Observer function for updating list row selection state.
++pub fn listbox_update_selection(
++    value_change: On<ValueChange<Entity>>,
++    q_listbox: Query<(), With<ListBox>>,
++    q_listitems: Query<(Has<Selected>, Has<InteractionDisabled>), With<ListItem>>,
++    q_parents: Query<&ChildOf>,
++    q_children: Query<&Children>,
++    mut commands: Commands,
++) {
++    {
++        let change = value_change.event();
++        let row = change.value;
++
++        // Find the ListBox that this change applies to. Prefer the event source if it's a ListBox,
++        // otherwise walk the ancestors of the row to find the containing ListBox.
++        let listbox = if q_listbox.contains(change.source) {
++            change.source
++        } else {
++            // requires: q_parents: Query<&ChildOf>
++            let mut found = None;
++            for ancestor in q_parents.iter_ancestors(row) {
++                if q_listbox.contains(ancestor) {
++                    found = Some(ancestor);
++                    break;
++                }
++            }
++            match found {
++                Some(lb) => lb,
++                None => return, // no containing ListBox found
++            }
++        };
++
++        // Gather all enabled list items that are descendants of the found ListBox.
++        let enabled_rows = q_children
++            .iter_descendants(listbox)
++            .filter_map(|child_id| match q_listitems.get(child_id) {
++                Ok((has_selected, false)) => Some((child_id, has_selected)),
++                _ => None,
++            })
++            .collect::<Vec<_>>();
++
++        if enabled_rows.is_empty() {
++            return;
++        }
++
++        // If the changed row isn't one of the enabled rows in this listbox, ignore.
++        if !enabled_rows.iter().any(|(id, _)| *id == row) {
++            return;
++        }
++
++        // Determine currently selected row (if any).
++        let current_selected = enabled_rows
++            .iter()
++            .find(|(_, checked)| *checked)
++            .map(|(id, _)| *id);
++
++        // If the selection hasn't changed, do nothing.
++        if current_selected == Some(row) {
++            return;
++        }
++
++        // Update Selected component: insert for the new row, remove for others.
++        for (id, _) in enabled_rows {
++            if id == row {
++                commands.entity(id).insert(Selected);
++            } else {
++                commands.entity(id).remove::<Selected>();
++            }
++        }
++    }
++}
+diff --git a/crates/bevy_ui_widgets/src/scrollarea.rs b/crates/bevy_ui_widgets/src/scrollarea.rs
+new file mode 100644
+index 00000000000000..b76c035c53c6d1
+--- /dev/null
++++ b/crates/bevy_ui_widgets/src/scrollarea.rs
+@@ -0,0 +1,131 @@
++use bevy_app::{App, Plugin};
++use bevy_ecs::{
++    component::Component, hierarchy::ChildOf, observer::On, query::With, reflect::ReflectComponent,
++    system::Query,
++};
++use bevy_input::mouse::MouseScrollUnit;
++use bevy_math::{Affine2, Vec2};
++use bevy_picking::events::{Pointer, Scroll};
++use bevy_reflect::Reflect;
++use bevy_ui::{ComputedNode, Node, OverflowAxis, ScrollPosition, UiGlobalTransform};
++
++use crate::ScrollIntoView;
++
++/// Marker component to enable trackpad / mouse wheel scrolling. This should be placed on an
++/// entity that has overflow: scroll.
++#[derive(Component, Debug, Default, Clone, Reflect)]
++#[require(ScrollPosition)]
++#[reflect(Component)]
++pub struct ScrollArea;
++
++fn scrollarea_on_scroll(
++    mut scroll: On<Pointer<Scroll>>,
++    mut q_scroll_area: Query<(&Node, &ComputedNode, &mut ScrollPosition), With<ScrollArea>>,
++) {
++    if let Ok((node, computed_node, mut scroll_pos)) = q_scroll_area.get_mut(scroll.entity) {
++        scroll.propagate(false);
++        let visible_size = computed_node.size() * computed_node.inverse_scale_factor;
++        let content_size = computed_node.content_size() * computed_node.inverse_scale_factor;
++
++        let can_scroll_x = node.overflow.x == OverflowAxis::Scroll;
++        let can_scroll_y = node.overflow.y == OverflowAxis::Scroll;
++
++        let scroll_delta = Vec2::new(scroll.x, scroll.y)
++            * match scroll.unit {
++                MouseScrollUnit::Line => MouseScrollUnit::SCROLL_UNIT_CONVERSION_FACTOR,
++                MouseScrollUnit::Pixel => 1.0,
++            };
++
++        let max_range = (content_size - visible_size).max(Vec2::ZERO);
++
++        if can_scroll_x {
++            scroll_pos.x = (scroll_pos.x - scroll_delta.x).clamp(0.0, max_range.x);
++        }
++
++        if can_scroll_y {
++            scroll_pos.y = (scroll_pos.y - scroll_delta.y).clamp(0.0, max_range.y);
++        }
++    }
++}
++
++fn on_scroll_into_view(
++    mut scroll: On<ScrollIntoView>,
++    q_node: Query<(&Node, &UiGlobalTransform, &ComputedNode)>,
++    q_parents: Query<&ChildOf>,
++    mut q_scroll_area: Query<&mut ScrollPosition, With<ScrollArea>>,
++) {
++    if let Ok((_target_node, target_transform, target_computed_node)) = q_node.get(scroll.entity) {
++        scroll.propagate(false);
++        let target_affine: Affine2 = target_transform.into();
++        let target_size = target_computed_node.size() * target_computed_node.inverse_scale_factor;
++        let target_pos = target_affine.translation * target_computed_node.inverse_scale_factor
++            - target_size * 0.5;
++
++        let Some(scroll_area_id) = q_parents
++            .iter_ancestors(scroll.entity)
++            .find(|id| q_scroll_area.contains(*id))
++        else {
++            return;
++        };
++
++        let (scroll_area_node, scroll_area_transform, scroll_area_computed_node) =
++            q_node.get(scroll_area_id).unwrap();
++        let scroll_area_affine: Affine2 = scroll_area_transform.into();
++        let scroll_area_size =
++            scroll_area_computed_node.size() * scroll_area_computed_node.inverse_scale_factor;
++        let scroll_area_pos = scroll_area_affine.translation
++            * scroll_area_computed_node.inverse_scale_factor
++            - scroll_area_size * 0.5;
++
++        // Get mutable access to the scroll position and content size info.
++        let Ok(mut scroll_pos) = q_scroll_area.get_mut(scroll_area_id) else {
++            return;
++        };
++
++        // Position of the target relative to the scroll area's top-left.
++        let target_local_top_left = target_pos - scroll_area_pos + scroll_pos.0;
++        let target_local_bottom_right = target_local_top_left + target_size;
++
++        let content_size = scroll_area_computed_node.content_size()
++            * scroll_area_computed_node.inverse_scale_factor;
++        let max_range = (content_size - scroll_area_size).max(Vec2::ZERO);
++
++        let can_scroll_x = scroll_area_node.overflow.x == OverflowAxis::Scroll;
++        let can_scroll_y = scroll_area_node.overflow.y == OverflowAxis::Scroll;
++
++        // Adjust by the minimal amount to make the target fully visible.
++        if can_scroll_x {
++            let view_min = scroll_pos.x;
++            let view_max = scroll_pos.x + scroll_area_size.x;
++
++            if target_local_top_left.x < view_min {
++                scroll_pos.x = target_local_top_left.x.clamp(0.0, max_range.x);
++            } else if target_local_bottom_right.x > view_max {
++                scroll_pos.x =
++                    (target_local_bottom_right.x - scroll_area_size.x).clamp(0.0, max_range.x);
++            }
++        }
++
++        if can_scroll_y {
++            let view_min = scroll_pos.y;
++            let view_max = scroll_pos.y + scroll_area_size.y;
++
++            if target_local_top_left.y < view_min {
++                scroll_pos.y = target_local_top_left.y.clamp(0.0, max_range.y);
++            } else if target_local_bottom_right.y > view_max {
++                scroll_pos.y =
++                    (target_local_bottom_right.y - scroll_area_size.y).clamp(0.0, max_range.y);
++            }
++        }
++    }
++}
++
++/// Plugin that adds the observers for the [`ScrollArea`] widget.
++pub struct ScrollAreaPlugin;
++
++impl Plugin for ScrollAreaPlugin {
++    fn build(&self, app: &mut App) {
++        app.add_observer(scrollarea_on_scroll)
++            .add_observer(on_scroll_into_view);
++    }
++}
+diff --git a/crates/bevy_ui_widgets/src/scrollbar.rs b/crates/bevy_ui_widgets/src/scrollbar.rs
+index 01f3cf8d1646c7..27d1001c53e25c 100644
+--- a/crates/bevy_ui_widgets/src/scrollbar.rs
++++ b/crates/bevy_ui_widgets/src/scrollbar.rs
+@@ -4,6 +4,7 @@ use bevy_ecs::{
+     change_detection::DetectChangesMut,
+     component::Component,
+     entity::Entity,
++    event::EntityEvent,
+     hierarchy::{ChildOf, Children},
+     observer::On,
+     query::{With, Without},
+@@ -33,6 +34,15 @@ pub enum ControlOrientation {
+     Vertical,
+ }
+ 
++/// An event which indicates that we want to scroll the specified item into view (adjusting
++/// the scroll position of it's parent).
++#[derive(Copy, Clone, Debug, PartialEq, EntityEvent)]
++#[entity_event(propagate)]
++pub struct ScrollIntoView {
++    /// The activated entity.
++    pub entity: Entity,
++}
++
+ /// A headless scrollbar widget, which can be used to build custom scrollbars.
+ ///
+ /// Scrollbars operate differently than the other UI widgets in a number of respects.
+diff --git a/examples/ui/widgets/feathers_gallery.rs b/examples/ui/widgets/feathers_gallery.rs
+index 63d9786de5cac4..e2e9d31601f810 100644
+--- a/examples/ui/widgets/feathers_gallery.rs
++++ b/examples/ui/widgets/feathers_gallery.rs
+@@ -19,10 +19,11 @@ use bevy::{
+     input_focus::{tab_navigation::TabGroup, AutoFocus, InputFocus},
+     prelude::*,
+     text::{EditableText, TextEdit, TextEditChange},
+-    ui::{Checked, InteractionDisabled},
++    ui::{Checked, InteractionDisabled, Selected},
+     ui_widgets::{
+-        checkbox_self_update, radio_self_update, slider_self_update, Activate, ActivateOnPress,
+-        RadioGroup, SliderPrecision, SliderStep, SliderValue, ValueChange,
++        checkbox_self_update, listbox_update_selection, radio_self_update, slider_self_update,
++        Activate, ActivateOnPress, RadioGroup, SliderPrecision, SliderStep, SliderValue,
++        ValueChange,
+     },
+     window::SystemCursorIcon,
+ };
+@@ -704,6 +705,33 @@ fn demo_column_2() -> impl Scene {
+                     ),
+                 ]
+             ),
++            subpane() Children [
++                subpane_header() Children [
++                    (Text("List") ThemedText),
++                ],
++                subpane_body() Children [
++                    @FeathersListView {
++                        @rows: {bsn_list![
++                            @FeathersListRow Children [(Text("First World") ThemedText)],
++                            @FeathersListRow Selected Children [(Text("Second Nature") ThemedText)],
++                            @FeathersListRow Children [(Text("Third Degree") ThemedText)],
++                            @FeathersListRow InteractionDisabled Children [(Text("Fourth Wall") ThemedText)],
++                            @FeathersListRow Children [(Text("Fifth Column") ThemedText)],
++                            @FeathersListRow Children [(Text("Sixth Sense") ThemedText)],
++                            @FeathersListRow Children [(Text("Seventh Heaven") ThemedText)],
++                            @FeathersListRow Children [(Text("Eighth Wonder") ThemedText)],
++                            @FeathersListRow Children [(Text("Ninth Inning") ThemedText)],
++                            @FeathersListRow Children [(Text("Tenth Amendment") ThemedText)],
++                            @FeathersListRow Children [(Text("Eleventh Hour") ThemedText)],
++                            @FeathersListRow Children [(Text("Twelfth Night") ThemedText)],
++                        ]}
++                    }
++                    Node {
++                        max_height: px(130)
++                    }
++                    on(listbox_update_selection)
++                ],
++            ]
+         ]
+     }
+ }

@@ -1,0 +1,224 @@
+commit 0097cb712a7361a69eb4f5ebb9bc13c2b8733f19
+Author: Tom Augspurger <TomAugspurger@users.noreply.github.com>
+Date:   Thu Sep 14 11:09:30 2017 -0500
+
+    PERF: Avoid values in Categorical.set_categories (#17515)
+    
+    Mater:
+    
+    ```python
+    In [1]: import pandas as pd; import numpy as np
+    
+    In [2]: arr = ['s%04d' % i for i in np.random.randint(0, 500000 // 10,
+                                                          size=500000)];
+    s = pd.Series(arr).astype('category')
+    
+    In [3]: %timeit s.cat.set_categories(s.cat.categories)
+    68.5 ms ± 846 µs per loop (mean ± std. dev. of 7 runs, 10 loops each)
+    ```
+    
+    HEAD:
+    
+    ```python
+    In [1]: import pandas as pd; import numpy as np
+    
+    In [2]: arr = ['s%04d' % i for i in np.random.randint(0, 500000 // 10,
+                                                          size=500000)]
+    s = pd.Series(arr).astype('category')
+    
+    In [3]: %timeit s.cat.set_categories(s.cat.categories)
+    7.43 ms ± 110 µs per loop (mean ± std. dev. of 7 runs, 100 loops each)
+    ```
+    
+    Closes https://github.com/pandas-dev/pandas/issues/17508
+
+diff --git a/asv_bench/benchmarks/categoricals.py b/asv_bench/benchmarks/categoricals.py
+index 6432ccfb19..d90c994b3d 100644
+--- a/asv_bench/benchmarks/categoricals.py
++++ b/asv_bench/benchmarks/categoricals.py
+@@ -67,6 +67,9 @@ class Categoricals2(object):
+     def time_rendering(self):
+         str(self.sel)
+ 
++    def time_set_categories(self):
++        self.ts.cat.set_categories(self.ts.cat.categories[::2])
++
+ 
+ class Categoricals3(object):
+     goal_time = 0.2
+diff --git a/doc/source/whatsnew/v0.21.0.txt b/doc/source/whatsnew/v0.21.0.txt
+index 939199d3f6..6495ad3e7f 100644
+--- a/doc/source/whatsnew/v0.21.0.txt
++++ b/doc/source/whatsnew/v0.21.0.txt
+@@ -467,6 +467,7 @@ Performance Improvements
+ 
+ - Improved performance of instantiating :class:`SparseDataFrame` (:issue:`16773`)
+ - :attr:`Series.dt` no longer performs frequency inference, yielding a large speedup when accessing the attribute (:issue:`17210`)
++- Improved performance of :meth:`Categorical.set_categories` by not materializing the values (:issue:`17508`)
+ - :attr:`Timestamp.microsecond` no longer re-computes on attribute access (:issue:`17331`)
+ 
+ .. _whatsnew_0210.bug_fixes:
+diff --git a/pandas/core/categorical.py b/pandas/core/categorical.py
+index 97df729004..e67ce29368 100644
+--- a/pandas/core/categorical.py
++++ b/pandas/core/categorical.py
+@@ -777,8 +777,9 @@ class Categorical(PandasObject):
+                 # remove all _codes which are larger and set to -1/NaN
+                 self._codes[self._codes >= len(new_categories)] = -1
+         else:
+-            values = cat.__array__()
+-            cat._codes = _get_codes_for_values(values, new_categories)
++            codes = _recode_for_categories(self.codes, self.categories,
++                                           new_categories)
++            cat._codes = codes
+         cat._categories = new_categories
+ 
+         if ordered is None:
+@@ -2113,6 +2114,38 @@ def _get_codes_for_values(values, categories):
+     return coerce_indexer_dtype(t.lookup(vals), cats)
+ 
+ 
++def _recode_for_categories(codes, old_categories, new_categories):
++    """
++    Convert a set of codes for to a new set of categories
++
++    Parameters
++    ----------
++    codes : array
++    old_categories, new_categories : Index
++
++    Returns
++    -------
++    new_codes : array
++
++    Examples
++    --------
++    >>> old_cat = pd.Index(['b', 'a', 'c'])
++    >>> new_cat = pd.Index(['a', 'b'])
++    >>> codes = np.array([0, 1, 1, 2])
++    >>> _recode_for_categories(codes, old_cat, new_cat)
++    array([ 1,  0,  0, -1])
++    """
++    from pandas.core.algorithms import take_1d
++
++    if len(old_categories) == 0:
++        # All null anyway, so just retain the nulls
++        return codes
++    indexer = coerce_indexer_dtype(new_categories.get_indexer(old_categories),
++                                   new_categories)
++    new_codes = take_1d(indexer, codes.copy(), fill_value=-1)
++    return new_codes
++
++
+ def _convert_to_list_like(list_like):
+     if hasattr(list_like, "dtype"):
+         return list_like
+diff --git a/pandas/core/dtypes/concat.py b/pandas/core/dtypes/concat.py
+index 0ce45eea11..f6f956832e 100644
+--- a/pandas/core/dtypes/concat.py
++++ b/pandas/core/dtypes/concat.py
+@@ -314,6 +314,7 @@ def union_categoricals(to_union, sort_categories=False, ignore_order=False):
+     Categories (3, object): [b, c, a]
+     """
+     from pandas import Index, Categorical, CategoricalIndex, Series
++    from pandas.core.categorical import _recode_for_categories
+ 
+     if len(to_union) == 0:
+         raise ValueError('No Categoricals to union')
+@@ -359,14 +360,8 @@ def union_categoricals(to_union, sort_categories=False, ignore_order=False):
+ 
+         new_codes = []
+         for c in to_union:
+-            if len(c.categories) > 0:
+-                indexer = categories.get_indexer(c.categories)
+-
+-                from pandas.core.algorithms import take_1d
+-                new_codes.append(take_1d(indexer, c.codes, fill_value=-1))
+-            else:
+-                # must be all NaN
+-                new_codes.append(c.codes)
++            new_codes.append(_recode_for_categories(c.codes, c.categories,
++                                                    categories))
+         new_codes = np.concatenate(new_codes)
+     else:
+         # ordered - to show a proper error message
+diff --git a/pandas/tests/test_categorical.py b/pandas/tests/test_categorical.py
+index 7bbe220378..8a5f6bf110 100644
+--- a/pandas/tests/test_categorical.py
++++ b/pandas/tests/test_categorical.py
+@@ -26,6 +26,7 @@ from pandas import (Categorical, Index, Series, DataFrame,
+                     Interval, IntervalIndex)
+ from pandas.compat import range, lrange, u, PY3, PYPY
+ from pandas.core.config import option_context
++from pandas.core.categorical import _recode_for_categories
+ 
+ 
+ class TestCategorical(object):
+@@ -963,6 +964,67 @@ Categories (3, object): [ああああ, いいいいい, ううううううう]""
+         with pytest.raises(ValueError):
+             cat.rename_categories([1, 2])
+ 
++    @pytest.mark.parametrize('codes, old, new, expected', [
++        ([0, 1], ['a', 'b'], ['a', 'b'], [0, 1]),
++        ([0, 1], ['b', 'a'], ['b', 'a'], [0, 1]),
++        ([0, 1], ['a', 'b'], ['b', 'a'], [1, 0]),
++        ([0, 1], ['b', 'a'], ['a', 'b'], [1, 0]),
++        ([0, 1, 0, 1], ['a', 'b'], ['a', 'b', 'c'], [0, 1, 0, 1]),
++        ([0, 1, 2, 2], ['a', 'b', 'c'], ['a', 'b'], [0, 1, -1, -1]),
++        ([0, 1, -1], ['a', 'b', 'c'], ['a', 'b', 'c'], [0, 1, -1]),
++        ([0, 1, -1], ['a', 'b', 'c'], ['b'], [-1, 0, -1]),
++        ([0, 1, -1], ['a', 'b', 'c'], ['d'], [-1, -1, -1]),
++        ([0, 1, -1], ['a', 'b', 'c'], [], [-1, -1, -1]),
++        ([-1, -1], [], ['a', 'b'], [-1, -1]),
++        ([1, 0], ['b', 'a'], ['a', 'b'], [0, 1]),
++    ])
++    def test_recode_to_categories(self, codes, old, new, expected):
++        codes = np.asanyarray(codes, dtype=np.int8)
++        expected = np.asanyarray(expected, dtype=np.int8)
++        old = Index(old)
++        new = Index(new)
++        result = _recode_for_categories(codes, old, new)
++        tm.assert_numpy_array_equal(result, expected)
++
++    def test_recode_to_categories_large(self):
++        N = 1000
++        codes = np.arange(N)
++        old = Index(codes)
++        expected = np.arange(N - 1, -1, -1, dtype=np.int16)
++        new = Index(expected)
++        result = _recode_for_categories(codes, old, new)
++        tm.assert_numpy_array_equal(result, expected)
++
++    @pytest.mark.parametrize('values, categories, new_categories', [
++        # No NaNs, same cats, same order
++        (['a', 'b', 'a'], ['a', 'b'], ['a', 'b'],),
++        # No NaNs, same cats, different order
++        (['a', 'b', 'a'], ['a', 'b'], ['b', 'a'],),
++        # Same, unsorted
++        (['b', 'a', 'a'], ['a', 'b'], ['a', 'b'],),
++        # No NaNs, same cats, different order
++        (['b', 'a', 'a'], ['a', 'b'], ['b', 'a'],),
++        # NaNs
++        (['a', 'b', 'c'], ['a', 'b'], ['a', 'b']),
++        (['a', 'b', 'c'], ['a', 'b'], ['b', 'a']),
++        (['b', 'a', 'c'], ['a', 'b'], ['a', 'b']),
++        (['b', 'a', 'c'], ['a', 'b'], ['a', 'b']),
++        # Introduce NaNs
++        (['a', 'b', 'c'], ['a', 'b'], ['a']),
++        (['a', 'b', 'c'], ['a', 'b'], ['b']),
++        (['b', 'a', 'c'], ['a', 'b'], ['a']),
++        (['b', 'a', 'c'], ['a', 'b'], ['a']),
++        # No overlap
++        (['a', 'b', 'c'], ['a', 'b'], ['d', 'e']),
++    ])
++    @pytest.mark.parametrize('ordered', [True, False])
++    def test_set_categories_many(self, values, categories, new_categories,
++                                 ordered):
++        c = Categorical(values, categories)
++        expected = Categorical(values, new_categories, ordered)
++        result = c.set_categories(new_categories, ordered=ordered)
++        tm.assert_categorical_equal(result, expected)
++
+     def test_reorder_categories(self):
+         cat = Categorical(["a", "b", "c", "a"], ordered=True)
+         old = cat.copy()

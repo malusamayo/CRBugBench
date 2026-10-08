@@ -1,0 +1,665 @@
+diff --git a/crates/api_models/src/payments.rs b/crates/api_models/src/payments.rs
+index 3b526c58ec7..64a8499d6ed 100644
+--- a/crates/api_models/src/payments.rs
++++ b/crates/api_models/src/payments.rs
+@@ -20,6 +20,7 @@ use serde::{
+     ser::Serializer,
+     Deserialize, Deserializer, Serialize,
+ };
++use strum::Display;
+ use time::{Date, PrimitiveDateTime};
+ use url::Url;
+ use utoipa::ToSchema;
+@@ -592,6 +593,7 @@ pub struct HeaderPayload {
+     pub client_source: Option<String>,
+     pub client_version: Option<String>,
+     pub x_hs_latency: Option<bool>,
++    pub browser_name: Option<api_enums::BrowserName>,
+ }
+ 
+ impl HeaderPayload {
+@@ -4294,14 +4296,21 @@ pub struct SessionTokenInfo {
+     pub certificate_keys: Secret<String>,
+     pub merchant_identifier: String,
+     pub display_name: String,
+-    pub initiative: String,
+-    pub initiative_context: String,
++    pub initiative: ApplepayInitiative,
++    pub initiative_context: Option<String>,
+     #[schema(value_type = Option<CountryAlpha2>)]
+     pub merchant_business_country: Option<api_enums::CountryAlpha2>,
+     #[serde(flatten)]
+     pub payment_processing_details_at: Option<PaymentProcessingDetailsAt>,
+ }
+ 
++#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Display)]
++#[serde(rename_all = "snake_case")]
++pub enum ApplepayInitiative {
++    Web,
++    Ios,
++}
++
+ #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, ToSchema)]
+ #[serde(tag = "payment_processing_details_at")]
+ pub enum PaymentProcessingDetailsAt {
+@@ -4416,7 +4425,9 @@ pub struct PaypalSessionTokenResponse {
+ #[serde(rename_all = "lowercase")]
+ pub struct ApplepaySessionTokenResponse {
+     /// Session object for Apple Pay
+-    pub session_token_data: ApplePaySessionResponse,
++    /// The session_token_data will be null for iOS devices because the Apple Pay session call is skipped, as there is no web domain involved
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub session_token_data: Option<ApplePaySessionResponse>,
+     /// Payment request object for Apple Pay
+     pub payment_request_data: Option<ApplePayPaymentRequest>,
+     /// The session token is w.r.t this connector
+diff --git a/crates/common_enums/src/enums.rs b/crates/common_enums/src/enums.rs
+index c3aa895e1ce..a2d26a601a1 100644
+--- a/crates/common_enums/src/enums.rs
++++ b/crates/common_enums/src/enums.rs
+@@ -2258,6 +2258,14 @@ pub enum PaymentSource {
+     ExternalAuthenticator,
+ }
+ 
++#[derive(Default, Debug, Clone, serde::Deserialize, serde::Serialize, strum::EnumString)]
++pub enum BrowserName {
++    #[default]
++    Safari,
++    #[serde(other)]
++    Unknown,
++}
++
+ impl PaymentSource {
+     pub fn is_for_internal_use_only(&self) -> bool {
+         match self {
+diff --git a/crates/router/src/connector/bluesnap/transformers.rs b/crates/router/src/connector/bluesnap/transformers.rs
+index 281dad58945..887c539f510 100644
+--- a/crates/router/src/connector/bluesnap/transformers.rs
++++ b/crates/router/src/connector/bluesnap/transformers.rs
+@@ -461,10 +461,16 @@ impl TryFrom<&types::PaymentsSessionRouterData> for BluesnapCreateWalletToken {
+                 })
+             }
+         }?;
++        let domain_name = session_token_data.initiative_context.ok_or(
++            errors::ConnectorError::MissingRequiredField {
++                field_name: "apple pay initiative_context",
++            },
++        )?;
++
+         Ok(Self {
+             wallet_type: "APPLE_PAY".to_string(),
+             validation_url: consts::APPLEPAY_VALIDATION_URL.to_string().into(),
+-            domain_name: session_token_data.initiative_context,
++            domain_name,
+             display_name: Some(session_token_data.display_name),
+         })
+     }
+@@ -523,8 +529,8 @@ impl TryFrom<types::PaymentsSessionResponseRouterData<BluesnapWalletTokenRespons
+             response: Ok(types::PaymentsResponseData::SessionResponse {
+                 session_token: api::SessionToken::ApplePay(Box::new(
+                     payments::ApplepaySessionTokenResponse {
+-                        session_token_data: payments::ApplePaySessionResponse::NoThirdPartySdk(
+-                            session_response,
++                        session_token_data: Some(
++                            payments::ApplePaySessionResponse::NoThirdPartySdk(session_response),
+                         ),
+                         payment_request_data: Some(payments::ApplePayPaymentRequest {
+                             country_code: item.data.get_billing_country()?,
+diff --git a/crates/router/src/connector/payme/transformers.rs b/crates/router/src/connector/payme/transformers.rs
+index 7c6f426d38b..7e8c9e03d51 100644
+--- a/crates/router/src/connector/payme/transformers.rs
++++ b/crates/router/src/connector/payme/transformers.rs
+@@ -547,8 +547,9 @@ impl<F>
+                         _,
+                     ))) => Some(api_models::payments::SessionToken::ApplePay(Box::new(
+                         api_models::payments::ApplepaySessionTokenResponse {
+-                            session_token_data:
++                            session_token_data: Some(
+                                 api_models::payments::ApplePaySessionResponse::NoSessionResponse,
++                            ),
+                             payment_request_data: Some(
+                                 api_models::payments::ApplePayPaymentRequest {
+                                     country_code: item.data.get_billing_country()?,
+diff --git a/crates/router/src/connector/trustpay/transformers.rs b/crates/router/src/connector/trustpay/transformers.rs
+index b07b819f37d..33141bf9d22 100644
+--- a/crates/router/src/connector/trustpay/transformers.rs
++++ b/crates/router/src/connector/trustpay/transformers.rs
+@@ -1216,12 +1216,13 @@ pub fn get_apple_pay_session<F, T>(
+             pre_processing_id: types::PreprocessingResponseId::ConnectorTransactionId(instance_id),
+             session_token: Some(types::api::SessionToken::ApplePay(Box::new(
+                 api_models::payments::ApplepaySessionTokenResponse {
+-                    session_token_data:
++                    session_token_data: Some(
+                         api_models::payments::ApplePaySessionResponse::ThirdPartySdk(
+                             api_models::payments::ThirdPartySdkSessionResponse {
+                                 secrets: secrets.to_owned().into(),
+                             },
+                         ),
++                    ),
+                     payment_request_data: Some(api_models::payments::ApplePayPaymentRequest {
+                         country_code: apple_pay_init_result.country_code,
+                         currency_code: apple_pay_init_result.currency_code,
+diff --git a/crates/router/src/core/payments.rs b/crates/router/src/core/payments.rs
+index 78c9ca5cd50..f36b95e1e30 100644
+--- a/crates/router/src/core/payments.rs
++++ b/crates/router/src/core/payments.rs
+@@ -461,6 +461,7 @@ where
+                         &customer,
+                         session_surcharge_details,
+                         &business_profile,
++                        header_payload.clone(),
+                     ))
+                     .await?
+                 }
+@@ -1610,6 +1611,7 @@ where
+                 call_connector_action,
+                 connector_request,
+                 business_profile,
++                header_payload.clone(),
+             )
+             .await
+     } else {
+@@ -1673,6 +1675,7 @@ pub async fn call_multiple_connectors_service<F, Op, Req>(
+     customer: &Option<domain::Customer>,
+     session_surcharge_details: Option<api::SessionSurchargeDetails>,
+     business_profile: &storage::business_profile::BusinessProfile,
++    header_payload: HeaderPayload,
+ ) -> RouterResult<PaymentData<F>>
+ where
+     Op: Debug,
+@@ -1736,6 +1739,7 @@ where
+             CallConnectorAction::Trigger,
+             None,
+             business_profile,
++            header_payload.clone(),
+         );
+ 
+         join_handlers.push(res);
+diff --git a/crates/router/src/core/payments/flows.rs b/crates/router/src/core/payments/flows.rs
+index f4609465200..aa5be3924a9 100644
+--- a/crates/router/src/core/payments/flows.rs
++++ b/crates/router/src/core/payments/flows.rs
+@@ -47,6 +47,7 @@ pub trait Feature<F, T> {
+         call_connector_action: payments::CallConnectorAction,
+         connector_request: Option<services::Request>,
+         business_profile: &storage::business_profile::BusinessProfile,
++        header_payload: api_models::payments::HeaderPayload,
+     ) -> RouterResult<Self>
+     where
+         Self: Sized,
+diff --git a/crates/router/src/core/payments/flows/approve_flow.rs b/crates/router/src/core/payments/flows/approve_flow.rs
+index f15274ba5be..f4f8409912e 100644
+--- a/crates/router/src/core/payments/flows/approve_flow.rs
++++ b/crates/router/src/core/payments/flows/approve_flow.rs
+@@ -52,6 +52,7 @@ impl Feature<api::Approve, types::PaymentsApproveData>
+         _call_connector_action: payments::CallConnectorAction,
+         _connector_request: Option<services::Request>,
+         _business_profile: &storage::business_profile::BusinessProfile,
++        _header_payload: api_models::payments::HeaderPayload,
+     ) -> RouterResult<Self> {
+         Err(ApiErrorResponse::NotImplemented {
+             message: NotImplementedMessage::Reason("Flow not supported".to_string()),
+diff --git a/crates/router/src/core/payments/flows/authorize_flow.rs b/crates/router/src/core/payments/flows/authorize_flow.rs
+index 5909b0841fb..23971f3696c 100644
+--- a/crates/router/src/core/payments/flows/authorize_flow.rs
++++ b/crates/router/src/core/payments/flows/authorize_flow.rs
+@@ -65,6 +65,7 @@ impl Feature<api::Authorize, types::PaymentsAuthorizeData> for types::PaymentsAu
+         call_connector_action: payments::CallConnectorAction,
+         connector_request: Option<services::Request>,
+         _business_profile: &storage::business_profile::BusinessProfile,
++        _header_payload: api_models::payments::HeaderPayload,
+     ) -> RouterResult<Self> {
+         let connector_integration: services::BoxedPaymentConnectorIntegrationInterface<
+             api::Authorize,
+diff --git a/crates/router/src/core/payments/flows/cancel_flow.rs b/crates/router/src/core/payments/flows/cancel_flow.rs
+index 0914bd0e901..d61730117a8 100644
+--- a/crates/router/src/core/payments/flows/cancel_flow.rs
++++ b/crates/router/src/core/payments/flows/cancel_flow.rs
+@@ -52,6 +52,7 @@ impl Feature<api::Void, types::PaymentsCancelData>
+         call_connector_action: payments::CallConnectorAction,
+         connector_request: Option<services::Request>,
+         _business_profile: &storage::business_profile::BusinessProfile,
++        _header_payload: api_models::payments::HeaderPayload,
+     ) -> RouterResult<Self> {
+         metrics::PAYMENT_CANCEL_COUNT.add(
+             &metrics::CONTEXT,
+diff --git a/crates/router/src/core/payments/flows/capture_flow.rs b/crates/router/src/core/payments/flows/capture_flow.rs
+index a2c2abe7d8a..3e098043544 100644
+--- a/crates/router/src/core/payments/flows/capture_flow.rs
++++ b/crates/router/src/core/payments/flows/capture_flow.rs
+@@ -52,6 +52,7 @@ impl Feature<api::Capture, types::PaymentsCaptureData>
+         call_connector_action: payments::CallConnectorAction,
+         connector_request: Option<services::Request>,
+         _business_profile: &storage::business_profile::BusinessProfile,
++        _header_payload: api_models::payments::HeaderPayload,
+     ) -> RouterResult<Self> {
+         let connector_integration: services::BoxedPaymentConnectorIntegrationInterface<
+             api::Capture,
+diff --git a/crates/router/src/core/payments/flows/complete_authorize_flow.rs b/crates/router/src/core/payments/flows/complete_authorize_flow.rs
+index e735278609b..bb56cb5a7c5 100644
+--- a/crates/router/src/core/payments/flows/complete_authorize_flow.rs
++++ b/crates/router/src/core/payments/flows/complete_authorize_flow.rs
+@@ -66,6 +66,7 @@ impl Feature<api::CompleteAuthorize, types::CompleteAuthorizeData>
+         call_connector_action: payments::CallConnectorAction,
+         connector_request: Option<services::Request>,
+         _business_profile: &storage::business_profile::BusinessProfile,
++        _header_payload: api_models::payments::HeaderPayload,
+     ) -> RouterResult<Self> {
+         let connector_integration: services::BoxedPaymentConnectorIntegrationInterface<
+             api::CompleteAuthorize,
+diff --git a/crates/router/src/core/payments/flows/incremental_authorization_flow.rs b/crates/router/src/core/payments/flows/incremental_authorization_flow.rs
+index 673bb8a1ace..2aa808f9532 100644
+--- a/crates/router/src/core/payments/flows/incremental_authorization_flow.rs
++++ b/crates/router/src/core/payments/flows/incremental_authorization_flow.rs
+@@ -59,6 +59,7 @@ impl Feature<api::IncrementalAuthorization, types::PaymentsIncrementalAuthorizat
+         call_connector_action: payments::CallConnectorAction,
+         connector_request: Option<services::Request>,
+         _business_profile: &storage::business_profile::BusinessProfile,
++        _header_payload: api_models::payments::HeaderPayload,
+     ) -> RouterResult<Self> {
+         let connector_integration: services::BoxedPaymentConnectorIntegrationInterface<
+             api::IncrementalAuthorization,
+diff --git a/crates/router/src/core/payments/flows/psync_flow.rs b/crates/router/src/core/payments/flows/psync_flow.rs
+index eae1d8cfd7f..5b0d1a48e67 100644
+--- a/crates/router/src/core/payments/flows/psync_flow.rs
++++ b/crates/router/src/core/payments/flows/psync_flow.rs
+@@ -55,6 +55,7 @@ impl Feature<api::PSync, types::PaymentsSyncData>
+         call_connector_action: payments::CallConnectorAction,
+         connector_request: Option<services::Request>,
+         _business_profile: &storage::business_profile::BusinessProfile,
++        _header_payload: api_models::payments::HeaderPayload,
+     ) -> RouterResult<Self> {
+         let connector_integration: services::BoxedPaymentConnectorIntegrationInterface<
+             api::PSync,
+diff --git a/crates/router/src/core/payments/flows/reject_flow.rs b/crates/router/src/core/payments/flows/reject_flow.rs
+index 020e6ff101d..cb1dcd5b19f 100644
+--- a/crates/router/src/core/payments/flows/reject_flow.rs
++++ b/crates/router/src/core/payments/flows/reject_flow.rs
+@@ -51,6 +51,7 @@ impl Feature<api::Reject, types::PaymentsRejectData>
+         _call_connector_action: payments::CallConnectorAction,
+         _connector_request: Option<services::Request>,
+         _business_profile: &storage::business_profile::BusinessProfile,
++        _header_payload: api_models::payments::HeaderPayload,
+     ) -> RouterResult<Self> {
+         Err(ApiErrorResponse::NotImplemented {
+             message: NotImplementedMessage::Reason("Flow not supported".to_string()),
+diff --git a/crates/router/src/core/payments/flows/session_flow.rs b/crates/router/src/core/payments/flows/session_flow.rs
+index 6cae31c3038..b6d5e4e8b38 100644
+--- a/crates/router/src/core/payments/flows/session_flow.rs
++++ b/crates/router/src/core/payments/flows/session_flow.rs
+@@ -61,6 +61,7 @@ impl Feature<api::Session, types::PaymentsSessionData> for types::PaymentsSessio
+         call_connector_action: payments::CallConnectorAction,
+         _connector_request: Option<services::Request>,
+         business_profile: &storage::business_profile::BusinessProfile,
++        header_payload: api_models::payments::HeaderPayload,
+     ) -> RouterResult<Self> {
+         metrics::SESSION_TOKEN_CREATED.add(
+             &metrics::CONTEXT,
+@@ -73,6 +74,7 @@ impl Feature<api::Session, types::PaymentsSessionData> for types::PaymentsSessio
+             Some(true),
+             call_connector_action,
+             business_profile,
++            header_payload,
+         )
+         .await
+     }
+@@ -151,6 +153,7 @@ async fn create_applepay_session_token(
+     router_data: &types::PaymentsSessionRouterData,
+     connector: &api::ConnectorData,
+     business_profile: &storage::business_profile::BusinessProfile,
++    header_payload: api_models::payments::HeaderPayload,
+ ) -> RouterResult<types::PaymentsSessionRouterData> {
+     let delayed_response = is_session_response_delayed(state, connector);
+     if delayed_response {
+@@ -184,9 +187,10 @@ async fn create_applepay_session_token(
+         // Get payment request data , apple pay session request and merchant keys
+         let (
+             payment_request_data,
+-            apple_pay_session_request,
++            apple_pay_session_request_optional,
+             apple_pay_merchant_cert,
+             apple_pay_merchant_cert_key,
++            apple_pay_merchant_identifier,
+             merchant_business_country,
+         ) = match apple_pay_metadata {
+             payment_types::ApplepaySessionTokenMetadata::ApplePayCombined(
+@@ -209,7 +213,7 @@ async fn create_applepay_session_token(
+                     let merchant_business_country = session_token_data.merchant_business_country;
+ 
+                     let apple_pay_session_request = get_session_request_for_simplified_apple_pay(
+-                        merchant_identifier,
++                        merchant_identifier.clone(),
+                         session_token_data,
+                     );
+ 
+@@ -229,9 +233,10 @@ async fn create_applepay_session_token(
+ 
+                     (
+                         payment_request_data,
+-                        apple_pay_session_request,
++                        Some(apple_pay_session_request),
+                         apple_pay_merchant_cert,
+                         apple_pay_merchant_cert_key,
++                        merchant_identifier,
+                         merchant_business_country,
+                     )
+                 }
+@@ -241,8 +246,12 @@ async fn create_applepay_session_token(
+                 } => {
+                     logger::info!("Apple pay manual flow");
+ 
+-                    let apple_pay_session_request =
+-                        get_session_request_for_manual_apple_pay(session_token_data.clone());
++                    let apple_pay_session_request = match header_payload.browser_name {
++                        Some(common_enums::BrowserName::Safari) | None => Some(
++                            get_session_request_for_manual_apple_pay(session_token_data.clone())?,
++                        ),
++                        Some(_) => None,
++                    };
+ 
+                     let merchant_business_country = session_token_data.merchant_business_country;
+ 
+@@ -251,6 +260,7 @@ async fn create_applepay_session_token(
+                         apple_pay_session_request,
+                         session_token_data.certificate.clone(),
+                         session_token_data.certificate_keys,
++                        session_token_data.merchant_identifier,
+                         merchant_business_country,
+                     )
+                 }
+@@ -258,9 +268,14 @@ async fn create_applepay_session_token(
+             payment_types::ApplepaySessionTokenMetadata::ApplePay(apple_pay_metadata) => {
+                 logger::info!("Apple pay manual flow");
+ 
+-                let apple_pay_session_request = get_session_request_for_manual_apple_pay(
+-                    apple_pay_metadata.session_token_data.clone(),
+-                );
++                let apple_pay_session_request = match header_payload.browser_name {
++                    Some(common_enums::BrowserName::Safari) | None => {
++                        Some(get_session_request_for_manual_apple_pay(
++                            apple_pay_metadata.session_token_data.clone(),
++                        )?)
++                    }
++                    Some(_) => None,
++                };
+ 
+                 let merchant_business_country = apple_pay_metadata
+                     .session_token_data
+@@ -269,7 +284,11 @@ async fn create_applepay_session_token(
+                     apple_pay_metadata.payment_request_data,
+                     apple_pay_session_request,
+                     apple_pay_metadata.session_token_data.certificate.clone(),
+-                    apple_pay_metadata.session_token_data.certificate_keys,
++                    apple_pay_metadata
++                        .session_token_data
++                        .certificate_keys
++                        .clone(),
++                    apple_pay_metadata.session_token_data.merchant_identifier,
+                     merchant_business_country,
+                 )
+             }
+@@ -319,48 +338,59 @@ async fn create_applepay_session_token(
+             amount_info,
+             payment_request_data,
+             router_data.request.to_owned(),
+-            apple_pay_session_request.merchant_identifier.as_str(),
++            apple_pay_merchant_identifier.as_str(),
+             merchant_business_country,
+             required_billing_contact_fields,
+             required_shipping_contact_fields,
+         )?;
+ 
+-        let applepay_session_request = build_apple_pay_session_request(
+-            state,
+-            apple_pay_session_request,
+-            apple_pay_merchant_cert,
+-            apple_pay_merchant_cert_key,
+-        )?;
+-        let response = services::call_connector_api(
+-            state,
+-            applepay_session_request,
+-            "create_apple_pay_session_token",
+-        )
+-        .await;
+-
+-        // logging the error if present in session call response
+-        log_session_response_if_error(&response);
+-
+-        let apple_pay_session_response = response
+-            .ok()
+-            .and_then(|apple_pay_res| {
+-                apple_pay_res
+-                    .map(|res| {
+-                        let response: Result<
+-                            payment_types::NoThirdPartySdkSessionResponse,
+-                            Report<common_utils::errors::ParsingError>,
+-                        > = res.response.parse_struct("NoThirdPartySdkSessionResponse");
+-
+-                        // logging the parsing failed error
+-                        if let Err(error) = response.as_ref() {
+-                            logger::error!(?error);
+-                        };
+-
+-                        response.ok()
+-                    })
++        let apple_pay_session_response = match header_payload.browser_name {
++            Some(common_enums::BrowserName::Safari) | None => {
++                let apple_pay_session_request = apple_pay_session_request_optional
++                    .ok_or(errors::ApiErrorResponse::InternalServerError)?;
++                let applepay_session_request = build_apple_pay_session_request(
++                    state,
++                    apple_pay_session_request,
++                    apple_pay_merchant_cert,
++                    apple_pay_merchant_cert_key,
++                )?;
++
++                let response = services::call_connector_api(
++                    state,
++                    applepay_session_request,
++                    "create_apple_pay_session_token",
++                )
++                .await;
++
++                // logging the error if present in session call response
++                log_session_response_if_error(&response);
++
++                response
+                     .ok()
+-            })
+-            .flatten();
++                    .and_then(|apple_pay_res| {
++                        apple_pay_res
++                            .map(|res| {
++                                let response: Result<
++                                    payment_types::NoThirdPartySdkSessionResponse,
++                                    Report<common_utils::errors::ParsingError>,
++                                > = res.response.parse_struct("NoThirdPartySdkSessionResponse");
++
++                                // logging the parsing failed error
++                                if let Err(error) = response.as_ref() {
++                                    logger::error!(?error);
++                                };
++
++                                response.ok()
++                            })
++                            .ok()
++                    })
++                    .flatten()
++            }
++            Some(_) => {
++                logger::debug!("Skipping apple pay session call based on the browser name");
++                None
++            }
++        };
+ 
+         let session_response =
+             apple_pay_session_response.map(payment_types::ApplePaySessionResponse::NoThirdPartySdk);
+@@ -390,13 +420,17 @@ fn get_session_request_for_simplified_apple_pay(
+ 
+ fn get_session_request_for_manual_apple_pay(
+     session_token_data: payment_types::SessionTokenInfo,
+-) -> payment_types::ApplepaySessionRequest {
+-    payment_types::ApplepaySessionRequest {
++) -> RouterResult<payment_types::ApplepaySessionRequest> {
++    let initiative_context = session_token_data
++        .initiative_context
++        .ok_or(errors::ApiErrorResponse::InternalServerError)
++        .attach_printable("Failed to get initiative_context for apple pay session call")?;
++    Ok(payment_types::ApplepaySessionRequest {
+         merchant_identifier: session_token_data.merchant_identifier.clone(),
+         display_name: session_token_data.display_name.clone(),
+-        initiative: session_token_data.initiative.clone(),
+-        initiative_context: session_token_data.initiative_context,
+-    }
++        initiative: session_token_data.initiative.to_string(),
++        initiative_context,
++    })
+ }
+ 
+ fn get_apple_pay_amount_info(
+@@ -456,7 +490,7 @@ fn create_apple_pay_session_response(
+             response: Ok(types::PaymentsResponseData::SessionResponse {
+                 session_token: payment_types::SessionToken::ApplePay(Box::new(
+                     payment_types::ApplepaySessionTokenResponse {
+-                        session_token_data: response,
++                        session_token_data: Some(response),
+                         payment_request_data: apple_pay_payment_request,
+                         connector: connector_name,
+                         delayed_session_token: delayed_response,
+@@ -471,7 +505,18 @@ fn create_apple_pay_session_response(
+         }),
+         None => Ok(types::PaymentsSessionRouterData {
+             response: Ok(types::PaymentsResponseData::SessionResponse {
+-                session_token: payment_types::SessionToken::NoSessionTokenReceived,
++                session_token: payment_types::SessionToken::ApplePay(Box::new(
++                    payment_types::ApplepaySessionTokenResponse {
++                        session_token_data: None,
++                        payment_request_data: apple_pay_payment_request,
++                        connector: connector_name,
++                        delayed_session_token: delayed_response,
++                        sdk_next_action: { payment_types::SdkNextAction { next_action } },
++                        connector_reference_id: None,
++                        connector_sdk_public_key: None,
++                        connector_merchant_id: None,
++                    },
++                )),
+             }),
+             ..router_data.clone()
+         }),
+@@ -646,6 +691,7 @@ where
+         _confirm: Option<bool>,
+         call_connector_action: payments::CallConnectorAction,
+         business_profile: &storage::business_profile::BusinessProfile,
++        header_payload: api_models::payments::HeaderPayload,
+     ) -> RouterResult<Self>;
+ }
+ 
+@@ -694,13 +740,21 @@ impl RouterDataSession for types::PaymentsSessionRouterData {
+         _confirm: Option<bool>,
+         call_connector_action: payments::CallConnectorAction,
+         business_profile: &storage::business_profile::BusinessProfile,
++        header_payload: api_models::payments::HeaderPayload,
+     ) -> RouterResult<Self> {
+         match connector.get_token {
+             api::GetToken::GpayMetadata => {
+                 create_gpay_session_token(state, self, connector, business_profile)
+             }
+             api::GetToken::ApplePayMetadata => {
+-                create_applepay_session_token(state, self, connector, business_profile).await
++                create_applepay_session_token(
++                    state,
++                    self,
++                    connector,
++                    business_profile,
++                    header_payload,
++                )
++                .await
+             }
+             api::GetToken::PaypalSdkMetadata => {
+                 create_paypal_sdk_session_token(state, self, connector, business_profile)
+diff --git a/crates/router/src/core/payments/flows/setup_mandate_flow.rs b/crates/router/src/core/payments/flows/setup_mandate_flow.rs
+index 7a876779033..07803a0c0fb 100644
+--- a/crates/router/src/core/payments/flows/setup_mandate_flow.rs
++++ b/crates/router/src/core/payments/flows/setup_mandate_flow.rs
+@@ -57,6 +57,7 @@ impl Feature<api::SetupMandate, types::SetupMandateRequestData> for types::Setup
+         call_connector_action: payments::CallConnectorAction,
+         connector_request: Option<services::Request>,
+         _business_profile: &storage::business_profile::BusinessProfile,
++        _header_payload: api_models::payments::HeaderPayload,
+     ) -> RouterResult<Self> {
+         let connector_integration: services::BoxedPaymentConnectorIntegrationInterface<
+             api::SetupMandate,
+diff --git a/crates/router/src/lib.rs b/crates/router/src/lib.rs
+index c543be8cc92..9cb6047a61b 100644
+--- a/crates/router/src/lib.rs
++++ b/crates/router/src/lib.rs
+@@ -77,6 +77,7 @@ pub mod headers {
+     pub const X_CLIENT_SOURCE: &str = "X-Client-Source";
+     pub const X_PAYMENT_CONFIRM_SOURCE: &str = "X-Payment-Confirm-Source";
+     pub const CONTENT_LENGTH: &str = "Content-Length";
++    pub const BROWSER_NAME: &str = "browsername";
+ }
+ 
+ pub mod pii {
+diff --git a/crates/router/src/routes/payments.rs b/crates/router/src/routes/payments.rs
+index e6e4d238677..d28bd78b86e 100644
+--- a/crates/router/src/routes/payments.rs
++++ b/crates/router/src/routes/payments.rs
+@@ -593,6 +593,13 @@ pub async fn payments_connector_session(
+     let flow = Flow::PaymentsSessionToken;
+     let payload = json_payload.into_inner();
+ 
++    let header_payload = match HeaderPayload::foreign_try_from(req.headers()) {
++        Ok(headers) => headers,
++        Err(err) => {
++            return api::log_and_return_error_response(err);
++        }
++    };
++
+     tracing::Span::current().record("payment_id", &payload.payment_id);
+ 
+     let locking_action = payload.get_locking_input(flow.clone());
+@@ -619,7 +626,7 @@ pub async fn payments_connector_session(
+                 api::AuthFlow::Client,
+                 payments::CallConnectorAction::Trigger,
+                 None,
+-                HeaderPayload::default(),
++                header_payload.clone(),
+             )
+         },
+         &auth::PublishableKeyAuth,
+diff --git a/crates/router/src/types/transformers.rs b/crates/router/src/types/transformers.rs
+index f754b31e0b0..d532e4f6e78 100644
+--- a/crates/router/src/types/transformers.rs
++++ b/crates/router/src/types/transformers.rs
+@@ -19,7 +19,7 @@ use masking::{ExposeInterface, PeekInterface};
+ use super::domain;
+ use crate::{
+     core::errors,
+-    headers::{X_CLIENT_SOURCE, X_CLIENT_VERSION, X_PAYMENT_CONFIRM_SOURCE},
++    headers::{BROWSER_NAME, X_CLIENT_SOURCE, X_CLIENT_VERSION, X_PAYMENT_CONFIRM_SOURCE},
+     services::authentication::get_header_value_by_key,
+     types::{
+         api::{self as api_types, routing as routing_types},
+@@ -1106,11 +1106,21 @@ impl ForeignTryFrom<&HeaderMap> for payments::HeaderPayload {
+         let client_version =
+             get_header_value_by_key(X_CLIENT_VERSION.into(), headers)?.map(|val| val.to_string());
+ 
++        let browser_name_str =
++            get_header_value_by_key(BROWSER_NAME.into(), headers)?.map(|val| val.to_string());
++
++        let browser_name = browser_name_str.map(|browser_name| {
++            browser_name
++                .parse_enum("BrowserName")
++                .unwrap_or(api_enums::BrowserName::Unknown)
++        });
++
+         Ok(Self {
+             payment_confirm_source,
+             client_source,
+             client_version,
+             x_hs_latency: Some(x_hs_latency),
++            browser_name,
+         })
+     }
+ }

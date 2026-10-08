@@ -1,0 +1,1687 @@
+commit 9bdf702c41b7b76705f5948d74dde015ed32106a
+Author: Martin Molinero <martin.molinero1@gmail.com>
+Date:   Fri Oct 12 16:47:08 2018 -0300
+
+    Creating new Synchronizer - TimeSlice streamer
+    
+    - Creating new `Synchronizer` which will consolidate and combine `TimeSlice`
+    streaming for both live and backtests modes. Will live in front of the
+    `DataManager`
+    - `SubscriptionSynchronizer` will be the `FrontierTimeProvider` exposed,
+    and owned, by the new `Synchronizer`
+    - Updating existing tests
+
+diff --git a/Engine/AlgorithmManager.cs b/Engine/AlgorithmManager.cs
+index 0ad686cae..c325e1f09 100644
+--- a/Engine/AlgorithmManager.cs
++++ b/Engine/AlgorithmManager.cs
+@@ -127,6 +127,7 @@ namespace QuantConnect.Lean.Engine
+         /// <param name="job">Algorithm job</param>
+         /// <param name="algorithm">Algorithm instance</param>
+         /// <param name="dataManager">DataManager object</param>
++        /// <param name="synchronizer">Instance which implements <see cref="ISynchronizer"/>. Used to stream the data</param>
+         /// <param name="transactions">Transaction manager object</param>
+         /// <param name="results">Result handler object</param>
+         /// <param name="realtime">Realtime processing object</param>
+@@ -134,7 +135,7 @@ namespace QuantConnect.Lean.Engine
+         /// <param name="alphas">Alpha handler used to process algorithm generated insights</param>
+         /// <param name="token">Cancellation token</param>
+         /// <remarks>Modify with caution</remarks>
+-        public void Run(AlgorithmNodePacket job, IAlgorithm algorithm, IDataManager dataManager, ITransactionHandler transactions, IResultHandler results, IRealTimeHandler realtime, ILeanManager leanManager, IAlphaHandler alphas, CancellationToken token)
++        public void Run(AlgorithmNodePacket job, IAlgorithm algorithm, IDataManager dataManager, ISynchronizer synchronizer, ITransactionHandler transactions, IResultHandler results, IRealTimeHandler realtime, ILeanManager leanManager, IAlphaHandler alphas, CancellationToken token)
+         {
+             //Initialize:
+             _dataPointCount = 0;
+@@ -202,7 +203,7 @@ namespace QuantConnect.Lean.Engine
+ 
+             //Loop over the queues: get a data collection, then pass them all into relevent methods in the algorithm.
+             Log.Trace("AlgorithmManager.Run(): Begin DataStream - Start: " + algorithm.StartDate + " Stop: " + algorithm.EndDate);
+-            foreach (var timeSlice in Stream(algorithm, dataManager, results, token))
++            foreach (var timeSlice in Stream(algorithm, dataManager, synchronizer, results, token))
+             {
+                 // reset our timer on each loop
+                 _currentTimeStepTime = DateTime.UtcNow;
+@@ -768,7 +769,7 @@ namespace QuantConnect.Lean.Engine
+             }
+         }
+ 
+-        private IEnumerable<TimeSlice> Stream(IAlgorithm algorithm, IDataManager dataManager, IResultHandler results, CancellationToken cancellationToken)
++        private IEnumerable<TimeSlice> Stream(IAlgorithm algorithm, IDataManager dataManager, ISynchronizer synchronizer, IResultHandler results, CancellationToken cancellationToken)
+         {
+             bool setStartTime = false;
+             var timeZone = algorithm.TimeZone;
+@@ -929,7 +930,7 @@ namespace QuantConnect.Lean.Engine
+                 }
+             }
+ 
+-            foreach (var timeSlice in dataManager.StreamData())
++            foreach (var timeSlice in synchronizer.StreamData(cancellationToken))
+             {
+                 if (!setStartTime)
+                 {
+diff --git a/Engine/DataFeeds/DataManager.cs b/Engine/DataFeeds/DataManager.cs
+index f6ca990e2..c66768b24 100644
+--- a/Engine/DataFeeds/DataManager.cs
++++ b/Engine/DataFeeds/DataManager.cs
+@@ -45,7 +45,12 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+         /// <summary>
+         /// Creates a new instance of the DataManager
+         /// </summary>
+-        public DataManager(IDataFeed dataFeed, UniverseSelection universeSelection, IAlgorithmSettings algorithmSettings, ITimeKeeper timeKeeper, MarketHoursDatabase marketHoursDatabase)
++        public DataManager(
++            IDataFeed dataFeed,
++            UniverseSelection universeSelection,
++            IAlgorithmSettings algorithmSettings,
++            ITimeKeeper timeKeeper,
++            MarketHoursDatabase marketHoursDatabase)
+         {
+             _dataFeed = dataFeed;
+             UniverseSelection = universeSelection;
+@@ -259,14 +264,6 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+         /// </summary>
+         public UniverseSelection UniverseSelection { get; }
+ 
+-        /// <summary>
+-        /// Returns an enumerable which provides the data to stream to the algorithm
+-        /// </summary>
+-        public IEnumerable<TimeSlice> StreamData()
+-        {
+-            return _dataFeed;
+-        }
+-
+         #endregion
+     }
+ }
+diff --git a/Engine/DataFeeds/FileSystemDataFeed.cs b/Engine/DataFeeds/FileSystemDataFeed.cs
+index 29d28992f..ba1931b3f 100644
+--- a/Engine/DataFeeds/FileSystemDataFeed.cs
++++ b/Engine/DataFeeds/FileSystemDataFeed.cs
+@@ -15,7 +15,6 @@
+ */
+ 
+ using System;
+-using System.Collections;
+ using System.Collections.Generic;
+ using System.Collections.Specialized;
+ using System.Linq;
+@@ -49,8 +48,7 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+         private SubscriptionCollection _subscriptions;
+         private CancellationTokenSource _cancellationTokenSource = new CancellationTokenSource();
+         private UniverseSelection _universeSelection;
+-        private SubscriptionDataReaderSubscriptionEnumeratorFactory _subscriptionfactory;
+-        private IDataFeedSubscriptionManager _subscriptionManager;
++        private SubscriptionDataReaderSubscriptionEnumeratorFactory _subscriptionFactory;
+ 
+         /// <summary>
+         /// Gets all of the current subscriptions this data feed is processing
+@@ -68,20 +66,24 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+         /// <summary>
+         /// Initializes the data feed for the specified job and algorithm
+         /// </summary>
+-        public void Initialize(IAlgorithm algorithm, AlgorithmNodePacket job, IResultHandler resultHandler,
+-                               IMapFileProvider mapFileProvider, IFactorFileProvider factorFileProvider,
+-                               IDataProvider dataProvider, IDataFeedSubscriptionManager subscriptionManager)
++        public void Initialize(IAlgorithm algorithm,
++            AlgorithmNodePacket job,
++            IResultHandler resultHandler,
++            IMapFileProvider mapFileProvider,
++            IFactorFileProvider factorFileProvider,
++            IDataProvider dataProvider,
++            IDataFeedSubscriptionManager subscriptionManager,
++            IDataFeedTimeProvider dataFeedTimeProvider)
+         {
+             _algorithm = algorithm;
+             _resultHandler = resultHandler;
+             _mapFileProvider = mapFileProvider;
+             _factorFileProvider = factorFileProvider;
+             _dataProvider = dataProvider;
+-            _subscriptionManager = subscriptionManager;
+             _subscriptions = subscriptionManager.DataFeedSubscriptions;
+             _universeSelection = subscriptionManager.UniverseSelection;
+             _cancellationTokenSource = new CancellationTokenSource();
+-            _subscriptionfactory = new SubscriptionDataReaderSubscriptionEnumeratorFactory(_resultHandler, _mapFileProvider, _factorFileProvider, _dataProvider, false, true);
++            _subscriptionFactory = new SubscriptionDataReaderSubscriptionEnumeratorFactory(_resultHandler, _mapFileProvider, _factorFileProvider, _dataProvider, false, true);
+ 
+             IsActive = true;
+             var threadCount = Math.Max(1, Math.Min(4, Environment.ProcessorCount - 3));
+@@ -390,7 +392,7 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+                 }
+             }
+ 
+-            return _subscriptionfactory;
++            return _subscriptionFactory;
+         }
+ 
+         /// <summary>
+@@ -422,79 +424,11 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+                     }
+                 }
+ 
+-                _subscriptionfactory?.DisposeSafely();
++                _subscriptionFactory?.DisposeSafely();
+                 Log.Trace("FileSystemDataFeed.Exit(): Exit Finished.");
+             }
+         }
+ 
+-        /// <summary>
+-        /// Returns an enumerator that iterates through the collection.
+-        /// </summary>
+-        /// <returns>
+-        /// A <see cref="T:System.Collections.Generic.IEnumerator`1"/> that can be used to iterate through the collection.
+-        /// </returns>
+-        /// <filterpriority>1</filterpriority>
+-        public IEnumerator<TimeSlice> GetEnumerator()
+-        {
+-            // compute initial frontier time
+-            var frontierUtc = GetInitialFrontierTime();
+-            Log.Trace(string.Format("FileSystemDataFeed.GetEnumerator(): Begin: {0} UTC", frontierUtc));
+-
+-            var subscriptionFrontierTimeProvider = new SubscriptionFrontierTimeProvider(frontierUtc, _subscriptionManager);
+-            var syncer = new SubscriptionSynchronizer(_universeSelection, _algorithm.TimeZone, _algorithm.Portfolio.CashBook, subscriptionFrontierTimeProvider);
+-            syncer.SubscriptionFinished += (sender, subscription) =>
+-            {
+-                RemoveSubscription(subscription.Configuration);
+-                Log.Debug($"FileSystemDataFeed.SubscriptionFinished(): Finished subscription: {subscription.Configuration} at {_algorithm.UtcTime} UTC");
+-            };
+-
+-            var previousDateTime = DateTime.MaxValue;
+-            while (!_cancellationTokenSource.IsCancellationRequested)
+-            {
+-                TimeSlice timeSlice;
+-
+-                try
+-                {
+-                    timeSlice = syncer.Sync(Subscriptions);
+-                }
+-                catch (Exception err)
+-                {
+-                    Log.Error(err);
+-
+-                    // notify the algorithm about the error, so it can be reported to the user
+-                    _algorithm.RunTimeError = err;
+-                    _algorithm.Status = AlgorithmStatus.RuntimeError;
+-
+-                    break;
+-                }
+-
+-                // SubscriptionFrontierTimeProvider will return twice the same time if there are no more subscriptions or if Subscription.Current is null
+-                if (timeSlice.Time != previousDateTime)
+-                {
+-                    previousDateTime = timeSlice.Time;
+-                    yield return timeSlice;
+-                }
+-                else if (timeSlice.SecurityChanges == SecurityChanges.None)
+-                {
+-                    // there's no more data to pull off, we're done (frontier is max value and no security changes)
+-                    break;
+-                }
+-            }
+-            Log.Trace(string.Format("FileSystemDataFeed.GetEnumerator(): Data Feed Completed at {0} UTC", _algorithm.UtcTime));
+-        }
+-
+-        /// <summary>
+-        /// Returns an enumerator that iterates through a collection.
+-        /// </summary>
+-        /// <returns>
+-        /// An <see cref="T:System.Collections.IEnumerator"/> object that can be used to iterate through the collection.
+-        /// </returns>
+-        /// <filterpriority>2</filterpriority>
+-        IEnumerator IEnumerable.GetEnumerator()
+-        {
+-            return GetEnumerator();
+-        }
+-
+         /// <summary>
+         /// Configure the enumerator with aggregation/fill-forward/filter behaviors. Returns new instance if re-configured
+         /// </summary>
+diff --git a/Engine/DataFeeds/IDataFeed.cs b/Engine/DataFeeds/IDataFeed.cs
+index ba25f683d..5acd43c6e 100644
+--- a/Engine/DataFeeds/IDataFeed.cs
++++ b/Engine/DataFeeds/IDataFeed.cs
+@@ -28,7 +28,7 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+     /// Datafeed interface for creating custom datafeed sources.
+     /// </summary>
+     [InheritedExport(typeof(IDataFeed))]
+-    public interface IDataFeed : IEnumerable<TimeSlice>
++    public interface IDataFeed
+     {
+         /// <summary>
+         /// Gets all of the current subscriptions this data feed is processing
+@@ -49,9 +49,14 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+         /// <summary>
+         /// Initializes the data feed for the specified job and algorithm
+         /// </summary>
+-        void Initialize(IAlgorithm algorithm, AlgorithmNodePacket job, IResultHandler resultHandler,
+-                        IMapFileProvider mapFileProvider, IFactorFileProvider factorFileProvider,
+-                        IDataProvider dataProvider, IDataFeedSubscriptionManager subscriptionManager);
++        void Initialize(IAlgorithm algorithm,
++            AlgorithmNodePacket job,
++            IResultHandler resultHandler,
++            IMapFileProvider mapFileProvider,
++            IFactorFileProvider factorFileProvider,
++            IDataProvider dataProvider,
++            IDataFeedSubscriptionManager subscriptionManager,
++            IDataFeedTimeProvider dataFeedTimeProvider);
+ 
+         /// <summary>
+         /// Adds a new subscription to provide data for the specified security.
+diff --git a/Engine/DataFeeds/IDataFeedTimeProvider.cs b/Engine/DataFeeds/IDataFeedTimeProvider.cs
+new file mode 100644
+index 000000000..a2a6c0e6e
+--- /dev/null
++++ b/Engine/DataFeeds/IDataFeedTimeProvider.cs
+@@ -0,0 +1,34 @@
++﻿/*
++ * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
++ * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++*/
++
++namespace QuantConnect.Lean.Engine.DataFeeds
++{
++    /// <summary>
++    /// Reduced interface which exposes required <see cref="ITimeProvider"/> for <see cref="IDataFeed"/> implementations
++    /// </summary>
++    public interface IDataFeedTimeProvider
++    {
++        /// <summary>
++        /// Continuous UTC time provider
++        /// </summary>
++        ITimeProvider TimeProvider { get; }
++
++        /// <summary>
++        /// Time provider which returns current UTC frontier time
++        /// </summary>
++        ITimeProvider FrontierTimeProvider { get; }
++    }
++}
+diff --git a/Engine/DataFeeds/IDataManager.cs b/Engine/DataFeeds/IDataManager.cs
+index 231818c31..f0ffd4879 100644
+--- a/Engine/DataFeeds/IDataManager.cs
++++ b/Engine/DataFeeds/IDataManager.cs
+@@ -14,8 +14,6 @@
+  *
+ */
+ 
+-using System.Collections.Generic;
+-
+ namespace QuantConnect.Lean.Engine.DataFeeds
+ {
+     /// <summary>
+@@ -27,10 +25,5 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+         /// Get the universe selection instance
+         /// </summary>
+         UniverseSelection UniverseSelection { get; }
+-
+-        /// <summary>
+-        /// Returns an enumerable which provides the data to stream to the algorithm
+-        /// </summary>
+-        IEnumerable<TimeSlice> StreamData();
+     }
+ }
+diff --git a/Engine/DataFeeds/ISynchronizer.cs b/Engine/DataFeeds/ISynchronizer.cs
+new file mode 100644
+index 000000000..86fe92941
+--- /dev/null
++++ b/Engine/DataFeeds/ISynchronizer.cs
+@@ -0,0 +1,32 @@
++﻿/*
++ * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
++ * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++*/
++
++using System.Collections.Generic;
++using System.Threading;
++
++namespace QuantConnect.Lean.Engine.DataFeeds
++{
++    /// <summary>
++    /// Interface which provides the data to stream to the algorithm
++    /// </summary>
++    public interface ISynchronizer
++    {
++        /// <summary>
++        /// Returns an enumerable which provides the data to stream to the algorithm
++        /// </summary>
++        IEnumerable<TimeSlice> StreamData(CancellationToken cancellationToken);
++    }
++}
+diff --git a/Engine/DataFeeds/LiveTradingDataFeed.cs b/Engine/DataFeeds/LiveTradingDataFeed.cs
+index e054044e4..0cf718827 100644
+--- a/Engine/DataFeeds/LiveTradingDataFeed.cs
++++ b/Engine/DataFeeds/LiveTradingDataFeed.cs
+@@ -15,7 +15,6 @@
+ */
+ 
+ using System;
+-using System.Collections;
+ using System.Collections.Generic;
+ using System.Collections.Specialized;
+ using System.Linq;
+@@ -50,20 +49,14 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+         private IAlgorithm _algorithm;
+         // used to get current time
+         private ITimeProvider _timeProvider;
+-        // used to keep time constant during a time sync iteration
+-        private ManualTimeProvider _frontierTimeProvider;
++        private ITimeProvider _frontierTimeProvider;
+         private IDataProvider _dataProvider;
+-        private SingleEntryDataCacheProvider _dataCacheProvider;
+-
+-        private IResultHandler _resultHandler;
+         private IDataQueueHandler _dataQueueHandler;
+         private BaseDataExchange _exchange;
+         private BaseDataExchange _customExchange;
+         private SubscriptionCollection _subscriptions;
+         private CancellationTokenSource _cancellationTokenSource = new CancellationTokenSource();
+         private UniverseSelection _universeSelection;
+-        private DateTime _frontierUtc;
+-
+ 
+         /// <summary>
+         /// Gets all of the current subscriptions this data feed is processing
+@@ -84,9 +77,14 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+         /// <summary>
+         /// Initializes the data feed for the specified job and algorithm
+         /// </summary>
+-        public void Initialize(IAlgorithm algorithm, AlgorithmNodePacket job, IResultHandler resultHandler,
+-                               IMapFileProvider mapFileProvider, IFactorFileProvider factorFileProvider,
+-                               IDataProvider dataProvider, IDataFeedSubscriptionManager subscriptionManager)
++        public void Initialize(IAlgorithm algorithm,
++            AlgorithmNodePacket job,
++            IResultHandler resultHandler,
++            IMapFileProvider mapFileProvider,
++            IFactorFileProvider factorFileProvider,
++            IDataProvider dataProvider,
++            IDataFeedSubscriptionManager subscriptionManager,
++            IDataFeedTimeProvider dataFeedTimeProvider)
+         {
+             if (!(job is LiveNodePacket))
+             {
+@@ -97,13 +95,12 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+ 
+             _algorithm = algorithm;
+             _job = (LiveNodePacket) job;
+-            _resultHandler = resultHandler;
+-            _timeProvider = GetTimeProvider();
++
++            _timeProvider = dataFeedTimeProvider.TimeProvider;
+             _dataQueueHandler = GetDataQueueHandler();
+             _dataProvider = dataProvider;
+-            _dataCacheProvider = new SingleEntryDataCacheProvider(dataProvider);
+ 
+-            _frontierTimeProvider = new ManualTimeProvider(_timeProvider.GetUtcNow());
++            _frontierTimeProvider = dataFeedTimeProvider.FrontierTimeProvider;
+             _customExchange = new BaseDataExchange("CustomDataExchange") {SleepInterval = 10};
+             // sleep is controlled on this exchange via the GetNextTicksEnumerator
+             _exchange = new BaseDataExchange("DataQueueExchange"){SleepInterval = 0};
+@@ -296,17 +293,6 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+             return Composer.Instance.GetExportedValueByTypeName<IDataQueueHandler>(_job.DataQueueHandler);
+         }
+ 
+-        /// <summary>
+-        /// Gets the <see cref="ITimeProvider"/> to use. By default this will load the
+-        /// <see cref="RealTimeProvider"/> which use's the system's <see cref="DateTime.UtcNow"/>
+-        /// for the current time
+-        /// </summary>
+-        /// <returns>he loaded <see cref="ITimeProvider"/></returns>
+-        protected virtual ITimeProvider GetTimeProvider()
+-        {
+-            return new RealTimeProvider();
+-        }
+-
+         /// <summary>
+         /// Creates a new subscription for the specified security
+         /// </summary>
+@@ -495,13 +481,14 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+                             args.Action == NotifyCollectionChangedAction.Add ? args.NewItems :
+                             args.Action == NotifyCollectionChangedAction.Remove ? args.OldItems : null;
+ 
+-                        if (items == null || _frontierUtc == DateTime.MinValue) return;
++                        var currentFrontierUtcTime = _frontierTimeProvider.GetUtcNow();
++                        if (items == null || currentFrontierUtcTime == DateTime.MinValue) return;
+ 
+                         var symbol = items.OfType<Symbol>().FirstOrDefault();
+                         if (symbol == null) return;
+ 
+-                        var collection = new BaseDataCollection(_frontierUtc, symbol);
+-                        var changes = _universeSelection.ApplyUniverseSelection(userDefined, _frontierUtc, collection);
++                        var collection = new BaseDataCollection(currentFrontierUtcTime, symbol);
++                        var changes = _universeSelection.ApplyUniverseSelection(userDefined, currentFrontierUtcTime, collection);
+                         _algorithm.OnSecuritiesChanged(changes);
+                     };
+                 }
+@@ -624,85 +611,6 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+             Log.Trace("LiveTradingDataFeed.GetNextTicksEnumerator(): Exiting enumerator thread...");
+         }
+ 
+-        /// <summary>
+-        /// Returns an enumerator that iterates through the collection.
+-        /// </summary>
+-        /// <returns>
+-        /// A <see cref="T:System.Collections.Generic.IEnumerator`1"/> that can be used to iterate through the collection.
+-        /// </returns>
+-        /// <filterpriority>1</filterpriority>
+-        public IEnumerator<TimeSlice> GetEnumerator()
+-        {
+-            var shouldSendExtraEmptyPacket = false;
+-            // we want to emit to the bridge minimally once a second since the data feed is
+-            // the heartbeat of the application, so this value will contain a second after
+-            // the last emit time, and if we pass this time, we'll emit even with no data
+-            var nextEmit = DateTime.MinValue;
+-            var syncer = new SubscriptionSynchronizer(_universeSelection, _algorithm.TimeZone, _algorithm.Portfolio.CashBook, _frontierTimeProvider);
+-            syncer.SubscriptionFinished += (sender, subscription) =>
+-            {
+-                RemoveSubscription(subscription.Configuration);
+-                Log.Debug($"LiveTradingDataFeed.SubscriptionFinished(): Finished subscription: {subscription.Configuration} at {_algorithm.UtcTime} UTC");
+-            };
+-            while (!_cancellationTokenSource.IsCancellationRequested)
+-            {
+-                // perform sleeps to wake up on the second?
+-                _frontierUtc = _timeProvider.GetUtcNow();
+-                _frontierTimeProvider.SetCurrentTime(_frontierUtc);
+-                TimeSlice timeSlice;
+-                try
+-                {
+-                    timeSlice = syncer.Sync(Subscriptions);
+-                }
+-                catch (Exception err)
+-                {
+-                    Log.Error(err);
+-                    // notify the algorithm about the error, so it can be reported to the user
+-                    _algorithm.RunTimeError = err;
+-                    _algorithm.Status = AlgorithmStatus.RuntimeError;
+-                    shouldSendExtraEmptyPacket = true;
+-                    break;
+-                }
+-                // check for cancellation
+-                if (_cancellationTokenSource.IsCancellationRequested) break;
+-                // emit on data or if we've elapsed a full second since last emit or there are security changes
+-                if (timeSlice.SecurityChanges != SecurityChanges.None || timeSlice.Data.Count != 0 || _frontierUtc >= nextEmit)
+-                {
+-                    yield return timeSlice;
+-                    // force emitting every second
+-                    nextEmit = _frontierUtc.RoundDown(Time.OneSecond).Add(Time.OneSecond);
+-                }
+-                // take a short nap
+-                Thread.Sleep(1);
+-            }
+-            if (shouldSendExtraEmptyPacket)
+-            {
+-                // send last empty packet list before terminating,
+-                // so the algorithm manager has a chance to detect the runtime error
+-                // and exit showing the correct error instead of a timeout
+-                nextEmit = _frontierUtc.RoundDown(Time.OneSecond).Add(Time.OneSecond);
+-                if (!_cancellationTokenSource.IsCancellationRequested)
+-                {
+-                    var timeSlice = TimeSlice.Create(nextEmit, _algorithm.TimeZone, _algorithm.Portfolio.CashBook, new List<DataFeedPacket>(), SecurityChanges.None, new Dictionary<Universe, BaseDataCollection>());
+-                    yield return timeSlice;
+-                }
+-            }
+-            Log.Trace("LiveTradingDataFeed.GetEnumerator(): Exited thread.");
+-        }
+-
+-        /// <summary>
+-        /// Returns an enumerator that iterates through a collection.
+-        /// </summary>
+-        /// <returns>
+-        /// An <see cref="T:System.Collections.IEnumerator"/> object that can be used to iterate through the collection.
+-        /// </returns>
+-        /// <filterpriority>2</filterpriority>
+-        IEnumerator IEnumerable.GetEnumerator()
+-        {
+-            return GetEnumerator();
+-        }
+-
+-
+         /// <summary>
+         /// Overrides methods of the base data exchange implementation
+         /// </summary>
+diff --git a/Engine/DataFeeds/NullDataFeed.cs b/Engine/DataFeeds/NullDataFeed.cs
+index 42acfd4f6..c2df8e926 100644
+--- a/Engine/DataFeeds/NullDataFeed.cs
++++ b/Engine/DataFeeds/NullDataFeed.cs
+@@ -15,7 +15,6 @@
+ */
+ 
+ using System;
+-using System.Collections;
+ using System.Collections.Generic;
+ using QuantConnect.Data;
+ using QuantConnect.Data.UniverseSelection;
+@@ -49,24 +48,20 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+         }
+ 
+         /// <inheritdoc />
+-        public void Initialize(IAlgorithm algorithm, AlgorithmNodePacket job, IResultHandler resultHandler,
+-            IMapFileProvider mapFileProvider, IFactorFileProvider factorFileProvider, IDataProvider dataProvider,
+-            IDataFeedSubscriptionManager subscriptionManager)
++        public void Initialize(
++            IAlgorithm algorithm,
++            AlgorithmNodePacket job,
++            IResultHandler resultHandler,
++            IMapFileProvider mapFileProvider,
++            IFactorFileProvider factorFileProvider,
++            IDataProvider dataProvider,
++            IDataFeedSubscriptionManager subscriptionManager,
++            IDataFeedTimeProvider dataFeedTimeProvider
++            )
+         {
+             throw new NotImplementedException("Unexpected usage of null data feed implementation.");
+         }
+ 
+-        /// <inheritdoc />
+-        public IEnumerator<TimeSlice> GetEnumerator()
+-        {
+-            throw new NotImplementedException("Unexpected usage of null data feed implementation.");
+-        }
+-
+-        IEnumerator IEnumerable.GetEnumerator()
+-        {
+-            return GetEnumerator();
+-        }
+-
+         /// <inheritdoc />
+         public bool AddSubscription(SubscriptionRequest request)
+         {
+diff --git a/Engine/DataFeeds/SubscriptionSynchronizer.cs b/Engine/DataFeeds/SubscriptionSynchronizer.cs
+index bd9b50137..24ee8822c 100644
+--- a/Engine/DataFeeds/SubscriptionSynchronizer.cs
++++ b/Engine/DataFeeds/SubscriptionSynchronizer.cs
+@@ -25,12 +25,13 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+     /// <summary>
+     /// Provides the ability to synchronize subscriptions into time slices
+     /// </summary>
+-    public class SubscriptionSynchronizer : ISubscriptionSynchronizer
++    public class SubscriptionSynchronizer : ISubscriptionSynchronizer, ITimeProvider
+     {
+-        private readonly ITimeProvider _timeProvider;
++        private ITimeProvider _timeProvider;
+         private readonly CashBook _cashBook;
+-        private readonly DateTimeZone _sliceTimeZone;
++        private DateTimeZone _sliceTimeZone;
+         private readonly UniverseSelection _universeSelection;
++        private ManualTimeProvider _frontierTimeProvider;
+ 
+         /// <summary>
+         /// Event fired when a subscription is finished
+@@ -42,19 +43,42 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+         /// </summary>
+         /// <param name="universeSelection">The universe selection instance used to handle universe
+         /// selection subscription output</param>
+-        /// <param name="sliceTimeZone">The time zone of the created slice object</param>
+         /// <param name="cashBook">The cash book, used for creating the cash book updates</param>
+         /// <returns>A time slice for the specified frontier time</returns>
+-        /// <param name="timeProvider">The time provider, used to obtain the current frontier UTC value.</param>
+-        public SubscriptionSynchronizer(UniverseSelection universeSelection, DateTimeZone sliceTimeZone,
+-                                        CashBook cashBook, ITimeProvider timeProvider)
++        public SubscriptionSynchronizer(UniverseSelection universeSelection,
++                                        CashBook cashBook)
+         {
+-            _timeProvider = timeProvider;
+             _universeSelection = universeSelection;
+-            _sliceTimeZone = sliceTimeZone;
+             _cashBook = cashBook;
+         }
+ 
++        /// <summary>
++        /// Sets the time provider. If already set will throw.
++        /// </summary>
++        /// <param name="timeProvider">The time provider, used to obtain the current frontier UTC value</param>
++        public void SetTimeProvider(ITimeProvider timeProvider)
++        {
++            if (_timeProvider != null)
++            {
++                throw new Exception("SubscriptionSynchronizer.SetTimeProvider(): can only be called once");
++            }
++            _timeProvider = timeProvider;
++            _frontierTimeProvider = new ManualTimeProvider(_timeProvider.GetUtcNow());
++        }
++
++        /// <summary>
++        /// Sets the time zone of the created slice object. If already set will throw.
++        /// </summary>
++        /// <param name="timeZone">The time zone of the created slice object</param>
++        public void SetSliceTimeZone(DateTimeZone timeZone)
++        {
++            if (_sliceTimeZone != null)
++            {
++                throw new Exception("SubscriptionSynchronizer.SetSliceTimeZone(): can only be called once");
++            }
++            _sliceTimeZone = timeZone;
++        }
++
+         /// <summary>
+         /// Syncs the specified subscriptions. The frontier time used for synchronization is
+         /// managed internally and dependent upon previous synchronization operations.
+@@ -68,7 +92,8 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+             var universeData = new Dictionary<Universe, BaseDataCollection>();
+             var universeDataForTimeSliceCreate = new Dictionary<Universe, BaseDataCollection>();
+ 
+-            var frontierUtc = _timeProvider.GetUtcNow();
++            _frontierTimeProvider.SetCurrentTimeUtc(_timeProvider.GetUtcNow());
++            var frontierUtc = _frontierTimeProvider.GetUtcNow();
+ 
+             SecurityChanges newChanges;
+             do
+@@ -181,5 +206,13 @@ namespace QuantConnect.Lean.Engine.DataFeeds
+             var handler = SubscriptionFinished;
+             if (handler != null) handler(this, subscription);
+         }
++
++        /// <summary>
++        /// Returns the current UTC frontier time
++        /// </summary>
++        public DateTime GetUtcNow()
++        {
++            return _frontierTimeProvider.GetUtcNow();
++        }
+     }
+ }
+\ No newline at end of file
+diff --git a/Engine/DataFeeds/Synchronizer.cs b/Engine/DataFeeds/Synchronizer.cs
+new file mode 100644
+index 000000000..9cb42734f
+--- /dev/null
++++ b/Engine/DataFeeds/Synchronizer.cs
+@@ -0,0 +1,225 @@
++﻿/*
++ * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
++ * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++*/
++
++using System;
++using System.Collections.Generic;
++using System.Threading;
++using NodaTime;
++using QuantConnect.Data.UniverseSelection;
++using QuantConnect.Interfaces;
++using QuantConnect.Logging;
++using QuantConnect.Securities;
++
++namespace QuantConnect.Lean.Engine.DataFeeds
++{
++    /// <summary>
++    /// Implementation of the <see cref="ISynchronizer"/> interface which provides the mechanism to stream data to the algorithm
++    /// </summary>
++    public class Synchronizer : ISynchronizer, IDataFeedTimeProvider
++    {
++        private SubscriptionSynchronizer _subscriptionSynchronizer;
++        private IDataFeedSubscriptionManager _subscriptionManager;
++        private IAlgorithm _algorithm;
++        private DateTimeZone _dateTimeZone;
++        private CashBook _cashBook;
++        private IDataFeed _dataFeed;
++        private bool _liveMode;
++
++        /// <summary>
++        /// Continuous UTC time provider
++        /// </summary>
++        public ITimeProvider TimeProvider { get; private set; }
++
++        /// <summary>
++        /// Time provider which returns current UTC frontier time
++        /// </summary>
++        public ITimeProvider FrontierTimeProvider => _subscriptionSynchronizer;
++
++        /// <summary>
++        /// Initializes the instance of the Synchronizer class
++        /// </summary>
++        public void Initialize(
++            IAlgorithm algorithm,
++            IDataFeedSubscriptionManager subscriptionManager,
++            IDataFeed dataFeed, // To be removed, when subscriptionManager is completely in front of the DF
++            bool liveMode,
++            CashBook cashBook)
++        {
++            _subscriptionManager = subscriptionManager;
++            _algorithm = algorithm;
++            _cashBook = cashBook;
++            _liveMode = liveMode;
++            _dataFeed = dataFeed;
++
++            _subscriptionSynchronizer = new SubscriptionSynchronizer(_subscriptionManager.UniverseSelection, _cashBook);
++
++            if (_liveMode)
++            {
++                TimeProvider = GetTimeProvider();
++                _subscriptionSynchronizer.SetTimeProvider(TimeProvider);
++            }
++        }
++
++        /// <summary>
++        /// Returns an enumerable which provides the data to stream to the algorithm
++        /// </summary>
++        public IEnumerable<TimeSlice> StreamData(CancellationToken cancellationToken)
++        {
++            PostInitialize();
++
++            var shouldSendExtraEmptyPacket = false;
++            var nextEmit = DateTime.MinValue;
++            var previousEmitTime = DateTime.MaxValue;
++            while (!cancellationToken.IsCancellationRequested)
++            {
++                TimeSlice timeSlice;
++                try
++                {
++                    timeSlice = _subscriptionSynchronizer.Sync(_subscriptionManager.DataFeedSubscriptions);
++                }
++                catch (Exception err)
++                {
++                    Log.Error(err);
++                    // notify the algorithm about the error, so it can be reported to the user
++                    _algorithm.RunTimeError = err;
++                    _algorithm.Status = AlgorithmStatus.RuntimeError;
++                    shouldSendExtraEmptyPacket = _liveMode;
++                    break;
++                }
++
++                // check for cancellation
++                if (cancellationToken.IsCancellationRequested) break;
++
++                if (_liveMode)
++                {
++                    var frontierUtc = FrontierTimeProvider.GetUtcNow();
++                    // emit on data or if we've elapsed a full second since last emit or there are security changes
++                    if (timeSlice.SecurityChanges != SecurityChanges.None
++                        || timeSlice.Data.Count != 0
++                        || frontierUtc >= nextEmit)
++                    {
++                        yield return timeSlice;
++                        // force emitting every second since the data feed is
++                        // the heartbeat of the application
++                        nextEmit = frontierUtc.RoundDown(Time.OneSecond).Add(Time.OneSecond);
++                    }
++                    // take a short nap
++                    Thread.Sleep(1);
++                }
++                else
++                {
++                    // SubscriptionFrontierTimeProvider will return twice the same time if there are no more subscriptions or if Subscription.Current is null
++                    if (timeSlice.Time != previousEmitTime)
++                    {
++                        previousEmitTime = timeSlice.Time;
++                        yield return timeSlice;
++                    }
++                    else if (timeSlice.SecurityChanges == SecurityChanges.None)
++                    {
++                        // there's no more data to pull off, we're done (frontier is max value and no security changes)
++                        break;
++                    }
++                }
++            }
++            if (shouldSendExtraEmptyPacket)
++            {
++                // send last empty packet list before terminating,
++                // so the algorithm manager has a chance to detect the runtime error
++                // and exit showing the correct error instead of a timeout
++                nextEmit = previousEmitTime.RoundDown(Time.OneSecond).Add(Time.OneSecond);
++                if (!cancellationToken.IsCancellationRequested)
++                {
++                    var timeSlice = TimeSlice.Create(
++                        nextEmit,
++                        _dateTimeZone,
++                        _cashBook,
++                        new List<DataFeedPacket>(),
++                        SecurityChanges.None,
++                        new Dictionary<Universe, BaseDataCollection>());
++                    yield return timeSlice;
++                }
++            }
++            Log.Trace("Synchronizer.GetEnumerator(): Exited thread.");
++        }
++
++        private void PostInitialize()
++        {
++            _subscriptionSynchronizer.SubscriptionFinished += (sender, subscription) =>
++            {
++                _dataFeed.RemoveSubscription(subscription.Configuration);
++                Log.Debug("Synchronizer.SubscriptionFinished(): Finished subscription:" +
++                    $"{subscription.Configuration} at {FrontierTimeProvider.GetUtcNow()} UTC");
++            };
++
++            // this is set after the algorithm initializes
++            _dateTimeZone = _algorithm.TimeZone;
++            _subscriptionSynchronizer.SetSliceTimeZone(_dateTimeZone);
++
++            if (!_liveMode)
++            {
++                // GetTimeProvider() will call GetInitialFrontierTime() which
++                // will consume added subscriptions so we need to do this after initialization
++                TimeProvider = GetTimeProvider();
++                _subscriptionSynchronizer.SetTimeProvider(TimeProvider);
++            }
++        }
++
++        /// <summary>
++        /// Gets the <see cref="ITimeProvider"/> to use. By default this will load the
++        /// <see cref="RealTimeProvider"/> for live mode, else <see cref="SubscriptionFrontierTimeProvider"/>
++        /// </summary>
++        /// <returns>The <see cref="ITimeProvider"/> to use</returns>
++        protected virtual ITimeProvider GetTimeProvider()
++        {
++            if (_liveMode)
++            {
++                return new RealTimeProvider();
++            }
++            return new SubscriptionFrontierTimeProvider(GetInitialFrontierTime(), _subscriptionManager);
++        }
++
++        private DateTime GetInitialFrontierTime()
++        {
++            var frontier = DateTime.MaxValue;
++            foreach (var subscription in _subscriptionManager.DataFeedSubscriptions)
++            {
++                var current = subscription.Current;
++                if (current == null)
++                {
++                    continue;
++                }
++
++                // we need to initialize both the frontier time and the offset provider, in order to do
++                // this we'll first convert the current.EndTime to UTC time, this will allow us to correctly
++                // determine the offset in ticks using the OffsetProvider, we can then use this to recompute
++                // the UTC time. This seems odd, but is necessary given Noda time's lenient mapping, the
++                // OffsetProvider exists to give forward marching mapping
++
++                // compute the initial frontier time
++                if (current.EmitTimeUtc < frontier)
++                {
++                    frontier = current.EmitTimeUtc;
++                }
++            }
++
++            if (frontier == DateTime.MaxValue)
++            {
++                frontier = _algorithm.StartDate.ConvertToUtc(_dateTimeZone);
++            }
++            return frontier;
++        }
++    }
++}
+diff --git a/Engine/Engine.cs b/Engine/Engine.cs
+index 5959b51ed..8a28f9290 100644
+--- a/Engine/Engine.cs
++++ b/Engine/Engine.cs
+@@ -109,6 +109,7 @@ namespace QuantConnect.Lean.Engine
+ 
+                 IBrokerage brokerage = null;
+                 DataManager dataManager = null;
++                var synchronizer = new Synchronizer();
+                 try
+                 {
+                     // Save algorithm to cache, load algorithm instance:
+@@ -145,9 +146,23 @@ namespace QuantConnect.Lean.Engine
+ 
+                     algorithm.SubscriptionManager.SetDataManager(dataManager);
+ 
++                    synchronizer.Initialize(
++                        algorithm,
++                        dataManager,
++                        _algorithmHandlers.DataFeed,
++                        _liveMode,
++                        algorithm.Portfolio.CashBook);
++
+                     // Initialize the data feed before we initialize so he can intercept added securities/universes via events
+-                    _algorithmHandlers.DataFeed.Initialize(algorithm, job, _algorithmHandlers.Results, _algorithmHandlers.MapFileProvider,
+-                                                            _algorithmHandlers.FactorFileProvider, _algorithmHandlers.DataProvider, dataManager);
++                    _algorithmHandlers.DataFeed.Initialize(
++                        algorithm,
++                        job,
++                        _algorithmHandlers.Results,
++                        _algorithmHandlers.MapFileProvider,
++                        _algorithmHandlers.FactorFileProvider,
++                        _algorithmHandlers.DataProvider,
++                        dataManager,
++                        (IDataFeedTimeProvider) synchronizer);
+ 
+                     // set the order processor on the transaction manager (needs to be done before initializing BrokerageHistoryProvider)
+                     algorithm.Transactions.SetOrderProcessor(_algorithmHandlers.Transactions);
+@@ -306,7 +321,7 @@ namespace QuantConnect.Lean.Engine
+                                 // -> Using this Data Feed,
+                                 // -> Send Orders to this TransactionHandler,
+                                 // -> Send Results to ResultHandler.
+-                                algorithmManager.Run(job, algorithm, dataManager, _algorithmHandlers.Transactions, _algorithmHandlers.Results, _algorithmHandlers.RealTime, _systemHandlers.LeanManager, _algorithmHandlers.Alphas, isolator.CancellationToken);
++                                algorithmManager.Run(job, algorithm, dataManager, synchronizer, _algorithmHandlers.Transactions, _algorithmHandlers.Results, _algorithmHandlers.RealTime, _systemHandlers.LeanManager, _algorithmHandlers.Alphas, isolator.CancellationToken);
+                             }
+                             catch (Exception err)
+                             {
+diff --git a/Engine/QuantConnect.Lean.Engine.csproj b/Engine/QuantConnect.Lean.Engine.csproj
+index 068a0f5b1..b1f536af3 100644
+--- a/Engine/QuantConnect.Lean.Engine.csproj
++++ b/Engine/QuantConnect.Lean.Engine.csproj
+@@ -154,8 +154,10 @@
+     <Compile Include="DataFeeds\Enumerators\LiveBaseDataSynchronizingEnumerator.cs" />
+     <Compile Include="DataFeeds\Enumerators\QuoteBarFillForwardEnumerator.cs" />
+     <Compile Include="DataFeeds\IDataFeedSubscriptionManager.cs" />
++    <Compile Include="DataFeeds\IDataFeedTimeProvider.cs" />
+     <Compile Include="DataFeeds\IDataManager.cs" />
+     <Compile Include="DataFeeds\ISubscriptionSynchronizer.cs" />
++    <Compile Include="DataFeeds\ISynchronizer.cs" />
+     <Compile Include="DataFeeds\LiveFutureChainProvider.cs" />
+     <Compile Include="DataFeeds\LiveOptionChainProvider.cs" />
+     <Compile Include="DataFeeds\NullDataFeed.cs" />
+@@ -196,6 +198,7 @@
+     <Compile Include="DataFeeds\DataFeedPacket.cs" />
+     <Compile Include="DataFeeds\SubscriptionCollection.cs" />
+     <Compile Include="DataFeeds\SubscriptionData.cs" />
++    <Compile Include="DataFeeds\Synchronizer.cs" />
+     <Compile Include="DataFeeds\TextSubscriptionDataSourceReader.cs" />
+     <Compile Include="DataFeeds\CreateStreamReaderErrorEventArgs.cs" />
+     <Compile Include="DataFeeds\BaseDataExchange.cs" />
+diff --git a/Tests/Brokerages/Paper/PaperBrokerageTests.cs b/Tests/Brokerages/Paper/PaperBrokerageTests.cs
+index 67a710796..d5f7dd2e7 100644
+--- a/Tests/Brokerages/Paper/PaperBrokerageTests.cs
++++ b/Tests/Brokerages/Paper/PaperBrokerageTests.cs
+@@ -15,7 +15,6 @@
+ */
+ 
+ using System;
+-using System.Collections;
+ using System.Collections.Generic;
+ using System.Linq;
+ using System.Threading;
+@@ -83,7 +82,8 @@ namespace QuantConnect.Tests.Brokerages.Paper
+             var algorithm = new AlgorithmStub();
+             algorithm.SetLiveMode(true);
+             var dividend = new Dividend(Symbols.SPY, DateTime.UtcNow, 10m, 100m);
+-            var feed = new TestDividendDataFeed(algorithm, dividend);
++
++            var feed = new TestDividendDataFeed();
+ 
+             var marketHoursDatabase = MarketHoursDatabase.FromDataFolder();
+             var symbolPropertiesDataBase = SymbolPropertiesDatabase.FromDataFolder();
+@@ -94,6 +94,7 @@ namespace QuantConnect.Tests.Brokerages.Paper
+                 algorithm.Settings,
+                 algorithm.TimeKeeper,
+                 marketHoursDatabase);
++            var synchronizer = new NullSynchronizer(algorithm, dividend);
+ 
+             algorithm.SubscriptionManager.SetDataManager(dataManager);
+             algorithm.AddSecurities(equities: new List<string> {"SPY"});
+@@ -123,6 +124,7 @@ namespace QuantConnect.Tests.Brokerages.Paper
+             manager.Run(job,
+                 algorithm,
+                 dataManager,
++                synchronizer,
+                 transactions,
+                 results,
+                 new BacktestingRealTimeHandler(),
+@@ -138,36 +140,6 @@ namespace QuantConnect.Tests.Brokerages.Paper
+ 
+         class TestDividendDataFeed : IDataFeed
+         {
+-            private readonly IAlgorithm _algorithm;
+-            private readonly Dividend _dividend;
+-            private readonly Symbol _symbol;
+-
+-            public TestDividendDataFeed(IAlgorithm algorithm, Dividend dividend)
+-            {
+-                _algorithm = algorithm;
+-                _dividend = dividend;
+-                _symbol = dividend.Symbol;
+-            }
+-            public IEnumerator<TimeSlice> GetEnumerator()
+-            {
+-                var dataFeedPacket = new DataFeedPacket(_algorithm.Securities[_symbol],
+-                    _algorithm.SubscriptionManager.Subscriptions.First(s => s.Symbol == _symbol),
+-                    new List<BaseData> {_dividend}, Ref.CreateReadOnly(() => false));
+-
+-                yield return TimeSlice.Create(DateTime.UtcNow,
+-                    TimeZones.NewYork,
+-                    _algorithm.Portfolio.CashBook,
+-                    new List<DataFeedPacket> {dataFeedPacket},
+-                    SecurityChanges.None,
+-                    new Dictionary<Universe, BaseDataCollection>()
+-                );
+-            }
+-
+-            IEnumerator IEnumerable.GetEnumerator()
+-            {
+-                return GetEnumerator();
+-            }
+-
+             public IEnumerable<Subscription> Subscriptions => new List<Subscription>();
+             public bool IsActive => true;
+ 
+@@ -178,10 +150,11 @@ namespace QuantConnect.Tests.Brokerages.Paper
+                 IMapFileProvider mapFileProvider,
+                 IFactorFileProvider factorFileProvider,
+                 IDataProvider dataProvider,
+-                IDataFeedSubscriptionManager subscriptionManager
++                IDataFeedSubscriptionManager subscriptionManager,
++                IDataFeedTimeProvider dataFeedTimeProvider
+                 )
+             {
+-                throw new System.NotImplementedException();
++                throw new NotImplementedException();
+             }
+ 
+             public bool AddSubscription(SubscriptionRequest request)
+@@ -204,5 +177,34 @@ namespace QuantConnect.Tests.Brokerages.Paper
+                 throw new System.NotImplementedException();
+             }
+         }
++
++        class NullSynchronizer : ISynchronizer
++        {
++            private readonly IAlgorithm _algorithm;
++            private readonly Dividend _dividend;
++            private readonly Symbol _symbol;
++
++            public NullSynchronizer(IAlgorithm algorithm, Dividend dividend)
++            {
++                _algorithm = algorithm;
++                _dividend = dividend;
++                _symbol = dividend.Symbol;
++            }
++
++            public IEnumerable<TimeSlice> StreamData(CancellationToken cancellationToken)
++            {
++                var dataFeedPacket = new DataFeedPacket(_algorithm.Securities[_symbol],
++                    _algorithm.SubscriptionManager.Subscriptions.First(s => s.Symbol == _symbol),
++                    new List<BaseData> { _dividend }, Ref.CreateReadOnly(() => false));
++
++                yield return TimeSlice.Create(DateTime.UtcNow,
++                    TimeZones.NewYork,
++                    _algorithm.Portfolio.CashBook,
++                    new List<DataFeedPacket> { dataFeedPacket },
++                    SecurityChanges.None,
++                    new Dictionary<Universe, BaseDataCollection>()
++                );
++            }
++        }
+     }
+ }
+diff --git a/Tests/Engine/AlgorithmManagerTests.cs b/Tests/Engine/AlgorithmManagerTests.cs
+index fad63605e..34ec494ca 100644
+--- a/Tests/Engine/AlgorithmManagerTests.cs
++++ b/Tests/Engine/AlgorithmManagerTests.cs
+@@ -15,7 +15,6 @@
+ */
+ 
+ using System;
+-using System.Collections;
+ using System.Collections.Concurrent;
+ using System.Collections.Generic;
+ using System.Diagnostics;
+@@ -40,6 +39,7 @@ using QuantConnect.Packets;
+ using QuantConnect.Scheduling;
+ using QuantConnect.Securities;
+ using QuantConnect.Statistics;
++using QuantConnect.Tests.Engine.DataFeeds;
+ using Log = QuantConnect.Logging.Log;
+ 
+ namespace QuantConnect.Tests.Engine
+@@ -70,6 +70,7 @@ namespace QuantConnect.Tests.Engine
+             var leanManager = new NullLeanManager();
+             var alphas = new NullAlphaHandler();
+             var token = new CancellationToken();
++            var nullSynchronizer = new NullSynchronizer(algorithm);
+ 
+             algorithm.Initialize();
+             algorithm.PostInitialize();
+@@ -77,106 +78,43 @@ namespace QuantConnect.Tests.Engine
+             results.Initialize(job, new QuantConnect.Messaging.Messaging(), new Api.Api(), feed, new BacktestingSetupHandler(), transactions);
+             results.SetAlgorithm(algorithm);
+             transactions.Initialize(algorithm, new BacktestingBrokerage(algorithm), results);
+-            feed.Initialize(algorithm, job, results, null, null, null, dataManager);
++            feed.Initialize(algorithm, job, results, null, null, null, dataManager, null);
+ 
+-            Log.Trace("Starting algorithm manager loop to process " + feed.Count + " time slices");
++            Log.Trace("Starting algorithm manager loop to process " + nullSynchronizer.Count + " time slices");
+             var sw = Stopwatch.StartNew();
+-            algorithmManager.Run(job, algorithm, dataManager, transactions, results, realtime, leanManager, alphas, token);
++            algorithmManager.Run(job, algorithm, dataManager, nullSynchronizer, transactions, results, realtime, leanManager, alphas, token);
+             sw.Stop();
+ 
+-            var thousands = feed.Count / 1000d;
++            var thousands = nullSynchronizer.Count / 1000d;
+             var seconds = sw.Elapsed.TotalSeconds;
+-            Log.Trace("COUNT: " + feed.Count + "  KPS: " + thousands/seconds);
++            Log.Trace("COUNT: " + nullSynchronizer.Count + "  KPS: " + thousands/seconds);
+         }
+ 
+         public class MockDataFeed : IDataFeed
+         {
+-            private DateTime _frontierUtc;
+-            private DateTime _endTimeUtc;
+-            private readonly List<BaseData> _data = new List<BaseData>();
+-            public readonly List<UpdateData<Security>> securitiesUpdateData = new List<UpdateData<Security>>();
+-            private readonly List<UpdateData<SubscriptionDataConfig>> _consolidatorUpdateData = new List<UpdateData<SubscriptionDataConfig>>();
+-            private readonly List<TimeSlice> _timeSlices = new List<TimeSlice>();
+-
+-            public int Count => _timeSlices.Count;
+-            public TimeSpan FrontierStepSize = TimeSpan.FromSeconds(1);
+-
+-            public IEnumerator<TimeSlice> GetEnumerator()
+-            {
+-                return _timeSlices.GetEnumerator();
+-            }
+-
+-            IEnumerator IEnumerable.GetEnumerator()
+-            {
+-                return GetEnumerator();
+-            }
+-
+-            public IEnumerable<TimeSlice> GetTimeSlices()
+-            {
+-                var bars = new TradeBars();
+-                var quotes = new QuoteBars();
+-                var ticks = new Ticks();
+-                var options = new OptionChains();
+-                var futures = new FuturesChains();
+-                var splits = new Splits();
+-                var dividends = new Dividends();
+-                var delistings = new Delistings();
+-                var symbolChanges = new SymbolChangedEvents();
+-                var dataFeedPackets = new List<DataFeedPacket>();
+-                var customData = new List<UpdateData<Security>>();
+-                var changes = SecurityChanges.None;
+-                do
+-                {
+-                    var slice = new Slice(default(DateTime), _data, bars, quotes, ticks, options, futures, splits, dividends, delistings, symbolChanges);
+-                    var timeSlice = new TimeSlice(_frontierUtc, _data.Count, slice, dataFeedPackets, securitiesUpdateData, _consolidatorUpdateData, customData, changes, new Dictionary<Universe, BaseDataCollection>());
+-                    yield return timeSlice;
+-                    _frontierUtc += FrontierStepSize;
+-                }
+-                while (_frontierUtc <= _endTimeUtc);
+-            }
+-
+             public bool IsActive { get; }
+             public IEnumerable<Subscription> Subscriptions { get; }
+ 
+-            public void Initialize(IAlgorithm algorithm,
++            public void Initialize(
++                IAlgorithm algorithm,
+                 AlgorithmNodePacket job,
+                 IResultHandler resultHandler,
+                 IMapFileProvider mapFileProvider,
+                 IFactorFileProvider factorFileProvider,
+                 IDataProvider dataProvider,
+-                IDataFeedSubscriptionManager subscriptionManager)
++                IDataFeedSubscriptionManager subscriptionManager,
++                IDataFeedTimeProvider dataFeedTimeProvider
++                )
+             {
+-                _frontierUtc = algorithm.StartDate.ConvertToUtc(algorithm.TimeZone);
+-                _endTimeUtc = algorithm.EndDate.ConvertToUtc(algorithm.TimeZone);
+-                foreach (var kvp in algorithm.Securities)
+-                {
+-                    var security = kvp.Value;
+-                    var tick = new Tick
+-                    {
+-                        Symbol = security.Symbol,
+-                        EndTime = _frontierUtc.ConvertFromUtc(security.Exchange.TimeZone)
+-                    };
+-                    _data.Add(tick);
+-                    securitiesUpdateData.Add(new UpdateData<Security>(security, typeof(Tick), new BaseData[]{tick}));
+-                    _consolidatorUpdateData.Add(new UpdateData<SubscriptionDataConfig>(security.Subscriptions.First(), typeof(Tick), new BaseData[]{tick}));
+-                }
+-
+-                _timeSlices.AddRange(GetTimeSlices().Take(int.MaxValue/1000));
+             }
+ 
+             public bool AddSubscription(SubscriptionRequest request)
+             {
+-                _data.Add(new Tick
+-                {
+-                    Symbol = request.Security.Symbol,
+-                    EndTime = _frontierUtc.ConvertFromUtc(request.Configuration.ExchangeTimeZone)
+-                });
+                 return true;
+             }
+ 
+             public bool RemoveSubscription(SubscriptionDataConfig configuration)
+             {
+-                _data.RemoveAll(d => d.Symbol == configuration.Symbol);
+                 return true;
+             }
+ 
+@@ -472,5 +410,66 @@ namespace QuantConnect.Tests.Engine
+                 throw new NotImplementedException();
+             }
+         }
++
++        class NullSynchronizer : ISynchronizer
++        {
++            private DateTime _frontierUtc;
++            private readonly DateTime _endTimeUtc;
++            private readonly List<BaseData> _data = new List<BaseData>();
++            private readonly List<UpdateData<SubscriptionDataConfig>> _consolidatorUpdateData = new List<UpdateData<SubscriptionDataConfig>>();
++            private readonly List<TimeSlice> _timeSlices = new List<TimeSlice>();
++            private readonly TimeSpan _frontierStepSize = TimeSpan.FromSeconds(1);
++            private readonly List<UpdateData<Security>> _securitiesUpdateData = new List<UpdateData<Security>>();
++            public int Count => _timeSlices.Count;
++
++            public NullSynchronizer(IAlgorithm algorithm)
++            {
++                _frontierUtc = algorithm.StartDate.ConvertToUtc(algorithm.TimeZone);
++                _endTimeUtc = algorithm.EndDate.ConvertToUtc(algorithm.TimeZone);
++                foreach (var kvp in algorithm.Securities)
++                {
++                    var security = kvp.Value;
++                    var tick = new Tick
++                    {
++                        Symbol = security.Symbol,
++                        EndTime = _frontierUtc.ConvertFromUtc(security.Exchange.TimeZone)
++                    };
++                    _data.Add(tick);
++                    _securitiesUpdateData.Add(new UpdateData<Security>(security, typeof(Tick), new BaseData[] { tick }));
++                    _consolidatorUpdateData.Add(new UpdateData<SubscriptionDataConfig>(security.Subscriptions.First(), typeof(Tick), new BaseData[] { tick }));
++                }
++
++                _timeSlices.AddRange(GenerateTimeSlices().Take(int.MaxValue / 1000));
++            }
++
++            public IEnumerable<TimeSlice> StreamData(CancellationToken cancellationToken)
++            {
++                return _timeSlices;
++            }
++
++            private IEnumerable<TimeSlice> GenerateTimeSlices()
++            {
++                var bars = new TradeBars();
++                var quotes = new QuoteBars();
++                var ticks = new Ticks();
++                var options = new OptionChains();
++                var futures = new FuturesChains();
++                var splits = new Splits();
++                var dividends = new Dividends();
++                var delistings = new Delistings();
++                var symbolChanges = new SymbolChangedEvents();
++                var dataFeedPackets = new List<DataFeedPacket>();
++                var customData = new List<UpdateData<Security>>();
++                var changes = SecurityChanges.None;
++                do
++                {
++                    var slice = new Slice(default(DateTime), _data, bars, quotes, ticks, options, futures, splits, dividends, delistings, symbolChanges);
++                    var timeSlice = new TimeSlice(_frontierUtc, _data.Count, slice, dataFeedPackets, _securitiesUpdateData, _consolidatorUpdateData, customData, changes, new Dictionary<Universe, BaseDataCollection>());
++                    yield return timeSlice;
++                    _frontierUtc += _frontierStepSize;
++                }
++                while (_frontierUtc <= _endTimeUtc);
++            }
++        }
+     }
+ }
+diff --git a/Tests/Engine/DataFeeds/AlgorithmStub.cs b/Tests/Engine/DataFeeds/AlgorithmStub.cs
+index adba0a0b4..9d9044b5a 100644
+--- a/Tests/Engine/DataFeeds/AlgorithmStub.cs
++++ b/Tests/Engine/DataFeeds/AlgorithmStub.cs
+@@ -24,7 +24,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
+     /// <summary>
+     /// This type allows tests to easily create an algorith that is mostly initialized in one line
+     /// </summary>
+-    public class AlgorithmStub : QCAlgorithm
++    internal class AlgorithmStub : QCAlgorithm
+     {
+         public List<SecurityChanges> SecurityChangesRecord = new List<SecurityChanges>();
+ 
+diff --git a/Tests/Engine/DataFeeds/CustomLiveDataFeedTests.cs b/Tests/Engine/DataFeeds/CustomLiveDataFeedTests.cs
+index 8365e7fc3..47125f41f 100644
+--- a/Tests/Engine/DataFeeds/CustomLiveDataFeedTests.cs
++++ b/Tests/Engine/DataFeeds/CustomLiveDataFeedTests.cs
+@@ -42,6 +42,9 @@ namespace QuantConnect.Tests.Engine.DataFeeds
+     [TestFixture]
+     public class CustomLiveDataFeedTests
+     {
++        private Synchronizer _synchronizer;
++        private IDataFeed _feed;
++
+         [Test]
+         public void EmitsDailyQuandlFutureDataOverWeekends()
+         {
+@@ -68,8 +71,9 @@ namespace QuantConnect.Tests.Engine.DataFeeds
+             timeProvider.SetCurrentTime(startDate);
+ 
+             var dataPointsEmitted = 0;
+-            var feed = RunLiveDataFeed(algorithm, startDate, symbols, timeProvider, dataManager);
++            RunLiveDataFeed(algorithm, startDate, symbols, timeProvider, dataManager);
+ 
++            var cancellationTokenSource = new CancellationTokenSource();
+             var lastFileWriteDate = DateTime.MinValue;
+ 
+             // create a timer to advance time much faster than realtime and to simulate live Quandl data file updates
+@@ -86,7 +90,8 @@ namespace QuantConnect.Tests.Engine.DataFeeds
+                 {
+                     Log.Trace($"Total data points emitted: {dataPointsEmitted}");
+ 
+-                    feed.Exit();
++                    _feed.Exit();
++                    cancellationTokenSource.Cancel();
+                     return;
+                 }
+ 
+@@ -147,7 +152,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
+ 
+             try
+             {
+-                foreach (var timeSlice in feed)
++                foreach (var timeSlice in _synchronizer.StreamData(cancellationTokenSource.Token))
+                 {
+                     foreach (var dataPoint in timeSlice.Slice.Values)
+                     {
+@@ -187,6 +192,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
+ 
+             var timeProvider = new ManualTimeProvider(TimeZones.NewYork);
+             timeProvider.SetCurrentTime(startDate);
++            var cancellationTokenSource = new CancellationTokenSource();
+ 
+             var dataPointsEmitted = 0;
+             var slicesEmitted = 0;
+@@ -204,7 +210,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
+                 return new[] { tick, tick2 };
+             });
+ 
+-            var feed = RunLiveDataFeed(algorithm, startDate, symbols, timeProvider, dataManager, dataQueueHandler);
++            RunLiveDataFeed(algorithm, startDate, symbols, timeProvider, dataManager, dataQueueHandler);
+             Thread.Sleep(5000); // Give remote sources a handicap, so the data is available in time
+ 
+             // create a timer to advance time much faster than realtime and to simulate live Quandl data file updates
+@@ -219,7 +225,8 @@ namespace QuantConnect.Tests.Engine.DataFeeds
+ 
+                 if (currentTime.Date > endDate.Date)
+                 {
+-                    feed.Exit();
++                    _feed.Exit();
++                    cancellationTokenSource.Cancel();
+                     return;
+                 }
+ 
+@@ -232,7 +239,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
+ 
+             try
+             {
+-                foreach (var timeSlice in feed)
++                foreach (var timeSlice in _synchronizer.StreamData(cancellationTokenSource.Token))
+                 {
+                     if (timeSlice.Slice.HasData)
+                     {
+@@ -255,7 +262,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
+             Assert.AreEqual(14 * symbols.Count, dataPointsEmitted);
+         }
+ 
+-        private static IDataFeed RunLiveDataFeed(
++        private IDataFeed RunLiveDataFeed(
+             IAlgorithm algorithm,
+             DateTime startDate,
+             IEnumerable<Symbol> symbols,
+@@ -263,20 +270,20 @@ namespace QuantConnect.Tests.Engine.DataFeeds
+             DataManager dataManager,
+             FuncDataQueueHandler funcDataQueueHandler  = null)
+         {
+-            var feed = new TestableLiveTradingDataFeed(funcDataQueueHandler ?? new FuncDataQueueHandler(x => Enumerable.Empty<BaseData>()),
+-                                                       timeProvider);
++            _feed = new TestableLiveTradingDataFeed(funcDataQueueHandler ?? new FuncDataQueueHandler(x => Enumerable.Empty<BaseData>()));
++            _synchronizer = new TestableSynchronizer(algorithm, dataManager, _feed, true, timeProvider);
+ 
+             var mapFileProvider = new LocalDiskMapFileProvider();
+-            feed.Initialize(algorithm, new LiveNodePacket(), new BacktestingResultHandler(),
+-                mapFileProvider, new LocalDiskFactorFileProvider(mapFileProvider), new DefaultDataProvider(), dataManager);
++            _feed.Initialize(algorithm, new LiveNodePacket(), new BacktestingResultHandler(),
++                mapFileProvider, new LocalDiskFactorFileProvider(mapFileProvider), new DefaultDataProvider(), dataManager, _synchronizer);
+ 
+             foreach (var symbol in symbols)
+             {
+                 var config = algorithm.Securities[symbol].SubscriptionDataConfig;
+                 var request = new SubscriptionRequest(false, null, algorithm.Securities[symbol], config, startDate, Time.EndOfTime);
+-                feed.AddSubscription(request);
++                _feed.AddSubscription(request);
+             }
+-            return feed;
++            return _feed;
+         }
+ 
+         private static int _countFilesWritten;
+diff --git a/Tests/Engine/DataFeeds/FileSystemDataFeedTests.cs b/Tests/Engine/DataFeeds/FileSystemDataFeedTests.cs
+index 18f98469f..8567bf63c 100644
+--- a/Tests/Engine/DataFeeds/FileSystemDataFeedTests.cs
++++ b/Tests/Engine/DataFeeds/FileSystemDataFeedTests.cs
+@@ -17,6 +17,7 @@
+ using System;
+ using System.Diagnostics;
+ using System.Linq;
++using System.Threading;
+ using NUnit.Framework;
+ using QuantConnect.Data.Auxiliary;
+ using QuantConnect.Data.UniverseSelection;
+@@ -52,15 +53,18 @@ namespace QuantConnect.Tests.Engine.DataFeeds
+                 algorithm.TimeKeeper,
+                 marketHoursDatabase);
+             algorithm.SubscriptionManager.SetDataManager(dataManager);
++            var synchronizer = new Synchronizer();
++            synchronizer.Initialize(algorithm, dataManager, feed, false, algorithm.Portfolio.CashBook);
+ 
+-            feed.Initialize(algorithm, job, resultHandler, mapFileProvider, factorFileProvider, dataProvider, dataManager);
++            feed.Initialize(algorithm, job, resultHandler, mapFileProvider, factorFileProvider, dataProvider, dataManager, synchronizer);
+             algorithm.Initialize();
+             algorithm.PostInitialize();
+ 
++            var cancellationTokenSource = new CancellationTokenSource();
+             var count = 0;
+             var stopwatch = Stopwatch.StartNew();
+             var lastMonth = algorithm.StartDate.Month;
+-            foreach (var timeSlice in feed)
++            foreach (var timeSlice in synchronizer.StreamData(cancellationTokenSource.Token))
+             {
+                 if (timeSlice.Time.Month != lastMonth)
+                 {
+diff --git a/Tests/Engine/DataFeeds/LiveTradingDataFeedTests.cs b/Tests/Engine/DataFeeds/LiveTradingDataFeedTests.cs
+index 99612c0e2..1cbdf3d71 100644
+--- a/Tests/Engine/DataFeeds/LiveTradingDataFeedTests.cs
++++ b/Tests/Engine/DataFeeds/LiveTradingDataFeedTests.cs
+@@ -19,7 +19,6 @@ using System.Collections.Generic;
+ using System.Diagnostics;
+ using System.Linq;
+ using System.Threading;
+-using System.Threading.Tasks;
+ using NUnit.Framework;
+ using QuantConnect.Data;
+ using QuantConnect.Data.Auxiliary;
+@@ -41,6 +40,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
+         private static bool LogsEnabled = false; // this is for travis log no to fill up and reach the max size.
+         private ManualTimeProvider _manualTimeProvider;
+         private AlgorithmStub _algorithm;
++        private Synchronizer _synchronizer;
+         private readonly DateTime _startDate = new DateTime(2018, 08, 1, 11, 0, 0);
+ 
+         [SetUp]
+@@ -495,7 +495,8 @@ namespace QuantConnect.Tests.Engine.DataFeeds
+             var timeZone = _algorithm.Securities[symbol].Exchange.TimeZone;
+             RestApiBaseData last = null;
+ 
+-            foreach (var ts in feed)
++            var cancellationTokenSource = new CancellationTokenSource();
++            foreach (var ts in _synchronizer.StreamData(cancellationTokenSource.Token))
+             {
+                 if (!ts.Slice.ContainsKey(symbol)) return;
+ 
+@@ -605,12 +606,21 @@ namespace QuantConnect.Tests.Engine.DataFeeds
+                 algorithm.TimeKeeper,
+                 marketHoursDatabase);
+             algorithm.SubscriptionManager.SetDataManager(dataManager);
++            var synchronizer = new TestableSynchronizer(_algorithm, dataManager, feed, true);
+             algorithm.AddSecurities(Resolution.Tick, Enumerable.Range(0, 20).Select(x => x.ToString()).ToList());
+             var getNextTicksFunction = Enumerable.Range(0, 20).Select(x => new Tick { Symbol = SymbolCache.GetSymbol(x.ToString()) }).ToList();
+             feed.DataQueueHandler = new FuncDataQueueHandler(handler => getNextTicksFunction);
+             var mapFileProvider = new LocalDiskMapFileProvider();
+             var fileProvider = new DefaultDataProvider();
+-            feed.Initialize(algorithm, job, resultHandler, mapFileProvider, new LocalDiskFactorFileProvider(mapFileProvider), fileProvider, dataManager);
++            feed.Initialize(
++                algorithm,
++                job,
++                resultHandler,
++                mapFileProvider,
++                new LocalDiskFactorFileProvider(mapFileProvider),
++                fileProvider,
++                dataManager,
++                synchronizer);
+ 
+             var unhandledExceptionWasThrown = false;
+             try
+@@ -663,7 +673,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
+ 
+             dataQueueHandler = new FuncDataQueueHandler(getNextTicksFunction);
+ 
+-            var feed = new TestableLiveTradingDataFeed(dataQueueHandler, _manualTimeProvider);
++            var feed = new TestableLiveTradingDataFeed(dataQueueHandler);
+             var mapFileProvider = new LocalDiskMapFileProvider();
+             var fileProvider = new DefaultDataProvider();
+             var marketHoursDatabase = MarketHoursDatabase.FromDataFolder();
+@@ -677,8 +687,9 @@ namespace QuantConnect.Tests.Engine.DataFeeds
+                 marketHoursDatabase);
+             _algorithm.SubscriptionManager.SetDataManager(dataManager);
+             _algorithm.AddSecurities(resolution, equities, forex);
++            _synchronizer = new TestableSynchronizer(_algorithm, dataManager, feed, true, _manualTimeProvider);
+ 
+-            feed.Initialize(_algorithm, job, resultHandler, mapFileProvider, new LocalDiskFactorFileProvider(mapFileProvider), fileProvider, dataManager);
++            feed.Initialize(_algorithm, job, resultHandler, mapFileProvider, new LocalDiskFactorFileProvider(mapFileProvider), fileProvider, dataManager, _synchronizer);
+ 
+             _algorithm.PostInitialize();
+             Thread.Sleep(150); // small handicap for the data to be pumped so TimeSlices have data of all subscriptions
+@@ -691,11 +702,16 @@ namespace QuantConnect.Tests.Engine.DataFeeds
+             ConsumeBridge(feed, timeout, false, handler);
+         }
+ 
+-        private void ConsumeBridge(IDataFeed feed, TimeSpan timeout, bool alwaysInvoke, Action<TimeSlice> handler, bool noOutput = true)
++        private void ConsumeBridge(IDataFeed feed,
++            TimeSpan timeout,
++            bool alwaysInvoke,
++            Action<TimeSlice> handler,
++            bool noOutput = true)
+         {
+             var endTime = DateTime.UtcNow.Add(timeout);
+             bool startedReceivingata = false;
+-            foreach (var timeSlice in feed)
++            var cancellationTokenSource = new CancellationTokenSource();
++            foreach (var timeSlice in _synchronizer.StreamData(cancellationTokenSource.Token))
+             {
+                 if (!noOutput)
+                 {
+@@ -716,6 +732,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
+                 if (endTime <= DateTime.UtcNow)
+                 {
+                     feed.Exit();
++                    cancellationTokenSource.Cancel();
+                     return;
+                 }
+             }
+@@ -747,21 +764,38 @@ namespace QuantConnect.Tests.Engine.DataFeeds
+         }
+     }
+ 
+-    public class TestableLiveTradingDataFeed : LiveTradingDataFeed
++    internal class TestableLiveTradingDataFeed : LiveTradingDataFeed
+     {
+-        private readonly ITimeProvider _timeProvider;
+         public IDataQueueHandler DataQueueHandler;
+ 
+-        public TestableLiveTradingDataFeed(IDataQueueHandler dataQueueHandler = null, ITimeProvider timeProvider = null)
++        public TestableLiveTradingDataFeed(IDataQueueHandler dataQueueHandler = null)
+         {
+             DataQueueHandler = dataQueueHandler;
+-            _timeProvider = timeProvider ?? new RealTimeProvider();
+         }
+ 
+         protected override IDataQueueHandler GetDataQueueHandler()
+         {
+             return DataQueueHandler;
+         }
++    }
++
++    internal class TestableSynchronizer : Synchronizer
++    {
++        private readonly ITimeProvider _timeProvider;
++        public TestableSynchronizer(
++            IAlgorithm algorithm,
++            IDataFeedSubscriptionManager subscriptionManager,
++            IDataFeed dataFeed,
++            bool liveMode,
++            ITimeProvider timeProvider = null)
++        {
++            _timeProvider = timeProvider ?? new RealTimeProvider();
++            Initialize(algorithm,
++                subscriptionManager,
++                dataFeed,
++                liveMode,
++                algorithm.Portfolio.CashBook);
++        }
+ 
+         protected override ITimeProvider GetTimeProvider()
+         {
+diff --git a/Tests/Engine/DataFeeds/SubscriptionSynchronizerTests.cs b/Tests/Engine/DataFeeds/SubscriptionSynchronizerTests.cs
+index 5a29aaf28..d99f25d8a 100644
+--- a/Tests/Engine/DataFeeds/SubscriptionSynchronizerTests.cs
++++ b/Tests/Engine/DataFeeds/SubscriptionSynchronizerTests.cs
+@@ -77,10 +77,9 @@ namespace QuantConnect.Tests.Engine.DataFeeds
+             var endTimeUtc = algorithm.EndDate.ConvertToUtc(TimeZones.NewYork);
+             var startTimeUtc = algorithm.StartDate.ConvertToUtc(TimeZones.NewYork);
+             var subscriptionBasedTimeProvider = new SubscriptionFrontierTimeProvider(startTimeUtc, dataManager);
+-            var synchronizer = new SubscriptionSynchronizer(dataManager.UniverseSelection, algorithm.TimeZone,
+-                                                            algorithm.Portfolio.CashBook,
+-                                                            subscriptionBasedTimeProvider);
+-
++            var synchronizer = new SubscriptionSynchronizer(dataManager.UniverseSelection, algorithm.Portfolio.CashBook);
++            synchronizer.SetTimeProvider(subscriptionBasedTimeProvider);
++            synchronizer.SetSliceTimeZone(algorithm.TimeZone);
+             var totalDataPoints = 0;
+             var subscriptions = dataManager.DataFeedSubscriptions;
+             foreach (var kvp in algorithm.Securities)
+diff --git a/Tests/Engine/RealTimePriceUpdateTests.cs b/Tests/Engine/RealTimePriceUpdateTests.cs
+index 4f9157087..89e87c7a4 100644
+--- a/Tests/Engine/RealTimePriceUpdateTests.cs
++++ b/Tests/Engine/RealTimePriceUpdateTests.cs
+@@ -25,7 +25,6 @@ using QuantConnect.Lean.Engine.DataFeeds;
+ using QuantConnect.Lean.Engine.Results;
+ using QuantConnect.Packets;
+ using QuantConnect.Securities;
+-using QuantConnect.Tests.Common.Securities;
+ 
+ namespace QuantConnect.Tests.Engine
+ {
+@@ -70,9 +69,10 @@ namespace QuantConnect.Tests.Engine
+                 algo.TimeKeeper,
+                 marketHoursDatabase);
+             algo.SubscriptionManager.SetDataManager(dataManager);
+-
++            var synchronizer = new Synchronizer();
++            synchronizer.Initialize(algo, dataManager, _liveTradingDataFeed, true, algo.Portfolio.CashBook);
+             _liveTradingDataFeed.Initialize(algo, jobPacket, new LiveTradingResultHandler(), new LocalDiskMapFileProvider(),
+-                                            null, new DefaultDataProvider(), dataManager);
++                                            null, new DefaultDataProvider(), dataManager, synchronizer);
+ 
+             algo.Initialize();
+         }

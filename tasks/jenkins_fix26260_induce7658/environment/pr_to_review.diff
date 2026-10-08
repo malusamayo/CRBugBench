@@ -1,0 +1,1168 @@
+commit 4963094f4ec3cba0d5789127e28fdd2629648019
+Author: Vincent Latombe <vincent@latombe.net>
+Date:   Fri Apr 28 20:23:09 2023 +0200
+
+    [JENKINS-70729] Rework clouds management into multiple pages (#7658)
+    
+    Co-authored-by: Jesse Glick <jglick@cloudbees.com>
+    Co-authored-by: Daniel Beck <1831569+daniel-beck@users.noreply.github.com>
+    Co-authored-by: Tim Jacomb <timjacomb1@gmail.com>
+    Co-authored-by: Tim Jacomb <21194782+timja@users.noreply.github.com>
+
+diff --git a/core/src/main/java/hudson/slaves/Cloud.java b/core/src/main/java/hudson/slaves/Cloud.java
+index 8ab456817a..b60a595585 100644
+--- a/core/src/main/java/hudson/slaves/Cloud.java
++++ b/core/src/main/java/hudson/slaves/Cloud.java
+@@ -46,13 +46,24 @@ import hudson.security.Permission;
+ import hudson.security.PermissionScope;
+ import hudson.slaves.NodeProvisioner.PlannedNode;
+ import hudson.util.DescriptorList;
++import hudson.util.FormApply;
++import java.io.IOException;
+ import java.util.Collection;
+ import java.util.Objects;
+ import java.util.concurrent.Future;
++import javax.servlet.ServletException;
+ import jenkins.model.Jenkins;
++import net.sf.json.JSONObject;
++import org.apache.commons.lang.Validate;
+ import org.kohsuke.accmod.Restricted;
+ import org.kohsuke.accmod.restrictions.DoNotUse;
+ import org.kohsuke.stapler.DataBoundConstructor;
++import org.kohsuke.stapler.HttpRedirect;
++import org.kohsuke.stapler.HttpResponse;
++import org.kohsuke.stapler.StaplerRequest;
++import org.kohsuke.stapler.StaplerResponse;
++import org.kohsuke.stapler.interceptor.RequirePOST;
++import org.kohsuke.stapler.verb.POST;
+ 
+ /**
+  * Creates {@link Node}s to dynamically expand/shrink the agents attached to Hudson.
+@@ -104,9 +115,10 @@ public abstract class Cloud extends Actionable implements ExtensionPoint, Descri
+      * This is expected to be short ID-like string that does not contain any character unsafe as variable name or
+      * URL path token.
+      */
+-    public final String name;
++    public String name;
+ 
+     protected Cloud(String name) {
++        Validate.notEmpty(name, Messages.Cloud_RequiredName());
+         this.name = name;
+     }
+ 
+@@ -122,7 +134,7 @@ public abstract class Cloud extends Actionable implements ExtensionPoint, Descri
+      * @return Jenkins relative URL.
+      */
+     public @NonNull String getUrl() {
+-        return "cloud/" + Util.rawEncode(name);
++        return "cloud/" + Util.rawEncode(name) + "/";
+     }
+ 
+     @Override
+@@ -275,6 +287,58 @@ public abstract class Cloud extends Actionable implements ExtensionPoint, Descri
+         Objects.hash(PERMISSION_SCOPE, PROVISION);
+     }
+ 
++    public String getIcon() {
++        return "symbol-cloud";
++    }
++
++    public String getIconClassName() {
++        return "symbol-cloud";
++    }
++
++    @SuppressWarnings("unused") // stapler
++    public String getIconAltText() {
++        return getClass().getSimpleName().replace("Cloud", "");
++    }
++
++    /**
++     * Deletes the cloud.
++     */
++    @RequirePOST
++    public HttpResponse doDoDelete() throws IOException {
++        checkPermission(Jenkins.ADMINISTER);
++        Jenkins.get().clouds.remove(this);
++        return new HttpRedirect("..");
++    }
++
++    /**
++     * Accepts the update to the node configuration.
++     */
++    @POST
++    public HttpResponse doConfigSubmit(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException, Descriptor.FormException {
++        checkPermission(Jenkins.ADMINISTER);
++
++        Jenkins j = Jenkins.get();
++        Cloud cloud = j.getCloud(this.name);
++        if (cloud == null) {
++            throw new ServletException("No such cloud " + this.name);
++        }
++        Cloud result = cloud.reconfigure(req, req.getSubmittedForm());
++        String proposedName = result.name;
++        if (!proposedName.equals(this.name)
++                && j.getCloud(proposedName) != null) {
++            throw new Descriptor.FormException(jenkins.agents.Messages.CloudSet_CloudAlreadyExists(proposedName), "name");
++        }
++        j.clouds.replace(this, result);
++        j.save();
++        // take the user back to the cloud top page.
++        return FormApply.success(".");
++    }
++
++    private Cloud reconfigure(@NonNull final StaplerRequest req, JSONObject form) throws Descriptor.FormException {
++        if (form == null)     return null;
++        return getDescriptor().newInstance(req, form);
++    }
++
+     /**
+      * Parameter object for {@link hudson.slaves.Cloud}.
+      * @since 2.259
+diff --git a/core/src/main/java/jenkins/agents/CloudSet.java b/core/src/main/java/jenkins/agents/CloudSet.java
+new file mode 100644
+index 0000000000..5229dd06f1
+--- /dev/null
++++ b/core/src/main/java/jenkins/agents/CloudSet.java
+@@ -0,0 +1,272 @@
++/*
++ * The MIT License
++ *
++ * Copyright (c) 2023, CloudBees Inc, and other contributors
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ */
++
++package jenkins.agents;
++
++import hudson.Extension;
++import hudson.Functions;
++import hudson.Util;
++import hudson.model.AbstractModelObject;
++import hudson.model.AutoCompletionCandidates;
++import hudson.model.Describable;
++import hudson.model.Descriptor;
++import hudson.model.Failure;
++import hudson.model.RootAction;
++import hudson.model.UpdateCenter;
++import hudson.slaves.Cloud;
++import hudson.util.FormValidation;
++import java.io.IOException;
++import java.net.URLEncoder;
++import java.nio.charset.StandardCharsets;
++import java.util.logging.Level;
++import java.util.logging.Logger;
++import javax.servlet.ServletException;
++import jenkins.model.Jenkins;
++import jenkins.model.ModelObjectWithChildren;
++import jenkins.model.ModelObjectWithContextMenu;
++import net.sf.json.JSONObject;
++import org.kohsuke.accmod.Restricted;
++import org.kohsuke.accmod.restrictions.DoNotUse;
++import org.kohsuke.accmod.restrictions.NoExternalUse;
++import org.kohsuke.stapler.QueryParameter;
++import org.kohsuke.stapler.StaplerProxy;
++import org.kohsuke.stapler.StaplerRequest;
++import org.kohsuke.stapler.StaplerResponse;
++import org.kohsuke.stapler.interceptor.RequirePOST;
++import org.kohsuke.stapler.verb.POST;
++
++@Restricted(NoExternalUse.class)
++public class CloudSet extends AbstractModelObject implements Describable<CloudSet>, ModelObjectWithChildren, RootAction, StaplerProxy {
++    private static final Logger LOGGER = Logger.getLogger(CloudSet.class.getName());
++
++    @Override
++    public Descriptor<CloudSet> getDescriptor() {
++        return Jenkins.get().getDescriptorOrDie(CloudSet.class);
++    }
++
++    public Cloud getDynamic(String token) {
++        return Jenkins.get().getCloud(token);
++    }
++
++    @Override
++    @Restricted(NoExternalUse.class)
++    public Object getTarget() {
++        Jenkins.get().checkPermission(Jenkins.SYSTEM_READ);
++        return this;
++    }
++
++    @Override
++    public String getIconFileName() {
++        return null;
++    }
++
++    @Override
++    public String getDisplayName() {
++        return Messages.CloudSet_DisplayName();
++    }
++
++    @Override
++    public String getUrlName() {
++        return "cloud";
++    }
++
++    @Override
++    public String getSearchUrl() {
++        return "/cloud/";
++    }
++
++    @SuppressWarnings("unused") // stapler
++    @Restricted(DoNotUse.class) // stapler
++    public String getCloudUrl(StaplerRequest request, Jenkins jenkins, Cloud cloud) {
++        String context = Functions.getNearestAncestorUrl(request, jenkins);
++        if (Jenkins.get().getCloud(cloud.name) != cloud) { // this cloud is not the first occurrence with this name
++            return context + "/cloud/cloudByIndex/" + getClouds().indexOf(cloud) + "/";
++        } else {
++            return context + "/" + cloud.getUrl();
++        }
++    }
++
++    @SuppressWarnings("unused") // stapler
++    @Restricted(DoNotUse.class) // stapler
++    public Cloud getCloudByIndex(int index) {
++        return Jenkins.get().clouds.get(index);
++    }
++
++    @SuppressWarnings("unused") // stapler
++    public boolean isCloudAvailable() {
++        return !Cloud.all().isEmpty();
++    }
++
++    @SuppressWarnings("unused") // stapler
++    public String getCloudUpdateCenterCategoryLabel() {
++        return URLEncoder.encode(UpdateCenter.getCategoryDisplayName("cloud"), StandardCharsets.UTF_8);
++    }
++
++    @Override
++    public ModelObjectWithContextMenu.ContextMenu doChildrenContextMenu(StaplerRequest request, StaplerResponse response) throws Exception {
++        ModelObjectWithContextMenu.ContextMenu m = new ModelObjectWithContextMenu.ContextMenu();
++        Jenkins.get().clouds.stream().forEach(c -> m.add(c));
++        return m;
++    }
++
++    public Cloud getDynamic(String name, StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
++        return Jenkins.get().clouds.getByName(name);
++    }
++
++    @SuppressWarnings("unused") // stapler
++    @Restricted(DoNotUse.class) // stapler
++    public Jenkins.CloudList getClouds() {
++        return Jenkins.get().clouds;
++    }
++
++    @SuppressWarnings("unused") // stapler
++    @Restricted(DoNotUse.class) // stapler
++    public boolean hasClouds() {
++        return !Jenkins.get().clouds.isEmpty();
++    }
++
++    /**
++     * Makes sure that the given name is good as an agent name.
++     * @return trimmed name if valid; throws ParseException if not
++     */
++    public String checkName(String name) throws Failure {
++        if (name == null)
++            throw new Failure("Query parameter 'name' is required");
++
++        name = name.trim();
++        Jenkins.checkGoodName(name);
++
++        if (Jenkins.get().getCloud(name) != null)
++            throw new Failure(Messages.CloudSet_CloudAlreadyExists(name));
++
++        // looks good
++        return name;
++    }
++
++    @SuppressWarnings("unused") // stapler
++    public FormValidation doCheckName(@QueryParameter String value) {
++        Jenkins.get().checkPermission(Jenkins.ADMINISTER);
++        if (Util.fixEmpty(value) == null) {
++            return FormValidation.ok();
++        }
++        try {
++            checkName(value);
++            return FormValidation.ok();
++        } catch (Failure e) {
++            return FormValidation.error(e.getMessage());
++        }
++    }
++
++    /**
++     * First check point in creating a new cloud.
++     */
++    @RequirePOST
++    public synchronized void doCreate(StaplerRequest req, StaplerResponse rsp,
++                                          @QueryParameter String name, @QueryParameter String mode,
++                                          @QueryParameter String from) throws IOException, ServletException, Descriptor.FormException {
++        final Jenkins jenkins = Jenkins.get();
++        jenkins.checkPermission(Jenkins.ADMINISTER);
++
++        if (mode != null && mode.equals("copy")) {
++            name = checkName(name);
++
++            Cloud src = jenkins.getCloud(from);
++            if (src == null) {
++                if (Util.fixEmpty(from) == null) {
++                    throw new Failure(Messages.CloudSet_SpecifyCloudToCopy());
++                } else {
++                    throw new Failure(Messages.CloudSet_NoSuchCloud(from));
++                }
++            }
++
++            // copy through XStream
++            String xml = Jenkins.XSTREAM.toXML(src);
++            // Not great, but cloud name is final
++            xml = xml.replace("<name>" + src.name + "</name>", "<name>" + name + "</name>");
++            Cloud result = (Cloud) Jenkins.XSTREAM.fromXML(xml);
++            jenkins.clouds.add(result);
++            // send the browser to the config page
++            rsp.sendRedirect2(Functions.getNearestAncestorUrl(req, jenkins) + "/" + result.getUrl() + "configure");
++        } else {
++            // proceed to step 2
++            if (mode == null) {
++                throw new Failure("No mode given");
++            }
++
++            Descriptor<Cloud> d = Cloud.all().findByName(mode);
++            if (d == null) {
++                throw new Failure("No node type ‘" + mode + "’ is known");
++            }
++            handleNewCloudPage(d, name, req, rsp);
++        }
++    }
++
++    private void handleNewCloudPage(Descriptor<Cloud> descriptor, String name, StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException, Descriptor.FormException {
++        checkName(name);
++        JSONObject formData = req.getSubmittedForm();
++        formData.put("name", name);
++        formData.put("cloudName", name); // ec2 uses that field name
++        formData.remove("mode"); // Cloud descriptors won't have this field.
++        req.setAttribute("instance", formData);
++        req.setAttribute("descriptor", descriptor);
++        req.getView(this, "_new.jelly").forward(req, rsp);
++    }
++
++    /**
++     * Really creates a new agent.
++     */
++    @POST
++    public synchronized void doDoCreate(StaplerRequest req, StaplerResponse rsp,
++                                            @QueryParameter String type) throws IOException, ServletException, Descriptor.FormException {
++        Jenkins.get().checkPermission(Jenkins.ADMINISTER);
++        Cloud cloud = Cloud.all().find(type).newInstance(req, req.getSubmittedForm());
++        if (!Jenkins.get().clouds.add(cloud)) {
++            LOGGER.log(Level.WARNING, () -> "Creating duplicate cloud name " + cloud.name + ". Plugin " + Jenkins.get().getPluginManager().whichPlugin(cloud.getClass()) + " should be updated to support user provided name.");
++        }
++        // take the user back to the cloud list top page
++        rsp.sendRedirect2(".");
++    }
++
++    @Extension
++    public static class DescriptorImpl extends Descriptor<CloudSet> implements StaplerProxy {
++
++        /**
++         * Auto-completion for the "copy from" field in the new cloud page.
++         */
++        @SuppressWarnings("unused") // stapler
++        public AutoCompletionCandidates doAutoCompleteCopyNewItemFrom(@QueryParameter final String value) {
++            final AutoCompletionCandidates r = new AutoCompletionCandidates();
++            Jenkins.get().clouds.stream()
++                    .filter(c -> c.name.startsWith(value))
++                    .forEach(c -> r.add(c.name));
++            return r;
++        }
++
++        @Override
++        public Object getTarget() {
++            Jenkins.get().checkPermission(Jenkins.ADMINISTER);
++            return this;
++        }
++    }
++}
+diff --git a/core/src/main/java/jenkins/agents/CloudsLink.java b/core/src/main/java/jenkins/agents/CloudsLink.java
+new file mode 100644
+index 0000000000..38293b0ba3
+--- /dev/null
++++ b/core/src/main/java/jenkins/agents/CloudsLink.java
+@@ -0,0 +1,69 @@
++/*
++ * The MIT License
++ *
++ * Copyright (c) 2023, CloudBees Inc, and other contributors
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ */
++
++package jenkins.agents;
++
++import edu.umd.cs.findbugs.annotations.NonNull;
++import hudson.Extension;
++import hudson.model.ManagementLink;
++import hudson.security.Permission;
++import jenkins.model.Jenkins;
++import org.jenkinsci.Symbol;
++
++@Extension
++@Symbol("clouds")
++public class CloudsLink extends ManagementLink {
++
++    @Override
++    public String getDisplayName() {
++        return Messages.CloudsLink_DisplayName();
++    }
++
++    @Override
++    public String getDescription() {
++        return Messages.CloudsLink_Description();
++    }
++
++    @Override
++    public String getIconFileName() {
++        return "symbol-cloud";
++    }
++
++    @Override
++    public String getUrlName() {
++        return "cloud";
++    }
++
++    @NonNull
++    @Override
++    public Category getCategory() {
++        return Category.CONFIGURATION;
++    }
++
++    @NonNull
++    @Override
++    public Permission getRequiredPermission() {
++        return Jenkins.SYSTEM_READ;
++    }
++}
+diff --git a/core/src/main/java/jenkins/diagnostics/ControllerExecutorsNoAgents.java b/core/src/main/java/jenkins/diagnostics/ControllerExecutorsNoAgents.java
+index 5170d60327..d06c3c7bff 100644
+--- a/core/src/main/java/jenkins/diagnostics/ControllerExecutorsNoAgents.java
++++ b/core/src/main/java/jenkins/diagnostics/ControllerExecutorsNoAgents.java
+@@ -57,7 +57,7 @@ public class ControllerExecutorsNoAgents extends AdministrativeMonitor {
+             disable(true);
+             rsp.sendRedirect(req.getContextPath() + "/manage");
+         } else if (req.hasParameter("cloud")) {
+-            rsp.sendRedirect(req.getContextPath() + "/configureClouds");
++            rsp.sendRedirect(req.getContextPath() + "/manage/cloud/");
+         } else if (req.hasParameter("agent")) {
+             rsp.sendRedirect(req.getContextPath() + "/computer/new");
+         }
+diff --git a/core/src/main/java/jenkins/management/NodesLink.java b/core/src/main/java/jenkins/management/NodesLink.java
+index e0058a2430..7a6f73f205 100644
+--- a/core/src/main/java/jenkins/management/NodesLink.java
++++ b/core/src/main/java/jenkins/management/NodesLink.java
+@@ -39,7 +39,7 @@ public class NodesLink extends ManagementLink {
+ 
+     @Override
+     public String getIconFileName() {
+-        return "symbol-cloud";
++        return "symbol-computer";
+     }
+ 
+     @Override
+diff --git a/core/src/main/java/jenkins/model/GlobalCloudConfiguration.java b/core/src/main/java/jenkins/model/GlobalCloudConfiguration.java
+index 2731e12649..8b25c8fc2b 100644
+--- a/core/src/main/java/jenkins/model/GlobalCloudConfiguration.java
++++ b/core/src/main/java/jenkins/model/GlobalCloudConfiguration.java
+@@ -3,29 +3,22 @@ package jenkins.model;
+ import edu.umd.cs.findbugs.annotations.CheckForNull;
+ import hudson.Extension;
+ import hudson.RestrictedSince;
+-import hudson.model.Descriptor;
+ import hudson.model.RootAction;
+-import hudson.slaves.Cloud;
+-import hudson.util.FormApply;
+-import java.io.IOException;
+-import javax.servlet.ServletException;
+-import net.sf.json.JSONObject;
+ import org.jenkinsci.Symbol;
+ import org.kohsuke.accmod.Restricted;
+ import org.kohsuke.accmod.restrictions.NoExternalUse;
+-import org.kohsuke.stapler.StaplerRequest;
+-import org.kohsuke.stapler.StaplerResponse;
+-import org.kohsuke.stapler.verb.POST;
+ 
+ /**
+- * Provides a configuration form for {@link Jenkins#clouds}.
+- *
+- * Has been overhauled in Jenkins 2.XXX to no longer contribute to Configure System, but be a standalone form.
++ * Redirects from /configureClouds to /cloud/.
++ * Previously was the form for clouds.
++ * <p>
++ * @deprecated Replaced by {@link jenkins.agents.CloudsLink} and {@link jenkins.agents.CloudSet}.
+  */
+ @Extension
+ @Symbol("cloud")
+ @Restricted(NoExternalUse.class)
+ @RestrictedSince("2.205")
++@Deprecated
+ public class GlobalCloudConfiguration implements RootAction {
+ 
+     @CheckForNull
+@@ -44,12 +37,4 @@ public class GlobalCloudConfiguration implements RootAction {
+     public String getUrlName() {
+         return "configureClouds";
+     }
+-
+-    @POST
+-    public void doConfigure(StaplerRequest req, StaplerResponse rsp) throws Descriptor.FormException, IOException, ServletException {
+-        Jenkins.get().checkPermission(Jenkins.ADMINISTER);
+-        JSONObject json = req.getSubmittedForm();
+-        Jenkins.get().clouds.rebuildHetero(req, json, Cloud.all(), "cloud");
+-        FormApply.success(req.getContextPath() + "/manage").generateResponse(req, rsp, null);
+-    }
+ }
+diff --git a/core/src/main/java/jenkins/model/Jenkins.java b/core/src/main/java/jenkins/model/Jenkins.java
+index dda1ef9d81..2696b4160b 100644
+--- a/core/src/main/java/jenkins/model/Jenkins.java
++++ b/core/src/main/java/jenkins/model/Jenkins.java
+@@ -264,6 +264,7 @@ import jenkins.AgentProtocol;
+ import jenkins.ExtensionComponentSet;
+ import jenkins.ExtensionRefreshException;
+ import jenkins.InitReactorRunner;
++import jenkins.agents.CloudSet;
+ import jenkins.diagnostics.URICheckEncodingMonitor;
+ import jenkins.install.InstallState;
+ import jenkins.install.SetupWizard;
+@@ -1575,6 +1576,14 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
+         return new ComputerSet();
+     }
+ 
++    /**
++     * Only there to bind to /cloud/ URL. Otherwise /cloud/new gets resolved to getCloud("new") by stapler which is not what we want.
++     */
++    @Restricted(DoNotUse.class)
++    public CloudSet getCloud() {
++        return new CloudSet();
++    }
++
+     /**
+      * Exposes {@link Descriptor} by its name to URL.
+      *
+diff --git a/core/src/main/java/jenkins/model/ModelObjectWithContextMenu.java b/core/src/main/java/jenkins/model/ModelObjectWithContextMenu.java
+index 69e1e236ca..eb754651b1 100644
+--- a/core/src/main/java/jenkins/model/ModelObjectWithContextMenu.java
++++ b/core/src/main/java/jenkins/model/ModelObjectWithContextMenu.java
+@@ -9,6 +9,7 @@ import hudson.model.Computer;
+ import hudson.model.Job;
+ import hudson.model.ModelObject;
+ import hudson.model.Node;
++import hudson.slaves.Cloud;
+ import java.io.IOException;
+ import java.net.URI;
+ import java.net.URISyntaxException;
+@@ -220,6 +221,13 @@ public interface ModelObjectWithContextMenu extends ModelObject {
+                 .withContextRelativeUrl(c.getUrl()));
+         }
+ 
++        public ContextMenu add(Cloud c) {
++            return add(new MenuItem()
++                    .withDisplayName(c.getDisplayName())
++                    .withIconClass(c.getIconClassName())
++                    .withContextRelativeUrl(c.getUrl()));
++        }
++
+         /**
+          * Adds a child item when rendering context menu of its parent.
+          *
+diff --git a/core/src/main/resources/hudson/model/AllView/noJob.groovy b/core/src/main/resources/hudson/model/AllView/noJob.groovy
+index 414c3753fd..6f5a7adeab 100644
+--- a/core/src/main/resources/hudson/model/AllView/noJob.groovy
++++ b/core/src/main/resources/hudson/model/AllView/noJob.groovy
+@@ -57,7 +57,7 @@ div {
+ 
+                             if (hasAdministerJenkinsPermission) {
+                                 li(class: "content-block") {
+-                                    a(href: "configureClouds", class: "content-block__link") {
++                                    a(href: "cloud/", class: "content-block__link") {
+                                         span(_("setUpCloud"))
+                                         span(class: "trailing-icon") {
+                                             l.icon(
+diff --git a/core/src/main/resources/hudson/model/ComputerSet/sidepanel.jelly b/core/src/main/resources/hudson/model/ComputerSet/sidepanel.jelly
+index 8deed1af27..ca76b76f16 100644
+--- a/core/src/main/resources/hudson/model/ComputerSet/sidepanel.jelly
++++ b/core/src/main/resources/hudson/model/ComputerSet/sidepanel.jelly
+@@ -30,7 +30,9 @@ THE SOFTWARE.
+   <l:header />
+   <l:side-panel>
+     <l:tasks>
+-      <l:task href="../configureClouds" icon="symbol-cloud" permission="${app.SYSTEM_READ}"
++      <l:task href="${h.getNearestAncestorUrl(request,it)}/" icon="symbol-computer"
++              title="${%Nodes}"/>
++      <l:task href="../cloud/" icon="symbol-cloud" permission="${app.SYSTEM_READ}"
+               title="${app.hasPermission(app.ADMINISTER) ? '%Clouds' : '%View Clouds'}"/>
+       <l:task href="configure" icon="symbol-settings" permissions="${app.MANAGE_AND_SYSTEM_READ}" title="${%Node Monitoring}"/>
+     </l:tasks>
+diff --git a/core/src/main/resources/hudson/slaves/Cloud/configure.jelly b/core/src/main/resources/hudson/slaves/Cloud/configure.jelly
+new file mode 100644
+index 0000000000..d165d6f031
+--- /dev/null
++++ b/core/src/main/resources/hudson/slaves/Cloud/configure.jelly
+@@ -0,0 +1,52 @@
++<!--
++The MIT License
++
++Copyright (c) 2023, CloudBees Inc.
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in
++all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++THE SOFTWARE.
++-->
++
++<?jelly escape-by-default='true'?>
++<j:jelly xmlns:j="jelly:core" xmlns:st="jelly:stapler" xmlns:l="/lib/layout" xmlns:f="/lib/form">
++  <l:layout permission="${app.SYSTEM_READ}" title="${%title(it.name)}">
++    <j:set var="readOnlyMode" value="${!app.hasPermission(app.ADMINISTER)}"/>
++    <st:include page="sidepanel.jelly"/>
++    <l:breadcrumb title="${%Configure}"/>
++    <l:main-panel>
++      <h1>${%title(it.name)}</h1>
++      <f:form method="post" action="configSubmit" name="config" class="jenkins-form">
++        <j:set var="instance" value="${it}"/>
++        <j:set var="descriptor" value="${instance.descriptor}"/>
++
++        <!-- main body of the configuration -->
++        <st:include it="${instance}" page="config.jelly"/>
++
++        <l:isAdmin>
++          <f:bottomButtonBar>
++            <f:submit value="${%Save}"/>
++            <f:apply />
++          </f:bottomButtonBar>
++        </l:isAdmin>
++      </f:form>
++      <l:isAdmin>
++        <st:adjunct includes="lib.form.confirm"/>
++      </l:isAdmin>
++    </l:main-panel>
++  </l:layout>
++</j:jelly>
+diff --git a/core/src/main/resources/hudson/slaves/Cloud/configure.properties b/core/src/main/resources/hudson/slaves/Cloud/configure.properties
+new file mode 100644
+index 0000000000..ab2ee7c16c
+--- /dev/null
++++ b/core/src/main/resources/hudson/slaves/Cloud/configure.properties
+@@ -0,0 +1 @@
++title=Cloud {0} Configuration
+diff --git a/core/src/main/resources/hudson/slaves/Cloud/delete.jelly b/core/src/main/resources/hudson/slaves/Cloud/delete.jelly
+new file mode 100644
+index 0000000000..b4500dbf3f
+--- /dev/null
++++ b/core/src/main/resources/hudson/slaves/Cloud/delete.jelly
+@@ -0,0 +1,37 @@
++<!--
++The MIT License
++
++Copyright (c) 2023, CloudBees Inc.
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in
++all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++THE SOFTWARE.
++-->
++
++<?jelly escape-by-default='true'?>
++<j:jelly xmlns:j="jelly:core" xmlns:st="jelly:stapler" xmlns:d="jelly:define" xmlns:l="/lib/layout" xmlns:t="/lib/hudson" xmlns:f="/lib/form" xmlns:i="jelly:fmt">
++  <l:layout permission="${app.ADMINISTER}" title="${%title(it.name)}">
++    <st:include page="sidepanel.jelly" />
++    <l:breadcrumb title="${%Delete}" />
++    <l:main-panel>
++      <form method="post" action="doDelete">
++        <h1>${%delete.cloud(it.displayName)}</h1>
++        <f:submit value="${%Yes}" clazz="jenkins-!-destructive-color" />
++      </form>
++    </l:main-panel>
++  </l:layout>
++</j:jelly>
+diff --git a/core/src/main/resources/hudson/slaves/Cloud/delete.properties b/core/src/main/resources/hudson/slaves/Cloud/delete.properties
+new file mode 100644
+index 0000000000..c44d66215e
+--- /dev/null
++++ b/core/src/main/resources/hudson/slaves/Cloud/delete.properties
+@@ -0,0 +1,2 @@
++title=Delete the cloud ‘{0}‘?
++delete.cloud=Delete the cloud ‘{0}’?
+diff --git a/core/src/main/resources/hudson/slaves/Cloud/help-name.html b/core/src/main/resources/hudson/slaves/Cloud/help-name.html
+new file mode 100644
+index 0000000000..53a09519dd
+--- /dev/null
++++ b/core/src/main/resources/hudson/slaves/Cloud/help-name.html
+@@ -0,0 +1,5 @@
++<div>
++  Uniquely identifies this Cloud instance among other instances in Jenkins
++  Clouds. This is expected to be short ID-like string that does not contain any
++  character unsafe as variable name or URL path token.
++</div>
+diff --git a/core/src/main/resources/hudson/slaves/Cloud/index.jelly b/core/src/main/resources/hudson/slaves/Cloud/index.jelly
+index da3478f2e0..84dc3a9a95 100644
+--- a/core/src/main/resources/hudson/slaves/Cloud/index.jelly
++++ b/core/src/main/resources/hudson/slaves/Cloud/index.jelly
+@@ -25,11 +25,11 @@ THE SOFTWARE.
+ <!-- This page have not existed historically so plugins might well not provide any views. -->
+ <?jelly escape-by-default='true'?>
+ <j:jelly xmlns:j="jelly:core" xmlns:st="jelly:stapler" xmlns:l="/lib/layout">
+-    <l:layout title="${it.name}">
++    <l:layout title="${%Cloud(it.name)}" permission="${app.SYSTEM_READ}">
+         <st:include page="sidepanel.jelly" it="${it}"/>
+         <!-- no need for additional breadcrumb here as we're on an index page already including breadcrumb -->
+         <l:main-panel>
+-            <h1>${%Cloud} ${it.name}</h1>
++            <h1>${%Cloud(it.name)}</h1>
+ 
+             <st:include page="top.jelly" optional="true"/>
+ 
+diff --git a/core/src/main/resources/hudson/slaves/Cloud/index.properties b/core/src/main/resources/hudson/slaves/Cloud/index.properties
+new file mode 100644
+index 0000000000..444ee764d9
+--- /dev/null
++++ b/core/src/main/resources/hudson/slaves/Cloud/index.properties
+@@ -0,0 +1 @@
++Cloud=Cloud {0}
+diff --git a/core/src/main/resources/hudson/slaves/Cloud/sidepanel.jelly b/core/src/main/resources/hudson/slaves/Cloud/sidepanel.jelly
+index 7a47b57953..2cae8deecb 100644
+--- a/core/src/main/resources/hudson/slaves/Cloud/sidepanel.jelly
++++ b/core/src/main/resources/hudson/slaves/Cloud/sidepanel.jelly
+@@ -27,6 +27,10 @@ THE SOFTWARE.
+     <l:header />
+     <l:side-panel>
+         <l:tasks>
++            <l:task contextMenu="false" href="." icon="symbol-computer" title="${%Status}"/>
++            <l:task href="configure" icon="symbol-settings"
++                    title="${app.hasPermission(app.ADMINISTER) ? '%Configure' : '%View Configuration'}"/>
++            <l:task href="delete" icon="icon-edit-delete icon-md" permission="${app.ADMINISTER}" title="${%Delete Cloud}"/>
+             <t:actions />
+         </l:tasks>
+         <j:forEach var="action" items="${it.allActions}">
+diff --git a/core/src/main/resources/hudson/slaves/Messages.properties b/core/src/main/resources/hudson/slaves/Messages.properties
+index 5d60fadf50..c25afc9473 100644
+--- a/core/src/main/resources/hudson/slaves/Messages.properties
++++ b/core/src/main/resources/hudson/slaves/Messages.properties
+@@ -41,7 +41,8 @@ ComputerLauncher.NoJavaFound=Java version {0} was found but 1.8 or later is need
+ ComputerLauncher.JavaVersionResult={0} -version returned {1}.
+ ComputerLauncher.UnknownJavaVersion=Couldn’t figure out the Java version of {0}
+ Cloud.ProvisionPermission.Description=Provision new nodes
++Cloud.RequiredName=Cloud must have a unique non-empty name.
+ JNLPLauncher.TCPPortDisabled=Either WebSocket mode is selected, or the TCP port for inbound agents must be enabled
+ JNLPLauncher.InstanceIdentityRequired=You must install the instance-identity plugin to use inbound agents in TCP mode
+ JNLPLauncher.WebsocketNotEnabled=WebSocket support is not enabled in this Jenkins installation
+-JNLPLauncher.TunnelingNotSupported=Tunneling is not supported in WebSocket mode
+\ No newline at end of file
++JNLPLauncher.TunnelingNotSupported=Tunneling is not supported in WebSocket mode
+diff --git a/core/src/main/resources/jenkins/agents/CloudSet/_new.jelly b/core/src/main/resources/jenkins/agents/CloudSet/_new.jelly
+new file mode 100644
+index 0000000000..3ea4d00d6a
+--- /dev/null
++++ b/core/src/main/resources/jenkins/agents/CloudSet/_new.jelly
+@@ -0,0 +1,48 @@
++<!--
++The MIT License
++
++Copyright (c) 2023, CloudBees Inc.
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in
++all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++THE SOFTWARE.
++-->
++
++<!--
++  2nd page in the "new cloud" page for displaying the entire configuration entries for the selected cloud type.
++-->
++<?jelly escape-by-default='true'?>
++<j:jelly xmlns:j="jelly:core" xmlns:st="jelly:stapler" xmlns:d="jelly:define" xmlns:l="/lib/layout"
++         xmlns:t="/lib/hudson" xmlns:f="/lib/form">
++  <l:layout permission="${app.ADMINISTER}" type="one-column" title="${%New cloud}">
++    <l:breadcrumb title="${%New cloud}"/>
++    <l:main-panel>
++      <f:form method="post" action="doCreate" name="config" class="jenkins-form">
++        <h1>${%New cloud}</h1>
++        <!-- main body of the configuration -->
++        <st:include it="${requestScope.instance}" class="${requestScope.descriptor.clazz}" page="config.jelly" optional="true" />
++        
++        <f:bottomButtonBar>
++          <input type="hidden" name="type" value="${request.getParameter('mode')}"/>
++
++          <f:submit value="${%Save}"/>
++        </f:bottomButtonBar>
++      </f:form>
++      <st:adjunct includes="lib.form.confirm" />
++    </l:main-panel>
++  </l:layout>
++</j:jelly>
+diff --git a/core/src/main/resources/jenkins/agents/CloudSet/index.jelly b/core/src/main/resources/jenkins/agents/CloudSet/index.jelly
+new file mode 100644
+index 0000000000..7678b52513
+--- /dev/null
++++ b/core/src/main/resources/jenkins/agents/CloudSet/index.jelly
+@@ -0,0 +1,124 @@
++<!--
++The MIT License
++
++Copyright (c) 2023, CloudBees Inc.
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in
++all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++THE SOFTWARE.
++-->
++
++<!--
++  Entrance to the configuration page
++-->
++<?jelly escape-by-default='true'?>
++<j:jelly xmlns:j="jelly:core" xmlns:st="jelly:stapler" xmlns:l="/lib/layout">
++  <l:layout title="${it.displayName}" type="one-column">
++    <l:main-panel>
++      <j:choose>
++        <j:when test="${it.cloudAvailable and it.hasClouds()}">
++          <l:app-bar title="${%Clouds}">
++            <l:isAdmin>
++              <a class="jenkins-button jenkins-button--primary" href="new">
++                <l:icon src="symbol-add"/>
++                ${%newCloud}
++              </a>
++            </l:isAdmin>
++          </l:app-bar>
++          <table id="clouds" class="jenkins-table sortable">
++            <thead>
++              <tr>
++                <th class="jenkins-table__cell--tight"/>
++                <th initialSortDir="down">${%Name}</th>
++                <th class="jenkins-table__cell--tight"/>
++              </tr>
++            </thead>
++            <tbody>
++              <j:forEach var="cloud" items="${it.clouds}">
++                <tr id="cloud_${cloud.name}">
++                  <td data="${cloud.icon}" class="jenkins-table__cell--tight jenkins-table__icon">
++                    <div class="jenkins-table__cell__button-wrapper">
++                      <l:icon src="${cloud.iconClassName}" tooltip="${cloud.iconAltText}"/>
++                    </div>
++                  </td>
++                  <td>
++                    <a href="${it.getCloudUrl(request,app,cloud)}" class="jenkins-table__link model-link inside">${cloud.name}</a>
++                  </td>
++                  <td class="jenkins-table__cell--tight">
++                    <div class="jenkins-table__cell__button-wrapper">
++                      <a href="${it.getCloudUrl(request,app,cloud)}configure" class="jenkins-table__button">
++                        <l:icon src="symbol-settings"/>
++                      </a>
++                    </div>
++                  </td>
++                </tr>
++              </j:forEach>
++            </tbody>
++          </table>
++        </j:when>
++        <j:otherwise>
++          <div class="empty-state-block">
++            <l:app-bar title="${%Clouds}"/>
++
++            <section class="empty-state-section">
++              <j:choose>
++                <j:when test="${it.cloudAvailable}">
++                  <p>${%noCloudAvailable}</p>
++                </j:when>
++                <j:otherwise>
++                  <p>${%noCloudPlugin}</p>
++                </j:otherwise>
++              </j:choose>
++              <ul class="empty-state-section-list">
++                <j:if test="${it.cloudAvailable}">
++                  <li class="content-block">
++                    <a href="new"
++                       class="content-block__link">
++                      <span>${%newCloud}</span>
++                      <span class="trailing-icon">
++                        <l:icon class="icon-md" src="symbol-arrow-right"/>
++                      </span>
++                    </a>
++                  </li>
++                </j:if>
++                <li class="content-block">
++                  <a href="${rootURL}/manage/pluginManager/available?filter=${it.cloudUpdateCenterCategoryLabel}"
++                     class="content-block__link">
++                    <span>${%installCloudPlugin}</span>
++                    <span class="trailing-icon">
++                      <l:icon class="icon-md" src="symbol-arrow-right"/>
++                    </span>
++                  </a>
++                </li>
++                <li class="content-block">
++                  <a href="https://www.jenkins.io/redirect/distributed-builds"
++                     class="content-block__link content-block__help-link"
++                     target="_blank" rel="noopener noreferrer">
++                    <span>${%learnMoreDistributedBuilds}</span>
++                    <span class="trailing-icon">
++                      <l:icon class="icon-md" src="symbol-link"/>
++                    </span>
++                  </a>
++                </li>
++              </ul>
++            </section>
++          </div>
++        </j:otherwise>
++      </j:choose>
++    </l:main-panel>
++  </l:layout>
++</j:jelly>
+diff --git a/core/src/main/resources/jenkins/agents/CloudSet/index.properties b/core/src/main/resources/jenkins/agents/CloudSet/index.properties
+new file mode 100644
+index 0000000000..83ebb39111
+--- /dev/null
++++ b/core/src/main/resources/jenkins/agents/CloudSet/index.properties
+@@ -0,0 +1,5 @@
++learnMoreDistributedBuilds=Learn more about distributed builds
++noCloudAvailable=There are no clouds currently setup, create one or install a plugin for more cloud options.
++noCloudPlugin=There are no cloud implementations for dynamically allocated agents installed.
++newCloud=New cloud
++installCloudPlugin=Install a plugin
+diff --git a/core/src/main/resources/jenkins/agents/CloudSet/new.jelly b/core/src/main/resources/jenkins/agents/CloudSet/new.jelly
+new file mode 100644
+index 0000000000..982b500e1f
+--- /dev/null
++++ b/core/src/main/resources/jenkins/agents/CloudSet/new.jelly
+@@ -0,0 +1,43 @@
++<!--
++The MIT License
++
++Copyright (c) 2023, CloudBees Inc.
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in
++all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++THE SOFTWARE.
++-->
++
++<!--
++  "New cloud" page.
++
++  The flow of this is:
++
++    new.jelly -> CloudSet.doCreate -> _new2.jelly -> CloudSet.doDoCreate
++-->
++<?jelly escape-by-default='true'?>
++<j:jelly xmlns:j="jelly:core" xmlns:st="jelly:stapler" xmlns:d="jelly:define" xmlns:l="/lib/layout" xmlns:t="/lib/hudson" xmlns:s="/lib/form">
++  <j:getStatic var="createPermission" className="jenkins.model.Jenkins" field="ADMINISTER"/>
++  <l:layout title="${%New cloud}" permission="${app.ADMINISTER}" type="one-column">
++    <l:breadcrumb title="${%New cloud}" />
++    <l:main-panel>
++      <j:invokeStatic var="clouds" className="hudson.slaves.Cloud" method="all" />
++      <n:form title="${%New cloud}" nameTitle="${%Cloud name}" copyTitle="${%Copy Existing Cloud}" showCopyOption="${it.hasClouds()}" action="create"
++              descriptors="${clouds}" checkUrl="checkName" xmlns:n="/lib/hudson/newFromList" />
++    </l:main-panel>
++  </l:layout>
++</j:jelly>
+diff --git a/core/src/main/resources/jenkins/agents/Messages.properties b/core/src/main/resources/jenkins/agents/Messages.properties
+new file mode 100644
+index 0000000000..11a27f4064
+--- /dev/null
++++ b/core/src/main/resources/jenkins/agents/Messages.properties
+@@ -0,0 +1,6 @@
++CloudSet.DisplayName=Clouds
++CloudSet.CloudAlreadyExists=Cloud called ‘{0}’ already exists
++CloudSet.SpecifyCloudToCopy=Specify which cloud to copy
++CloudSet.NoSuchCloud=No such cloud: {0}
++CloudsLink.DisplayName=Clouds
++CloudsLink.Description=Add, remove, and configure cloud instances to provision agents on-demand.
+diff --git a/core/src/main/resources/jenkins/management/Messages.properties b/core/src/main/resources/jenkins/management/Messages.properties
+index 36453e534b..88cb5b5574 100644
+--- a/core/src/main/resources/jenkins/management/Messages.properties
++++ b/core/src/main/resources/jenkins/management/Messages.properties
+@@ -56,7 +56,7 @@ CliLink.Description=Access/manage Jenkins from your shell, or from your script.
+ ConsoleLink.DisplayName=Script Console
+ ConsoleLink.Description=Executes arbitrary script for administration/trouble-shooting/diagnostics.
+ 
+-NodesLink.DisplayName=Nodes and Clouds
++NodesLink.DisplayName=Nodes
+ NodesLink.Description=Add, remove, control and monitor the various nodes that Jenkins runs jobs on.
+ 
+ ShutdownLink.DisplayName_prepare=Prepare for Shutdown
+diff --git a/core/src/main/resources/jenkins/model/GlobalCloudConfiguration/index.groovy b/core/src/main/resources/jenkins/model/GlobalCloudConfiguration/index.groovy
+index a9a46499fc..d4d5e19e74 100644
+--- a/core/src/main/resources/jenkins/model/GlobalCloudConfiguration/index.groovy
++++ b/core/src/main/resources/jenkins/model/GlobalCloudConfiguration/index.groovy
+@@ -1,54 +1,5 @@
+ package jenkins.model.GlobalCloudConfiguration
+ 
+-import hudson.slaves.Cloud
+-import jenkins.model.Jenkins
+-
+-
+-def f = namespace(lib.FormTagLib)
+-def l = namespace(lib.LayoutTagLib)
+ def st = namespace("jelly:stapler")
+ 
+-l.layout(norefresh:true, permission:app.SYSTEM_READ, title:my.displayName) {
+-    set("readOnlyMode", !app.hasPermission(app.ADMINISTER))
+-    l.side_panel {
+-        l.tasks {
+-            l.task(icon:"symbol-settings", href: "../computer/", title:_("Nodes"))
+-        }
+-    }
+-    l.main_panel {
+-        l.app_bar(title: my.displayName)
+-        def clouds = Cloud.all()
+-        if (!clouds.isEmpty()) {
+-            p()
+-            div(class:"behavior-loading") {
+-                l.spinner(text: _("Loading"))
+-            }
+-
+-            f.form(method:"post",name:"config",action:"configure", class: "jenkins-form") {
+-                f.block {
+-                    if (app.clouds.size() == 0 && !h.hasPermission(app.ADMINISTER)) {
+-                        p(_("No clouds have been configured."))
+-                    }
+-
+-                    f.hetero_list(name:"cloud", hasHeader:true, descriptors:Cloud.all(), items:app.clouds,
+-                            addCaption:_("Add a new cloud"), deleteCaption:_("Delete cloud"))
+-                }
+-
+-                l.isAdmin {
+-                    f.bottomButtonBar {
+-                        f.submit(value: _("Save"))
+-                        f.apply(value: _("Apply"))
+-                    }
+-                }
+-            }
+-            l.isAdmin {
+-                st.adjunct(includes: "lib.form.confirm")
+-            }
+-        } else {
+-            String label = Jenkins.get().updateCenter.getCategoryDisplayName("cloud")
+-
+-            p(_("There are no cloud implementations for dynamically allocated agents installed. "))
+-            a(href: rootURL + "/pluginManager/available?filter=" + URLEncoder.encode(label, "UTF-8"), _("Go to plugin manager."))
+-        }
+-    }
+-}
++st.redirect(url: rootURL + "/manage/cloud/")
+diff --git a/core/src/spotbugs/excludesFilter.xml b/core/src/spotbugs/excludesFilter.xml
+index 6f1d90c620..3f10eb5fc0 100644
+--- a/core/src/spotbugs/excludesFilter.xml
++++ b/core/src/spotbugs/excludesFilter.xml
+@@ -319,6 +319,7 @@
+           <Class name="hudson.util.HudsonIsLoading"/>
+           <Class name="hudson.util.HudsonIsRestarting"/>
+           <Class name="hudson.widgets.HistoryWidget"/>
++          <Class name="jenkins.agents.CloudSet"/>
+           <Class name="jenkins.management.AdministrativeMonitorsApi"/>
+           <Class name="jenkins.model.Jenkins"/>
+           <Class name="jenkins.model.ParameterizedJobMixIn"/>
+diff --git a/test/src/test/java/hudson/slaves/CloudTest.java b/test/src/test/java/hudson/slaves/CloudTest.java
+index 90f3bb84a3..c75a50840e 100644
+--- a/test/src/test/java/hudson/slaves/CloudTest.java
++++ b/test/src/test/java/hudson/slaves/CloudTest.java
+@@ -82,7 +82,7 @@ public class CloudTest {
+     public void cloudNameIsEncodedInGetUrl() {
+         ACloud aCloud = new ACloud("../../gibberish", "0");
+ 
+-        assertEquals("Cloud name is encoded in Cloud#getUrl", "cloud/..%2F..%2Fgibberish", aCloud.getUrl());
++        assertEquals("Cloud name is encoded in Cloud#getUrl", "cloud/..%2F..%2Fgibberish/", aCloud.getUrl());
+     }
+ 
+     public static final class ACloud extends AbstractCloudImpl {

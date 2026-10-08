@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "track": "fix",
+  "task": {
+    "pr_number": 18318,
+    "pr_url": "https://github.com/astral-sh/uv/pull/18318",
+    "commit": "499cc82b359084f18622d541ee88d04038279956",
+    "detectability": 4,
+    "szz_confidence": "high",
+    "blamed_line_share": 1.0
+  },
+  "cases": [
+    {
+      "id": "issue:18522",
+      "provenance": "A user reported this defect after the reviewed pull request, and a later fix repaired it.",
+      "summary": "`uv tool upgrade --all` does not update anything",
+      "description": "### Summary\n\nSince the flag `uv tool list --outdated` was released (thank you for that!) I list the outdated packages, then run `uv tool upgrade --all` and it states that nothing to update:\n\n```fish\n\uf432 uv tool list --color never --outdated\nbandit v1.9.3 [latest: 1.9.4]\n- bandit\n- bandit-baseline\n- bandit-config-generator\nbasedpyright v1.38.1 [latest: 1.38.2]\n- basedpyright\n- basedpyright-langserver\nmeson v1.10.1 [latest: 1.10.2]\n- meson\npyinfra v3.6.1 [latest: 3.7]\n- pyinfra\nruff v0.15.2 [latest: 0.15.6]\n- ruff\nsemgrep v1.152.0 [latest: 1.155.0]\n- pysemgrep\n- semgrep\ntombi v0.7.32 [latest: 0.9.6]\n- tombi\n```\n```fish\n\uf432 uv tool upgrade --all\nNothing to upgrade\n```\nBandit was in the list of outdated packages:\n```fish\n\uf432 bandit --version\nbandit 1.9.3\n  python version = 3.13.2 (main, Feb  5 2025, 19:11:32) [Clang 19.1.6 ]\n```\n\nEven upgrading one package doesn't work:\n```fish\n\uf432 uv tool upgrade bandit\nNothing to upgrade\n```\n\nI have to install `@latest` to upgrade the package:\n```fish\n\uf432 uv tool install bandit@latest\nResolved 7 packages in 149ms\nPrepared 1 package in 33ms\nUninstalled 1 package in 1ms\nInstalled 1 package in 3ms\n - bandit==1.9.3\n + bandit==1.9.4\nInstalled 3 executables: bandit, bandit-baseline, bandit-config-generator\n```\n\nI would expect that running `uv tool upgrade --all` or `uv tool upgrade <package>` would upgrade the package without issues.\n\n### Platform\n\nPop!_OS 24.04 LTS Linux 6.18.7-76061807-generic x86_64 GNU/Linux\n\n### Version\n\nuv 0.10.10\n\n### Python version\n\nPython 3.13.2",
+      "location": {
+        "files": [
+          "crates/uv/src/commands/tool/list.rs"
+        ]
+      },
+      "evidence": {
+        "eventual_fix_title": "Respect installed settings in `uv tool list --outdated`",
+        "eventual_fix_problem_statement": "Respect installed settings in `uv tool list --outdated`\n\n## Summary\r\n\r\nCloses https://github.com/astral-sh/uv/issues/18522.",
+        "eventual_fix_diff": "commit c1517ec647a72a698b2af4d77927b31d9e3d83b3\nAuthor: Charlie Marsh <charlie.r.marsh@gmail.com>\nDate:   Fri Mar 20 20:05:32 2026 -0400\n\n    Respect installed settings in `uv tool list --outdated` (#18586)\n    \n    ## Summary\n    \n    Closes https://github.com/astral-sh/uv/issues/18522.\n\ndiff --git a/crates/uv/src/commands/tool/list.rs b/crates/uv/src/commands/tool/list.rs\nindex cd1972894..a2674f23a 100644\n--- a/crates/uv/src/commands/tool/list.rs\n+++ b/crates/uv/src/commands/tool/list.rs\n@@ -11,11 +11,11 @@ use uv_cache_info::Timestamp;\n use uv_client::{BaseClientBuilder, RegistryClientBuilder};\n use uv_configuration::Concurrency;\n use uv_distribution_filename::DistFilename;\n-use uv_distribution_types::IndexCapabilities;\n+use uv_distribution_types::{IndexCapabilities, RequiresPython};\n use uv_fs::Simplified;\n use uv_normalize::PackageName;\n use uv_python::LenientImplementationName;\n-use uv_resolver::{ExcludeNewer, PrereleaseMode};\n+use uv_settings::ResolverInstallerOptions;\n use uv_tool::InstalledTools;\n use uv_warnings::warn_user;\n \n@@ -23,6 +23,7 @@ use crate::commands::ExitStatus;\n use crate::commands::pip::latest::LatestClient;\n use crate::commands::reporters::LatestVersionReporter;\n use crate::printer::Printer;\n+use crate::settings::ResolverInstallerSettings;\n \n /// List installed tools.\n #[expect(clippy::fn_params_excessive_bools)]\n@@ -114,35 +115,51 @@ pub(crate) async fn list(\n     let latest: FxHashMap<PackageName, Option<DistFilename>> = if outdated\n         && !valid_tools.is_empty()\n     {\n-        let capabilities = IndexCapabilities::default();\n-\n-        // Initialize the registry client.\n-        let client = RegistryClientBuilder::new(\n-            client_builder,\n-            cache.clone().with_refresh(Refresh::All(Timestamp::now())),\n-        )\n-        .build();\n         let download_concurrency = concurrency.downloads_semaphore.clone();\n \n-        // Initialize the client to fetch the latest version of each package.\n-        let latest_client = LatestClient {\n-            client: &client,\n-            capabilities: &capabilities,\n-            prerelease: PrereleaseMode::default(),\n-            exclude_newer: &ExcludeNewer::default(),\n-            tags: None,\n-            requires_python: None,\n-        };\n-\n         let reporter = LatestVersionReporter::from(printer).with_length(valid_tools.len() as u64);\n \n         // Fetch the latest version for each tool.\n         let mut fetches = futures::stream::iter(&valid_tools)\n-            .map(async |(name, _tool, _tool_env, _version)| {\n-                let latest = latest_client\n-                    .find_latest(name, None, &download_concurrency)\n-                    .await?;\n-                Ok::<(&PackageName, Option<DistFilename>), uv_client::Error>((name, latest))\n+            .map(|(name, tool, tool_env, _version)| {\n+                let client_builder = client_builder.clone();\n+                let download_concurrency = download_concurrency.clone();\n+                async move {\n+                    let capabilities = IndexCapabilities::default();\n+                    let settings = ResolverInstallerSettings::from(ResolverInstallerOptions::from(\n+                        tool.options().clone(),\n+                    ));\n+                    let interpreter = tool_env.environment().interpreter();\n+\n+                    let client = RegistryClientBuilder::new(\n+                        client_builder\n+                            .clone()\n+                            .keyring(settings.resolver.keyring_provider),\n+                        cache.clone().with_refresh(Refresh::All(Timestamp::now())),\n+                    )\n+                    .index_locations(settings.resolver.index_locations.clone())\n+                    .index_strategy(settings.resolver.index_strategy)\n+                    .markers(interpreter.markers())\n+                    .platform(interpreter.platform())\n+                    .build();\n+\n+                    let requires_python = RequiresPython::greater_than_equal_version(\n+                        interpreter.python_full_version(),\n+                    );\n+                    let latest_client = LatestClient {\n+                        client: &client,\n+                        capabilities: &capabilities,\n+                        prerelease: settings.resolver.prerelease,\n+                        exclude_newer: &settings.resolver.exclude_newer,\n+                        tags: None,\n+                        requires_python: Some(&requires_python),\n+                    };\n+\n+                    let latest = latest_client\n+                        .find_latest(name, None, &download_concurrency)\n+                        .await?;\n+                    Ok::<(&PackageName, Option<DistFilename>), anyhow::Error>((name, latest))\n+                }\n             })\n             .buffer_unordered(concurrency.downloads);\n \ndiff --git a/crates/uv/tests/it/tool_list.rs b/crates/uv/tests/it/tool_list.rs\nindex 54f0417ca..7b2dfdc89 100644\n--- a/crates/uv/tests/it/tool_list.rs\n+++ b/crates/uv/tests/it/tool_list.rs\n@@ -165,6 +165,37 @@ fn tool_list_outdated() {\n     );\n }\n \n+#[test]\n+fn tool_list_outdated_respects_exclude_newer() {\n+    let context = uv_test::test_context!(\"3.12\").with_filtered_exe_suffix();\n+    let tool_dir = context.temp_dir.child(\"tools\");\n+    let bin_dir = context.temp_dir.child(\"bin\");\n+\n+    // Install `black` with a persisted `exclude-newer` cutoff.\n+    context\n+        .tool_install()\n+        .arg(\"black\")\n+        .arg(\"--exclude-newer\")\n+        .arg(\"2024-03-25T00:00:00Z\")\n+        .env(EnvVars::UV_TOOL_DIR, tool_dir.as_os_str())\n+        .env(EnvVars::XDG_BIN_HOME, bin_dir.as_os_str())\n+        .assert()\n+        .success();\n+\n+    // `--outdated` should respect the stored tool settings and avoid flagging upgrades that\n+    // `uv tool upgrade` would intentionally skip.\n+    uv_snapshot!(context.filters(), context.tool_list()\n+    .arg(\"--outdated\")\n+    .env(EnvVars::UV_TOOL_DIR, tool_dir.as_os_str())\n+    .env(EnvVars::XDG_BIN_HOME, bin_dir.as_os_str()), @\"\n+    success: true\n+    exit_code: 0\n+    ----- stdout -----\n+\n+    ----- stderr -----\n+    \");\n+}\n+\n #[test]\n fn tool_list_missing_receipt() {\n     let context = uv_test::test_context!(\"3.12\").with_filtered_exe_suffix();\n"
+      },
+      "metadata": {
+        "oracle_source": "issue",
+        "issue_number": 18522,
+        "issue_url": "https://github.com/astral-sh/uv/issues/18522",
+        "issue_type": "",
+        "issue_priority": null,
+        "issue_severity": null,
+        "issue_tags": [],
+        "issue_area_path": "",
+        "issue_resolved_reason": "",
+        "fix_pr": 18586,
+        "fix_pr_url": "https://github.com/astral-sh/uv/pull/18586",
+        "fix_commit": "c1517ec647a72a698b2af4d77927b31d9e3d83b3",
+        "verification": {
+          "root_cause_confirmed": "yes",
+          "source": "published task list"
+        }
+      }
+    }
+  ]
+}

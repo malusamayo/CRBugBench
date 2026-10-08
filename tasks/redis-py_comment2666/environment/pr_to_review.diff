@@ -1,0 +1,285 @@
+diff --git a/redis/asyncio/client.py b/redis/asyncio/client.py
+index 9e16ee08de..bb946cbce9 100644
+--- a/redis/asyncio/client.py
++++ b/redis/asyncio/client.py
+@@ -511,12 +511,17 @@ async def execute_command(self, *args, **options):
+         if self.single_connection_client:
+             await self._single_conn_lock.acquire()
+         try:
+-            return await conn.retry.call_with_retry(
+-                lambda: self._send_command_parse_response(
+-                    conn, command_name, *args, **options
+-                ),
+-                lambda error: self._disconnect_raise(conn, error),
++            return await asyncio.shield(
++                conn.retry.call_with_retry(
++                    lambda: self._send_command_parse_response(
++                        conn, command_name, *args, **options
++                    ),
++                    lambda error: self._disconnect_raise(conn, error),
++                )
+             )
++        except asyncio.CancelledError:
++            await conn.disconnect(nowait=True)
++            raise
+         finally:
+             if self.single_connection_client:
+                 self._single_conn_lock.release()
+@@ -772,10 +777,16 @@ async def _execute(self, conn, command, *args, **kwargs):
+         called by the # connection to resubscribe us to any channels and
+         patterns we were previously listening to
+         """
+-        return await conn.retry.call_with_retry(
+-            lambda: command(*args, **kwargs),
+-            lambda error: self._disconnect_raise_connect(conn, error),
+-        )
++        try:
++            return await asyncio.shield(
++                conn.retry.call_with_retry(
++                    lambda: command(*args, **kwargs),
++                    lambda error: self._disconnect_raise_connect(conn, error),
++                )
++            )
++        except asyncio.CancelledError:
++            await conn.disconnect()
++            raise
+ 
+     async def parse_response(self, block: bool = True, timeout: float = 0):
+         """Parse the response from a publish/subscribe command"""
+@@ -1191,13 +1202,18 @@ async def immediate_execute_command(self, *args, **options):
+                 command_name, self.shard_hint
+             )
+             self.connection = conn
+-
+-        return await conn.retry.call_with_retry(
+-            lambda: self._send_command_parse_response(
+-                conn, command_name, *args, **options
+-            ),
+-            lambda error: self._disconnect_reset_raise(conn, error),
+-        )
++        try:
++            return await asyncio.shield(
++                conn.retry.call_with_retry(
++                    lambda: self._send_command_parse_response(
++                        conn, command_name, *args, **options
++                    ),
++                    lambda error: self._disconnect_reset_raise(conn, error),
++                )
++            )
++        except asyncio.CancelledError:
++            await conn.disconnect()
++            raise
+ 
+     def pipeline_execute_command(self, *args, **options):
+         """
+diff --git a/redis/asyncio/cluster.py b/redis/asyncio/cluster.py
+index 569a0765f8..325f741030 100644
+--- a/redis/asyncio/cluster.py
++++ b/redis/asyncio/cluster.py
+@@ -1029,9 +1029,12 @@ async def execute_pipeline(self, commands: List["PipelineCommand"]) -> bool:
+         ret = False
+         for cmd in commands:
+             try:
+-                cmd.result = await self.parse_response(
+-                    connection, cmd.args[0], **cmd.kwargs
++                cmd.result = await asyncio.shield(
++                    self.parse_response(connection, cmd.args[0], **cmd.kwargs)
+                 )
++            except asyncio.CancelledError:
++                await connection.disconnect(nowait=True)
++                raise
+             except Exception as e:
+                 cmd.result = e
+                 ret = True
+diff --git a/tests/test_asyncio/test_cluster.py b/tests/test_asyncio/test_cluster.py
+index 0857c056c2..13e5e26ae3 100644
+--- a/tests/test_asyncio/test_cluster.py
++++ b/tests/test_asyncio/test_cluster.py
+@@ -340,23 +340,6 @@ async def test_from_url(self, request: FixtureRequest) -> None:
+         rc = RedisCluster.from_url("rediss://localhost:16379")
+         assert rc.connection_kwargs["connection_class"] is SSLConnection
+ 
+-    async def test_asynckills(self, r) -> None:
+-
+-        await r.set("foo", "foo")
+-        await r.set("bar", "bar")
+-
+-        t = asyncio.create_task(r.get("foo"))
+-        await asyncio.sleep(1)
+-        t.cancel()
+-        try:
+-            await t
+-        except asyncio.CancelledError:
+-            pytest.fail("connection is left open with unread response")
+-
+-        assert await r.get("bar") == b"bar"
+-        assert await r.ping()
+-        assert await r.get("foo") == b"foo"
+-
+     async def test_max_connections(
+         self, create_redis: Callable[..., RedisCluster]
+     ) -> None:
+diff --git a/tests/test_asyncio/test_connection.py b/tests/test_asyncio/test_connection.py
+index d3b6285cfb..e2d77fc1c3 100644
+--- a/tests/test_asyncio/test_connection.py
++++ b/tests/test_asyncio/test_connection.py
+@@ -44,27 +44,6 @@ async def test_invalid_response(create_redis):
+     await r.connection.disconnect()
+ 
+ 
+-async def test_asynckills():
+-
+-    for b in [True, False]:
+-        r = Redis(single_connection_client=b)
+-
+-        await r.set("foo", "foo")
+-        await r.set("bar", "bar")
+-
+-        t = asyncio.create_task(r.get("foo"))
+-        await asyncio.sleep(1)
+-        t.cancel()
+-        try:
+-            await t
+-        except asyncio.CancelledError:
+-            pytest.fail("connection left open with unread response")
+-
+-        assert await r.get("bar") == b"bar"
+-        assert await r.ping()
+-        assert await r.get("foo") == b"foo"
+-
+-
+ @pytest.mark.onlynoncluster
+ async def test_single_connection():
+     """Test that concurrent requests on a single client are synchronised."""
+diff --git a/tests/test_asyncio/test_cwe_404.py b/tests/test_asyncio/test_cwe_404.py
+new file mode 100644
+index 0000000000..60ad32f63d
+--- /dev/null
++++ b/tests/test_asyncio/test_cwe_404.py
+@@ -0,0 +1,126 @@
++import asyncio
++import sys
++
++import pytest
++
++from redis.asyncio import Redis
++from redis.asyncio.cluster import RedisCluster
++
++
++async def pipe(
++    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, delay: float, name=""
++):
++    while data := await reader.read(1000):
++        await asyncio.sleep(delay)
++        writer.write(data)
++        await writer.drain()
++
++
++class DelayProxy:
++    def __init__(self, addr, redis_addr, delay: float):
++        self.addr = addr
++        self.redis_addr = redis_addr
++        self.delay = delay
++
++    async def start(self):
++        self.server = await asyncio.start_server(self.handle, *self.addr)
++        self.ROUTINE = asyncio.create_task(self.server.serve_forever())
++
++    async def handle(self, reader, writer):
++        # establish connection to redis
++        redis_reader, redis_writer = await asyncio.open_connection(*self.redis_addr)
++        pipe1 = asyncio.create_task(pipe(reader, redis_writer, self.delay, "to redis:"))
++        pipe2 = asyncio.create_task(
++            pipe(redis_reader, writer, self.delay, "from redis:")
++        )
++        await asyncio.gather(pipe1, pipe2)
++
++    async def stop(self):
++        # clean up enough so that we can reuse the looper
++        self.ROUTINE.cancel()
++        loop = self.server.get_loop()
++        await loop.shutdown_asyncgens()
++
++
++async def test_standalone():
++
++    # create a tcp socket proxy that relays data to Redis and back,
++    # inserting 0.1 seconds of delay
++    dp = DelayProxy(addr=("localhost", 5380), redis_addr=("localhost", 6379), delay=0.1)
++    await dp.start()
++
++    for b in [True, False]:
++        # note that we connect to proxy, rather than to Redis directly
++        async with Redis(host="localhost", port=5380, single_connection_client=b) as r:
++
++            await r.set("foo", "foo")
++            await r.set("bar", "bar")
++
++            t = asyncio.create_task(r.get("foo"))
++            await asyncio.sleep(0.050)
++            t.cancel()
++            try:
++                await t
++                sys.stderr.write("try again, we did not cancel the task in time\n")
++            except asyncio.CancelledError:
++                sys.stderr.write(
++                    "canceled task, connection is left open with unread response\n"
++                )
++
++            assert await r.get("bar") == b"bar"
++            assert await r.ping()
++            assert await r.get("foo") == b"foo"
++
++    await dp.stop()
++
++
++async def test_standalone_pipeline():
++    dp = DelayProxy(addr=("localhost", 5380), redis_addr=("localhost", 6379), delay=0.1)
++    await dp.start()
++    async with Redis(host="localhost", port=5380) as r:
++        await r.set("foo", "foo")
++        await r.set("bar", "bar")
++
++        pipe = r.pipeline()
++
++        pipe2 = r.pipeline()
++        pipe2.get("bar")
++        pipe2.ping()
++        pipe2.get("foo")
++
++        t = asyncio.create_task(pipe.get("foo").execute())
++        await asyncio.sleep(0.050)
++        t.cancel()
++
++        pipe.get("bar")
++        pipe.ping()
++        pipe.get("foo")
++        assert await pipe.execute() == [b"foo", b"bar", True, b"foo"]
++        assert await pipe2.execute() == [b"bar", True, b"foo"]
++
++    await dp.stop()
++
++
++async def test_cluster(request):
++
++    dp = DelayProxy(addr=("localhost", 5381), redis_addr=("localhost", 6372), delay=0.1)
++    await dp.start()
++
++    r = RedisCluster.from_url("redis://localhost:5381")
++    await r.initialize()
++    await r.set("foo", "foo")
++    await r.set("bar", "bar")
++
++    t = asyncio.create_task(r.get("foo"))
++    await asyncio.sleep(0.050)
++    t.cancel()
++    try:
++        await t
++    except asyncio.CancelledError:
++        pytest.fail("connection is left open with unread response")
++
++    assert await r.get("bar") == b"bar"
++    assert await r.ping()
++    assert await r.get("foo") == b"foo"
++
++    await dp.stop()

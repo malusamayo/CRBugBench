@@ -1,0 +1,242 @@
+diff --git a/src/bundles/Elsa.Server.Web/Program.cs b/src/bundles/Elsa.Server.Web/Program.cs
+index 1c35e86c8a..ab141ca62a 100644
+--- a/src/bundles/Elsa.Server.Web/Program.cs
++++ b/src/bundles/Elsa.Server.Web/Program.cs
+@@ -26,8 +26,8 @@
+ const bool useProtoActor = false;
+ const bool useHangfire = false;
+ const bool useQuartz = true;
+-const bool useMassTransit = true;
+-const bool useMassTransitAzureServiceBus = false;
++const bool useMassTransit = false;
++const bool useMassTransitAzureServiceBus = true;
+ const bool useMassTransitRabbitMq = false;
+ 
+ var builder = WebApplication.CreateBuilder(args);
+@@ -133,7 +133,10 @@
+                     });
+                 }
+ 
+-                runtime.UseMassTransitDispatcher();
++                if(useMassTransit)
++                {
++                    runtime.UseMassTransitDispatcher();
++                }
+                 runtime.WorkflowInboxCleanupOptions = options => configuration.GetSection("Runtime:WorkflowInboxCleanup").Bind(options);
+             })
+             .UseEnvironments(environments => environments.EnvironmentsOptions = options => configuration.GetSection("Environments").Bind(options))
+@@ -186,7 +189,11 @@
+                         ef.UseSqlite(sqliteConnectionString);
+                 });
+ 
+-                alterations.UseMassTransitDispatcher();
++                if (useMassTransit)
++                {
++                    alterations.UseMassTransitDispatcher();
++                }
++                
+             })
+             .UseWorkflowContexts();
+ 
+diff --git a/src/modules/Elsa.JavaScript/Contracts/IJavaScriptEvaluator.cs b/src/modules/Elsa.JavaScript/Contracts/IJavaScriptEvaluator.cs
+index 6758139238..4e7882e21a 100644
+--- a/src/modules/Elsa.JavaScript/Contracts/IJavaScriptEvaluator.cs
++++ b/src/modules/Elsa.JavaScript/Contracts/IJavaScriptEvaluator.cs
+@@ -24,7 +24,7 @@ public interface IJavaScriptEvaluator
+         string expression, 
+         Type returnType, 
+         ExpressionExecutionContext context,
+-        ExpressionEvaluatorOptions options,
++        ExpressionEvaluatorOptions? options = default,
+         Action<Engine>? configureEngine = default, 
+         CancellationToken cancellationToken = default);
+ }
+\ No newline at end of file
+diff --git a/src/modules/Elsa.JavaScript/Helpers/StringObjectDictionaryConverter.cs b/src/modules/Elsa.JavaScript/Helpers/StringObjectDictionaryConverter.cs
+new file mode 100644
+index 0000000000..41b8f593a2
+--- /dev/null
++++ b/src/modules/Elsa.JavaScript/Helpers/StringObjectDictionaryConverter.cs
+@@ -0,0 +1,40 @@
++using System.Collections;
++
++namespace Elsa.JavaScript.Helpers;
++
++/// <summary>
++/// Contains methods for converting dictionaries with string keys and object values by replacing IList fields with Array fields.
++/// </summary>
++public static class StringObjectDictionaryConverter
++{
++    /// <summary>
++    /// Recursively converts all IList fields of an ExpandoObject to Array fields.
++    /// This allows JS expressions to properly use Array methods on lists, such as .length, filter, etc.
++    /// </summary>
++    public static object? ConvertListsToArray(object? value)
++    {
++        if (value is not IDictionary<string, object> dictionary) 
++            return value;
++
++        // Copy the dictionary to avoid modifying the original.
++        dictionary = new Dictionary<string, object>(dictionary);
++        var keys = dictionary.Keys.ToList();
++        foreach (var key in keys)
++        {
++            if (dictionary[key] is IList && dictionary[key].GetType().IsGenericType)
++            {
++                var list = (IList)dictionary[key];
++                var elementType = dictionary[key].GetType().GetGenericArguments()[0];
++                var array = Array.CreateInstance(elementType, list.Count);
++                list.CopyTo(array, 0);
++                dictionary[key] = array;
++            }
++            else
++            {
++                ConvertListsToArray(dictionary[key]);
++            }
++        }
++
++        return dictionary;
++    }
++}
+\ No newline at end of file
+diff --git a/src/modules/Elsa.JavaScript/Services/JintJavaScriptEvaluator.cs b/src/modules/Elsa.JavaScript/Services/JintJavaScriptEvaluator.cs
+index 53adfb070d..127043d002 100644
+--- a/src/modules/Elsa.JavaScript/Services/JintJavaScriptEvaluator.cs
++++ b/src/modules/Elsa.JavaScript/Services/JintJavaScriptEvaluator.cs
+@@ -5,6 +5,7 @@
+ using Elsa.Expressions.Models;
+ using Elsa.Extensions;
+ using Elsa.JavaScript.Contracts;
++using Elsa.JavaScript.Helpers;
+ using Elsa.JavaScript.Notifications;
+ using Elsa.JavaScript.Options;
+ using Elsa.Mediator.Contracts;
+@@ -37,7 +38,7 @@ public JintJavaScriptEvaluator(INotificationSender mediator, IOptions<JintOption
+     public async Task<object?> EvaluateAsync(string expression,
+         Type returnType,
+         ExpressionExecutionContext context,
+-        ExpressionEvaluatorOptions options,
++        ExpressionEvaluatorOptions? options = default,
+         Action<Engine>? configureEngine = default,
+         CancellationToken cancellationToken = default)
+     {
+@@ -47,8 +48,10 @@ public JintJavaScriptEvaluator(INotificationSender mediator, IOptions<JintOption
+         return result.ConvertTo(returnType);
+     }
+ 
+-    private async Task<Engine> GetConfiguredEngine(Action<Engine>? configureEngine, ExpressionExecutionContext context, ExpressionEvaluatorOptions options, CancellationToken cancellationToken)
++    private async Task<Engine> GetConfiguredEngine(Action<Engine>? configureEngine, ExpressionExecutionContext context, ExpressionEvaluatorOptions? options, CancellationToken cancellationToken)
+     {
++        options ??= new ExpressionEvaluatorOptions();
++
+         var engine = new Engine(opts =>
+         {
+             if (_jintOptions.AllowClrAccess)
+@@ -76,11 +79,11 @@ private async Task<Engine> GetConfiguredEngine(Action<Engine>? configureEngine,
+ 
+         // Create output getters for each activity.
+         CreateActivityOutputAccessors(engine, context);
+-        
++
+         // Create argument getters for each argument.
+         foreach (var argument in options.Arguments)
+             engine.SetValue($"get{argument.Key}", (Func<object?>)(() => argument.Value));
+-        
++
+         // Add common functions.
+         engine.SetValue("isNullOrWhiteSpace", (Func<string, bool>)(value => string.IsNullOrWhiteSpace(value)));
+         engine.SetValue("isNullOrEmpty", (Func<string, bool>)(value => string.IsNullOrEmpty(value)));
+@@ -119,7 +122,7 @@ private void CreateWorkflowInputAccessors(Engine engine, ExpressionExecutionCont
+         var inputs = context.GetWorkflowInputs();
+ 
+         foreach (var input in inputs)
+-            engine.SetValue($"get{input.Name}", (Func<object?>)(() => input.Value));
++            engine.SetValue($"get{input.Name}", (Func<object?>)(() => StringObjectDictionaryConverter.ConvertListsToArray(input.Value)));
+     }
+ 
+     private static void CreateVariableAccessors(Engine engine, ExpressionExecutionContext context)
+diff --git a/src/modules/Elsa.Workflows.Core/Extensions/ExpressionExecutionContextExtensions.cs b/src/modules/Elsa.Workflows.Core/Extensions/ExpressionExecutionContextExtensions.cs
+index b93272793a..9eef19bc6b 100644
+--- a/src/modules/Elsa.Workflows.Core/Extensions/ExpressionExecutionContextExtensions.cs
++++ b/src/modules/Elsa.Workflows.Core/Extensions/ExpressionExecutionContextExtensions.cs
+@@ -292,10 +292,10 @@ where v.TryGet(context, out _)
+             select v;
+ 
+         var variable = q.FirstOrDefault();
+-        
+-        if(variable != null)
++
++        if (variable != null)
+             variable.Set(context, value);
+-        
++
+         if (variable == null)
+             CreateVariable(context, variableName, value);
+     }
+@@ -362,7 +362,7 @@ public static IEnumerable<Variable> EnumerateVariablesInScope(this ExpressionExe
+         var input = workflowExecutionContext.Input;
+         return input.TryGetValue(name, out var value) ? value : default;
+     }
+-    
++
+     /// <summary>
+     /// Returns the value of the specified input.
+     /// </summary>
+@@ -393,7 +393,9 @@ public static IEnumerable<Variable> EnumerateVariablesInScope(this ExpressionExe
+     /// </summary>
+     public static IEnumerable<ActivityOutputs> GetActivityOutputs(this ExpressionExecutionContext context)
+     {
+-        var activityExecutionContext = context.GetActivityExecutionContext();
++        if (!context.TryGetActivityExecutionContext(out var activityExecutionContext))
++            yield break;
++
+         var useActivityName = activityExecutionContext.WorkflowExecutionContext.Workflow.CreatedWithModernTooling();
+         var activitiesWithOutputs = activityExecutionContext.GetActivitiesWithOutputs();
+ 
+diff --git a/test/integration/Elsa.IntegrationTests/Scenarios/JavaScriptListsAndArrays/Tests.cs b/test/integration/Elsa.IntegrationTests/Scenarios/JavaScriptListsAndArrays/Tests.cs
+new file mode 100644
+index 0000000000..66b7051607
+--- /dev/null
++++ b/test/integration/Elsa.IntegrationTests/Scenarios/JavaScriptListsAndArrays/Tests.cs
+@@ -0,0 +1,40 @@
++using System;
++using System.Collections.Generic;
++using System.Dynamic;
++using System.Threading.Tasks;
++using Elsa.Expressions.Models;
++using Elsa.Extensions;
++using Elsa.JavaScript.Contracts;
++using Elsa.Testing.Shared;
++using Microsoft.Extensions.DependencyInjection;
++using Xunit;
++using Xunit.Abstractions;
++
++namespace Elsa.IntegrationTests.Scenarios.JavaScriptListsAndArrays;
++
++public class Tests
++{
++    private readonly IServiceProvider _services;
++    private readonly IJavaScriptEvaluator _evaluator;
++
++    public Tests(ITestOutputHelper testOutputHelper)
++    {
++        var testOutputHelper1 = testOutputHelper ?? throw new ArgumentNullException(nameof(testOutputHelper));
++        _services = new TestApplicationBuilder(testOutputHelper1).Build();
++        _evaluator = _services.GetRequiredService<IJavaScriptEvaluator>();
++    }
++
++    [Fact(DisplayName = "Workflow inputs containing .NET lists on dynamic objects are converted to arrays for use in JavaScript.")]
++    public async Task Test1()
++    {
++        dynamic dynamicObject = new ExpandoObject();
++        
++        dynamicObject.List = new List<string> { "a", "b", "c" };
++        var script = "getObj().List.filter(x => x === 'b').length === 1";
++        var context = new ExpressionExecutionContext(_services, new MemoryRegister());
++        context.SetVariable("obj", (object)dynamicObject);
++        var result = await _evaluator.EvaluateAsync(script, typeof(bool), context);
++        
++        Assert.True((bool)result!);
++    }
++}
+\ No newline at end of file

@@ -1,0 +1,437 @@
+commit 6481d63ea4b8cd768d064e0a6769d7cbd4a2803c
+Author: Terts Diepraam <terts.diepraam@gmail.com>
+Date:   Mon Nov 13 15:22:49 2023 +0100
+
+    uucore/format: implement single specifier formats
+
+diff --git a/src/uu/seq/src/seq.rs b/src/uu/seq/src/seq.rs
+index 217e90428..bb4d5414e 100644
+--- a/src/uu/seq/src/seq.rs
++++ b/src/uu/seq/src/seq.rs
+@@ -3,13 +3,13 @@
+ // For the full copyright and license information, please view the LICENSE
+ // file that was distributed with this source code.
+ // spell-checker:ignore (ToDO) istr chiter argptr ilen extendedbigdecimal extendedbigint numberparse
+-use std::io::{stdout, ErrorKind, Write};
++use std::io::{stdout, Write};
+ 
+ use clap::{crate_version, Arg, ArgAction, Command};
+-use num_traits::Zero;
++use num_traits::{Zero, ToPrimitive};
+ 
+ use uucore::error::UResult;
+-use uucore::format::{printf, FormatArgument};
++use uucore::format::{printf, FormatArgument, Format, num_format};
+ use uucore::{format_usage, help_about, help_usage};
+ 
+ mod error;
+@@ -119,16 +119,31 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+     let result = match (first.number, increment.number, last.number) {
+         (Number::Int(first), Number::Int(increment), last) => {
+             let last = last.round_towards(&first);
++            let format = match options.format {
++                Some(f) => {
++                    let f = Format::<num_format::SignedInt>::parse(f)?;
++                    Some(f)
++                }
++                None => None,
++            };
+             print_seq_integers(
+                 (first, increment, last),
+                 &options.separator,
+                 &options.terminator,
+                 options.equal_width,
+                 padding,
+-                options.format,
++                format,
+             )
+         }
+-        (first, increment, last) => print_seq(
++        (first, increment, last) => {
++            let format = match options.format {
++                Some(f) => {
++                    let f = Format::<num_format::Float>::parse(f)?;
++                    Some(f)
++                }
++                None => None,
++            };
++            print_seq(
+             (
+                 first.into_extended_big_decimal(),
+                 increment.into_extended_big_decimal(),
+@@ -139,8 +154,9 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+             &options.terminator,
+             options.equal_width,
+             padding,
+-            options.format,
+-        ),
++            format,
++            )
++        }
+     };
+     match result {
+         Ok(_) => Ok(()),
+@@ -244,7 +260,7 @@ fn print_seq(
+     terminator: &str,
+     pad: bool,
+     padding: usize,
+-    format: Option<&str>,
++    format: Option<Format<num_format::Float>>,
+ ) -> UResult<()> {
+     let stdout = stdout();
+     let mut stdout = stdout.lock();
+@@ -268,10 +284,16 @@ fn print_seq(
+         // it as a string and ultimately writing to `stdout`. We
+         // shouldn't have to do so much converting back and forth via
+         // strings.
+-        match format {
++        match &format {
+             Some(f) => {
+-                let s = format!("{value}");
+-                printf(f, &[FormatArgument::String(s)])?;
++                let float = match &value {
++                    ExtendedBigDecimal::BigDecimal(bd) => bd.to_f64().unwrap(),
++                    ExtendedBigDecimal::Infinity => f64::INFINITY,
++                    ExtendedBigDecimal::MinusInfinity => f64::NEG_INFINITY,
++                    ExtendedBigDecimal::MinusZero => -0.0,
++                    ExtendedBigDecimal::Nan => f64::NAN,
++                };
++                f.fmt(&mut stdout, float)?;
+             }
+             None => write_value_float(&mut stdout, &value, padding, largest_dec)?,
+         }
+@@ -306,7 +328,7 @@ fn print_seq_integers(
+     terminator: &str,
+     pad: bool,
+     padding: usize,
+-    format: Option<&str>,
++    format: Option<Format<num_format::SignedInt>>,
+ ) -> UResult<()> {
+     let stdout = stdout();
+     let mut stdout = stdout.lock();
+@@ -324,10 +346,16 @@ fn print_seq_integers(
+         // the current value and writes the result to `stdout`.
+         //
+         // TODO See similar comment about formatting in `print_seq()`.
+-        match format {
++        match &format {
+             Some(f) => {
+-                let s = format!("{value}");
+-                printf(f, &[FormatArgument::String(s)])?;
++                let int = match &value {
++                    ExtendedBigInt::BigInt(bi) => bi.to_i64().unwrap(),
++                    ExtendedBigInt::Infinity => todo!(),
++                    ExtendedBigInt::MinusInfinity => todo!(),
++                    ExtendedBigInt::MinusZero => todo!(),
++                    ExtendedBigInt::Nan => todo!(),
++                };
++                f.fmt(&mut stdout, int)?;
+             }
+             None => write_value_int(&mut stdout, &value, padding, pad)?,
+         }
+diff --git a/src/uucore/src/lib/features/format/mod.rs b/src/uucore/src/lib/features/format/mod.rs
+index d6db5e8c7..48151be98 100644
+--- a/src/uucore/src/lib/features/format/mod.rs
++++ b/src/uucore/src/lib/features/format/mod.rs
+@@ -10,8 +10,8 @@
+ //! parsing errors occur during writing.
+ // spell-checker:ignore (vars) charf decf floatf intf scif strf Cninety
+ 
+-mod spec;
+ pub mod num_format;
++mod spec;
+ 
+ use spec::Spec;
+ use std::{
+@@ -22,6 +22,8 @@ use std::{
+ 
+ use crate::error::UError;
+ 
++use self::num_format::Formatter;
++
+ #[derive(Debug)]
+ pub enum FormatError {
+     SpecError,
+@@ -33,6 +35,12 @@ pub enum FormatError {
+ impl Error for FormatError {}
+ impl UError for FormatError {}
+ 
++impl From<std::io::Error> for FormatError {
++    fn from(value: std::io::Error) -> Self {
++        FormatError::IoError(value)
++    }
++}
++
+ impl Display for FormatError {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         // TODO: Be more precise about these
+@@ -181,3 +189,65 @@ pub fn sprintf<'a>(
+     printf_writer(&mut writer, format_string, arguments)?;
+     Ok(writer)
+ }
++
++/// A parsed format for a single float value
++/// 
++/// This is used by `seq`. It can be constructed with [`FloatFormat::parse`]
++/// and can write a value with [`FloatFormat::fmt`].
++/// 
++/// It can only accept a single specification without any asterisk parameters.
++/// If it does get more specifications, it will return an error.
++pub struct Format<F: Formatter> {
++    prefix: Vec<u8>,
++    suffix: Vec<u8>,
++    formatter: F,
++}
++
++impl<F: Formatter> Format<F> {
++    pub fn parse(format_string: impl AsRef<[u8]>) -> Result<Self, FormatError> {
++        let mut iter = parse_iter(format_string.as_ref());
++
++        let mut prefix = Vec::new();
++        let mut spec = None;
++        for item in &mut iter {
++            match item? {
++                FormatItem::Spec(s) => {
++                    spec = Some(s);
++                    break;
++                }
++                FormatItem::Text(t) => prefix.extend_from_slice(&t),
++                FormatItem::Char(c) => prefix.push(c),
++            }
++        }
++
++        let Some(spec) = spec else {
++            return Err(FormatError::SpecError);
++        };
++
++        let formatter = F::try_from_spec(spec)?;
++
++        let mut suffix = Vec::new();
++        for item in &mut iter {
++            match item? {
++                FormatItem::Spec(_) => {
++                    return Err(FormatError::SpecError);
++                }
++                FormatItem::Text(t) => suffix.extend_from_slice(&t),
++                FormatItem::Char(c) => suffix.push(c),
++            }
++        }
++
++        Ok(Self {
++            prefix,
++            suffix,
++            formatter,
++        })
++    }
++
++    pub fn fmt(&self, mut w: impl Write, f: F::Input) -> std::io::Result<()> {
++        w.write_all(&self.prefix)?;
++        self.formatter.fmt(&mut w, f)?;
++        w.write_all(&self.suffix)?;
++        Ok(())
++    }
++}
+diff --git a/src/uucore/src/lib/features/format/num_format.rs b/src/uucore/src/lib/features/format/num_format.rs
+index 3a27ac200..fd010bdc0 100644
+--- a/src/uucore/src/lib/features/format/num_format.rs
++++ b/src/uucore/src/lib/features/format/num_format.rs
+@@ -1,10 +1,16 @@
+ use std::io::Write;
+ 
+-use super::FormatError;
++use super::{
++    spec::{CanAsterisk, Spec},
++    FormatError,
++};
+ 
+ pub trait Formatter {
+     type Input;
+-    fn fmt(&self, writer: impl Write, x: Self::Input) -> Result<(), FormatError>;
++    fn fmt(&self, writer: impl Write, x: Self::Input) -> std::io::Result<()>;
++    fn try_from_spec(s: Spec) -> Result<Self, FormatError>
++    where
++        Self: Sized;
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -64,14 +70,13 @@ pub struct SignedInt {
+ impl Formatter for SignedInt {
+     type Input = i64;
+ 
+-    fn fmt(&self, mut writer: impl Write, x: Self::Input) -> Result<(), FormatError> {
++    fn fmt(&self, mut writer: impl Write, x: Self::Input) -> std::io::Result<()> {
+         if x >= 0 {
+             match self.positive_sign {
+                 PositiveSign::None => Ok(()),
+                 PositiveSign::Plus => write!(writer, "+"),
+                 PositiveSign::Space => write!(writer, " "),
+-            }
+-            .map_err(FormatError::IoError)?;
++            }?;
+         }
+ 
+         match self.alignment {
+@@ -79,7 +84,29 @@ impl Formatter for SignedInt {
+             NumberAlignment::RightSpace => write!(writer, "{x:>width$}", width = self.width),
+             NumberAlignment::RightZero => write!(writer, "{x:0>width$}", width = self.width),
+         }
+-        .map_err(FormatError::IoError)
++    }
++
++    fn try_from_spec(s: Spec) -> Result<Self, FormatError> {
++        let Spec::SignedInt {
++            width,
++            positive_sign,
++            alignment,
++        } = s
++        else {
++            return Err(FormatError::SpecError);
++        };
++
++        let width = match width {
++            Some(CanAsterisk::Fixed(x)) => x,
++            None => 0,
++            Some(CanAsterisk::Asterisk) => return Err(FormatError::SpecError),
++        };
++
++        Ok(Self {
++            width,
++            positive_sign,
++            alignment,
++        })
+     }
+ }
+ 
+@@ -92,7 +119,7 @@ pub struct UnsignedInt {
+ impl Formatter for UnsignedInt {
+     type Input = u64;
+ 
+-    fn fmt(&self, mut writer: impl Write, x: Self::Input) -> Result<(), FormatError> {
++    fn fmt(&self, mut writer: impl Write, x: Self::Input) -> std::io::Result<()> {
+         let s = match self.variant {
+             UnsignedIntVariant::Decimal => format!("{x}"),
+             UnsignedIntVariant::Octal(Prefix::No) => format!("{x:o}"),
+@@ -116,7 +143,29 @@ impl Formatter for UnsignedInt {
+             NumberAlignment::RightSpace => write!(writer, "{s:>width$}", width = self.width),
+             NumberAlignment::RightZero => write!(writer, "{s:0>width$}", width = self.width),
+         }
+-        .map_err(FormatError::IoError)
++    }
++
++    fn try_from_spec(s: Spec) -> Result<Self, FormatError> {
++        let Spec::UnsignedInt {
++            variant,
++            width,
++            alignment,
++        } = s
++        else {
++            return Err(FormatError::SpecError);
++        };
++
++        let width = match width {
++            Some(CanAsterisk::Fixed(x)) => x,
++            None => 0,
++            Some(CanAsterisk::Asterisk) => return Err(FormatError::SpecError),
++        };
++
++        Ok(Self {
++            width,
++            variant,
++            alignment,
++        })
+     }
+ }
+ 
+@@ -147,14 +196,13 @@ impl Default for Float {
+ impl Formatter for Float {
+     type Input = f64;
+ 
+-    fn fmt(&self, mut writer: impl Write, x: Self::Input) -> Result<(), FormatError> {
++    fn fmt(&self, mut writer: impl Write, x: Self::Input) -> std::io::Result<()> {
+         if x.is_sign_positive() {
+             match self.positive_sign {
+                 PositiveSign::None => Ok(()),
+                 PositiveSign::Plus => write!(writer, "+"),
+                 PositiveSign::Space => write!(writer, " "),
+-            }
+-            .map_err(FormatError::IoError)?;
++            }?;
+         }
+ 
+         let s = match self.variant {
+@@ -177,7 +225,46 @@ impl Formatter for Float {
+             NumberAlignment::RightSpace => write!(writer, "{s:>width$}", width = self.width),
+             NumberAlignment::RightZero => write!(writer, "{s:0>width$}", width = self.width),
+         }
+-        .map_err(FormatError::IoError)
++    }
++
++    fn try_from_spec(s: Spec) -> Result<Self, FormatError>
++    where
++        Self: Sized,
++    {
++        let Spec::Float {
++            variant,
++            case,
++            force_decimal,
++            width,
++            positive_sign,
++            alignment,
++            precision,
++        } = s
++        else {
++            return Err(FormatError::SpecError);
++        };
++
++        let width = match width {
++            Some(CanAsterisk::Fixed(x)) => x,
++            None => 0,
++            Some(CanAsterisk::Asterisk) => return Err(FormatError::SpecError),
++        };
++
++        let precision = match precision {
++            Some(CanAsterisk::Fixed(x)) => x,
++            None => 0,
++            Some(CanAsterisk::Asterisk) => return Err(FormatError::SpecError),
++        };
++
++        Ok(Self {
++            variant,
++            case,
++            force_decimal,
++            width,
++            positive_sign,
++            alignment,
++            precision,
++        })
+     }
+ }
+ 
+diff --git a/src/uucore/src/lib/features/format/spec.rs b/src/uucore/src/lib/features/format/spec.rs
+index 808969970..9c53669fa 100644
+--- a/src/uucore/src/lib/features/format/spec.rs
++++ b/src/uucore/src/lib/features/format/spec.rs
+@@ -252,6 +252,7 @@ impl Spec {
+                     alignment,
+                 }
+                 .fmt(writer, *i)
++                .map_err(FormatError::IoError)
+             }
+             &Spec::UnsignedInt {
+                 variant,
+@@ -271,6 +272,7 @@ impl Spec {
+                     alignment,
+                 }
+                 .fmt(writer, *i)
++                .map_err(FormatError::IoError)
+             }
+             &Spec::Float {
+                 variant,
+@@ -299,6 +301,7 @@ impl Spec {
+                     precision,
+                 }
+                 .fmt(writer, *f)
++                .map_err(FormatError::IoError)
+             }
+         }
+     }

@@ -1,0 +1,120 @@
+diff --git a/meilisearch-core/src/bucket_sort.rs b/meilisearch-core/src/bucket_sort.rs
+index 01200008b40..4b8da11ab98 100644
+--- a/meilisearch-core/src/bucket_sort.rs
++++ b/meilisearch-core/src/bucket_sort.rs
+@@ -212,6 +212,7 @@ where
+     FD: Fn(DocumentId) -> Option<u64>,
+ {
+     let mut result = SortResult::default();
++    let mut filtered_count = 0;
+ 
+     let words_set = index.main.words_fst(reader)?;
+     let stop_words = index.main.stop_words_fst(reader)?;
+@@ -319,6 +320,7 @@ where
+             for group in group.binary_group_by_mut(|a, b| criterion.eq(&ctx, a, b)) {
+                 // we must compute the real distinguished len of this sub-group
+                 for document in group.iter() {
++                    let contains_key = filter_map.contains_key(&document.id);
+                     let filter_accepted = match &filter {
+                         Some(filter) => {
+                             let entry = filter_map.entry(document.id);
+@@ -328,13 +330,20 @@ where
+                     };
+ 
+                     if filter_accepted {
++                        let contains_key = key_cache.contains_key(&document.id);
+                         let entry = key_cache.entry(document.id);
+                         let key = entry.or_insert_with(|| (distinct)(document.id).map(Rc::new));
+ 
+-                        match key.clone() {
++                        let distinct_accepted = match key.clone() {
+                             Some(key) => buf_distinct.register(key),
+                             None => buf_distinct.register_without_key(),
+                         };
++
++                        if !distinct_accepted && !contains_key {
++                            filtered_count += 1;
++                        }
++                    } else if !contains_key {
++                        filtered_count += 1;
+                     }
+ 
+                     // the requested range end is reached: stop computing distinct
+@@ -390,7 +399,7 @@ where
+         }
+     }
+     result.documents = documents;
+-    result.nb_hits = docids.len();
++    result.nb_hits = docids.len() - filtered_count;
+ 
+     Ok(result)
+ }
+diff --git a/meilisearch-core/src/query_builder.rs b/meilisearch-core/src/query_builder.rs
+index effaa3f2a0b..8332fa2a12c 100644
+--- a/meilisearch-core/src/query_builder.rs
++++ b/meilisearch-core/src/query_builder.rs
+@@ -227,10 +227,17 @@ impl<'c, 'f, 'd, 'i> QueryBuilder<'c, 'f, 'd, 'i> {
+ 
+     fn sort_result_from_docids(&self, docids: &[DocumentId], range: Range<usize>) -> SortResult {
+         let mut sort_result = SortResult::default();
++        let mut filtered_count = 0;
+         let mut result = match self.filter {
+             Some(ref filter) => docids
+                 .iter()
+-                .filter(|item| (filter)(**item))
++                .filter(|item| {
++                    let is_filtered = (filter)(**item);
++                    if is_filtered {
++                        filtered_count += 1;
++                    }
++                    is_filtered
++                })
+                 .skip(range.start)
+                 .take(range.end - range.start)
+                 .map(|&id| Document::from_highlights(id, &[]))
+@@ -250,15 +257,19 @@ impl<'c, 'f, 'd, 'i> QueryBuilder<'c, 'f, 'd, 'i> {
+             result.retain(|doc| {
+                 let id = doc.id;
+                 let key = (distinct)(id);
+-                match key {
++                let distinct_accepted = match key {
+                     Some(key) => distinct_map.register(key),
+                     None => distinct_map.register_without_key(),
++                };
++                if distinct_accepted {
++                    filtered_count += 1;
+                 }
++                distinct_accepted
+             });
+         }
+ 
+         sort_result.documents = result;
+-        sort_result.nb_hits = docids.len();
++        sort_result.nb_hits = docids.len() - filtered_count;
+         sort_result
+     }
+ 
+diff --git a/meilisearch-http/tests/placeholder_search.rs b/meilisearch-http/tests/placeholder_search.rs
+index d064b446fee..70d834ca6cb 100644
+--- a/meilisearch-http/tests/placeholder_search.rs
++++ b/meilisearch-http/tests/placeholder_search.rs
+@@ -176,6 +176,7 @@ async fn placeholder_search_with_filter() {
+         let hits = response["hits"].as_array().unwrap();
+         let bug = Value::String(String::from("bug"));
+         let wontfix = Value::String(String::from("wontfix"));
++        assert_eq!(63, response["nbHits"]);
+         assert!(hits.iter().all(|v|
+                 v["color"].as_str().unwrap() == "green" &&
+                 v["tags"].as_array().unwrap().contains(&bug) ||
+diff --git a/meilisearch-http/tests/search.rs b/meilisearch-http/tests/search.rs
+index 189e6c4531e..57f66ad3da3 100644
+--- a/meilisearch-http/tests/search.rs
++++ b/meilisearch-http/tests/search.rs
+@@ -538,6 +538,7 @@ async fn search_with_filter() {
+     ]);
+ 
+     test_post_get_search!(server, query, |response, _status_code| {
++        assert_eq!(32, response["nbHits"]);
+         assert_json_eq!(expected.clone(), response["hits"].clone(), ordered: false);
+     });
+ 

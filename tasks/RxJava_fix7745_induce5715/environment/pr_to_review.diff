@@ -1,0 +1,228 @@
+commit 9521512c0f0c980f074ec5b0fbfe954b00c56f1d
+Author: David Karnok <akarnokd@gmail.com>
+Date:   Wed Nov 15 11:24:45 2017 +0100
+
+    2.x: distinguish between sync and async dispose in ScheduledRunnable (#5715)
+    
+    * 2.x: distinguish between sync and async dispose in ScheduledRunnable
+    
+    * Coverage improvement and fix a missing state change
+    
+    * Add test case for the parent-done reordered check
+
+diff --git a/src/main/java/io/reactivex/internal/schedulers/ScheduledRunnable.java b/src/main/java/io/reactivex/internal/schedulers/ScheduledRunnable.java
+index c942deacf..61218fbe4 100644
+--- a/src/main/java/io/reactivex/internal/schedulers/ScheduledRunnable.java
++++ b/src/main/java/io/reactivex/internal/schedulers/ScheduledRunnable.java
+@@ -26,7 +26,12 @@ implements Runnable, Callable<Object>, Disposable {
+     private static final long serialVersionUID = -6120223772001106981L;
+     final Runnable actual;
+ 
+-    static final Object DISPOSED = new Object();
++    /** Indicates that the parent tracking this task has been notified about its completion. */
++    static final Object PARENT_DISPOSED = new Object();
++    /** Indicates the dispose() was called from within the run/call method. */
++    static final Object SYNC_DISPOSED = new Object();
++    /** Indicates the dispose() was called from another thread. */
++    static final Object ASYNC_DISPOSED = new Object();
+ 
+     static final Object DONE = new Object();
+ 
+@@ -66,13 +71,13 @@ implements Runnable, Callable<Object>, Disposable {
+         } finally {
+             lazySet(THREAD_INDEX, null);
+             Object o = get(PARENT_INDEX);
+-            if (o != DISPOSED && o != null && compareAndSet(PARENT_INDEX, o, DONE)) {
++            if (o != PARENT_DISPOSED && compareAndSet(PARENT_INDEX, o, DONE) && o != null) {
+                 ((DisposableContainer)o).delete(this);
+             }
+ 
+             for (;;) {
+                 o = get(FUTURE_INDEX);
+-                if (o == DISPOSED || compareAndSet(FUTURE_INDEX, o, DONE)) {
++                if (o == SYNC_DISPOSED || o == ASYNC_DISPOSED || compareAndSet(FUTURE_INDEX, o, DONE)) {
+                     break;
+                 }
+             }
+@@ -85,8 +90,12 @@ implements Runnable, Callable<Object>, Disposable {
+             if (o == DONE) {
+                 return;
+             }
+-            if (o == DISPOSED) {
+-                f.cancel(get(THREAD_INDEX) != Thread.currentThread());
++            if (o == SYNC_DISPOSED) {
++                f.cancel(false);
++                return;
++            }
++            if (o == ASYNC_DISPOSED) {
++                f.cancel(true);
+                 return;
+             }
+             if (compareAndSet(FUTURE_INDEX, o, f)) {
+@@ -99,12 +108,13 @@ implements Runnable, Callable<Object>, Disposable {
+     public void dispose() {
+         for (;;) {
+             Object o = get(FUTURE_INDEX);
+-            if (o == DONE || o == DISPOSED) {
++            if (o == DONE || o == SYNC_DISPOSED || o == ASYNC_DISPOSED) {
+                 break;
+             }
+-            if (compareAndSet(FUTURE_INDEX, o, DISPOSED)) {
++            boolean async = get(THREAD_INDEX) != Thread.currentThread();
++            if (compareAndSet(FUTURE_INDEX, o, async ? ASYNC_DISPOSED : SYNC_DISPOSED)) {
+                 if (o != null) {
+-                    ((Future<?>)o).cancel(get(THREAD_INDEX) != Thread.currentThread());
++                    ((Future<?>)o).cancel(async);
+                 }
+                 break;
+             }
+@@ -112,10 +122,10 @@ implements Runnable, Callable<Object>, Disposable {
+ 
+         for (;;) {
+             Object o = get(PARENT_INDEX);
+-            if (o == DONE || o == DISPOSED || o == null) {
++            if (o == DONE || o == PARENT_DISPOSED || o == null) {
+                 return;
+             }
+-            if (compareAndSet(PARENT_INDEX, o, DISPOSED)) {
++            if (compareAndSet(PARENT_INDEX, o, PARENT_DISPOSED)) {
+                 ((DisposableContainer)o).delete(this);
+                 return;
+             }
+@@ -124,7 +134,7 @@ implements Runnable, Callable<Object>, Disposable {
+ 
+     @Override
+     public boolean isDisposed() {
+-        Object o = get(FUTURE_INDEX);
+-        return o == DISPOSED || o == DONE;
++        Object o = get(PARENT_INDEX);
++        return o == PARENT_DISPOSED || o == DONE;
+     }
+ }
+diff --git a/src/test/java/io/reactivex/internal/schedulers/ScheduledRunnableTest.java b/src/test/java/io/reactivex/internal/schedulers/ScheduledRunnableTest.java
+index 169767d4c..49d20edf8 100644
+--- a/src/test/java/io/reactivex/internal/schedulers/ScheduledRunnableTest.java
++++ b/src/test/java/io/reactivex/internal/schedulers/ScheduledRunnableTest.java
+@@ -18,6 +18,7 @@ import static org.junit.Assert.*;
+ import java.lang.Thread.UncaughtExceptionHandler;
+ import java.util.List;
+ import java.util.concurrent.FutureTask;
++import java.util.concurrent.atomic.*;
+ 
+ import org.junit.Test;
+ 
+@@ -283,4 +284,114 @@ public class ScheduledRunnableTest {
+             TestHelper.race(r1, r2);
+         }
+     }
++
++    @Test
++    public void syncWorkerCancelRace() {
++        for (int i = 0; i < 10000; i++) {
++            final CompositeDisposable set = new CompositeDisposable();
++            final AtomicBoolean interrupted = new AtomicBoolean();
++            final AtomicInteger sync = new AtomicInteger(2);
++            final AtomicInteger syncb = new AtomicInteger(2);
++
++            Runnable r0 = new Runnable() {
++                @Override
++                public void run() {
++                    set.dispose();
++                    if (sync.decrementAndGet() != 0) {
++                        while (sync.get() != 0) { }
++                    }
++                    if (syncb.decrementAndGet() != 0) {
++                        while (syncb.get() != 0) { }
++                    }
++                    for (int j = 0; j < 1000; j++) {
++                        if (Thread.currentThread().isInterrupted()) {
++                            interrupted.set(true);
++                            break;
++                        }
++                    }
++                }
++            };
++
++            final ScheduledRunnable run = new ScheduledRunnable(r0, set);
++            set.add(run);
++
++            final FutureTask<Void> ft = new FutureTask<Void>(run, null);
++
++            Runnable r2 = new Runnable() {
++                @Override
++                public void run() {
++                    if (sync.decrementAndGet() != 0) {
++                        while (sync.get() != 0) { }
++                    }
++                    run.setFuture(ft);
++                    if (syncb.decrementAndGet() != 0) {
++                        while (syncb.get() != 0) { }
++                    }
++                }
++            };
++
++            TestHelper.race(ft, r2);
++
++            assertFalse("The task was interrupted", interrupted.get());
++        }
++    }
++
++    @Test
++    public void disposeAfterRun() {
++        final ScheduledRunnable run = new ScheduledRunnable(Functions.EMPTY_RUNNABLE, null);
++
++        run.run();
++        assertEquals(ScheduledRunnable.DONE, run.get(ScheduledRunnable.FUTURE_INDEX));
++
++        run.dispose();
++        assertEquals(ScheduledRunnable.DONE, run.get(ScheduledRunnable.FUTURE_INDEX));
++    }
++
++    @Test
++    public void syncDisposeIdempotent() {
++        final ScheduledRunnable run = new ScheduledRunnable(Functions.EMPTY_RUNNABLE, null);
++        run.set(ScheduledRunnable.THREAD_INDEX, Thread.currentThread());
++
++        run.dispose();
++        assertEquals(ScheduledRunnable.SYNC_DISPOSED, run.get(ScheduledRunnable.FUTURE_INDEX));
++        run.dispose();
++        assertEquals(ScheduledRunnable.SYNC_DISPOSED, run.get(ScheduledRunnable.FUTURE_INDEX));
++        run.run();
++        assertEquals(ScheduledRunnable.SYNC_DISPOSED, run.get(ScheduledRunnable.FUTURE_INDEX));
++    }
++
++    @Test
++    public void asyncDisposeIdempotent() {
++        final ScheduledRunnable run = new ScheduledRunnable(Functions.EMPTY_RUNNABLE, null);
++
++        run.dispose();
++        assertEquals(ScheduledRunnable.ASYNC_DISPOSED, run.get(ScheduledRunnable.FUTURE_INDEX));
++        run.dispose();
++        assertEquals(ScheduledRunnable.ASYNC_DISPOSED, run.get(ScheduledRunnable.FUTURE_INDEX));
++        run.run();
++        assertEquals(ScheduledRunnable.ASYNC_DISPOSED, run.get(ScheduledRunnable.FUTURE_INDEX));
++    }
++
++
++    @Test
++    public void noParentIsDisposed() {
++        ScheduledRunnable run = new ScheduledRunnable(Functions.EMPTY_RUNNABLE, null);
++        assertFalse(run.isDisposed());
++        run.run();
++        assertTrue(run.isDisposed());
++    }
++
++    @Test
++    public void withParentIsDisposed() {
++        CompositeDisposable set = new CompositeDisposable();
++        ScheduledRunnable run = new ScheduledRunnable(Functions.EMPTY_RUNNABLE, set);
++        set.add(run);
++
++        assertFalse(run.isDisposed());
++
++        run.run();
++        assertTrue(run.isDisposed());
++
++        assertFalse(set.remove(run));
++    }
+ }

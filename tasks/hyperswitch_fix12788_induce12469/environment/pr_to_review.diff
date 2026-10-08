@@ -1,0 +1,1988 @@
+commit b340e6e94b30f314967d359c4e1768b1e4909ad1
+Author: Aniket Burman <93077964+aniketburman014@users.noreply.github.com>
+Date:   Tue Jun 2 10:40:13 2026 +0530
+
+    feat(relay): add unreferenced refund API support for FiservCommerceHub (#12469)
+    
+    Co-authored-by: Aniket Burman <aniket.burman@Aniket-Burman-JDXHW2PH34.local>
+    Co-authored-by: hyperswitch-bot[bot] <148525504+hyperswitch-bot[bot]@users.noreply.github.com>
+
+diff --git a/api-reference/v1/openapi_spec_v1.json b/api-reference/v1/openapi_spec_v1.json
+index dc93705151..e309835aa8 100644
+--- a/api-reference/v1/openapi_spec_v1.json
++++ b/api-reference/v1/openapi_spec_v1.json
+@@ -38389,6 +38389,48 @@
+           }
+         }
+       },
++      "RecipientCardData": {
++        "type": "object",
++        "required": [
++          "card_number",
++          "card_exp_month",
++          "card_exp_year"
++        ],
++        "properties": {
++          "card_number": {
++            "type": "string",
++            "example": "4000000000009995"
++          },
++          "card_exp_month": {
++            "type": "string",
++            "example": "03"
++          },
++          "card_exp_year": {
++            "type": "string",
++            "example": "30"
++          },
++          "card_holder_name": {
++            "type": "string",
++            "example": "John Doe",
++            "nullable": true
++          }
++        }
++      },
++      "RecipientPaymentMethodData": {
++        "oneOf": [
++          {
++            "type": "object",
++            "required": [
++              "card"
++            ],
++            "properties": {
++              "card": {
++                "$ref": "#/components/schemas/RecipientCardData"
++              }
++            }
++          }
++        ]
++      },
+       "RecommendedAction": {
+         "type": "string",
+         "enum": [
+@@ -39039,6 +39081,17 @@
+                 "$ref": "#/components/schemas/RelayVoidRequestData"
+               }
+             }
++          },
++          {
++            "type": "object",
++            "required": [
++              "unreferenced_refund"
++            ],
++            "properties": {
++              "unreferenced_refund": {
++                "$ref": "#/components/schemas/RelayUnreferencedRefundData"
++              }
++            }
+           }
+         ]
+       },
+@@ -39216,9 +39269,35 @@
+           "refund",
+           "capture",
+           "incremental_authorization",
+-          "void"
++          "void",
++          "unreferenced_refund"
+         ]
+       },
++      "RelayUnreferencedRefundData": {
++        "type": "object",
++        "required": [
++          "amount",
++          "currency",
++          "customer_id",
++          "recipient_payment_method_data"
++        ],
++        "properties": {
++          "amount": {
++            "type": "integer",
++            "format": "int64",
++            "example": 6540
++          },
++          "currency": {
++            "$ref": "#/components/schemas/Currency"
++          },
++          "customer_id": {
++            "type": "string"
++          },
++          "recipient_payment_method_data": {
++            "$ref": "#/components/schemas/RecipientPaymentMethodData"
++          }
++        }
++      },
+       "RelayVoidRequestData": {
+         "type": "object",
+         "required": [
+diff --git a/crates/api_models/src/lib.rs b/crates/api_models/src/lib.rs
+index cea478f729..526361ff02 100644
+--- a/crates/api_models/src/lib.rs
++++ b/crates/api_models/src/lib.rs
+@@ -51,6 +51,7 @@ pub mod surcharge_decision_configs;
+ pub mod three_ds_decision_rule;
+ #[cfg(feature = "tokenization_v2")]
+ pub mod tokenization;
++pub mod unreferenced_refund;
+ pub mod user;
+ pub mod user_role;
+ pub mod verifications;
+diff --git a/crates/api_models/src/relay.rs b/crates/api_models/src/relay.rs
+index da6201fdfe..9cd3e09ebd 100644
+--- a/crates/api_models/src/relay.rs
++++ b/crates/api_models/src/relay.rs
+@@ -2,7 +2,7 @@ use common_utils::types::MinorUnit;
+ use serde::{Deserialize, Serialize};
+ use utoipa::ToSchema;
+ 
+-use crate::enums as api_enums;
++use crate::{enums as api_enums, unreferenced_refund};
+ 
+ #[derive(Debug, ToSchema, Clone, Deserialize, Serialize)]
+ pub struct RelayRequest {
+@@ -28,6 +28,19 @@ pub enum RelayData {
+     Capture(RelayCaptureRequestData),
+     IncrementalAuthorization(RelayIncrementalAuthorizationRequestData),
+     Void(RelayVoidRequestData),
++    UnreferencedRefund(RelayUnreferencedRefundData),
++}
++
++#[derive(Debug, ToSchema, Clone, Deserialize, Serialize)]
++pub struct RelayUnreferencedRefundData {
++    #[schema(value_type = i64, example = 6540)]
++    pub amount: MinorUnit,
++    #[schema(value_type = Currency)]
++    pub currency: api_enums::Currency,
++    #[schema(value_type = String)]
++    pub customer_id: Option<String>,
++    #[schema(value_type = RecipientPaymentMethodData)]
++    pub recipient_payment_method_data: Option<unreferenced_refund::RecipientPaymentMethodData>,
+ }
+ 
+ #[derive(Debug, ToSchema, Clone, Deserialize, Serialize)]
+diff --git a/crates/api_models/src/unreferenced_refund.rs b/crates/api_models/src/unreferenced_refund.rs
+new file mode 100644
+index 0000000000..ac3fa2d691
+--- /dev/null
++++ b/crates/api_models/src/unreferenced_refund.rs
+@@ -0,0 +1,143 @@
++use cards::CardNumber;
++use common_utils::types::MinorUnit;
++use hyperswitch_masking::{PeekInterface, Secret};
++use serde::{Deserialize, Serialize};
++use utoipa::ToSchema;
++
++use crate::{enums as api_enums, relay::RelayError};
++
++// ─── Request ────────────────────────────────────────────────────────────────
++
++#[derive(Debug, ToSchema, Clone, Deserialize, Serialize)]
++pub struct UnreferencedRefundRequest {
++    /// Amount in minor units
++    #[schema(value_type = i64, example = 1000)]
++    pub amount: MinorUnit,
++
++    /// Currency
++    #[schema(value_type = Currency, example = "USD")]
++    pub currency: api_enums::Currency,
++
++    /// Identifier of the connector ( merchant connector account ) which was chosen to make the refund
++    #[schema(example = "mca_5apGeP94tMts6rg3U3kR", value_type = String)]
++    pub connector_id: common_utils::id_type::MerchantConnectorAccountId,
++
++    /// Customer ID
++    #[schema(example = "cus_123456789")]
++    pub customer_id: Option<String>,
++
++    /// The identifier that is associated to a resource at the connector reference
++    #[schema(example = "7256228702616471803954")]
++    pub connector_resource_id: Option<String>,
++
++    /// Recipient payment method data
++    pub recipient_payment_method_data: RecipientPaymentMethodData,
++}
++
++#[derive(Debug, ToSchema, Clone, Deserialize, Serialize)]
++#[serde(rename_all = "snake_case")]
++pub enum RecipientPaymentMethodData {
++    Card(RecipientCardData),
++}
++
++#[derive(Debug, ToSchema, Clone, Deserialize, Serialize)]
++pub struct RecipientCardData {
++    #[schema(value_type = String, example = "4000000000009995")]
++    pub card_number: CardNumber,
++
++    #[schema(value_type = String, example = "03")]
++    pub card_exp_month: Secret<String>,
++
++    #[schema(value_type = String, example = "30")]
++    pub card_exp_year: Secret<String>,
++
++    #[schema(value_type = Option<String>, example = "John Doe")]
++    pub card_holder_name: Option<Secret<String>>,
++}
++
++impl RecipientCardData {
++    pub fn get_expiry_year_4_digit(&self) -> Secret<String> {
++        let year = self.card_exp_year.peek();
++        let full_year = if year.len() == 2 {
++            format!("20{year}")
++        } else {
++            year.to_string()
++        };
++        Secret::new(full_year)
++    }
++}
++
++// ─── Response ────────────────────────────────────────────────────────────────
++
++#[derive(Debug, ToSchema, Clone, Deserialize, Serialize)]
++pub struct UnreferencedRefundResponse {
++    /// Unique identifier for this unreferenced refund
++    #[schema(example = "relay_V0BvOr4rk7AEIuq4nW5H", value_type = String)]
++    pub id: common_utils::id_type::RelayId,
++
++    /// The status of the relay request
++    #[schema(value_type = RelayStatus)]
++    pub status: api_enums::RelayStatus,
++
++    /// Connector name for which the relay was processed
++    #[schema(example = "fiservcommercehub")]
++    pub connector: String,
++
++    /// Identifier of the connector ( merchant connector account ) which was chosen to make the refund
++    #[schema(example = "mca_5apGeP94tMts6rg3U3kR", value_type = String)]
++    pub connector_id: common_utils::id_type::MerchantConnectorAccountId,
++
++    /// The identifier that is associated to a resource at the connector reference
++    #[schema(example = "7256228702616471803954")]
++    pub connector_resource_id: String,
++
++    /// The identifier that is associated to a resource at the connector to which the  request is being made
++    #[schema(example = "re_3QY4TnEOqOywnAIx1Mm1p7GQ")]
++    pub connector_reference_id: Option<String>,
++
++    /// The business profile that is associated with this request.
++    #[schema(example = "pro_xxx", value_type = String)]
++    pub profile_id: common_utils::id_type::ProfileId,
++
++    /// Error details if failed
++    pub error: Option<RelayError>,
++
++    /// Raw response from connector
++    pub raw_connector_response: Option<Secret<serde_json::Value>>,
++}
++
++impl TryFrom<crate::relay::RelayRequest> for UnreferencedRefundRequest {
++    type Error = error_stack::Report<common_utils::errors::ValidationError>;
++
++    fn try_from(request: crate::relay::RelayRequest) -> Result<Self, Self::Error> {
++        let data = match request.data {
++            Some(crate::relay::RelayData::UnreferencedRefund(data)) => data,
++            _ => Err(error_stack::report!(
++                common_utils::errors::ValidationError::InvalidValue {
++                    message: "Relay data of type unreferenced_refund is required".to_string(),
++                }
++            ))?,
++        };
++
++        let recipient_payment_method_data =
++            data.recipient_payment_method_data.ok_or_else(|| {
++                error_stack::report!(
++                    common_utils::errors::ValidationError::MissingRequiredField {
++                        field_name: "recipient_payment_method_data".to_string(),
++                    }
++                )
++            })?;
++
++        Ok(Self {
++            amount: data.amount,
++            currency: data.currency,
++            connector_id: request.connector_id,
++            customer_id: data.customer_id,
++            connector_resource_id: Some(request.connector_resource_id),
++            recipient_payment_method_data,
++        })
++    }
++}
++
++impl common_utils::events::ApiEventMetric for UnreferencedRefundRequest {}
++impl common_utils::events::ApiEventMetric for UnreferencedRefundResponse {}
+diff --git a/crates/common_enums/src/enums.rs b/crates/common_enums/src/enums.rs
+index 3c591534da..37fe2d5fa7 100644
+--- a/crates/common_enums/src/enums.rs
++++ b/crates/common_enums/src/enums.rs
+@@ -3097,6 +3097,7 @@ pub enum RelayType {
+     Capture,
+     IncrementalAuthorization,
+     Void,
++    UnreferencedRefund,
+ }
+ 
+ #[derive(
+diff --git a/crates/common_utils/src/crypto.rs b/crates/common_utils/src/crypto.rs
+index 5354e436c2..36f912952b 100644
+--- a/crates/common_utils/src/crypto.rs
++++ b/crates/common_utils/src/crypto.rs
+@@ -16,6 +16,7 @@ use rsa::{
+     pkcs8::{DecodePrivateKey, DecodePublicKey},
+     signature::Verifier,
+     traits::PublicKeyParts,
++    Oaep,
+ };
+ 
+ use crate::{
+@@ -779,6 +780,28 @@ pub fn extract_rsa_public_key_components(
+     Ok((n_b64, e_b64))
+ }
+ 
++/// Encrypt plaintext using RSA-OAEP with SHA-256.
++/// `public_key_der` must be a DER-encoded SubjectPublicKeyInfo (PKCS#8) public key.
++/// Returns the raw ciphertext bytes.
++pub fn encrypt_rsa_oaep_sha256(
++    public_key_der: &[u8],
++    plaintext: &[u8],
++) -> CustomResult<Vec<u8>, errors::CryptoError> {
++    use rand::rngs::OsRng;
++
++    let public_key = rsa::RsaPublicKey::from_public_key_der(public_key_der)
++        .change_context(errors::CryptoError::EncodingFailed)
++        .attach_printable("Failed to parse DER public key for RSA-OAEP")?;
++
++    let padding = Oaep::new::<rsa::sha2::Sha256>();
++    let mut rng = OsRng;
++
++    public_key
++        .encrypt(&mut rng, padding, plaintext)
++        .change_context(errors::CryptoError::EncodingFailed)
++        .attach_printable("RSA OAEP encryption failed")
++}
++
+ /// Represents the RSA-PSS-SHA256 signing algorithm
+ #[derive(Debug)]
+ pub struct RsaPssSha256;
+diff --git a/crates/diesel_models/src/relay.rs b/crates/diesel_models/src/relay.rs
+index 0616e359a6..e0366fe3ab 100644
+--- a/crates/diesel_models/src/relay.rs
++++ b/crates/diesel_models/src/relay.rs
+@@ -78,4 +78,5 @@ pub struct RelayUpdateInternal {
+     pub error_code: Option<String>,
+     pub error_message: Option<String>,
+     pub modified_at: PrimitiveDateTime,
++    pub response_data: Option<pii::SecretSerdeValue>,
+ }
+diff --git a/crates/hyperswitch_connectors/src/connector_relay.rs b/crates/hyperswitch_connectors/src/connector_relay.rs
+new file mode 100644
+index 0000000000..df01928e4b
+--- /dev/null
++++ b/crates/hyperswitch_connectors/src/connector_relay.rs
+@@ -0,0 +1,117 @@
++pub mod fiservcommercehub;
++
++use bytes::Bytes;
++use common_utils::request::Request;
++use hyperswitch_domain_models::connector_endpoints::Connectors;
++use hyperswitch_interfaces::{
++    errors::ConnectorError,
++    relay::{ConnectorRelayIntegration, UnreferencedRefundResponse, UnreferencedRefundRouterData},
++};
++
++macro_rules! define_relay_connectors {
++    (
++        $(
++            $name:literal => $variant:ident($connector:path)
++        ),* $(,)?
++    ) => {
++        pub enum RelayConnectors {
++            $(
++                $variant($connector),
++            )*
++        }
++
++        impl RelayConnectors {
++            pub fn from_connector_name(
++                name: &str,
++            ) -> error_stack::Result<Self, ConnectorError> {
++                match name {
++                    $(
++                        $name => Ok(Self::$variant($connector)),
++                    )*
++                    _ => Err(ConnectorError::FlowNotSupported {
++                        flow: "UnreferencedRefund".to_string(),
++                        connector: name.to_string(),
++                    }
++                    .into()),
++                }
++            }
++        }
++
++        impl ConnectorRelayIntegration for RelayConnectors {
++            fn base_url<'a>(
++                &self,
++                connectors: &'a Connectors,
++            ) -> &'a str {
++                match self {
++                    $(
++                        Self::$variant(c) => c.base_url(connectors),
++                    )*
++                }
++            }
++
++            fn supports_access_token(&self) -> bool {
++                match self {
++                    $(
++                        Self::$variant(c) => c.supports_access_token(),
++                    )*
++                }
++            }
++
++            fn build_relay_request(
++                &self,
++                router_data: &UnreferencedRefundRouterData<'_>,
++            ) -> error_stack::Result<Request, ConnectorError> {
++                match self {
++                    $(
++                        Self::$variant(c) => {
++                            c.build_relay_request(router_data)
++                        }
++                    )*
++                }
++            }
++
++            fn handle_relay_success_response(
++                &self,
++                response: Bytes,
++            ) -> error_stack::Result<
++                UnreferencedRefundResponse,
++                ConnectorError,
++            > {
++                match self {
++                    $(
++                        Self::$variant(c) => {
++                            c.handle_relay_success_response(response)
++                        }
++                    )*
++                }
++            }
++
++            fn get_relay_error_response(
++                &self,
++                response: Bytes,
++                status_code: u16,
++            ) -> error_stack::Result<
++                UnreferencedRefundResponse,
++                ConnectorError,
++            > {
++                match self {
++                    $(
++                        Self::$variant(c) => {
++                            c.get_relay_error_response(
++                                response,
++                                status_code,
++                            )
++                        }
++                    )*
++                }
++            }
++        }
++    };
++}
++
++define_relay_connectors! {
++    "fiservcommercehub" =>
++        Fiservcommercehub(
++            fiservcommercehub::Fiservcommercehub
++        ),
++}
+diff --git a/crates/hyperswitch_connectors/src/connector_relay/fiservcommercehub.rs b/crates/hyperswitch_connectors/src/connector_relay/fiservcommercehub.rs
+new file mode 100644
+index 0000000000..3e3c296223
+--- /dev/null
++++ b/crates/hyperswitch_connectors/src/connector_relay/fiservcommercehub.rs
+@@ -0,0 +1,440 @@
++use api_models::unreferenced_refund::{RecipientCardData, RecipientPaymentMethodData};
++use base64::Engine;
++use bytes::Bytes;
++use common_utils::{
++    consts::BASE64_ENGINE,
++    crypto::encrypt_rsa_oaep_sha256,
++    request::{Method, Request, RequestContent},
++    types::FloatMajorUnit,
++};
++use error_stack::ResultExt;
++use hyperswitch_domain_models::{connector_endpoints::Connectors, router_data::ConnectorAuthType};
++use hyperswitch_interfaces::{
++    errors::ConnectorError,
++    relay::{ConnectorRelayIntegration, UnreferencedRefundResponse, UnreferencedRefundRouterData},
++};
++use hyperswitch_masking::{ExposeInterface, Mask, Maskable, PeekInterface, Secret};
++use ring::hmac;
++use serde::{Deserialize, Serialize};
++use time::OffsetDateTime;
++use uuid::Uuid;
++
++pub struct Fiservcommercehub;
++
++struct FiservcommercehubAuthType {
++    api_key: Secret<String>,
++    api_secret: Secret<String>,
++    merchant_id: Secret<String>,
++    terminal_id: Secret<String>,
++}
++
++impl TryFrom<&ConnectorAuthType> for FiservcommercehubAuthType {
++    type Error = error_stack::Report<ConnectorError>;
++
++    fn try_from(auth: &ConnectorAuthType) -> Result<Self, Self::Error> {
++        match auth {
++            ConnectorAuthType::MultiAuthKey {
++                api_key,
++                key1,
++                api_secret,
++                key2,
++            } => Ok(Self {
++                api_key: api_key.clone(),
++                api_secret: api_secret.clone(),
++                merchant_id: key1.clone(),
++                terminal_id: key2.clone(),
++            }),
++            _ => Err(ConnectorError::FailedToObtainAuthType.into()),
++        }
++    }
++}
++
++impl FiservcommercehubAuthType {
++    fn generate_hmac_signature(
++        &self,
++        client_request_id: &str,
++        timestamp_str: &str,
++        payload: &str,
++    ) -> String {
++        let raw = format!(
++            "{}{}{}{}",
++            self.api_key.peek(),
++            client_request_id,
++            timestamp_str,
++            payload
++        );
++        let key = hmac::Key::new(
++            hmac::HMAC_SHA256,
++            self.api_secret.clone().expose().as_bytes(),
++        );
++        BASE64_ENGINE.encode(hmac::sign(&key, raw.as_bytes()).as_ref())
++    }
++}
++
++// ── Status Mapping ────────────────────────────────────────────────────────────
++
++#[derive(Debug, Clone, Deserialize)]
++#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
++enum FiservcommercehubRefundState {
++    Approved,
++    Captured,
++    Authorized,
++    Pending,
++    Declined,
++    Rejected,
++    Failed,
++    Cancelled,
++}
++
++impl From<FiservcommercehubRefundState> for common_enums::RefundStatus {
++    fn from(state: FiservcommercehubRefundState) -> Self {
++        match state {
++            FiservcommercehubRefundState::Approved | FiservcommercehubRefundState::Captured => {
++                Self::Success
++            }
++            FiservcommercehubRefundState::Authorized | FiservcommercehubRefundState::Pending => {
++                Self::Pending
++            }
++            FiservcommercehubRefundState::Declined
++            | FiservcommercehubRefundState::Rejected
++            | FiservcommercehubRefundState::Failed
++            | FiservcommercehubRefundState::Cancelled => Self::Failure,
++        }
++    }
++}
++
++// ── Request Structs ───────────────────────────────────────────────────────────
++
++#[derive(Debug, Serialize)]
++struct Amount {
++    currency: String,
++    total: FloatMajorUnit,
++}
++
++#[derive(Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++struct EncryptionData {
++    key_id: String,
++    encryption_type: String,
++    encryption_block: Secret<String>,
++    encryption_block_fields: String,
++}
++
++#[derive(Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++struct EncryptedSource {
++    source_type: String,
++    encryption_data: EncryptionData,
++}
++
++#[derive(Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++struct MerchantDetails {
++    merchant_id: Secret<String>,
++    terminal_id: Secret<String>,
++}
++
++#[derive(Default, Debug, Serialize)]
++#[serde(rename_all = "UPPERCASE")]
++enum TransactionInteractionOrigin {
++    #[default]
++    Ecom,
++}
++
++#[derive(Default, Debug, Serialize)]
++#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
++enum TransactionInteractionEciIndicator {
++    #[default]
++    ChannelEncrypted,
++}
++
++#[derive(Default, Debug, Serialize)]
++#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
++enum TransactionInteractionPosConditionCode {
++    #[default]
++    CardNotPresentEcom,
++}
++
++#[derive(Default, Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++struct TransactionInteraction {
++    origin: TransactionInteractionOrigin,
++    eci_indicator: TransactionInteractionEciIndicator,
++    pos_condition_code: TransactionInteractionPosConditionCode,
++}
++
++#[derive(Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++struct FiservcommercehubCreditRequestEncrypted {
++    amount: Amount,
++    source: EncryptedSource,
++    merchant_details: MerchantDetails,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    transaction_interaction: Option<TransactionInteraction>,
++}
++
++// ── Response Structs ──────────────────────────────────────────────────────────
++
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "camelCase")]
++struct TransactionProcessingDetails {
++    transaction_id: Option<String>,
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "camelCase")]
++struct GatewayResponse {
++    transaction_state: FiservcommercehubRefundState,
++    transaction_processing_details: Option<TransactionProcessingDetails>,
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "camelCase")]
++struct FiservcommercehubCreditResponse {
++    gateway_response: GatewayResponse,
++}
++
++#[derive(Debug, Deserialize)]
++struct ErrorEntry {
++    #[serde(rename = "type")]
++    error_type: Option<String>,
++    code: Option<String>,
++    message: String,
++}
++
++#[derive(Debug, Deserialize)]
++struct FiservcommercehubErrorResponse {
++    error: Vec<ErrorEntry>,
++}
++
++const ACCESS_TOKEN_SEPARATOR: &str = "|||";
++
++// ── Helper Methods ────────────────────────────────────────────────────────────
++
++impl Fiservcommercehub {
++    /// Build the 7 HMAC auth headers. Must be called with the already-serialised
++    /// body string so that the signature covers the exact bytes that will be sent.
++    fn build_auth_headers(
++        auth: &FiservcommercehubAuthType,
++        body_str: &str,
++    ) -> Vec<(String, Maskable<String>)> {
++        let timestamp_ms = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
++        let timestamp_str = timestamp_ms.to_string();
++        let client_request_id = Uuid::new_v4().to_string();
++        let signature = auth.generate_hmac_signature(&client_request_id, &timestamp_str, body_str);
++
++        vec![
++            (
++                "Content-Type".to_string(),
++                "application/json".to_string().into(),
++            ),
++            (
++                "Api-Key".to_string(),
++                auth.api_key.peek().to_string().into_masked(),
++            ),
++            ("Timestamp".to_string(), timestamp_str.into()),
++            ("Client-Request-Id".to_string(), client_request_id.into()),
++            ("Authorization".to_string(), signature.into_masked()),
++            ("Auth-Token-Type".to_string(), "HMAC".to_string().into()),
++            ("Accept-Language".to_string(), "en".to_string().into()),
++        ]
++    }
++
++    /// Encrypt card fields via RSA-OAEP-SHA256 using the public key embedded in
++    /// `access_token` ("keyId|||Base64DERPublicKey").
++    fn encrypt_card(
++        card: &RecipientCardData,
++        access_token: &str,
++    ) -> error_stack::Result<EncryptionData, ConnectorError> {
++        let parts: Vec<&str> = access_token.split(ACCESS_TOKEN_SEPARATOR).collect();
++
++        let key_id = parts
++            .first()
++            .ok_or(ConnectorError::RequestEncodingFailed)
++            .attach_printable("access_token missing key_id")?
++            .to_string();
++
++        let encoded_public_key = parts
++            .get(1)
++            .ok_or(ConnectorError::RequestEncodingFailed)
++            .attach_printable("access_token missing encoded_public_key")?;
++
++        let public_key_der = BASE64_ENGINE
++            .decode(encoded_public_key)
++            .change_context(ConnectorError::RequestEncodingFailed)
++            .attach_printable("Failed to decode Base64 RSA public key")?;
++
++        let card_data = card.card_number.peek().to_string();
++        let name_on_card = card.card_holder_name.as_ref().map(|n| n.peek().to_string());
++        let expiration_month = card.card_exp_month.peek().to_string();
++        let expiration_year = card.get_expiry_year_4_digit().peek().to_string();
++
++        let plain_block = format!(
++            "{}{}{}{}",
++            card_data,
++            expiration_month,
++            expiration_year,
++            name_on_card.as_deref().unwrap_or(""),
++        );
++
++        let ciphertext = encrypt_rsa_oaep_sha256(&public_key_der, plain_block.as_bytes())
++            .change_context(ConnectorError::RequestEncodingFailed)
++            .attach_printable("RSA-OAEP card encryption failed")?;
++
++        let encryption_block = Secret::new(BASE64_ENGINE.encode(&ciphertext));
++
++        let mut encryption_block_fields = format!(
++            "card.cardData:{},card.expirationMonth:{},card.expirationYear:{}",
++            card_data.len(),
++            expiration_month.len(),
++            expiration_year.len(),
++        );
++        name_on_card.as_ref().map(|name| {
++            encryption_block_fields.push_str(&format!(",card.nameOnCard:{}", name.len()));
++        });
++
++        Ok(EncryptionData {
++            key_id,
++            encryption_type: "RSA".to_string(),
++            encryption_block,
++            encryption_block_fields,
++        })
++    }
++}
++
++impl ConnectorRelayIntegration for Fiservcommercehub {
++    fn base_url<'a>(&self, connectors: &'a Connectors) -> &'a str {
++        connectors.fiservcommercehub.base_url.as_ref()
++    }
++
++    fn supports_access_token(&self) -> bool {
++        true
++    }
++
++    fn build_relay_request(
++        &self,
++        router_data: &UnreferencedRefundRouterData<'_>,
++    ) -> error_stack::Result<Request, ConnectorError> {
++        let auth = FiservcommercehubAuthType::try_from(router_data.auth_type)
++            .change_context(ConnectorError::FailedToObtainAuthType)?;
++
++        let request = router_data.request;
++
++        let total = request
++            .amount
++            .to_major_unit_as_f64(request.currency)
++            .change_context(ConnectorError::RequestEncodingFailed)
++            .attach_printable("Failed to convert minor unit amount to major unit float")?;
++
++        let amount = Amount {
++            currency: request.currency.to_string(),
++            total,
++        };
++        let merchant_details = MerchantDetails {
++            merchant_id: auth.merchant_id.clone(),
++            terminal_id: auth.terminal_id.clone(),
++        };
++        let transaction_interaction = Some(TransactionInteraction::default());
++
++        let access_token = router_data
++            .access_token
++            .as_ref()
++            .map(|t| t.token.peek().as_str())
++            .ok_or(ConnectorError::MissingRequiredField {
++                field_name: "access_token",
++            })
++            .attach_printable(
++                "FiservCommerceHub requires an RSA public key via access_token for card encryption",
++            )?;
++
++        let RecipientPaymentMethodData::Card(ref card) = request.recipient_payment_method_data;
++
++        let url = format!("{}payments/v1/refunds", router_data.base_url);
++
++        let encryption_data = Self::encrypt_card(card, access_token)?;
++
++        let body = FiservcommercehubCreditRequestEncrypted {
++            amount,
++            source: EncryptedSource {
++                source_type: "PaymentCard".to_string(),
++                encryption_data,
++            },
++            merchant_details,
++            transaction_interaction,
++        };
++
++        // Serialize body first, then build HMAC over that exact string.
++        let body_str = serde_json::to_string(&body)
++            .change_context(ConnectorError::RequestEncodingFailed)
++            .attach_printable("Failed to serialize encrypted credit request")?;
++
++        let mut req = Request::new(Method::Post, &url);
++        req.set_body(RequestContent::Json(Box::new(body)));
++
++        for (name, value) in Self::build_auth_headers(&auth, &body_str) {
++            req.add_header(&name, value);
++        }
++
++        Ok(req)
++    }
++
++    fn handle_relay_success_response(
++        &self,
++        response: Bytes,
++    ) -> error_stack::Result<UnreferencedRefundResponse, ConnectorError> {
++        let raw_response = serde_json::from_slice::<serde_json::Value>(&response)
++            .ok()
++            .map(Secret::new);
++
++        let parsed: FiservcommercehubCreditResponse = serde_json::from_slice(&response)
++            .change_context(ConnectorError::ResponseDeserializationFailed)
++            .attach_printable("Failed to parse success response from Commerce Hub")?;
++
++        let refund_status =
++            common_enums::RefundStatus::from(parsed.gateway_response.transaction_state);
++
++        let connector_refund_id = parsed
++            .gateway_response
++            .transaction_processing_details
++            .and_then(|d| d.transaction_id);
++
++        Ok(UnreferencedRefundResponse {
++            connector_refund_id,
++            refund_status,
++            error_code: None,
++            error_message: None,
++            raw_response,
++        })
++    }
++
++    fn get_relay_error_response(
++        &self,
++        response: Bytes,
++        _status_code: u16,
++    ) -> error_stack::Result<UnreferencedRefundResponse, ConnectorError> {
++        let raw_response = serde_json::from_slice::<serde_json::Value>(&response)
++            .ok()
++            .map(Secret::new);
++
++        let err_resp: FiservcommercehubErrorResponse = serde_json::from_slice(&response)
++            .change_context(ConnectorError::ResponseDeserializationFailed)
++            .attach_printable("Failed to parse error response from Commerce Hub")?;
++        let entry = err_resp.error.into_iter().next();
++        let code = entry
++            .as_ref()
++            .and_then(|e| e.code.as_deref().or(e.error_type.as_deref()))
++            .unwrap_or("UNKNOWN_ERROR")
++            .to_string();
++        let message = entry
++            .map(|e| e.message)
++            .unwrap_or_else(|| "Unknown error from Commerce Hub".to_string());
++
++        Ok(UnreferencedRefundResponse {
++            connector_refund_id: None,
++            refund_status: common_enums::RefundStatus::Failure,
++            error_code: Some(code),
++            error_message: Some(message),
++            raw_response,
++        })
++    }
++}
+diff --git a/crates/hyperswitch_connectors/src/lib.rs b/crates/hyperswitch_connectors/src/lib.rs
+index 5873398d8e..8e60c7cfc1 100644
+--- a/crates/hyperswitch_connectors/src/lib.rs
++++ b/crates/hyperswitch_connectors/src/lib.rs
+@@ -1,5 +1,6 @@
+ //! Hyperswitch connectors
+ 
++pub mod connector_relay;
+ pub mod connectors;
+ pub mod constants;
+ pub mod default_implementations;
+diff --git a/crates/hyperswitch_domain_models/src/relay.rs b/crates/hyperswitch_domain_models/src/relay.rs
+index aa8c92c9e2..ce68529175 100644
+--- a/crates/hyperswitch_domain_models/src/relay.rs
++++ b/crates/hyperswitch_domain_models/src/relay.rs
+@@ -99,6 +99,13 @@ impl From<api_models::relay::RelayData> for RelayData {
+                 currency: relay_void_request.currency,
+                 cancellation_reason: relay_void_request.cancellation_reason,
+             }),
++            api_models::relay::RelayData::UnreferencedRefund(data) => {
++                Self::UnreferencedRefund(RelayUnreferencedRefundData {
++                    amount: data.amount,
++                    currency: data.currency,
++                    customer_id: data.customer_id,
++                })
++            }
+         }
+     }
+ }
+@@ -291,7 +298,6 @@ impl RelayUpdate {
+         }
+     }
+ }
+-
+ impl From<RelayData> for api_models::relay::RelayData {
+     fn from(relay: RelayData) -> Self {
+         match relay {
+@@ -327,6 +333,14 @@ impl From<RelayData> for api_models::relay::RelayData {
+                     cancellation_reason: relay_void_request.cancellation_reason,
+                 })
+             }
++            RelayData::UnreferencedRefund(relay_unreferenced_refund_data) => {
++                Self::UnreferencedRefund(api_models::relay::RelayUnreferencedRefundData {
++                    amount: relay_unreferenced_refund_data.amount,
++                    currency: relay_unreferenced_refund_data.currency,
++                    customer_id: relay_unreferenced_refund_data.customer_id,
++                    recipient_payment_method_data: None,
++                })
++            }
+         }
+     }
+ }
+@@ -343,40 +357,7 @@ impl From<Relay> for api_models::relay::RelayResponse {
+                 },
+             );
+ 
+-        let data = value.request_data.map(|relay_data| match relay_data {
+-            RelayData::Refund(relay_refund_request) => {
+-                api_models::relay::RelayData::Refund(api_models::relay::RelayRefundRequestData {
+-                    amount: relay_refund_request.amount,
+-                    currency: relay_refund_request.currency,
+-                    reason: relay_refund_request.reason,
+-                })
+-            }
+-            RelayData::Capture(relay_capture_request) => {
+-                api_models::relay::RelayData::Capture(api_models::relay::RelayCaptureRequestData {
+-                    authorized_amount: relay_capture_request.authorized_amount,
+-                    amount_to_capture: relay_capture_request.amount_to_capture,
+-                    currency: relay_capture_request.currency,
+-                    capture_method: relay_capture_request.capture_method,
+-                })
+-            }
+-            RelayData::IncrementalAuthorization(relay_incremental_authorization_request) => {
+-                api_models::relay::RelayData::IncrementalAuthorization(
+-                    api_models::relay::RelayIncrementalAuthorizationRequestData {
+-                        total_amount: relay_incremental_authorization_request.total_amount,
+-                        additional_amount: relay_incremental_authorization_request
+-                            .additional_amount,
+-                        currency: relay_incremental_authorization_request.currency,
+-                    },
+-                )
+-            }
+-            RelayData::Void(relay_void_request) => {
+-                api_models::relay::RelayData::Void(api_models::relay::RelayVoidRequestData {
+-                    amount: relay_void_request.amount,
+-                    currency: relay_void_request.currency,
+-                    cancellation_reason: relay_void_request.cancellation_reason,
+-                })
+-            }
+-        });
++        let data = value.request_data.map(api_models::relay::RelayData::from);
+         Self {
+             id: value.id,
+             status: value.status,
+@@ -398,6 +379,7 @@ pub enum RelayData {
+     Capture(RelayCaptureData),
+     IncrementalAuthorization(RelayIncrementalAuthorizationData),
+     Void(RelayVoidData),
++    UnreferencedRefund(RelayUnreferencedRefundData),
+ }
+ 
+ impl RelayData {
+@@ -421,6 +403,9 @@ impl RelayData {
+                 enums::RelayType::Void => {
+                     Ok(Some(Self::Void(RelayVoidData::from_value(data.expose())?)))
+                 }
++                enums::RelayType::UnreferencedRefund => Ok(Some(Self::UnreferencedRefund(
++                    RelayUnreferencedRefundData::from_value(data.expose())?,
++                ))),
+             },
+             None => Ok(None),
+         }
+@@ -429,20 +414,22 @@ impl RelayData {
+     pub fn get_refund_data(&self) -> CustomResult<RelayRefundData, ApiErrorResponse> {
+         match self.clone() {
+             Self::Refund(refund_data) => Ok(refund_data),
+-            Self::Capture(_) | Self::IncrementalAuthorization(_) | Self::Void(_) => {
+-                Err(ApiErrorResponse::InternalServerError)
+-                    .attach_printable("relay data does not contain relay refund data")
+-            }
++            Self::Capture(_)
++            | Self::IncrementalAuthorization(_)
++            | Self::Void(_)
++            | Self::UnreferencedRefund(_) => Err(ApiErrorResponse::InternalServerError)
++                .attach_printable("relay data does not contain relay refund data"),
+         }
+     }
+ 
+     pub fn get_capture_data(&self) -> CustomResult<RelayCaptureData, ApiErrorResponse> {
+         match self.clone() {
+             Self::Capture(capture_data) => Ok(capture_data),
+-            Self::Refund(_) | Self::IncrementalAuthorization(_) | Self::Void(_) => {
+-                Err(ApiErrorResponse::InternalServerError)
+-                    .attach_printable("relay data does not contain relay capture data")
+-            }
++            Self::Refund(_)
++            | Self::IncrementalAuthorization(_)
++            | Self::Void(_)
++            | Self::UnreferencedRefund(_) => Err(ApiErrorResponse::InternalServerError)
++                .attach_printable("relay data does not contain relay capture data"),
+         }
+     }
+ 
+@@ -453,20 +440,35 @@ impl RelayData {
+             Self::IncrementalAuthorization(incremental_authorization_data) => {
+                 Ok(incremental_authorization_data)
+             }
+-            Self::Refund(_) | Self::Capture(_) | Self::Void(_) => Err(
+-                ApiErrorResponse::InternalServerError,
+-            )
+-            .attach_printable("relay data does not contain relay incremental authorization data"),
++            Self::Refund(_) | Self::Capture(_) | Self::Void(_) | Self::UnreferencedRefund(_) => {
++                Err(ApiErrorResponse::InternalServerError).attach_printable(
++                    "relay data does not contain relay incremental authorization data",
++                )
++            }
+         }
+     }
+ 
+     pub fn get_void_data(&self) -> CustomResult<RelayVoidData, ApiErrorResponse> {
+         match self.clone() {
+             Self::Void(void_data) => Ok(void_data),
+-            Self::Refund(_) | Self::Capture(_) | Self::IncrementalAuthorization(_) => {
+-                Err(ApiErrorResponse::InternalServerError)
+-                    .attach_printable("relay data does not contain relay void data")
+-            }
++            Self::Refund(_)
++            | Self::Capture(_)
++            | Self::IncrementalAuthorization(_)
++            | Self::UnreferencedRefund(_) => Err(ApiErrorResponse::InternalServerError)
++                .attach_printable("relay data does not contain relay void data"),
++        }
++    }
++
++    pub fn get_unreferenced_refund_data(
++        &self,
++    ) -> CustomResult<RelayUnreferencedRefundData, ApiErrorResponse> {
++        match self.clone() {
++            Self::UnreferencedRefund(data) => Ok(data),
++            Self::Refund(_)
++            | Self::Capture(_)
++            | Self::IncrementalAuthorization(_)
++            | Self::Void(_) => Err(ApiErrorResponse::InternalServerError)
++                .attach_printable("relay data does not contain unreferenced refund data"),
+         }
+     }
+ }
+@@ -540,6 +542,23 @@ impl RelayVoidData {
+     }
+ }
+ 
++#[derive(Debug, Clone, Deserialize, Serialize)]
++pub struct RelayUnreferencedRefundData {
++    pub amount: MinorUnit,
++    pub currency: enums::Currency,
++    pub customer_id: Option<String>,
++}
++
++impl RelayUnreferencedRefundData {
++    pub fn from_value(value: serde_json::Value) -> CustomResult<Self, ValidationError> {
++        value
++            .parse_value("RelayUnreferencedRefundData")
++            .change_context(ValidationError::InvalidValue {
++                message: "Failed while deserializing RelayUnreferencedRefundData".to_string(),
++            })
++    }
++}
++
+ #[derive(Debug)]
+ pub enum RelayUpdate {
+     ErrorUpdate {
+@@ -551,6 +570,13 @@ pub enum RelayUpdate {
+         connector_reference_id: Option<String>,
+         status: common_enums::RelayStatus,
+     },
++    UnreferencedRefundUpdate {
++        connector_reference_id: Option<String>,
++        status: common_enums::RelayStatus,
++        error_code: Option<String>,
++        error_message: Option<String>,
++        response_data: Option<pii::SecretSerdeValue>,
++    },
+ }
+ 
+ impl From<RelayUpdate> for RelayUpdateInternal {
+@@ -566,6 +592,7 @@ impl From<RelayUpdate> for RelayUpdateInternal {
+                 connector_reference_id: None,
+                 status: Some(status),
+                 modified_at: common_utils::date_time::now(),
++                response_data: None,
+             },
+             RelayUpdate::StatusUpdate {
+                 connector_reference_id,
+@@ -576,6 +603,21 @@ impl From<RelayUpdate> for RelayUpdateInternal {
+                 error_code: None,
+                 error_message: None,
+                 modified_at: common_utils::date_time::now(),
++                response_data: None,
++            },
++            RelayUpdate::UnreferencedRefundUpdate {
++                connector_reference_id,
++                status,
++                error_code,
++                error_message,
++                response_data,
++            } => Self {
++                connector_reference_id,
++                status: Some(status),
++                error_code,
++                error_message,
++                modified_at: common_utils::date_time::now(),
++                response_data,
+             },
+         }
+     }
+diff --git a/crates/hyperswitch_interfaces/src/lib.rs b/crates/hyperswitch_interfaces/src/lib.rs
+index bc7c92f49a..59bf5e4ebc 100644
+--- a/crates/hyperswitch_interfaces/src/lib.rs
++++ b/crates/hyperswitch_interfaces/src/lib.rs
+@@ -35,3 +35,5 @@ pub mod webhooks;
+ 
+ /// Crm interface
+ pub mod crm;
++/// Connector relay integration interface
++pub mod relay;
+diff --git a/crates/hyperswitch_interfaces/src/relay.rs b/crates/hyperswitch_interfaces/src/relay.rs
+new file mode 100644
+index 0000000000..c1bad8bffa
+--- /dev/null
++++ b/crates/hyperswitch_interfaces/src/relay.rs
+@@ -0,0 +1,96 @@
++//! Connector relay integration interface
++
++use api_models::unreferenced_refund::UnreferencedRefundRequest;
++use bytes::Bytes;
++use common_utils::request::Request;
++use hyperswitch_domain_models::router_data::{AccessToken, ConnectorAuthType};
++use hyperswitch_masking::Secret;
++
++use crate::errors::ConnectorError;
++
++/// All data required to build a relay request
++#[derive(Debug)]
++pub struct UnreferencedRefundRouterData<'a> {
++    /// Merchant-supplied request fields (amount, currency, card data, etc.)
++    pub request: &'a UnreferencedRefundRequest,
++    /// Access token fetched from the Redis cache by Hyperswitch — never supplied by the merchant.
++    pub access_token: Option<AccessToken>,
++    /// Parsed connector credentials.
++    pub auth_type: &'a ConnectorAuthType,
++    /// Connector base URL from config.
++    pub base_url: &'a str,
++}
++
++/// Response returned by a connector for an unreferenced refund relay operation.
++#[derive(Debug)]
++pub struct UnreferencedRefundResponse {
++    /// Connector-assigned refund/transaction ID
++    pub connector_refund_id: Option<String>,
++    /// Mapped refund status
++    pub refund_status: common_enums::RefundStatus,
++    /// Connector error code (populated on failure)
++    pub error_code: Option<String>,
++    /// Connector error message (populated on failure)
++    pub error_message: Option<String>,
++    /// Raw JSON response from the connector
++    pub raw_response: Option<Secret<serde_json::Value>>,
++}
++
++/// Trait implemented by connectors that support relay operations (e.g. unreferenced refund).
++pub trait ConnectorRelayIntegration {
++    /// Connector base URL from config.
++    fn base_url<'a>(
++        &self,
++        connectors: &'a hyperswitch_domain_models::connector_endpoints::Connectors,
++    ) -> &'a str;
++
++    /// Whether this connector requires an access token before relay requests.
++    fn supports_access_token(&self) -> bool;
++
++    /// Build the outbound HTTP request.
++    fn build_relay_request(
++        &self,
++        router_data: &UnreferencedRefundRouterData<'_>,
++    ) -> error_stack::Result<Request, ConnectorError>;
++
++    /// Parse a 2xx success response — connector-specific.
++    fn handle_relay_success_response(
++        &self,
++        response: Bytes,
++    ) -> error_stack::Result<UnreferencedRefundResponse, ConnectorError>;
++
++    /// Parse a 4xx error response — connector-specific.
++    fn get_relay_error_response(
++        &self,
++        response: Bytes,
++        status_code: u16,
++    ) -> error_stack::Result<UnreferencedRefundResponse, ConnectorError>;
++
++    /// Parse a 5xx error response — default impl returns a generic message without JSON parsing.
++    fn get_relay_5xx_error_response(
++        &self,
++        status_code: u16,
++    ) -> error_stack::Result<UnreferencedRefundResponse, ConnectorError> {
++        Ok(UnreferencedRefundResponse {
++            connector_refund_id: None,
++            refund_status: common_enums::RefundStatus::Pending,
++            error_code: Some(status_code.to_string()),
++            error_message: Some(format!("Server error: HTTP {status_code}")),
++            raw_response: None,
++        })
++    }
++
++    /// Orchestrates the three methods above based on HTTP status code.
++    /// Connectors do not override this.
++    fn handle_relay_response(
++        &self,
++        response: Bytes,
++        status_code: u16,
++    ) -> error_stack::Result<UnreferencedRefundResponse, ConnectorError> {
++        match status_code {
++            500..=599 => self.get_relay_5xx_error_response(status_code),
++            400..=499 => self.get_relay_error_response(response, status_code),
++            _ => self.handle_relay_success_response(response),
++        }
++    }
++}
+diff --git a/crates/openapi/src/openapi.rs b/crates/openapi/src/openapi.rs
+index 76668edf57..b7a838d50d 100644
+--- a/crates/openapi/src/openapi.rs
++++ b/crates/openapi/src/openapi.rs
+@@ -790,6 +790,9 @@ Never share your secret api keys. Keep them guarded and secure.
+         api_models::relay::RelayCaptureRequestData,
+         api_models::relay::RelayIncrementalAuthorizationRequestData,
+         api_models::relay::RelayVoidRequestData,
++        api_models::relay::RelayUnreferencedRefundData,
++        api_models::unreferenced_refund::RecipientPaymentMethodData,
++        api_models::unreferenced_refund::RecipientCardData,
+         api_models::enums::RelayStatus,
+         api_models::relay::RelayError,
+         api_models::payments::AmountFilter,
+diff --git a/crates/router/src/core/payments/access_token.rs b/crates/router/src/core/payments/access_token.rs
+index 2842a3e7d7..ea1112172a 100644
+--- a/crates/router/src/core/payments/access_token.rs
++++ b/crates/router/src/core/payments/access_token.rs
+@@ -1,17 +1,20 @@
+ use std::fmt::Debug;
+ 
++use common_enums;
+ use common_utils::ext_traits::AsyncExt;
+ use error_stack::ResultExt;
+ use hyperswitch_interfaces::{
+     api::{gateway, ConnectorSpecifications, ConnectorValidation},
+     consts as interfaces_consts,
+ };
++use unified_connector_service_client::payments as payments_grpc;
+ 
+ use crate::{
+     consts,
+     core::{
+         errors::{self, RouterResult},
+         payments::{self, gateway::context as gateway_context},
++        unified_connector_service,
+     },
+     routes::{metrics, SessionState},
+     services::{self, logger},
+@@ -280,6 +283,166 @@ pub async fn add_access_token<
+     }
+ }
+ 
++/// Reads the Redis cache first. On a cache miss, calls UCS via the
++/// `create_server_authentication_token` gRPC method to generate a fresh token, caches it,
++/// and returns it.
++#[allow(clippy::too_many_arguments)]
++pub async fn get_access_token_for_relay(
++    state: &SessionState,
++    connector_name: &str,
++    merchant_id: &common_utils::id_type::MerchantId,
++    profile_id: &common_utils::id_type::ProfileId,
++    merchant_connector_account: &domain::MerchantConnectorAccount,
++    processor: &domain::Processor,
++    relay_id: &common_utils::id_type::RelayId,
++) -> RouterResult<Option<types::AccessToken>> {
++    let merchant_connector_id = merchant_connector_account
++        .get_id()
++        .get_string_repr()
++        .to_string();
++
++    let access_token_key = common_utils::access_token::get_default_access_token_key(
++        merchant_id,
++        merchant_connector_id,
++    );
++
++    let cached = state
++        .store
++        .get_access_token(access_token_key.clone())
++        .await
++        .change_context(errors::ApiErrorResponse::InternalServerError)
++        .attach_printable("Failed to read access token from cache")?;
++
++    match cached {
++        Some(access_token) => {
++            logger::info!(
++                connector = %connector_name,
++                "Cached access token found"
++            );
++            Ok(Some(access_token))
++        }
++        None => {
++            logger::info!(
++                connector = %connector_name,
++                "No cached access token — generating via UCS"
++            );
++            fetch_access_token_from_ucs(
++                state,
++                connector_name,
++                merchant_id,
++                profile_id,
++                merchant_connector_account,
++                processor,
++                relay_id,
++                access_token_key,
++            )
++            .await
++        }
++    }
++}
++
++#[allow(clippy::too_many_arguments)]
++async fn fetch_access_token_from_ucs(
++    state: &SessionState,
++    connector_name: &str,
++    merchant_id: &common_utils::id_type::MerchantId,
++    profile_id: &common_utils::id_type::ProfileId,
++    merchant_connector_account: &domain::MerchantConnectorAccount,
++    processor: &domain::Processor,
++    relay_id: &common_utils::id_type::RelayId,
++    access_token_key: String,
++) -> RouterResult<Option<types::AccessToken>> {
++    let client = state
++        .grpc_client
++        .unified_connector_service_client
++        .clone()
++        .ok_or(errors::ApiErrorResponse::InternalServerError)
++        .attach_printable("UCS gRPC client not configured")?;
++
++    #[cfg(feature = "v1")]
++    let mca_type = payments::helpers::MerchantConnectorAccountType::DbVal(Box::new(
++        merchant_connector_account.clone(),
++    ));
++    #[cfg(feature = "v2")]
++    let mca_type =
++        hyperswitch_domain_models::merchant_connector_account::MerchantConnectorAccountTypeDetails::MerchantConnectorAccount(Box::new(
++            merchant_connector_account.clone(),
++        ));
++
++    let connector_auth_metadata =
++        unified_connector_service::build_unified_connector_service_auth_metadata(
++            mca_type,
++            processor,
++            connector_name.to_string(),
++        )
++        .change_context(errors::ApiErrorResponse::InternalServerError)
++        .attach_printable("Failed to build UCS auth metadata")?;
++
++    let lineage_ids =
++        external_services::grpc_client::LineageIds::new(merchant_id.clone(), profile_id.clone());
++
++    let grpc_headers = state
++        .get_grpc_headers_ucs(common_enums::ExecutionMode::Primary)
++        .external_vault_proxy_metadata(None)
++        .merchant_reference_id(None)
++        .resource_id(None)
++        .lineage_ids(lineage_ids)
++        .build();
++
++    #[cfg(feature = "v1")]
++    let test_mode = merchant_connector_account.test_mode;
++    #[cfg(feature = "v2")]
++    let test_mode = merchant_connector_account.get_connector_test_mode();
++
++    let create_request =
++        payments_grpc::MerchantAuthenticationServiceCreateServerAuthenticationTokenRequest {
++            merchant_access_token_id: Some(relay_id.get_string_repr().to_string()),
++            // depricated field we have to remove this/ Default to unspecified connector
++            connector: 0_i32,
++            metadata: None,
++            connector_feature_data: None,
++            test_mode,
++        };
++
++    let response = client
++        .create_access_token(create_request, connector_auth_metadata, grpc_headers)
++        .await
++        .change_context(errors::ApiErrorResponse::InternalServerError)
++        .attach_printable("UCS create_access_token gRPC call failed")?;
++
++    let (access_token_result, _status_code) =
++        unified_connector_service::handle_unified_connector_service_response_for_create_access_token(
++            response.into_inner(),
++        )
++        .change_context(errors::ApiErrorResponse::InternalServerError)
++        .attach_printable("Failed to parse UCS access token response")?;
++
++    let access_token = access_token_result.map_err(|err| {
++        error_stack::Report::new(errors::ApiErrorResponse::InternalServerError).attach_printable(
++            format!("UCS returned error for access token generation: {err:?}"),
++        )
++    })?;
++
++    // The expiry should be adjusted for network delays from the connector
++    let modified_token = types::AccessToken {
++        expires: access_token
++            .expires
++            .saturating_sub(consts::REDUCE_ACCESS_TOKEN_EXPIRY_TIME.into()),
++        ..access_token
++    };
++
++    state
++        .store
++        .set_access_token(access_token_key, modified_token.clone())
++        .await
++        .map_err(|cache_err| {
++            logger::error!(error = ?cache_err, "Failed to cache access token — proceeding anyway");
++        })
++        .ok();
++
++    Ok(Some(modified_token))
++}
++
+ pub async fn refresh_connector_auth(
+     state: &SessionState,
+     connector: &api_types::ConnectorData,
+diff --git a/crates/router/src/core/relay.rs b/crates/router/src/core/relay.rs
+index 2b95b217c3..489145647f 100644
+--- a/crates/router/src/core/relay.rs
++++ b/crates/router/src/core/relay.rs
+@@ -2,18 +2,25 @@ use std::marker::PhantomData;
+ 
+ use api_models::relay as relay_api_models;
+ use async_trait::async_trait;
++use bytes::Bytes;
+ use common_enums::RelayStatus;
+ use common_utils::{
+     self, fp_utils,
+     id_type::{self, GenerateId},
+ };
+ use error_stack::ResultExt;
++use hyperswitch_connectors::connector_relay::RelayConnectors;
+ use hyperswitch_domain_models::relay;
++use hyperswitch_interfaces::{
++    api_client::call_connector_api,
++    relay::{ConnectorRelayIntegration, UnreferencedRefundRouterData},
++};
++use hyperswitch_masking::Secret;
+ 
+ use super::errors::{self, ConnectorErrorExt, RouterResponse, RouterResult, StorageErrorExt};
+ use crate::{
+     connector::utils::RouterData,
+-    core::payments,
++    core::payments::{self, access_token as access_token_core},
+     routes::SessionState,
+     services::{self, api::ConnectorValidation},
+     types::{
+@@ -130,6 +137,7 @@ impl RelayRequestInner<RelayRefund> {
+             Some(relay_api_models::RelayData::Capture(_))
+             | Some(relay_api_models::RelayData::Void(_))
+             | Some(relay_api_models::RelayData::IncrementalAuthorization(_))
++            | Some(relay_api_models::RelayData::UnreferencedRefund(_))
+             | None => Err(errors::ApiErrorResponse::InvalidRequestData {
+                 message: "Relay data is required for relay type refund".to_string(),
+             })?,
+@@ -261,6 +269,7 @@ impl RelayRequestInner<RelayCapture> {
+             Some(relay_api_models::RelayData::Refund(_))
+             | Some(relay_api_models::RelayData::Void(_))
+             | Some(relay_api_models::RelayData::IncrementalAuthorization(_))
++            | Some(relay_api_models::RelayData::UnreferencedRefund(_))
+             | None => Err(errors::ApiErrorResponse::InvalidRequestData {
+                 message: "Relay data is required for relay type capture".to_string(),
+             })?,
+@@ -395,8 +404,10 @@ impl RelayRequestInner<RelayIncrementalAuthorization> {
+             Some(relay_api_models::RelayData::Refund(_))
+             | Some(relay_api_models::RelayData::Void(_))
+             | Some(relay_api_models::RelayData::Capture(_))
++            | Some(relay_api_models::RelayData::UnreferencedRefund(_))
+             | None => Err(errors::ApiErrorResponse::InvalidRequestData {
+-                message: "Relay data is required for relay type capture".to_string(),
++                message: "Relay data is required for relay type incremental_authorization"
++                    .to_string(),
+             })?,
+         }
+     }
+@@ -530,6 +541,7 @@ impl RelayRequestInner<RelayVoid> {
+             Some(relay_api_models::RelayData::Refund(_))
+             | Some(relay_api_models::RelayData::IncrementalAuthorization(_))
+             | Some(relay_api_models::RelayData::Capture(_))
++            | Some(relay_api_models::RelayData::UnreferencedRefund(_))
+             | None => Err(errors::ApiErrorResponse::InvalidRequestData {
+                 message: "Relay data is required for relay type void".to_string(),
+             })?,
+@@ -684,6 +696,26 @@ pub async fn relay_flow_decider(
+                 RelayRequestInner::<RelayVoid>::from_relay_request(request)?;
+             relay(state, platform, profile_id_optional, relay_capture_request).await
+         }
++        common_enums::RelayType::UnreferencedRefund => {
++            let profile_id = profile_id_optional.get_required_value("ProfileId")?;
++            let connector_resource_id = request.connector_resource_id.clone();
++            let unreferenced_refund_request =
++                api_models::unreferenced_refund::UnreferencedRefundRequest::try_from(request)
++                    .change_context(errors::ApiErrorResponse::InvalidRequestData {
++                        message: "Invalid relay request for unreferenced refund".to_string(),
++                    })?;
++            let (updated_relay, _, _) = process_relay_unreferenced_refund(
++                &state,
++                &platform,
++                &profile_id,
++                connector_resource_id,
++                &unreferenced_refund_request,
++            )
++            .await?;
++            Ok(hyperswitch_domain_models::api::ApplicationResponse::Json(
++                relay_api_models::RelayResponse::from(updated_relay),
++            ))
++        }
+     }
+ }
+ 
+@@ -889,9 +921,9 @@ pub async fn relay_retrieve(
+                 relay_record
+             }
+         }
+-        common_enums::RelayType::IncrementalAuthorization | common_enums::RelayType::Void => {
+-            relay_record
+-        }
++        common_enums::RelayType::IncrementalAuthorization
++        | common_enums::RelayType::Void
++        | common_enums::RelayType::UnreferencedRefund => relay_record,
+     };
+ 
+     let response = relay_api_models::RelayResponse::from(relay_response);
+@@ -962,6 +994,249 @@ pub async fn sync_relay_refund_with_gateway(
+     Ok(relay_response)
+ }
+ 
++async fn process_unreferenced_refund(
++    state: &SessionState,
++    platform: &domain::Platform,
++    profile_id: &id_type::ProfileId,
++    connector_resource_id: String,
++    request: &api_models::unreferenced_refund::UnreferencedRefundRequest,
++) -> RouterResult<(relay::Relay, String, Option<Secret<serde_json::Value>>)> {
++    let db = state.store.as_ref();
++    let merchant_id = platform.get_provider().get_account().get_id();
++    let processor_merchant_id = platform.get_processor().get_account().get_id();
++    let connector_id: &id_type::MerchantConnectorAccountId = &request.connector_id;
++
++    #[cfg(feature = "v1")]
++    let connector_account = db
++        .find_by_merchant_connector_account_merchant_id_merchant_connector_id(
++            processor_merchant_id,
++            connector_id,
++            platform.get_processor().get_key_store(),
++        )
++        .await
++        .to_not_found_response(errors::ApiErrorResponse::MerchantConnectorAccountNotFound {
++            id: connector_id.get_string_repr().to_string(),
++        })?;
++
++    #[cfg(feature = "v2")]
++    let connector_account = db
++        .find_merchant_connector_account_by_id(
++            connector_id,
++            platform.get_processor().get_key_store(),
++        )
++        .await
++        .to_not_found_response(errors::ApiErrorResponse::MerchantConnectorAccountNotFound {
++            id: connector_id.get_string_repr().to_string(),
++        })?;
++
++    let connector_name = connector_account.get_connector_name_as_string();
++    let auth_type = connector_account
++        .get_connector_account_details()
++        .change_context(errors::ApiErrorResponse::InternalServerError)
++        .attach_printable("Failed to parse connector auth type")?;
++
++    let relay_connector = RelayConnectors::from_connector_name(&connector_name).change_context(
++        errors::ApiErrorResponse::InvalidRequestData {
++            message: format!("Connector {connector_name} does not support unreferenced refund"),
++        },
++    )?;
++
++    let base_url = relay_connector.base_url(&state.conf.connectors);
++
++    let relay_id = id_type::RelayId::generate();
++
++    let access_token = if relay_connector.supports_access_token() {
++        access_token_core::get_access_token_for_relay(
++            state,
++            &connector_name,
++            processor_merchant_id,
++            profile_id,
++            &connector_account,
++            platform.get_processor(),
++            &relay_id,
++        )
++        .await?
++    } else {
++        None
++    };
++
++    let created_by = platform
++        .get_initiator()
++        .and_then(|initiator| initiator.to_created_by());
++
++    let relay_domain = relay::Relay {
++        id: relay_id,
++        connector_resource_id: connector_resource_id.clone(),
++        connector_id: connector_id.clone(),
++        profile_id: profile_id.clone(),
++        merchant_id: merchant_id.clone(),
++        relay_type: common_enums::RelayType::UnreferencedRefund,
++        request_data: Some(relay::RelayData::UnreferencedRefund(
++            relay::RelayUnreferencedRefundData {
++                amount: request.amount,
++                currency: request.currency,
++                customer_id: request.customer_id.clone(),
++            },
++        )),
++        status: RelayStatus::Created,
++        connector_reference_id: None,
++        error_code: None,
++        error_message: None,
++        created_at: common_utils::date_time::now(),
++        modified_at: common_utils::date_time::now(),
++        response_data: None,
++        processor_merchant_id: Some(processor_merchant_id.clone()),
++        created_by,
++    };
++
++    let relay_record = db
++        .insert_relay(platform.get_processor().get_key_store(), relay_domain)
++        .await
++        .change_context(errors::ApiErrorResponse::InternalServerError)
++        .attach_printable("Failed to insert unreferenced refund relay record")?;
++
++    let relay_router_data = UnreferencedRefundRouterData {
++        request,
++        access_token,
++        auth_type: &auth_type,
++        base_url,
++    };
++
++    let connector_request = relay_connector
++        .build_relay_request(&relay_router_data)
++        .change_context(errors::ApiErrorResponse::InternalServerError)
++        .attach_printable("Failed to build relay request")?;
++
++    let api_response =
++        call_connector_api(state, connector_request, "relay_unreferenced_refund").await;
++
++    let (response_bytes, relay_update) = match api_response {
++        Ok(resp) => {
++            let (status, bytes) = match resp {
++                Ok(r) => (r.status_code, r.response),
++                Err(r) => (r.status_code, r.response),
++            };
++            let connector_resp = relay_connector
++                .handle_relay_response(bytes.clone(), status)
++                .change_context(errors::ApiErrorResponse::InternalServerError)
++                .attach_printable("Failed to handle relay response")?;
++            let relay_status = RelayStatus::from(connector_resp.refund_status);
++            let relay_update = relay::RelayUpdate::UnreferencedRefundUpdate {
++                connector_reference_id: connector_resp.connector_refund_id,
++                status: relay_status,
++                error_code: connector_resp.error_code,
++                error_message: connector_resp.error_message,
++                response_data: connector_resp.raw_response,
++            };
++            (bytes, relay_update)
++        }
++        Err(err) => {
++            let (error_code, error_message) = if err.current_context().is_upstream_timeout() {
++                (
++                    hyperswitch_interfaces::consts::REQUEST_TIMEOUT_ERROR_CODE.to_string(),
++                    hyperswitch_interfaces::consts::REQUEST_TIMEOUT_ERROR_MESSAGE.to_string(),
++                )
++            } else {
++                ("CONNECTOR_UNREACHABLE".to_string(), err.to_string())
++            };
++            let relay_update = relay::RelayUpdate::ErrorUpdate {
++                error_code,
++                error_message,
++                status: RelayStatus::Pending,
++            };
++            (Bytes::new(), relay_update)
++        }
++    };
++
++    let updated_relay = db
++        .update_relay(
++            platform.get_processor().get_key_store(),
++            relay_record,
++            relay_update,
++        )
++        .await
++        .change_context(errors::ApiErrorResponse::InternalServerError)
++        .attach_printable("Failed to update unreferenced refund relay record")?;
++
++    let raw_connector_response = serde_json::from_slice::<serde_json::Value>(&response_bytes)
++        .ok()
++        .map(Secret::new);
++
++    Ok((updated_relay, connector_name, raw_connector_response))
++}
++
++async fn process_relay_unreferenced_refund(
++    state: &SessionState,
++    platform: &domain::Platform,
++    profile_id: &id_type::ProfileId,
++    connector_resource_id: String,
++    request: &api_models::unreferenced_refund::UnreferencedRefundRequest,
++) -> RouterResult<(relay::Relay, String, Option<Secret<serde_json::Value>>)> {
++    fp_utils::when(!request.amount.is_greater_than(0), || {
++        Err(errors::ApiErrorResponse::PreconditionFailed {
++            message: "Amount must be greater than 0".to_string(),
++        })
++    })?;
++
++    let db = state.store.as_ref();
++    let merchant_id = platform.get_processor().get_account().get_id();
++
++    db.find_business_profile_by_merchant_id_profile_id(
++        platform.get_processor().get_key_store(),
++        merchant_id,
++        profile_id,
++    )
++    .await
++    .change_context(errors::ApiErrorResponse::ProfileNotFound {
++        id: profile_id.get_string_repr().to_owned(),
++    })?;
++
++    process_unreferenced_refund(state, platform, profile_id, connector_resource_id, request).await
++}
++
++pub async fn relay_unreferenced_refund(
++    state: SessionState,
++    platform: domain::Platform,
++    profile_id: id_type::ProfileId,
++    request: api_models::unreferenced_refund::UnreferencedRefundRequest,
++) -> RouterResponse<api_models::unreferenced_refund::UnreferencedRefundResponse> {
++    let connector_resource_id = request
++        .connector_resource_id
++        .clone()
++        .unwrap_or_else(|| format!("internal_{}", uuid::Uuid::now_v7()));
++
++    let (updated_relay, connector_name, raw_connector_response) =
++        process_relay_unreferenced_refund(
++            &state,
++            &platform,
++            &profile_id,
++            connector_resource_id.clone(),
++            &request,
++        )
++        .await?;
++
++    let error = updated_relay
++        .error_code
++        .zip(updated_relay.error_message)
++        .map(|(code, message)| api_models::relay::RelayError { code, message });
++
++    let response = api_models::unreferenced_refund::UnreferencedRefundResponse {
++        id: updated_relay.id,
++        status: updated_relay.status,
++        connector: connector_name,
++        connector_id: updated_relay.connector_id,
++        connector_resource_id,
++        connector_reference_id: updated_relay.connector_reference_id,
++        profile_id,
++        error,
++        raw_connector_response,
++    };
++
++    Ok(hyperswitch_domain_models::api::ApplicationResponse::Json(
++        response,
++    ))
++}
++
+ pub async fn sync_relay_capture_with_gateway(
+     state: &SessionState,
+     processor: &domain::Processor,
+diff --git a/crates/router/src/routes/app.rs b/crates/router/src/routes/app.rs
+index d41453b884..9e8e08a75d 100644
+--- a/crates/router/src/routes/app.rs
++++ b/crates/router/src/routes/app.rs
+@@ -893,6 +893,10 @@ impl Relay {
+         web::scope("/relay")
+             .app_data(web::Data::new(state))
+             .service(web::resource("").route(web::post().to(relay::relay)))
++            .service(
++                web::resource("/unreferenced_refund")
++                    .route(web::post().to(relay::unreferenced_refund)),
++            )
+             .service(web::resource("/{relay_id}").route(web::get().to(relay::relay_retrieve)))
+     }
+ }
+diff --git a/crates/router/src/routes/lock_utils.rs b/crates/router/src/routes/lock_utils.rs
+index 21094ce3a6..7441865233 100644
+--- a/crates/router/src/routes/lock_utils.rs
++++ b/crates/router/src/routes/lock_utils.rs
+@@ -208,7 +208,7 @@ impl From<Flow> for ApiIdentifier {
+             | Flow::RefundsFilters
+             | Flow::RefundsAggregate
+             | Flow::RefundsManualUpdate => Self::Refunds,
+-            Flow::Relay | Flow::RelayRetrieve => Self::Relay,
++            Flow::Relay | Flow::RelayRetrieve | Flow::RelayUnreferencedRefund => Self::Relay,
+             Flow::FrmFulfillment
+             | Flow::IncomingWebhookReceive
+             | Flow::IncomingRelayWebhookReceive
+diff --git a/crates/router/src/routes/relay.rs b/crates/router/src/routes/relay.rs
+index d0d544cd6f..c6fbd07e6b 100644
+--- a/crates/router/src/routes/relay.rs
++++ b/crates/router/src/routes/relay.rs
+@@ -1,12 +1,51 @@
+ use actix_web::{web, Responder};
++use common_utils::ext_traits::OptionExt;
++use error_stack::ResultExt;
+ use router_env::{instrument, tracing, Flow};
+ 
+ use crate::{
+     self as app,
+-    core::{api_locking, relay},
++    core::{api_locking, errors, relay},
+     services::{api, authentication as auth},
+ };
+ 
++#[instrument(skip_all, fields(flow = ?Flow::RelayUnreferencedRefund))]
++#[cfg(feature = "oltp")]
++pub async fn unreferenced_refund(
++    state: web::Data<app::AppState>,
++    req: actix_web::HttpRequest,
++    payload: web::Json<api_models::unreferenced_refund::UnreferencedRefundRequest>,
++) -> impl Responder {
++    let flow = Flow::RelayUnreferencedRefund;
++    let payload = payload.into_inner();
++    Box::pin(api::server_wrap(
++        flow,
++        state,
++        &req,
++        payload,
++        |state, auth: auth::AuthenticationData, req, _| async move {
++            #[cfg(feature = "v1")]
++            let profile_id = auth
++                .profile
++                .get_required_value("profile_id")
++                .change_context(errors::ApiErrorResponse::MissingRequiredField {
++                    field_name: "profile_id",
++                })?
++                .get_id()
++                .clone();
++            #[cfg(feature = "v2")]
++            let profile_id = auth.profile.get_id().clone();
++            relay::relay_unreferenced_refund(state, auth.platform, profile_id, req).await
++        },
++        &auth::HeaderAuth(auth::ApiKeyAuth {
++            allow_connected_scope_operation: false,
++            allow_platform_self_operation: false,
++        }),
++        api_locking::LockAction::NotApplicable,
++    ))
++    .await
++}
++
+ #[instrument(skip_all, fields(flow = ?Flow::Relay))]
+ #[cfg(feature = "oltp")]
+ pub async fn relay(
+diff --git a/crates/router_env/src/logger/types.rs b/crates/router_env/src/logger/types.rs
+index 3c56116f45..043244410a 100644
+--- a/crates/router_env/src/logger/types.rs
++++ b/crates/router_env/src/logger/types.rs
+@@ -647,6 +647,8 @@ pub enum Flow {
+     Relay,
+     /// Relay retrieve flow
+     RelayRetrieve,
++    /// Relay unreferenced refund flow
++    RelayUnreferencedRefund,
+     /// Card tokenization flow
+     TokenizeCard,
+     /// Card tokenization using payment method flow
+diff --git a/migrations/2026-05-22-000001_add_unreferenced_refund_to_relay_type/down.sql b/migrations/2026-05-22-000001_add_unreferenced_refund_to_relay_type/down.sql
+new file mode 100644
+index 0000000000..3189f1963a
+--- /dev/null
++++ b/migrations/2026-05-22-000001_add_unreferenced_refund_to_relay_type/down.sql
+@@ -0,0 +1,3 @@
++-- This file should undo anything in `up.sql`
++-- PostgreSQL does not support removing enum values; intentional no-op.
++select 1;
+diff --git a/migrations/2026-05-22-000001_add_unreferenced_refund_to_relay_type/up.sql b/migrations/2026-05-22-000001_add_unreferenced_refund_to_relay_type/up.sql
+new file mode 100644
+index 0000000000..3bcf7e4a6b
+--- /dev/null
++++ b/migrations/2026-05-22-000001_add_unreferenced_refund_to_relay_type/up.sql
+@@ -0,0 +1,2 @@
++-- Your SQL goes here
++ALTER TYPE "RelayType" ADD VALUE IF NOT EXISTS 'unreferenced_refund';

@@ -1,0 +1,527 @@
+commit 9be989146d5b958cafcc930385e63595a885cb20
+Author: Taym Haddadi <haddadi.taym@gmail.com>
+Date:   Tue Feb 13 08:58:48 2024 +0100
+
+    WebIDL: Use `ArrayBuffer` instead of raw `JSObject` in bindings (#31202)
+    
+    * WebIDL: Use ArrayBuffer instead of raw JSObject in bindings
+    
+    Signed-off-by: Bentaimia Haddadi <haddadi.taym@gmail.com>
+    
+    * Convert GPUBufferMapInfo mapping to Arc<Mutex>
+    
+    * Remove #[allow(unsafe_code)] from GPUBuffer
+    
+    * Add doc comments
+    
+    * Implement trace for Arc<Mutex<Vec<T>>>
+    
+    Signed-off-by: Bentaimia Haddadi <haddadi.taym@gmail.com>
+    
+    * Use #[no_trace] for GPUBufferMapInfo.mapping
+    
+    * Make create_new_external_array_buffer generic
+    
+    Signed-off-by: Bentaimia Haddadi <haddadi.taym@gmail.com>
+    
+    * Address review comments
+    
+    * Remove HeapTypedArray::new and avoid cloning Arc
+    
+    Signed-off-by: Bentaimia Haddadi <haddadi.taym@gmail.com>
+    
+    * Use expect for GetMappedRange and ReadAsArrayBuffer
+    
+    Signed-off-by: Bentaimia Haddadi <haddadi.taym@gmail.com>
+    
+    * Use doc comments for FileReaderSyncMethods
+    
+    Signed-off-by: Bentaimia Haddadi <haddadi.taym@gmail.com>
+    
+    * Return for Error::JsFailed GetMappedRange and ReadAsArrayBuffer
+    
+    Signed-off-by: Bentaimia Haddadi <haddadi.taym@gmail.com>
+    
+    * Fix detached_internal implementation and comments
+    
+    Signed-off-by: Bentaimia Haddadi <haddadi.taym@gmail.com>
+    
+    * format code
+    
+    Signed-off-by: Bentaimia Haddadi <haddadi.taym@gmail.com>
+    
+    * Update expectations
+    
+    ---------
+    
+    Signed-off-by: Bentaimia Haddadi <haddadi.taym@gmail.com>
+    Co-authored-by: sagudev <16504129+sagudev@users.noreply.github.com>
+
+diff --git a/components/script/dom/bindings/codegen/CodegenRust.py b/components/script/dom/bindings/codegen/CodegenRust.py
+index 1207543de90..3b474a543b0 100644
+--- a/components/script/dom/bindings/codegen/CodegenRust.py
++++ b/components/script/dom/bindings/codegen/CodegenRust.py
+@@ -128,6 +128,7 @@ builtinNames = {
+     IDLType.Tags.uint32array: 'Uint32Array',
+     IDLType.Tags.float32array: 'Float32Array',
+     IDLType.Tags.float64array: 'Float64Array',
++    IDLType.Tags.arrayBuffer: 'ArrayBuffer',
+ }
+ 
+ numericTags = [
+@@ -1481,7 +1482,7 @@ def getRetvalDeclarationForType(returnType, descriptorProvider):
+         return CGGeneric("()")
+     if returnType.isPrimitive() and returnType.tag() in builtinNames:
+         return builtin_return_type(returnType)
+-    if returnType.isTypedArray() and returnType.tag() in builtinNames:
++    if is_typed_array(returnType) and returnType.tag() in builtinNames:
+         return builtin_return_type(returnType)
+     if returnType.isDOMString():
+         result = CGGeneric("DOMString")
+@@ -6516,6 +6517,7 @@ def generate_imports(config, cgthings, descriptors, callbacks=None, dictionaries
+         'js::typedarray::Uint32Array',
+         'js::typedarray::Float32Array',
+         'js::typedarray::Float64Array',
++        'js::typedarray::ArrayBuffer',
+         'crate::dom',
+         'crate::dom::bindings',
+         'crate::dom::bindings::codegen::InterfaceObjectMap',
+diff --git a/components/script/dom/bindings/typedarrays.rs b/components/script/dom/bindings/typedarrays.rs
+index a85f07f9298..c5582ccc5f3 100644
+--- a/components/script/dom/bindings/typedarrays.rs
++++ b/components/script/dom/bindings/typedarrays.rs
+@@ -4,12 +4,17 @@
+ 
+ #![allow(unsafe_code)]
+ 
++use std::borrow::BorrowMut;
++use std::ffi::c_void;
+ use std::marker::PhantomData;
+ use std::ptr;
++use std::sync::{Arc, Mutex};
+ 
+-use js::jsapi::{Heap, JSObject, JS_GetArrayBufferViewBuffer};
++use js::jsapi::{
++    Heap, JSObject, JS_GetArrayBufferViewBuffer, JS_IsArrayBufferViewObject, NewExternalArrayBuffer,
++};
+ use js::rust::wrappers::DetachArrayBuffer;
+-use js::rust::{CustomAutoRooterGuard, MutableHandleObject};
++use js::rust::{CustomAutoRooterGuard, Handle, MutableHandleObject};
+ use js::typedarray::{CreateWith, TypedArray, TypedArrayElement, TypedArrayElementCreator};
+ 
+ use crate::script_runtime::JSContext;
+@@ -52,14 +57,7 @@ where
+             array as Result<CustomAutoRooterGuard<'_, TypedArray<T, *mut JSObject>>, &mut ()>
+         {
+             let data = array.to_vec();
+-            let mut is_shared = false;
+-            unsafe {
+-                rooted!(in (*cx) let view_buffer =
+-                    JS_GetArrayBufferViewBuffer(*cx, self.internal.handle(), &mut is_shared));
+-                // This buffer is always created unshared
+-                debug_assert!(!is_shared);
+-                let _ = DetachArrayBuffer(*cx, view_buffer.handle());
+-            }
++            let _ = self.detach_internal(cx);
+             Ok(data)
+         } else {
+             Err(())
+@@ -68,6 +66,26 @@ where
+         data
+     }
+ 
++    /// <https://tc39.es/ecma262/#sec-detacharraybuffer>
++    pub fn detach_internal(&self, cx: JSContext) -> bool {
++        assert!(self.is_initialized());
++        let mut is_shared = false;
++        unsafe {
++            if JS_IsArrayBufferViewObject(*self.internal.handle()) {
++                // If it is an ArrayBuffer view, get the buffer using JS_GetArrayBufferViewBuffer
++                rooted!(in (*cx) let view_buffer =
++                    JS_GetArrayBufferViewBuffer(*cx, self.internal.handle(), &mut is_shared));
++                // This buffer is always created unshared
++                debug_assert!(!is_shared);
++                // Detach the ArrayBuffer
++                DetachArrayBuffer(*cx, view_buffer.handle())
++            } else {
++                // If it's not an ArrayBuffer view, Detach the internal buffer directly
++                DetachArrayBuffer(*cx, Handle::from_raw(self.internal.handle()))
++            }
++        }
++    }
++
+     pub fn copy_data_to(
+         &self,
+         cx: JSContext,
+@@ -142,3 +160,40 @@ where
+         TypedArray::from(dest.get())
+     }
+ }
++
++pub fn create_new_external_array_buffer<T>(
++    cx: JSContext,
++    mapping: Arc<Mutex<Vec<T::Element>>>,
++    offset: usize,
++    range_size: usize,
++    m_end: usize,
++) -> HeapTypedArray<T>
++where
++    T: TypedArrayElement + TypedArrayElementCreator,
++    T::Element: Clone + Copy,
++{
++    /// `freeFunc()` must be threadsafe, should be safely callable from any thread
++    /// without causing conflicts or unexpected behavior.
++    /// <https://github.com/servo/mozjs/blob/main/mozjs-sys/mozjs/js/public/ArrayBuffer.h#L89>
++    unsafe extern "C" fn free_func(_contents: *mut c_void, free_user_data: *mut c_void) {
++        let _ = Arc::from_raw(free_user_data as _);
++    }
++
++    unsafe {
++        let mapping_slice_ptr =
++            mapping.lock().unwrap().borrow_mut()[offset as usize..m_end as usize].as_mut_ptr();
++
++        let array_buffer = NewExternalArrayBuffer(
++            *cx,
++            range_size as usize,
++            mapping_slice_ptr as _,
++            Some(free_func),
++            Arc::into_raw(mapping) as _,
++        );
++
++        HeapTypedArray {
++            internal: Heap::boxed(array_buffer),
++            phantom: PhantomData::default(),
++        }
++    }
++}
+diff --git a/components/script/dom/filereadersync.rs b/components/script/dom/filereadersync.rs
+index b8700173177..81590ffc9b6 100644
+--- a/components/script/dom/filereadersync.rs
++++ b/components/script/dom/filereadersync.rs
+@@ -3,12 +3,11 @@
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+ use std::ptr;
+-use std::ptr::NonNull;
+ 
+ use dom_struct::dom_struct;
+ use js::jsapi::JSObject;
+ use js::rust::HandleObject;
+-use js::typedarray::{ArrayBuffer, CreateWith};
++use js::typedarray::{ArrayBuffer, ArrayBufferU8};
+ 
+ use crate::dom::bindings::codegen::Bindings::BlobBinding::BlobMethods;
+ use crate::dom::bindings::codegen::Bindings::FileReaderSyncBinding::FileReaderSyncMethods;
+@@ -16,6 +15,7 @@ use crate::dom::bindings::error::{Error, Fallible};
+ use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, Reflector};
+ use crate::dom::bindings::root::DomRoot;
+ use crate::dom::bindings::str::DOMString;
++use crate::dom::bindings::typedarrays::create_typed_array;
+ use crate::dom::blob::Blob;
+ use crate::dom::filereader::FileReaderSharedFunctionality;
+ use crate::dom::globalscope::GlobalScope;
+@@ -51,7 +51,7 @@ impl FileReaderSync {
+ }
+ 
+ impl FileReaderSyncMethods for FileReaderSync {
+-    // https://w3c.github.io/FileAPI/#readAsBinaryStringSyncSection
++    /// <https://w3c.github.io/FileAPI/#readAsBinaryStringSyncSection>
+     fn ReadAsBinaryString(&self, blob: &Blob) -> Fallible<DOMString> {
+         // step 1
+         let blob_contents = FileReaderSync::get_blob_bytes(blob)?;
+@@ -60,7 +60,7 @@ impl FileReaderSyncMethods for FileReaderSync {
+         Ok(DOMString::from(String::from_utf8_lossy(&blob_contents)))
+     }
+ 
+-    // https://w3c.github.io/FileAPI/#readAsTextSync
++    /// <https://w3c.github.io/FileAPI/#readAsTextSync>
+     fn ReadAsText(&self, blob: &Blob, label: Option<DOMString>) -> Fallible<DOMString> {
+         // step 1
+         let blob_contents = FileReaderSync::get_blob_bytes(blob)?;
+@@ -75,7 +75,7 @@ impl FileReaderSyncMethods for FileReaderSync {
+         Ok(output)
+     }
+ 
+-    // https://w3c.github.io/FileAPI/#readAsDataURLSync-section
++    /// <https://w3c.github.io/FileAPI/#readAsDataURLSync-section>
+     fn ReadAsDataURL(&self, blob: &Blob) -> Fallible<DOMString> {
+         // step 1
+         let blob_contents = FileReaderSync::get_blob_bytes(blob)?;
+@@ -87,23 +87,15 @@ impl FileReaderSyncMethods for FileReaderSync {
+         Ok(output)
+     }
+ 
+-    #[allow(unsafe_code)]
+-    // https://w3c.github.io/FileAPI/#readAsArrayBufferSyncSection
+-    fn ReadAsArrayBuffer(&self, cx: JSContext, blob: &Blob) -> Fallible<NonNull<JSObject>> {
++    /// <https://w3c.github.io/FileAPI/#readAsArrayBufferSyncSection>
++    fn ReadAsArrayBuffer(&self, cx: JSContext, blob: &Blob) -> Fallible<ArrayBuffer> {
+         // step 1
+         let blob_contents = FileReaderSync::get_blob_bytes(blob)?;
+ 
+         // step 2
+-        unsafe {
+-            rooted!(in(*cx) let mut array_buffer = ptr::null_mut::<JSObject>());
+-            assert!(ArrayBuffer::create(
+-                *cx,
+-                CreateWith::Slice(&blob_contents),
+-                array_buffer.handle_mut()
+-            )
+-            .is_ok());
+-
+-            Ok(NonNull::new_unchecked(array_buffer.get()))
+-        }
++        rooted!(in(*cx) let mut array_buffer = ptr::null_mut::<JSObject>());
++
++        create_typed_array::<ArrayBufferU8>(cx, &blob_contents, array_buffer.handle_mut())
++            .map_err(|_| Error::JSFailed)
+     }
+ }
+diff --git a/components/script/dom/gpubuffer.rs b/components/script/dom/gpubuffer.rs
+index 8c7a268fa30..6031778179c 100644
+--- a/components/script/dom/gpubuffer.rs
++++ b/components/script/dom/gpubuffer.rs
+@@ -2,20 +2,20 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+-use std::cell::{Cell, RefCell};
+-use std::ffi::c_void;
++use std::cell::Cell;
+ use std::ops::Range;
+-use std::ptr::NonNull;
+ use std::rc::Rc;
+ use std::string::String;
++use std::sync::{Arc, Mutex};
+ 
+ use dom_struct::dom_struct;
+ use ipc_channel::ipc::IpcSharedMemory;
+-use js::jsapi::{DetachArrayBuffer, Heap, JSObject, NewExternalArrayBuffer};
++use js::typedarray::{ArrayBuffer, ArrayBufferU8};
+ use webgpu::identity::WebGPUOpResult;
+ use webgpu::wgpu::device::HostMap;
+ use webgpu::{WebGPU, WebGPUBuffer, WebGPURequest, WebGPUResponse, WebGPUResponseResult};
+ 
++use super::bindings::typedarrays::{create_new_external_array_buffer, HeapTypedArray};
+ use crate::dom::bindings::cell::DomRefCell;
+ use crate::dom::bindings::codegen::Bindings::WebGPUBinding::{
+     GPUBufferMethods, GPUMapModeConstants, GPUSize64,
+@@ -46,12 +46,15 @@ pub enum GPUBufferState {
+ 
+ #[derive(JSTraceable, MallocSizeOf)]
+ pub struct GPUBufferMapInfo {
+-    #[ignore_malloc_size_of = "Rc"]
+-    pub mapping: Rc<RefCell<Vec<u8>>>,
++    #[ignore_malloc_size_of = "Arc"]
++    #[no_trace]
++    /// The `mapping` is wrapped in an `Arc` to ensure thread safety.
++    /// This is necessary for integration with the SpiderMonkey engine,
++    pub mapping: Arc<Mutex<Vec<u8>>>,
+     pub mapping_range: Range<u64>,
+     pub mapped_ranges: Vec<Range<u64>>,
+     #[ignore_malloc_size_of = "defined in mozjs"]
+-    pub js_buffers: Vec<Box<Heap<*mut JSObject>>>,
++    pub js_buffers: Vec<HeapTypedArray<ArrayBufferU8>>,
+     pub map_mode: Option<u32>,
+ }
+ 
+@@ -95,7 +98,6 @@ impl GPUBuffer {
+         }
+     }
+ 
+-    #[allow(unsafe_code)]
+     pub fn new(
+         global: &GlobalScope,
+         channel: WebGPU,
+@@ -134,7 +136,6 @@ impl Drop for GPUBuffer {
+ }
+ 
+ impl GPUBufferMethods for GPUBuffer {
+-    #[allow(unsafe_code)]
+     /// <https://gpuweb.github.io/gpuweb/#dom-gpubuffer-unmap>
+     fn Unmap(&self) -> Fallible<()> {
+         let cx = GlobalScope::get_cx();
+@@ -147,16 +148,18 @@ impl GPUBufferMethods for GPUBuffer {
+             // Step 3
+             GPUBufferState::Mapped | GPUBufferState::MappedAtCreation => {
+                 let mut info = self.map_info.borrow_mut();
+-                let m_info = info.as_mut().unwrap();
++                let m_info = if let Some(m_info) = info.as_mut() {
++                    m_info
++                } else {
++                    return Err(Error::Operation);
++                };
+                 let m_range = m_info.mapping_range.clone();
+                 if let Err(e) = self.channel.0.send((
+                     self.device.use_current_scope(),
+                     WebGPURequest::UnmapBuffer {
+                         buffer_id: self.id().0,
+                         device_id: self.device.id().0,
+-                        array_buffer: IpcSharedMemory::from_bytes(
+-                            m_info.mapping.borrow().as_slice(),
+-                        ),
++                        array_buffer: IpcSharedMemory::from_bytes(&*m_info.mapping.lock().unwrap()),
+                         is_map_read: m_info.map_mode == Some(GPUMapModeConstants::READ),
+                         offset: m_range.start,
+                         size: m_range.end - m_range.start,
+@@ -165,8 +168,8 @@ impl GPUBufferMethods for GPUBuffer {
+                     warn!("Failed to send Buffer unmap ({:?}) ({})", self.buffer.0, e);
+                 }
+                 // Step 3.3
+-                m_info.js_buffers.drain(..).for_each(|obj| unsafe {
+-                    DetachArrayBuffer(*cx, obj.handle());
++                m_info.js_buffers.drain(..).for_each(|obj| {
++                    obj.detach_internal(cx);
+                 });
+             },
+             // Step 2
+@@ -205,7 +208,6 @@ impl GPUBufferMethods for GPUBuffer {
+         Ok(())
+     }
+ 
+-    #[allow(unsafe_code)]
+     /// <https://gpuweb.github.io/gpuweb/#dom-gpubuffer-mapasync-offset-size>
+     fn MapAsync(
+         &self,
+@@ -268,7 +270,7 @@ impl GPUBufferMethods for GPUBuffer {
+ 
+         self.state.set(GPUBufferState::MappingPending);
+         *self.map_info.borrow_mut() = Some(GPUBufferMapInfo {
+-            mapping: Rc::new(RefCell::new(Vec::with_capacity(0))),
++            mapping: Arc::new(Mutex::new(Vec::with_capacity(0))),
+             mapping_range: map_range,
+             mapped_ranges: Vec::new(),
+             js_buffers: Vec::new(),
+@@ -279,13 +281,12 @@ impl GPUBufferMethods for GPUBuffer {
+     }
+ 
+     /// <https://gpuweb.github.io/gpuweb/#dom-gpubuffer-getmappedrange>
+-    #[allow(unsafe_code)]
+     fn GetMappedRange(
+         &self,
+         cx: JSContext,
+         offset: GPUSize64,
+         size: Option<GPUSize64>,
+-    ) -> Fallible<NonNull<JSObject>> {
++    ) -> Fallible<ArrayBuffer> {
+         let range_size = if let Some(s) = size {
+             s
+         } else if offset >= self.size {
+@@ -295,8 +296,11 @@ impl GPUBufferMethods for GPUBuffer {
+         };
+         let m_end = offset + range_size;
+         let mut info = self.map_info.borrow_mut();
+-        let m_info = info.as_mut().unwrap();
+-
++        let m_info = if let Some(m_info) = info.as_mut() {
++            m_info
++        } else {
++            return Err(Error::Operation);
++        };
+         let mut valid = match self.state.get() {
+             GPUBufferState::Mapped | GPUBufferState::MappedAtCreation => true,
+             _ => false,
+@@ -313,24 +317,20 @@ impl GPUBufferMethods for GPUBuffer {
+             return Err(Error::Operation);
+         }
+ 
+-        unsafe extern "C" fn free_func(_contents: *mut c_void, free_user_data: *mut c_void) {
+-            let _ = Rc::from_raw(free_user_data as _);
+-        }
++        let heap_typed_array = create_new_external_array_buffer::<ArrayBufferU8>(
++            cx,
++            Arc::clone(&m_info.mapping),
++            offset as usize,
++            range_size as usize,
++            m_end as usize,
++        );
+ 
+-        let array_buffer = unsafe {
+-            NewExternalArrayBuffer(
+-                *cx,
+-                range_size as usize,
+-                m_info.mapping.borrow_mut()[offset as usize..m_end as usize].as_mut_ptr() as _,
+-                Some(free_func),
+-                Rc::into_raw(m_info.mapping.clone()) as _,
+-            )
+-        };
++        let result = heap_typed_array.get_internal().map_err(|_| Error::JSFailed);
+ 
+         m_info.mapped_ranges.push(offset..m_end);
+-        m_info.js_buffers.push(Heap::boxed(array_buffer));
++        m_info.js_buffers.push(heap_typed_array);
+ 
+-        Ok(NonNull::new(array_buffer).unwrap())
++        result
+     }
+ 
+     /// <https://gpuweb.github.io/gpuweb/#dom-gpuobjectbase-label>
+@@ -345,7 +345,6 @@ impl GPUBufferMethods for GPUBuffer {
+ }
+ 
+ impl AsyncWGPUListener for GPUBuffer {
+-    #[allow(unsafe_code)]
+     fn handle_response(&self, response: Option<WebGPUResponseResult>, promise: &Rc<Promise>) {
+         match response {
+             Some(response) => match response {
+@@ -356,7 +355,9 @@ impl AsyncWGPUListener for GPUBuffer {
+                         .as_mut()
+                         .unwrap()
+                         .mapping
+-                        .borrow_mut() = bytes.to_vec();
++                        .lock()
++                        .unwrap()
++                        .as_mut() = bytes.to_vec();
+                     promise.resolve_native(&());
+                     self.state.set(GPUBufferState::Mapped);
+                 },
+diff --git a/components/script/dom/gpudevice.rs b/components/script/dom/gpudevice.rs
+index 58775a34f44..89b98f0d232 100644
+--- a/components/script/dom/gpudevice.rs
++++ b/components/script/dom/gpudevice.rs
+@@ -5,10 +5,11 @@
+ #![allow(unsafe_code)]
+ 
+ use std::borrow::Cow;
+-use std::cell::{Cell, RefCell};
++use std::cell::Cell;
+ use std::collections::HashMap;
+ use std::num::NonZeroU64;
+ use std::rc::Rc;
++use std::sync::{Arc, Mutex};
+ 
+ use dom_struct::dom_struct;
+ use js::jsapi::{Heap, JSObject};
+@@ -401,7 +402,7 @@ impl GPUDeviceMethods for GPUDevice {
+         if descriptor.mappedAtCreation {
+             let buf_data = vec![0u8; descriptor.size as usize];
+             map_info = DomRefCell::new(Some(GPUBufferMapInfo {
+-                mapping: Rc::new(RefCell::new(buf_data)),
++                mapping: Arc::new(Mutex::new(buf_data)),
+                 mapping_range: 0..descriptor.size,
+                 mapped_ranges: Vec::new(),
+                 js_buffers: Vec::new(),
+diff --git a/tests/wpt/webgpu/meta/webgpu/cts.https.html.ini b/tests/wpt/webgpu/meta/webgpu/cts.https.html.ini
+index 04439683899..afa59583aa8 100644
+--- a/tests/wpt/webgpu/meta/webgpu/cts.https.html.ini
++++ b/tests/wpt/webgpu/meta/webgpu/cts.https.html.ini
+@@ -15676,9 +15676,6 @@
+     expected: FAIL
+ 
+ 
+-[cts.https.html?q=webgpu:api,validation,buffer,mapping:getMappedRange,state,unmapped:*]
+-  expected: CRASH
+-
+ [cts.https.html?q=webgpu:api,validation,buffer,mapping:unmap,state,mappingPending:*]
+   expected: CRASH
+ 
+@@ -31996,9 +31993,6 @@
+ [cts.https.html?q=webgpu:shader,validation,parse,var_and_let:initializer_type:*]
+   expected: CRASH
+ 
+-[cts.https.html?q=webgpu:api,validation,buffer,mapping:getMappedRange,state,destroyed:*]
+-  expected: CRASH
+-
+ [cts.https.html?q=webgpu:api,operation,buffers,map_detach:while_mapped:*]
+   [:]
+     expected: FAIL

@@ -1,0 +1,522 @@
+commit 7759a0700239c2ac4a21157f62031710a778428c
+Author: mahoestar <matthew.horsley@e-star.com>
+Date:   Thu Nov 13 16:12:32 2025 +0000
+
+    Add support for IP_MULTICAST_ALL to EpollDatagramChannel and IOUringDatagramChannel (#15755)
+    
+    Motivation:
+    
+    IP multicast behaviour varies between Windows and Linux.
+    
+    On Windows, you only receive datagrams for the groups your socket has
+    joined.
+    
+    On Linux, by default, you receive datagrams for all groups joined by the
+    host.
+    
+    This behaviour can be controlled using the IP_MULTICAST_ALL (or
+    IPV6_MULTICAST_ALL) socket option - it is set to 1 by default.
+    
+    OpenJDK sets this to 0 on all NIO and Net multicast channels, it is not
+    configurable.
+    
+    This PR makes the option configurable for epoll socket channels, so that
+    behaviour can be made consistent between NIO and native datagram
+    channels.
+    
+    Modification:
+    
+    Add IP_MULTICAST_ALL and IPV6_MULTICAST_ALL options to native epoll
+    transport and native io uring transport.
+    
+    Set IP_MULTICAST_ALL to 0 when constructing epoll and io uring datagram
+    channels.
+    
+    Result:
+    
+    Fixes https://github.com/netty/netty/issues/15753.
+    
+    ---------
+    
+    Co-authored-by: Norman Maurer <norman_maurer@apple.com>
+
+diff --git a/transport-classes-epoll/src/main/java/io/netty/channel/epoll/EpollChannelOption.java b/transport-classes-epoll/src/main/java/io/netty/channel/epoll/EpollChannelOption.java
+index 19fcaab324..51c9cc39c9 100644
+--- a/transport-classes-epoll/src/main/java/io/netty/channel/epoll/EpollChannelOption.java
++++ b/transport-classes-epoll/src/main/java/io/netty/channel/epoll/EpollChannelOption.java
+@@ -31,6 +31,7 @@ public final class EpollChannelOption<T> extends UnixChannelOption<T> {
+             valueOf(EpollChannelOption.class, "TCP_USER_TIMEOUT");
+     public static final ChannelOption<Boolean> IP_FREEBIND = valueOf("IP_FREEBIND");
+     public static final ChannelOption<Boolean> IP_BIND_ADDRESS_NO_PORT = valueOf("IP_BIND_ADDRESS_NO_PORT");
++    public static final ChannelOption<Boolean> IP_MULTICAST_ALL = valueOf("IP_MULTICAST_ALL");
+     public static final ChannelOption<Boolean> IP_TRANSPARENT = valueOf("IP_TRANSPARENT");
+     public static final ChannelOption<Boolean> IP_RECVORIGDSTADDR = valueOf("IP_RECVORIGDSTADDR");
+     /**
+diff --git a/transport-classes-epoll/src/main/java/io/netty/channel/epoll/EpollDatagramChannel.java b/transport-classes-epoll/src/main/java/io/netty/channel/epoll/EpollDatagramChannel.java
+index cec0e725f9..fb0197ba1f 100644
+--- a/transport-classes-epoll/src/main/java/io/netty/channel/epoll/EpollDatagramChannel.java
++++ b/transport-classes-epoll/src/main/java/io/netty/channel/epoll/EpollDatagramChannel.java
+@@ -37,6 +37,9 @@ import io.netty.util.UncheckedBooleanSupplier;
+ import io.netty.util.internal.ObjectUtil;
+ import io.netty.util.internal.RecyclableArrayList;
+ import io.netty.util.internal.StringUtil;
++import io.netty.util.internal.SystemPropertyUtil;
++import io.netty.util.internal.logging.InternalLogger;
++import io.netty.util.internal.logging.InternalLoggerFactory;
+ 
+ import java.io.IOException;
+ import java.net.Inet4Address;
+@@ -55,6 +58,9 @@ import static io.netty.channel.epoll.LinuxSocket.newSocketDgram;
+  * maximal performance.
+  */
+ public final class EpollDatagramChannel extends AbstractEpollChannel implements DatagramChannel {
++    private static final InternalLogger logger = InternalLoggerFactory.getInstance(EpollDatagramChannel.class);
++    private static final boolean IP_MULTICAST_ALL =
++            SystemPropertyUtil.getBoolean("io.netty.channel.epoll.ipMulticastAll", false);
+     private static final ChannelMetadata METADATA = new ChannelMetadata(true, 16);
+     private static final String EXPECTED_TYPES =
+             " (expected: " + StringUtil.simpleClassName(DatagramPacket.class) + ", " +
+@@ -66,6 +72,12 @@ public final class EpollDatagramChannel extends AbstractEpollChannel implements
+     private final EpollDatagramChannelConfig config;
+     private volatile boolean connected;
+ 
++    static {
++        if (logger.isDebugEnabled()) {
++            logger.debug("-Dio.netty.channel.epoll.ipMulticastAll: {}", IP_MULTICAST_ALL);
++        }
++    }
++
+     /**
+      * Returns {@code true} if {@link io.netty.channel.unix.SegmentedDatagramPacket} is supported natively.
+      *
+@@ -114,6 +126,14 @@ public final class EpollDatagramChannel extends AbstractEpollChannel implements
+ 
+     private EpollDatagramChannel(LinuxSocket fd, boolean active) {
+         super(null, fd, active, EpollIoOps.valueOf(0));
++
++        // Configure IP_MULTICAST_ALL - disable by default to match the behaviour of NIO.
++        try {
++            fd.setIpMulticastAll(IP_MULTICAST_ALL);
++        } catch (IOException e) {
++            logger.debug("Failed to set IP_MULTICAST_ALL to {}", IP_MULTICAST_ALL, e);
++        }
++
+         config = new EpollDatagramChannelConfig(this);
+     }
+ 
+diff --git a/transport-classes-epoll/src/main/java/io/netty/channel/epoll/EpollDatagramChannelConfig.java b/transport-classes-epoll/src/main/java/io/netty/channel/epoll/EpollDatagramChannelConfig.java
+index 4af835878c..4b0a45a668 100644
+--- a/transport-classes-epoll/src/main/java/io/netty/channel/epoll/EpollDatagramChannelConfig.java
++++ b/transport-classes-epoll/src/main/java/io/netty/channel/epoll/EpollDatagramChannelConfig.java
+@@ -50,7 +50,7 @@ public final class EpollDatagramChannelConfig extends EpollChannelConfig impleme
+                 ChannelOption.IP_TOS, ChannelOption.DATAGRAM_CHANNEL_ACTIVE_ON_REGISTRATION,
+                 EpollChannelOption.SO_REUSEPORT, EpollChannelOption.IP_FREEBIND, EpollChannelOption.IP_TRANSPARENT,
+                 EpollChannelOption.IP_RECVORIGDSTADDR, EpollChannelOption.MAX_DATAGRAM_PAYLOAD_SIZE,
+-                EpollChannelOption.UDP_GRO);
++                EpollChannelOption.UDP_GRO, EpollChannelOption.IP_MULTICAST_ALL);
+     }
+ 
+     @SuppressWarnings({ "unchecked", "deprecation" })
+@@ -98,6 +98,9 @@ public final class EpollDatagramChannelConfig extends EpollChannelConfig impleme
+         if (option == EpollChannelOption.IP_RECVORIGDSTADDR) {
+             return (T) Boolean.valueOf(isIpRecvOrigDestAddr());
+         }
++        if (option == EpollChannelOption.IP_MULTICAST_ALL) {
++            return (T) Boolean.valueOf(isIpMulticastAll());
++        }
+         if (option == EpollChannelOption.MAX_DATAGRAM_PAYLOAD_SIZE) {
+             return (T) Integer.valueOf(getMaxDatagramPayloadSize());
+         }
+@@ -128,6 +131,8 @@ public final class EpollDatagramChannelConfig extends EpollChannelConfig impleme
+             setNetworkInterface((NetworkInterface) value);
+         } else if (option == ChannelOption.IP_MULTICAST_TTL) {
+             setTimeToLive((Integer) value);
++        } else if (option == EpollChannelOption.IP_MULTICAST_ALL) {
++            setIpMulticastAll((Boolean) value);
+         } else if (option == ChannelOption.IP_TOS) {
+             setTrafficClass((Integer) value);
+         } else if (option == ChannelOption.DATAGRAM_CHANNEL_ACTIVE_ON_REGISTRATION) {
+@@ -511,6 +516,31 @@ public final class EpollDatagramChannelConfig extends EpollChannelConfig impleme
+         }
+     }
+ 
++    /**
++     * Returns {@code true} if <a href="https://man7.org/linux/man-pages/man7/ip.7.html">IP_MULTICAST_ALL</a> (or
++     * IPV6_MULTICAST_ALL for IPV6) is enabled, {@code false} otherwise.
++     */
++    public boolean isIpMulticastAll() {
++        try {
++            return ((EpollDatagramChannel) channel).socket.isIpMulticastAll();
++        } catch (IOException e) {
++            throw new ChannelException(e);
++        }
++    }
++
++    /**
++     * If {@code true} is used <a href="https://man7.org/linux/man-pages/man7/ip.7.html">IP_MULTICAST_ALL</a> is
++     * enabled (or IPV6_MULTICAST_ALL for IPV6), {@code false} for disable it. Default is enabled.
++     */
++    public EpollDatagramChannelConfig setIpMulticastAll(boolean multicastAll) {
++        try {
++            ((EpollDatagramChannel) channel).socket.setIpMulticastAll(multicastAll);
++            return this;
++        } catch (IOException e) {
++            throw new ChannelException(e);
++        }
++    }
++
+     /**
+      * Set the maximum {@link io.netty.channel.socket.DatagramPacket} size. This will be used to determine if
+      * {@code recvmmsg} should be used when reading from the underlying socket. When {@code recvmmsg} is used
+diff --git a/transport-classes-epoll/src/main/java/io/netty/channel/epoll/LinuxSocket.java b/transport-classes-epoll/src/main/java/io/netty/channel/epoll/LinuxSocket.java
+index 618483a18a..4c82e53efb 100644
+--- a/transport-classes-epoll/src/main/java/io/netty/channel/epoll/LinuxSocket.java
++++ b/transport-classes-epoll/src/main/java/io/netty/channel/epoll/LinuxSocket.java
+@@ -209,6 +209,10 @@ public final class LinuxSocket extends Socket {
+         setIpBindAddressNoPort(intValue(), enabled ? 1 : 0);
+     }
+ 
++    void setIpMulticastAll(boolean enabled) throws IOException {
++        setIpMulticastAll(intValue(), ipv6, enabled ? 1 : 0);
++    }
++
+     void setIpFreeBind(boolean enabled) throws IOException {
+         setIpFreeBind(intValue(), enabled ? 1 : 0);
+     }
+@@ -274,6 +278,10 @@ public final class LinuxSocket extends Socket {
+         return isIpBindAddressNoPort(intValue()) != 0;
+     }
+ 
++    boolean isIpMulticastAll() throws IOException {
++        return isIpMulticastAll(intValue(), ipv6) != 0;
++    }
++
+     boolean isIpFreeBind() throws IOException {
+         return isIpFreeBind(intValue()) != 0;
+     }
+@@ -465,6 +473,7 @@ public final class LinuxSocket extends Socket {
+     private static native int getTcpUserTimeout(int fd) throws IOException;
+     private static native int getTimeToLive(int fd) throws IOException;
+     private static native int isIpBindAddressNoPort(int fd) throws IOException;
++    private static native int isIpMulticastAll(int fd, boolean ipv6) throws IOException;
+     private static native int isIpFreeBind(int fd) throws IOException;
+     private static native int isIpTransparent(int fd) throws IOException;
+     private static native int isIpRecvOrigDestAddr(int fd) throws IOException;
+@@ -482,6 +491,7 @@ public final class LinuxSocket extends Socket {
+     private static native void setTcpKeepCnt(int fd, int probes) throws IOException;
+     private static native void setTcpUserTimeout(int fd, int milliseconds)throws IOException;
+     private static native void setIpBindAddressNoPort(int fd, int ipBindAddressNoPort) throws IOException;
++    private static native void setIpMulticastAll(int fd, boolean ipv6, int enabled) throws IOException;
+     private static native void setIpFreeBind(int fd, int freeBind) throws IOException;
+     private static native void setIpTransparent(int fd, int transparent) throws IOException;
+     private static native void setIpRecvOrigDestAddr(int fd, int transparent) throws IOException;
+diff --git a/transport-classes-io_uring/src/main/java/io/netty/channel/uring/IoUringChannelOption.java b/transport-classes-io_uring/src/main/java/io/netty/channel/uring/IoUringChannelOption.java
+index 7c8903d6ae..d1b11ed2ce 100644
+--- a/transport-classes-io_uring/src/main/java/io/netty/channel/uring/IoUringChannelOption.java
++++ b/transport-classes-io_uring/src/main/java/io/netty/channel/uring/IoUringChannelOption.java
+@@ -72,4 +72,5 @@ public final class IoUringChannelOption<T> extends UnixChannelOption<T> {
+     public static final ChannelOption<Integer> IO_URING_WRITE_ZERO_COPY_THRESHOLD =
+             ChannelOption.valueOf(IoUringChannelOption.class, "IO_URING_WRITE_ZERO_COPY_THRESHOLD");
+ 
++    public static final ChannelOption<Boolean> IP_MULTICAST_ALL = valueOf("IP_MULTICAST_ALL");
+ }
+diff --git a/transport-classes-io_uring/src/main/java/io/netty/channel/uring/IoUringDatagramChannel.java b/transport-classes-io_uring/src/main/java/io/netty/channel/uring/IoUringDatagramChannel.java
+index 49bd6c6791..6fe67645ee 100644
+--- a/transport-classes-io_uring/src/main/java/io/netty/channel/uring/IoUringDatagramChannel.java
++++ b/transport-classes-io_uring/src/main/java/io/netty/channel/uring/IoUringDatagramChannel.java
+@@ -35,6 +35,9 @@ import io.netty.channel.unix.Socket;
+ import io.netty.util.UncheckedBooleanSupplier;
+ import io.netty.util.internal.ObjectUtil;
+ import io.netty.util.internal.StringUtil;
++import io.netty.util.internal.SystemPropertyUtil;
++import io.netty.util.internal.logging.InternalLogger;
++import io.netty.util.internal.logging.InternalLoggerFactory;
+ 
+ import java.io.IOException;
+ import java.net.Inet4Address;
+@@ -48,6 +51,9 @@ import java.nio.channels.UnresolvedAddressException;
+ import static io.netty.channel.unix.Errors.ioResult;
+ 
+ public final class IoUringDatagramChannel extends AbstractIoUringChannel implements DatagramChannel {
++    private static final InternalLogger logger = InternalLoggerFactory.getInstance(IoUringDatagramChannel.class);
++    private static final boolean IP_MULTICAST_ALL =
++            SystemPropertyUtil.getBoolean("io.netty.channel.iouring.ipMulticastAll", false);
+     private static final ChannelMetadata METADATA = new ChannelMetadata(true, 16);
+     private static final String EXPECTED_TYPES =
+             " (expected: " + StringUtil.simpleClassName(DatagramPacket.class) + ", " +
+@@ -59,6 +65,12 @@ public final class IoUringDatagramChannel extends AbstractIoUringChannel impleme
+     private final IoUringDatagramChannelConfig config;
+     private volatile boolean connected;
+ 
++    static {
++        if (logger.isDebugEnabled()) {
++            logger.debug("-Dio.netty.channel.iouring.ipMulticastAll: {}", IP_MULTICAST_ALL);
++        }
++    }
++
+     // These buffers are used for msghdr, iov, sockaddr_in / sockaddr_in6 when doing recvmsg / sendmsg
+     //
+     // TODO: Alternative we could also allocate these everytime from the ByteBufAllocator or we could use
+@@ -103,6 +115,14 @@ public final class IoUringDatagramChannel extends AbstractIoUringChannel impleme
+     private IoUringDatagramChannel(LinuxSocket fd, boolean active) {
+         // Always use a blocking fd and so make use of fast-poll.
+         super(null, fd, active);
++
++        // Configure IP_MULTICAST_ALL - disable by default to match the behaviour of NIO.
++        try {
++            fd.setIpMulticastAll(IP_MULTICAST_ALL);
++        } catch (IOException e) {
++            logger.debug("Failed to set IP_MULTICAST_ALL to {}", IP_MULTICAST_ALL, e);
++        }
++
+         config = new IoUringDatagramChannelConfig(this);
+     }
+ 
+diff --git a/transport-classes-io_uring/src/main/java/io/netty/channel/uring/IoUringDatagramChannelConfig.java b/transport-classes-io_uring/src/main/java/io/netty/channel/uring/IoUringDatagramChannelConfig.java
+index 008c28d8f4..f427a54484 100644
+--- a/transport-classes-io_uring/src/main/java/io/netty/channel/uring/IoUringDatagramChannelConfig.java
++++ b/transport-classes-io_uring/src/main/java/io/netty/channel/uring/IoUringDatagramChannelConfig.java
+@@ -51,7 +51,8 @@ final class IoUringDatagramChannelConfig extends IoUringChannelConfig implements
+                 ChannelOption.IP_MULTICAST_ADDR, ChannelOption.IP_MULTICAST_IF, ChannelOption.IP_MULTICAST_TTL,
+                 ChannelOption.IP_TOS, ChannelOption.DATAGRAM_CHANNEL_ACTIVE_ON_REGISTRATION,
+                 IoUringChannelOption.SO_REUSEPORT, IoUringChannelOption.IP_FREEBIND,
+-                IoUringChannelOption.IP_TRANSPARENT, IoUringChannelOption.MAX_DATAGRAM_PAYLOAD_SIZE);
++                IoUringChannelOption.IP_TRANSPARENT, IoUringChannelOption.MAX_DATAGRAM_PAYLOAD_SIZE,
++                IoUringChannelOption.IP_MULTICAST_ALL);
+     }
+ 
+     @SuppressWarnings({ "unchecked", "deprecation" })
+@@ -99,6 +100,9 @@ final class IoUringDatagramChannelConfig extends IoUringChannelConfig implements
+         if (option == IoUringChannelOption.MAX_DATAGRAM_PAYLOAD_SIZE) {
+             return (T) Integer.valueOf(getMaxDatagramPayloadSize());
+         }
++        if (option == IoUringChannelOption.IP_MULTICAST_ALL) {
++            return (T) Boolean.valueOf(isIpMulticastAll());
++        }
+         return super.getOption(option);
+     }
+ 
+@@ -135,6 +139,8 @@ final class IoUringDatagramChannelConfig extends IoUringChannelConfig implements
+             setIpTransparent((Boolean) value);
+         } else if (option == IoUringChannelOption.MAX_DATAGRAM_PAYLOAD_SIZE) {
+             setMaxDatagramPayloadSize((Integer) value);
++        } else if (option == IoUringChannelOption.IP_MULTICAST_ALL) {
++            setIpMulticastAll((Boolean) value);
+         } else {
+             return super.setOption(option, value);
+         }
+@@ -491,4 +497,29 @@ final class IoUringDatagramChannelConfig extends IoUringChannelConfig implements
+     public int getMaxDatagramPayloadSize() {
+         return maxDatagramSize;
+     }
++
++    /**
++     * If {@code true} is used <a href="https://man7.org/linux/man-pages/man7/ip.7.html">IP_MULTICAST_ALL</a> is
++     * enabled (or IPV6_MULTICAST_ALL for IPV6), {@code false} for disable it. Default is enabled.
++     */
++    public IoUringDatagramChannelConfig setIpMulticastAll(boolean multicastAll) {
++        try {
++            ((IoUringDatagramChannel) channel).socket.setIpMulticastAll(multicastAll);
++            return this;
++        } catch (IOException e) {
++            throw new ChannelException(e);
++        }
++    }
++
++    /**
++     * Returns {@code true} if <a href="https://man7.org/linux/man-pages/man7/ip.7.html">IP_MULTICAST_ALL</a> (or
++     * IPV6_MULTICAST_ALL for IPV6) is enabled, {@code false} otherwise.
++     */
++    public boolean isIpMulticastAll() {
++        try {
++            return ((IoUringDatagramChannel) channel).socket.isIpMulticastAll();
++        } catch (IOException e) {
++            throw new ChannelException(e);
++        }
++    }
+ }
+diff --git a/transport-classes-io_uring/src/main/java/io/netty/channel/uring/LinuxSocket.java b/transport-classes-io_uring/src/main/java/io/netty/channel/uring/LinuxSocket.java
+index 04358cc9e6..01ad4637ad 100644
+--- a/transport-classes-io_uring/src/main/java/io/netty/channel/uring/LinuxSocket.java
++++ b/transport-classes-io_uring/src/main/java/io/netty/channel/uring/LinuxSocket.java
+@@ -204,6 +204,10 @@ final class LinuxSocket extends Socket {
+         setIpRecvOrigDestAddr(intValue(), enabled ? 1 : 0);
+     }
+ 
++    void setIpMulticastAll(boolean enabled) throws IOException {
++        setIpMulticastAll(intValue(), ipv6, enabled ? 1 : 0);
++    }
++
+     int getTimeToLive() throws IOException {
+         return getTimeToLive(intValue());
+     }
+@@ -265,6 +269,10 @@ final class LinuxSocket extends Socket {
+         return isIpRecvOrigDestAddr(intValue()) != 0;
+     }
+ 
++    boolean isIpMulticastAll() throws IOException {
++        return isIpMulticastAll(intValue(), ipv6) != 0;
++    }
++
+     PeerCredentials getPeerCredentials() throws IOException {
+         return getPeerCredentials(intValue());
+     }
+@@ -350,6 +358,7 @@ final class LinuxSocket extends Socket {
+     private static native int isIpFreeBind(int fd) throws IOException;
+     private static native int isIpTransparent(int fd) throws IOException;
+     private static native int isIpRecvOrigDestAddr(int fd) throws IOException;
++    private static native int isIpMulticastAll(int fd, boolean ipv6) throws IOException;
+     private static native void getTcpInfo(int fd, long[] array) throws IOException;
+     private static native PeerCredentials getPeerCredentials(int fd) throws IOException;
+     private static native int isTcpFastOpenConnect(int fd) throws IOException;
+@@ -368,6 +377,7 @@ final class LinuxSocket extends Socket {
+     private static native void setIpFreeBind(int fd, int freeBind) throws IOException;
+     private static native void setIpTransparent(int fd, int transparent) throws IOException;
+     private static native void setIpRecvOrigDestAddr(int fd, int transparent) throws IOException;
++    private static native void setIpMulticastAll(int fd, boolean ipv6, int enabled) throws IOException;
+     private static native void setTcpMd5Sig(
+             int fd, boolean ipv6, byte[] address, int scopeId, byte[] key) throws IOException;
+     private static native void setInterface(
+diff --git a/transport-native-epoll/src/main/c/netty_epoll_linuxsocket.c b/transport-native-epoll/src/main/c/netty_epoll_linuxsocket.c
+index cd1e6abfb1..ba88ca24f3 100644
+--- a/transport-native-epoll/src/main/c/netty_epoll_linuxsocket.c
++++ b/transport-native-epoll/src/main/c/netty_epoll_linuxsocket.c
+@@ -68,6 +68,16 @@
+ #define IP_BIND_ADDRESS_NO_PORT 24
+ #endif
+ 
++// IP_MULTICAST_ALL defined in linux 2.6.31. We define this here so older kernels can compile.
++#ifndef IP_MULTICAST_ALL
++#define IP_MULTICAST_ALL 49
++#endif
++
++// IPV6_MULTICAST_ALL supported since 4.20. We define this here so older kernels can compile.
++#ifndef IPV6_MULTICAST_ALL
++#define IPV6_MULTICAST_ALL 29
++#endif
++
+ static jweak peerCredentialsClassWeak = NULL;
+ static jmethodID peerCredentialsMethodId = NULL;
+ 
+@@ -240,6 +250,30 @@ static void netty_epoll_linuxsocket_setIpBindAddressNoPort(JNIEnv* env, jclass c
+     netty_unix_socket_setOption(env, fd, SOL_IP, IP_BIND_ADDRESS_NO_PORT, &optval, sizeof(optval));
+ }
+ 
++static void netty_epoll_linuxsocket_setIpMulticastAll(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6, jint optval) {
++    if (ipv6 == JNI_TRUE) {
++        netty_unix_socket_setOption(env, fd, IPPROTO_IPV6, IPV6_MULTICAST_ALL, &optval, sizeof(optval));
++    } else {
++        netty_unix_socket_setOption(env, fd, IPPROTO_IP, IP_MULTICAST_ALL, &optval, sizeof(optval));
++    }
++}
++
++static jint netty_epoll_linuxsocket_isIpMulticastAll(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6) {
++    if (ipv6 == JNI_TRUE) {
++        int optval;
++        if (netty_unix_socket_getOption(env, fd, IPPROTO_IPV6, IPV6_MULTICAST_ALL, &optval, sizeof(optval)) == -1) {
++            return -1;
++        }
++        return optval;
++    } else {
++        int optval;
++        if (netty_unix_socket_getOption(env, fd, IPPROTO_IP, IP_MULTICAST_ALL, &optval, sizeof(optval)) == -1) {
++            return -1;
++        }
++        return optval;
++    }
++}
++
+ static void netty_epoll_linuxsocket_setIpFreeBind(JNIEnv* env, jclass clazz, jint fd, jint optval) {
+     netty_unix_socket_setOption(env, fd, IPPROTO_IP, IP_FREEBIND, &optval, sizeof(optval));
+ }
+@@ -807,6 +841,7 @@ static const JNINativeMethod fixed_method_table[] = {
+   { "setTcpKeepCnt", "(II)V", (void *) netty_epoll_linuxsocket_setTcpKeepCnt },
+   { "setTcpUserTimeout", "(II)V", (void *) netty_epoll_linuxsocket_setTcpUserTimeout },
+   { "setIpBindAddressNoPort", "(II)V", (void *) netty_epoll_linuxsocket_setIpBindAddressNoPort },
++  { "setIpMulticastAll", "(IZI)V", (void *) netty_epoll_linuxsocket_setIpMulticastAll },
+   { "setIpFreeBind", "(II)V", (void *) netty_epoll_linuxsocket_setIpFreeBind },
+   { "setIpTransparent", "(II)V", (void *) netty_epoll_linuxsocket_setIpTransparent },
+   { "setIpRecvOrigDestAddr", "(II)V", (void *) netty_epoll_linuxsocket_setIpRecvOrigDestAddr },
+@@ -815,6 +850,7 @@ static const JNINativeMethod fixed_method_table[] = {
+   { "getTcpKeepCnt", "(I)I", (void *) netty_epoll_linuxsocket_getTcpKeepCnt },
+   { "getTcpUserTimeout", "(I)I", (void *) netty_epoll_linuxsocket_getTcpUserTimeout },
+   { "isIpBindAddressNoPort", "(I)I", (void *) netty_epoll_linuxsocket_isIpBindAddressNoPort },
++  { "isIpMulticastAll", "(IZ)I", (void *) netty_epoll_linuxsocket_isIpMulticastAll },
+   { "isIpFreeBind", "(I)I", (void *) netty_epoll_linuxsocket_isIpFreeBind },
+   { "isIpTransparent", "(I)I", (void *) netty_epoll_linuxsocket_isIpTransparent },
+   { "isIpRecvOrigDestAddr", "(I)I", (void *) netty_epoll_linuxsocket_isIpRecvOrigDestAddr },
+diff --git a/transport-native-io_uring/src/main/c/netty_io_uring_linuxsocket.c b/transport-native-io_uring/src/main/c/netty_io_uring_linuxsocket.c
+index bcc54bd8fd..0adfbc68d8 100644
+--- a/transport-native-io_uring/src/main/c/netty_io_uring_linuxsocket.c
++++ b/transport-native-io_uring/src/main/c/netty_io_uring_linuxsocket.c
+@@ -63,6 +63,16 @@
+ #define UDP_GRO 104
+ #endif
+ 
++// IP_MULTICAST_ALL defined in linux 2.6.31. We define this here so older kernels can compile.
++#ifndef IP_MULTICAST_ALL
++#define IP_MULTICAST_ALL 49
++#endif
++
++// IPV6_MULTICAST_ALL supported since 4.20. We define this here so older kernels can compile.
++#ifndef IPV6_MULTICAST_ALL
++#define IPV6_MULTICAST_ALL 29
++#endif
++
+ static jweak peerCredentialsClassWeak = NULL;
+ static jmethodID peerCredentialsMethodId = NULL;
+ 
+@@ -166,6 +176,14 @@ static void netty_io_uring_linuxsocket_setIpRecvOrigDestAddr(JNIEnv* env, jclass
+     netty_unix_socket_setOption(env, fd, IPPROTO_IP, IP_RECVORIGDSTADDR, &optval, sizeof(optval));
+ }
+ 
++static void netty_io_uring_linuxsocket_setIpMulticastAll(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6, jint optval) {
++    if (ipv6 == JNI_TRUE) {
++        netty_unix_socket_setOption(env, fd, IPPROTO_IPV6, IPV6_MULTICAST_ALL, &optval, sizeof(optval));
++    } else {
++        netty_unix_socket_setOption(env, fd, IPPROTO_IP, IP_MULTICAST_ALL, &optval, sizeof(optval));
++    }
++}
++
+ static void netty_io_uring_linuxsocket_setSoBusyPoll(JNIEnv* env, jclass clazz, jint fd, jint optval) {
+     netty_unix_socket_setOption(env, fd, SOL_SOCKET, SO_BUSY_POLL, &optval, sizeof(optval));
+ }
+@@ -531,6 +549,22 @@ static jint netty_io_uring_linuxsocket_isIpRecvOrigDestAddr(JNIEnv* env, jclass
+      return optval;
+ }
+ 
++static jint netty_io_uring_linuxsocket_isIpMulticastAll(JNIEnv* env, jclass clazz, jint fd, jboolean ipv6) {
++    if (ipv6 == JNI_TRUE) {
++        int optval;
++        if (netty_unix_socket_getOption(env, fd, IPPROTO_IPV6, IPV6_MULTICAST_ALL, &optval, sizeof(optval)) == -1) {
++            return -1;
++        }
++        return optval;
++    } else {
++        int optval;
++        if (netty_unix_socket_getOption(env, fd, IPPROTO_IP, IP_MULTICAST_ALL, &optval, sizeof(optval)) == -1) {
++            return -1;
++        }
++        return optval;
++    }
++}
++
+ static void netty_io_uring_linuxsocket_getTcpInfo(JNIEnv* env, jclass clazz, jint fd, jlongArray array) {
+      struct tcp_info tcp_info;
+      if (netty_unix_socket_getOption(env, fd, IPPROTO_TCP, TCP_INFO, &tcp_info, sizeof(tcp_info)) == -1) {
+@@ -684,6 +718,7 @@ static const JNINativeMethod fixed_method_table[] = {
+   { "setIpFreeBind", "(II)V", (void *) netty_io_uring_linuxsocket_setIpFreeBind },
+   { "setIpTransparent", "(II)V", (void *) netty_io_uring_linuxsocket_setIpTransparent },
+   { "setIpRecvOrigDestAddr", "(II)V", (void *) netty_io_uring_linuxsocket_setIpRecvOrigDestAddr },
++  { "setIpMulticastAll", "(IZI)V", (void *) netty_io_uring_linuxsocket_setIpMulticastAll },
+   { "getTcpKeepIdle", "(I)I", (void *) netty_io_uring_linuxsocket_getTcpKeepIdle },
+   { "getTcpKeepIntvl", "(I)I", (void *) netty_io_uring_linuxsocket_getTcpKeepIntvl },
+   { "getTcpKeepCnt", "(I)I", (void *) netty_io_uring_linuxsocket_getTcpKeepCnt },
+@@ -691,6 +726,7 @@ static const JNINativeMethod fixed_method_table[] = {
+   { "isIpFreeBind", "(I)I", (void *) netty_io_uring_linuxsocket_isIpFreeBind },
+   { "isIpTransparent", "(I)I", (void *) netty_io_uring_linuxsocket_isIpTransparent },
+   { "isIpRecvOrigDestAddr", "(I)I", (void *) netty_io_uring_linuxsocket_isIpRecvOrigDestAddr },
++  { "isIpMulticastAll", "(IZ)I", (void *) netty_io_uring_linuxsocket_isIpMulticastAll },
+   { "getTcpInfo", "(I[J)V", (void *) netty_io_uring_linuxsocket_getTcpInfo },
+   { "setTcpMd5Sig", "(IZ[BI[B)V", (void *) netty_io_uring_linuxsocket_setTcpMd5Sig },
+   { "joinGroup", "(IZ[B[BII)V", (void *) netty_io_uring_linuxsocket_joinGroup },

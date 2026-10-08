@@ -1,0 +1,296 @@
+diff --git a/src/Api/Vault/Controllers/CiphersController.cs b/src/Api/Vault/Controllers/CiphersController.cs
+index 32591c6a2507..3d616c226b11 100644
+--- a/src/Api/Vault/Controllers/CiphersController.cs
++++ b/src/Api/Vault/Controllers/CiphersController.cs
+@@ -451,7 +451,7 @@ public async Task<CipherMiniResponseModel> PutRestoreAdmin(string id)
+     }
+ 
+     [HttpPut("restore")]
+-    public async Task<ListResponseModel<CipherResponseModel>> PutRestoreMany([FromBody] CipherBulkRestoreRequestModel model)
++    public async Task<ListResponseModel<CipherMiniResponseModel>> PutRestoreMany([FromBody] CipherBulkRestoreRequestModel model)
+     {
+         if (!_globalSettings.SelfHosted && model.Ids.Count() > 500)
+         {
+@@ -461,12 +461,30 @@ public async Task<ListResponseModel<CipherResponseModel>> PutRestoreMany([FromBo
+         var userId = _userService.GetProperUserId(User).Value;
+         var cipherIdsToRestore = new HashSet<Guid>(model.Ids.Select(i => new Guid(i)));
+ 
+-        var ciphers = await _cipherRepository.GetManyByUserIdAsync(userId);
+-        var restoringCiphers = ciphers.Where(c => cipherIdsToRestore.Contains(c.Id) && c.Edit);
++        var restoredCiphers = await _cipherService.RestoreManyAsync(cipherIdsToRestore, userId);
++        var responses = restoredCiphers.Select(c => new CipherMiniResponseModel(c, _globalSettings, c.OrganizationUseTotp));
++        return new ListResponseModel<CipherMiniResponseModel>(responses);
++    }
++
++    [HttpPut("restore-admin")]
++    public async Task<ListResponseModel<CipherMiniResponseModel>> PutRestoreManyAdmin([FromBody] CipherBulkRestoreRequestModel model)
++    {
++        if (!_globalSettings.SelfHosted && model.Ids.Count() > 500)
++        {
++            throw new BadRequestException("You can only restore up to 500 items at a time.");
++        }
++
++        if (model == null || model.OrganizationId == default || !await _currentContext.EditAnyCollection(model.OrganizationId))
++        {
++            throw new NotFoundException();
++        }
++
++        var userId = _userService.GetProperUserId(User).Value;
++        var cipherIdsToRestore = new HashSet<Guid>(model.Ids.Select(i => new Guid(i)));
+ 
+-        await _cipherService.RestoreManyAsync(restoringCiphers, userId);
+-        var responses = restoringCiphers.Select(c => new CipherResponseModel(c, _globalSettings));
+-        return new ListResponseModel<CipherResponseModel>(responses);
++        var restoredCiphers = await _cipherService.RestoreManyAsync(cipherIdsToRestore, userId, model.OrganizationId, true);
++        var responses = restoredCiphers.Select(c => new CipherMiniResponseModel(c, _globalSettings, c.OrganizationUseTotp));
++        return new ListResponseModel<CipherMiniResponseModel>(responses);
+     }
+ 
+     [HttpPut("move")]
+diff --git a/src/Api/Vault/Models/Request/CipherRequestModel.cs b/src/Api/Vault/Models/Request/CipherRequestModel.cs
+index 842c99800c9a..a7cc399fe448 100644
+--- a/src/Api/Vault/Models/Request/CipherRequestModel.cs
++++ b/src/Api/Vault/Models/Request/CipherRequestModel.cs
+@@ -291,6 +291,7 @@ public class CipherBulkRestoreRequestModel
+ {
+     [Required]
+     public IEnumerable<string> Ids { get; set; }
++    public Guid OrganizationId { get; set; }
+ }
+ 
+ public class CipherBulkMoveRequestModel
+diff --git a/src/Core/Vault/Repositories/ICipherRepository.cs b/src/Core/Vault/Repositories/ICipherRepository.cs
+index 3df130aa81dc..401add13da31 100644
+--- a/src/Core/Vault/Repositories/ICipherRepository.cs
++++ b/src/Core/Vault/Repositories/ICipherRepository.cs
+@@ -36,5 +36,6 @@ Task CreateAsync(IEnumerable<Cipher> ciphers, IEnumerable<Collection> collection
+     Task SoftDeleteAsync(IEnumerable<Guid> ids, Guid userId);
+     Task SoftDeleteByIdsOrganizationIdAsync(IEnumerable<Guid> ids, Guid organizationId);
+     Task<DateTime> RestoreAsync(IEnumerable<Guid> ids, Guid userId);
++    Task<DateTime> RestoreByIdsOrganizationIdAsync(IEnumerable<Guid> ids, Guid organizationId);
+     Task DeleteDeletedAsync(DateTime deletedDateBefore);
+ }
+diff --git a/src/Core/Vault/Services/ICipherService.cs b/src/Core/Vault/Services/ICipherService.cs
+index 165be9a59091..165ea3fb06eb 100644
+--- a/src/Core/Vault/Services/ICipherService.cs
++++ b/src/Core/Vault/Services/ICipherService.cs
+@@ -35,7 +35,7 @@ Task ImportCiphersAsync(List<Collection> collections, List<CipherDetails> cipher
+     Task SoftDeleteAsync(Cipher cipher, Guid deletingUserId, bool orgAdmin = false);
+     Task SoftDeleteManyAsync(IEnumerable<Guid> cipherIds, Guid deletingUserId, Guid? organizationId = null, bool orgAdmin = false);
+     Task RestoreAsync(Cipher cipher, Guid restoringUserId, bool orgAdmin = false);
+-    Task RestoreManyAsync(IEnumerable<CipherDetails> ciphers, Guid restoringUserId);
++    Task<ICollection<CipherOrganizationDetails>> RestoreManyAsync(IEnumerable<Guid> cipherIds, Guid restoringUserId, Guid? organizationId = null, bool orgAdmin = false);
+     Task UploadFileForExistingAttachmentAsync(Stream stream, Cipher cipher, CipherAttachment.MetaData attachmentId);
+     Task<AttachmentResponseData> GetAttachmentDownloadDataAsync(Cipher cipher, string attachmentId);
+     Task<bool> ValidateCipherAttachmentFile(Cipher cipher, CipherAttachment.MetaData attachmentData);
+diff --git a/src/Core/Vault/Services/Implementations/CipherService.cs b/src/Core/Vault/Services/Implementations/CipherService.cs
+index f0e84eb634bb..a20097cef2d9 100644
+--- a/src/Core/Vault/Services/Implementations/CipherService.cs
++++ b/src/Core/Vault/Services/Implementations/CipherService.cs
+@@ -849,13 +849,28 @@ public async Task RestoreAsync(Cipher cipher, Guid restoringUserId, bool orgAdmi
+         await _pushService.PushSyncCipherUpdateAsync(cipher, null);
+     }
+ 
+-    public async Task RestoreManyAsync(IEnumerable<CipherDetails> ciphers, Guid restoringUserId)
++    public async Task<ICollection<CipherOrganizationDetails>> RestoreManyAsync(IEnumerable<Guid> cipherIds, Guid restoringUserId, Guid? organizationId = null, bool orgAdmin = false)
+     {
+-        var revisionDate = await _cipherRepository.RestoreAsync(ciphers.Select(c => c.Id), restoringUserId);
++        var cipherIdsSet = new HashSet<Guid>(cipherIds);
++        var restoringCiphers = new List<CipherOrganizationDetails>();
++        DateTime? revisionDate;
+ 
+-        var events = ciphers.Select(c =>
++        if (orgAdmin && organizationId.HasValue)
++        {
++            var ciphers = await _cipherRepository.GetManyOrganizationDetailsByOrganizationIdAsync(organizationId.Value);
++            restoringCiphers = ciphers.Where(c => cipherIdsSet.Contains(c.Id)).ToList();
++            revisionDate = await _cipherRepository.RestoreByIdsOrganizationIdAsync(restoringCiphers.Select(c => c.Id), organizationId.Value);
++        }
++        else
+         {
+-            c.RevisionDate = revisionDate;
++            var ciphers = await _cipherRepository.GetManyByUserIdAsync(restoringUserId);
++            restoringCiphers = ciphers.Where(c => cipherIdsSet.Contains(c.Id) && c.Edit).Select(c => (CipherOrganizationDetails)c).ToList();
++            revisionDate = await _cipherRepository.RestoreAsync(restoringCiphers.Select(c => c.Id), restoringUserId);
++        }
++
++        var events = restoringCiphers.Select(c =>
++        {
++            c.RevisionDate = revisionDate.Value;
+             c.DeletedDate = null;
+             return new Tuple<Cipher, EventType, DateTime?>(c, EventType.Cipher_Restored, null);
+         });
+@@ -866,6 +881,8 @@ public async Task RestoreManyAsync(IEnumerable<CipherDetails> ciphers, Guid rest
+ 
+         // push
+         await _pushService.PushSyncCiphersAsync(restoringUserId);
++
++        return restoringCiphers;
+     }
+ 
+     public async Task<(IEnumerable<CipherOrganizationDetails>, Dictionary<Guid, IGrouping<Guid, CollectionCipher>>)> GetOrganizationCiphers(Guid userId, Guid organizationId)
+diff --git a/src/Infrastructure.Dapper/Vault/Repositories/CipherRepository.cs b/src/Infrastructure.Dapper/Vault/Repositories/CipherRepository.cs
+index 31b8b10f5a68..cc1fd554e21a 100644
+--- a/src/Infrastructure.Dapper/Vault/Repositories/CipherRepository.cs
++++ b/src/Infrastructure.Dapper/Vault/Repositories/CipherRepository.cs
+@@ -669,6 +669,19 @@ public async Task<DateTime> RestoreAsync(IEnumerable<Guid> ids, Guid userId)
+         }
+     }
+ 
++    public async Task<DateTime> RestoreByIdsOrganizationIdAsync(IEnumerable<Guid> ids, Guid organizationId)
++    {
++        using (var connection = new SqlConnection(ConnectionString))
++        {
++            var results = await connection.ExecuteScalarAsync<DateTime>(
++                $"[{Schema}].[Cipher_RestoreByIdsOrganizationId]",
++                new { Ids = ids.ToGuidIdArrayTVP(), OrganizationId = organizationId },
++                commandType: CommandType.StoredProcedure);
++
++            return results;
++        }
++    }
++
+     public async Task DeleteDeletedAsync(DateTime deletedDateBefore)
+     {
+         using (var connection = new SqlConnection(ConnectionString))
+diff --git a/src/Infrastructure.EntityFramework/Vault/Repositories/CipherRepository.cs b/src/Infrastructure.EntityFramework/Vault/Repositories/CipherRepository.cs
+index cf2b5085d2ab..07d8576fe972 100644
+--- a/src/Infrastructure.EntityFramework/Vault/Repositories/CipherRepository.cs
++++ b/src/Infrastructure.EntityFramework/Vault/Repositories/CipherRepository.cs
+@@ -625,6 +625,31 @@ public async Task<DateTime> RestoreAsync(IEnumerable<Guid> ids, Guid userId)
+         return await ToggleCipherStates(ids, userId, CipherStateAction.Restore);
+     }
+ 
++    public async Task<DateTime> RestoreByIdsOrganizationIdAsync(IEnumerable<Guid> ids, Guid organizationId)
++    {
++        using (var scope = ServiceScopeFactory.CreateScope())
++        {
++            var dbContext = GetDatabaseContext(scope);
++            var utcNow = DateTime.UtcNow;
++            var ciphers = from c in dbContext.Ciphers
++                          where c.OrganizationId == organizationId &&
++                                ids.Contains(c.Id)
++                          select c;
++
++            await ciphers.ForEachAsync(cipher =>
++            {
++                dbContext.Attach(cipher);
++                cipher.DeletedDate = null;
++                cipher.RevisionDate = utcNow;
++            });
++
++            await OrganizationUpdateStorage(organizationId);
++            await dbContext.UserBumpAccountRevisionDateByOrganizationIdAsync(organizationId);
++            await dbContext.SaveChangesAsync();
++            return utcNow;
++        }
++    }
++
+     public async Task SoftDeleteAsync(IEnumerable<Guid> ids, Guid userId)
+     {
+         await ToggleCipherStates(ids, userId, CipherStateAction.SoftDelete);
+diff --git a/src/Sql/Vault/dbo/Stored Procedures/Cipher/Cipher_RestoreByIdsOrganizationId.sql b/src/Sql/Vault/dbo/Stored Procedures/Cipher/Cipher_RestoreByIdsOrganizationId.sql
+new file mode 100644
+index 000000000000..1a0d5a8f500b
+--- /dev/null
++++ b/src/Sql/Vault/dbo/Stored Procedures/Cipher/Cipher_RestoreByIdsOrganizationId.sql	
+@@ -0,0 +1,29 @@
++CREATE PROCEDURE [dbo].[Cipher_RestoreByIdsOrganizationId]
++    @Ids AS [dbo].[GuidIdArray] READONLY,
++    @OrganizationId AS UNIQUEIDENTIFIER
++AS
++BEGIN
++    SET NOCOUNT ON
++        
++    IF (SELECT COUNT(1) FROM @Ids) < 1
++        BEGIN
++            RETURN(-1)
++        END
++
++    -- Delete ciphers
++    DECLARE @UtcNow DATETIME2(7) = GETUTCDATE();
++    UPDATE
++        [dbo].[Cipher]
++    SET
++        [DeletedDate] = NULL,
++        [RevisionDate] = @UtcNow
++    WHERE
++        [Id] IN (SELECT * FROM @Ids)
++        AND OrganizationId = @OrganizationId
++
++    -- Cleanup organization
++    EXEC [dbo].[Organization_UpdateStorage] @OrganizationId
++    EXEC [dbo].[User_BumpAccountRevisionDateByOrganizationId] @OrganizationId
++
++    SELECT @UtcNow
++END
+\ No newline at end of file
+diff --git a/test/Core.Test/Vault/Services/CipherServiceTests.cs b/test/Core.Test/Vault/Services/CipherServiceTests.cs
+index 8ab34a130f9e..df6cc7198b11 100644
+--- a/test/Core.Test/Vault/Services/CipherServiceTests.cs
++++ b/test/Core.Test/Vault/Services/CipherServiceTests.cs
+@@ -167,21 +167,23 @@ public async Task RestoreAsync_UpdatesOrganizationCipher(Guid restoringUserId, C
+ 
+     [Theory]
+     [BitAutoData]
+-    public async Task RestoreManyAsync_UpdatesCiphers(IEnumerable<CipherDetails> ciphers,
++    public async Task RestoreManyAsync_UpdatesCiphers(ICollection<CipherDetails> ciphers,
+         SutProvider<CipherService> sutProvider)
+     {
++        var cipherIds = ciphers.Select(c => c.Id).ToArray();
+         var restoringUserId = ciphers.First().UserId.Value;
+         var previousRevisionDate = DateTime.UtcNow;
+         foreach (var cipher in ciphers)
+         {
++            cipher.Edit = true;
+             cipher.RevisionDate = previousRevisionDate;
+         }
+ 
++        sutProvider.GetDependency<ICipherRepository>().GetManyByUserIdAsync(restoringUserId).Returns(ciphers);
+         var revisionDate = previousRevisionDate + TimeSpan.FromMinutes(1);
+-        sutProvider.GetDependency<ICipherRepository>().RestoreAsync(Arg.Any<IEnumerable<Guid>>(), restoringUserId)
+-            .Returns(revisionDate);
++        sutProvider.GetDependency<ICipherRepository>().RestoreAsync(Arg.Any<IEnumerable<Guid>>(), restoringUserId).Returns(revisionDate);
+ 
+-        await sutProvider.Sut.RestoreManyAsync(ciphers, restoringUserId);
++        await sutProvider.Sut.RestoreManyAsync(cipherIds, restoringUserId);
+ 
+         foreach (var cipher in ciphers)
+         {
+diff --git a/util/Migrator/DbScripts/2023-04-21_00_CipherRestoreByIdsOrganizationId.sql b/util/Migrator/DbScripts/2023-04-21_00_CipherRestoreByIdsOrganizationId.sql
+new file mode 100644
+index 000000000000..e156984f615a
+--- /dev/null
++++ b/util/Migrator/DbScripts/2023-04-21_00_CipherRestoreByIdsOrganizationId.sql
+@@ -0,0 +1,30 @@
++CREATE OR ALTER PROCEDURE [dbo].[Cipher_RestoreByIdsOrganizationId]
++    @Ids AS [dbo].[GuidIdArray] READONLY,
++    @OrganizationId AS UNIQUEIDENTIFIER
++AS
++BEGIN
++    SET NOCOUNT ON
++        
++    IF (SELECT COUNT(1) FROM @Ids) < 1
++        BEGIN
++            RETURN(-1)
++        END
++
++    -- Delete ciphers
++    DECLARE @UtcNow DATETIME2(7) = GETUTCDATE();
++    UPDATE
++        [dbo].[Cipher]
++    SET
++        [DeletedDate] = NULL,
++        [RevisionDate] = @UtcNow
++    WHERE
++        [Id] IN (SELECT * FROM @Ids)
++        AND OrganizationId = @OrganizationId
++
++    -- Cleanup organization
++    EXEC [dbo].[Organization_UpdateStorage] @OrganizationId
++    EXEC [dbo].[User_BumpAccountRevisionDateByOrganizationId] @OrganizationId
++
++    SELECT @UtcNow
++END
++GO
+\ No newline at end of file

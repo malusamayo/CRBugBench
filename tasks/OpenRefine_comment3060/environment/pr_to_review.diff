@@ -1,0 +1,146 @@
+diff --git a/extensions/wikidata/src/org/openrefine/wikidata/commands/PreviewWikibaseSchemaCommand.java b/extensions/wikidata/src/org/openrefine/wikidata/commands/PreviewWikibaseSchemaCommand.java
+index 1ebdfb1dd2c4f..a71ee064d60f1 100644
+--- a/extensions/wikidata/src/org/openrefine/wikidata/commands/PreviewWikibaseSchemaCommand.java
++++ b/extensions/wikidata/src/org/openrefine/wikidata/commands/PreviewWikibaseSchemaCommand.java
+@@ -89,7 +89,7 @@ public void doPost(HttpServletRequest request, HttpServletResponse response)
+ 
+             // Inspect the edits and generate warnings
+             EditInspector inspector = new EditInspector(warningStore);
+-            inspector.inspect(editBatch);
++            inspector.inspect(editBatch, schema);
+             
+             // Dump the first 10 edits, scheduled with the default scheduler
+             WikibaseAPIUpdateScheduler scheduler = new WikibaseAPIUpdateScheduler();
+diff --git a/extensions/wikidata/src/org/openrefine/wikidata/qa/EditInspector.java b/extensions/wikidata/src/org/openrefine/wikidata/qa/EditInspector.java
+index 119e7b90b1603..51bf6bad6f067 100644
+--- a/extensions/wikidata/src/org/openrefine/wikidata/qa/EditInspector.java
++++ b/extensions/wikidata/src/org/openrefine/wikidata/qa/EditInspector.java
+@@ -23,15 +23,42 @@
+  ******************************************************************************/
+ package org.openrefine.wikidata.qa;
+ 
+-import org.openrefine.wikidata.qa.scrutinizers.*;
++import org.openrefine.wikidata.qa.scrutinizers.CalendarScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.CommonDescriptionScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.ConflictsWithScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.DifferenceWithinRangeScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.DistinctValuesScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.EditScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.EnglishDescriptionScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.EntityTypeScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.FormatScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.InverseConstraintScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.ItemRequiresScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.MultiValueScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.NewItemScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.NoEditsMadeScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.QualifierCompatibilityScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.QuantityScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.RestrictedPositionScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.RestrictedValuesScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.SelfReferentialScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.SingleValueScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.UnsourcedScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.UseAsQualifierScrutinizer;
++import org.openrefine.wikidata.qa.scrutinizers.WhitespaceScrutinizer;
++import org.openrefine.wikidata.schema.WikibaseSchema;
+ import org.openrefine.wikidata.updates.ItemUpdate;
+ import org.openrefine.wikidata.updates.scheduler.WikibaseAPIUpdateScheduler;
+ import org.openrefine.wikidata.utils.EntityCache;
++import org.wikidata.wdtk.datamodel.interfaces.EntityDocument;
+ import org.wikidata.wdtk.datamodel.interfaces.EntityIdValue;
++import org.wikidata.wdtk.datamodel.interfaces.PropertyIdValue;
+ 
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.ExecutionException;
+ import java.util.stream.Collectors;
+ 
+ /**
+@@ -45,10 +72,12 @@ public class EditInspector {
+     private Map<String, EditScrutinizer> scrutinizers;
+     private QAWarningStore warningStore;
+     private ConstraintFetcher fetcher;
++    private EntityCache entityCache;
+ 
+     public EditInspector(QAWarningStore warningStore) {
+         this.scrutinizers = new HashMap<>();
+-        this.fetcher = new WikidataConstraintFetcher(EntityCache.getEntityCache());
++        this.entityCache = EntityCache.getEntityCache();
++        this.fetcher = new WikidataConstraintFetcher(entityCache);
+         this.warningStore = warningStore;
+ 
+         // Register all known scrutinizers here
+@@ -93,9 +122,12 @@ public void register(EditScrutinizer scrutinizer) {
+      * 
+      * @param editBatch
+      */
+-    public void inspect(List<ItemUpdate> editBatch) {
++    public void inspect(List<ItemUpdate> editBatch, WikibaseSchema schema) throws ExecutionException {
+         // First, schedule them with some scheduler,
+         // so that all newly created entities appear in the batch
++        SchemaPropertyFetcher fetcher = new SchemaPropertyFetcher();
++        Set<PropertyIdValue> properties = fetcher.getAllProperties(schema);
++        List<EntityDocument> propertyDocuments = entityCache.getMultipleDocuments(properties.stream().collect(Collectors.toList()));
+         WikibaseAPIUpdateScheduler scheduler = new WikibaseAPIUpdateScheduler();
+         editBatch = scheduler.schedule(editBatch);
+ 
+diff --git a/extensions/wikidata/src/org/openrefine/wikidata/qa/SchemaPropertyFetcher.java b/extensions/wikidata/src/org/openrefine/wikidata/qa/SchemaPropertyFetcher.java
+new file mode 100644
+index 0000000000000..f02a99c349f6b
+--- /dev/null
++++ b/extensions/wikidata/src/org/openrefine/wikidata/qa/SchemaPropertyFetcher.java
+@@ -0,0 +1,51 @@
++package org.openrefine.wikidata.qa;
++
++import org.openrefine.wikidata.schema.WbExpression;
++import org.openrefine.wikidata.schema.WbItemDocumentExpr;
++import org.openrefine.wikidata.schema.WbPropConstant;
++import org.openrefine.wikidata.schema.WbReferenceExpr;
++import org.openrefine.wikidata.schema.WbSnakExpr;
++import org.openrefine.wikidata.schema.WbStatementExpr;
++import org.openrefine.wikidata.schema.WbStatementGroupExpr;
++import org.openrefine.wikidata.schema.WikibaseSchema;
++import org.wikidata.wdtk.datamodel.helpers.Datamodel;
++import org.wikidata.wdtk.datamodel.interfaces.PropertyIdValue;
++
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++
++public class SchemaPropertyFetcher {
++
++    public Set<PropertyIdValue> getAllProperties(WikibaseSchema schema) {
++        Set<PropertyIdValue> properties = new HashSet<>();
++        List<WbItemDocumentExpr> itemDocumentExprs = schema.getItemDocumentExpressions();
++        for (WbItemDocumentExpr itemDocumentExpr : itemDocumentExprs) {
++            List<WbStatementGroupExpr> statementGroups = itemDocumentExpr.getStatementGroups();
++            for(WbStatementGroupExpr statementGroup : statementGroups) {
++                WbExpression<? extends PropertyIdValue> statementGroupProperty = statementGroup.getProperty();
++                if (statementGroupProperty instanceof WbPropConstant) {
++                    properties.add(Datamodel.makeWikidataPropertyIdValue(((WbPropConstant) statementGroupProperty).getPid()));
++                }
++                List<WbStatementExpr> statementExprs = statementGroup.getStatements();
++                for(WbStatementExpr statementExpr : statementExprs) {
++                    List<WbSnakExpr> snakExprs = statementExpr.getQualifiers();
++                    List<WbReferenceExpr> referenceExprs = statementExpr.getReferences();
++                    for (WbReferenceExpr referenceExpr : referenceExprs) {
++                        snakExprs.addAll(referenceExpr.getSnaks());
++                    }
++
++                    for (WbSnakExpr snakExpr : snakExprs) {
++                        WbExpression<? extends PropertyIdValue> qualifierProperty = snakExpr.getProp();
++                        if (qualifierProperty instanceof WbPropConstant) {
++                            properties.add(Datamodel.makeWikidataPropertyIdValue(((WbPropConstant) qualifierProperty).getPid()));
++                        }
++                    }
++                }
++            }
++        }
++
++        return properties;
++    }
++}
++

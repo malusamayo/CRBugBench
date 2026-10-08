@@ -1,0 +1,1002 @@
+diff --git a/Duplicati/UnitTest/ToolTests.cs b/Duplicati/UnitTest/ToolTests.cs
+index b839294951..3e9f10f7aa 100644
+--- a/Duplicati/UnitTest/ToolTests.cs
++++ b/Duplicati/UnitTest/ToolTests.cs
+@@ -29,6 +29,8 @@
+ using System.Threading.Tasks;
+ using Assert = NUnit.Framework.Legacy.ClassicAssert;
+ 
++#nullable enable
++
+ namespace Duplicati.UnitTest
+ {
+ 
+@@ -138,8 +140,16 @@ public void TestEmptySourceRenamesDestination()
+             foreach (var (name, contents) in filelist.Zip(files))
+             {
+                 var filename = Path.GetFileName(name);
+-                var newcontents = File.ReadAllBytes(newfilelist.FirstOrDefault(x => x.EndsWith(filename)));
+-                Assert.AreEqual(contents, newcontents, "File contents are not equal");
++                var newfilename = newfilelist.FirstOrDefault(x => x.EndsWith(filename));
++                if (newfilename == null)
++                {
++                    Assert.Fail($"File {filename} was not renamed in the destination directory.");
++                }
++                else
++                {
++                    var newcontents = File.ReadAllBytes(newfilename);
++                    Assert.AreEqual(contents, newcontents, "File contents are not equal");
++                }
+             }
+         }
+ 
+@@ -153,6 +163,10 @@ public void TestMainMethodParsesArgumentsCorrectly()
+             string[][] testCases =
+             {
+                 ["source", "destination", "--parse-arguments-only"],
++                ["source", "destination", "--parse-arguments-only", "--auto-create-folders"],
++                ["source", "destination", "--parse-arguments-only", "--backend-retries", "5"],
++                ["source", "destination", "--parse-arguments-only", "--backend-retry-delay", "1000"],
++                ["source", "destination", "--parse-arguments-only", "--backend-retry-with-exponential-backoff"],
+                 ["source", "destination", "--parse-arguments-only", "--dry-run"],
+                 ["source", "destination", "--parse-arguments-only", "--force"],
+                 ["source", "destination", "--parse-arguments-only", "--dry-run", "--force"],
+@@ -422,6 +436,95 @@ public void TestRemoteSynchronization()
+             Assert.IsTrue(DirectoriesAndContentsAreEqual(DATAFOLDER, l2r), "Restored second level files is not equal to original files");
+         }
+ 
++        [Test]
++        [Category("Tools/RemoteSynchronization")]
++        [TestCase(true, false, "0")] // Fail first transfer on source.
++        [TestCase(true, false, "1,3")] // Fail middle transfers on source.
++        [TestCase(true, false, "4")] // Fail last transfer on source.
++        [TestCase(true, false, "0,1,2,3,4")] // Fail all transfers on source.
++        [TestCase(false, true, "0")] // Fail first transfer on destination.
++        [TestCase(false, true, "1,3")] // Fail middle transfers on destination.
++        [TestCase(false, true, "4")] // Fail last transfer on destination.
++        [TestCase(false, true, "0,1,2,3,4")] // Fail all transfers on destination.
++        public void TestRemoteSynchronizationWithFaultyBackend(bool failSource, bool failDest, string failIndices)
++        {
++            var expect_to_fail = failIndices == "0,1,2,3,4";
++
++            var l1 = Path.Combine(TARGETFOLDER, "l1");
++            var l2 = Path.Combine(TARGETFOLDER, "l2");
++            Directory.CreateDirectory(l1);
++            Directory.CreateDirectory(l2);
++
++            int backendCount = 0;
++            var failIdxs = failIndices.Split(',').Select(int.Parse).ToList();
++            Library.DynamicLoader.BackendLoader.AddBackend(new DeterministicErrorBackend());
++            DeterministicErrorBackend.ErrorGenerator = (action, remotename) =>
++            {
++                if (action == DeterministicErrorBackend.BackendAction.GetBefore || action == DeterministicErrorBackend.BackendAction.PutBefore)
++                {
++                    var currentIdx = backendCount;
++                    if (failIdxs.Count > 0 && currentIdx == failIdxs.First())
++                    {
++                        failIdxs.RemoveAt(0);
++                        return true; // Simulate failure
++                    }
++                    else
++                    {
++                        backendCount++;
++                    }
++                }
++
++                return false; // No failure
++            };
++
++            GenerateTestData(l1, 5, 0, 0, 1024).Wait();
++
++            // Setup backend URLs with failure injection
++            var protocol = new DeterministicErrorBackend().ProtocolKey;
++            string srcUrl = failSource ? $"{protocol}://{l1}" : $"file://{l1}";
++            string dstUrl = failDest ? $"{protocol}://{l2}" : $"file://{l2}";
++
++            var args = new string[] {
++                srcUrl, dstUrl,
++                "--confirm",
++                "--backend-retries", "5",
++                "--backend-retry-delay", "10"
++            };
++
++            // Redirect standard error to a buffer if we expect to fail. If it doesn't fail, we can omit it.
++            var originalError = Console.Error;
++            StringWriter? errorBuffer = null;
++            if (expect_to_fail)
++            {
++                errorBuffer = new StringWriter();
++                Console.SetError(errorBuffer);
++            }
++
++            var async_call = RemoteSynchronization.Program.Main(args);
++            var return_code = async_call.ConfigureAwait(false).GetAwaiter().GetResult();
++
++            // Expect nonzero return code if any backend fails less than the number of retries
++            if (expect_to_fail)
++            {
++                try
++                {
++                    Assert.AreNotEqual(0, return_code, "Expected failure due to all transfers failing.");
++                    Assert.IsFalse(DirectoriesAndContentsAreEqual(l1, l2), "Synchronized directories should not be equal due to failures.");
++                }
++                catch
++                {
++                    Console.SetError(originalError); // Restore standard error
++                    Console.Error.WriteLine(errorBuffer?.ToString());
++                    throw;
++                }
++            }
++            else
++            {
++                Assert.AreEqual(0, return_code, "Expected success.");
++                Assert.IsTrue(DirectoriesAndContentsAreEqual(l1, l2), "Synchronized directories are not equal.");
++            }
++        }
++
+         /// <summary>
+         /// Tests that the remote synchronization tool verifies the contents of the files.
+         /// </summary>
+diff --git a/Tools/RemoteSynchronization/LightWeightBackendManager.cs b/Tools/RemoteSynchronization/LightWeightBackendManager.cs
+new file mode 100644
+index 0000000000..88a70c04fb
+--- /dev/null
++++ b/Tools/RemoteSynchronization/LightWeightBackendManager.cs
+@@ -0,0 +1,370 @@
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Threading;
++using System.Threading.Tasks;
++using Duplicati.Library.Interface;
++using Duplicati.Library.Utility;
++
++namespace RemoteSynchronization
++{
++    /// <summary>
++    /// A lightweight backend manager that handles remote synchronization operations.
++    /// This class is designed to manage backend operations such as Get, Put, Delete, Rename, and List asynchronously.
++    /// It supports retrying operations with a specified delay and can automatically create folders if they do not exist.
++    /// The class implements IDisposable to ensure proper resource management.
++    /// It uses a streaming backend for efficient file operations and handles exceptions gracefully to allow for retries and recovery.
++    /// A retry incurs a new instantiation of the backend.
++    /// It is designed to mimic the behavior of Duplicati.Library.Main.Backend.BackendManager.
++    /// </summary>
++    /// <param name="backendUrl">The backend URL string.</param>
++    /// <param name="options">A dictionary of options to pass to the backend.</param>
++    /// <param name="maxRetries">The maximum number of retries for failed operations.</param>
++    /// <param name="retryDelay">The delay between retries, in milliseconds.</param>
++    /// <param name="autoCreateFolders">Whether to automatically create folders if they do not exist.</param>
++    /// <param name="retryWithExponentialBackoff">Whether to use exponential backoff for retries.</param>
++    public class LightWeightBackendManager(string backendUrl, Dictionary<string, string> options, int maxRetries = 3, int retryDelay = 1000, bool autoCreateFolders = false, bool retryWithExponentialBackoff = false) : IDisposable
++    {
++        private static readonly string LOGTAG = Duplicati.Library.Logging.Log.LogTagFromType<Program>();
++
++        public IBackend? _backend = null;
++
++        private bool _anyDownloaded = false;
++        private bool _anyUploaded = false;
++        private readonly string _backendUrl = backendUrl;
++        private int _instantiations = 0;
++        private readonly int _maxRetries = maxRetries;
++        private readonly Dictionary<string, string> _options = options;
++        private int _retryDelay = retryDelay;
++        private IStreamingBackend? _streamingBackend = null;
++
++        /// <summary>
++        /// Deletes a file from the remote backend.
++        /// </summary>
++        /// <param name="remotename">The name of the remote file to delete.</param>
++        /// <param name="token">A cancellation token to cancel the operation.</param>
++        /// <returns>A task representing the asynchronous delete operation.</returns>
++        public Task DeleteAsync(string remotename, CancellationToken token)
++        {
++            return RetryWithDelay(
++                $"Delete {remotename}",
++                () => _streamingBackend!.DeleteAsync(remotename, token),
++                null,
++                false,
++                token
++            );
++        }
++
++        /// <summary>
++        /// Gets the display name of the backend.
++        /// This property initializes the backend if it has not been instantiated yet.
++        /// </summary>
++        /// <returns>The display name of the backend.</returns>
++        public string DisplayName
++        {
++            get
++            {
++                Instantiate();
++
++                return _streamingBackend!.DisplayName;
++            }
++        }
++
++        /// <summary>
++        /// Disposes of the backend and streaming backend resources.
++        /// </summary>
++        public void Dispose()
++        {
++            try
++            {
++                _streamingBackend?.Dispose();
++                _streamingBackend = null;
++                _backend?.Dispose();
++                _backend = null;
++            }
++            catch (Exception ex)
++            {
++                Duplicati.Library.Logging.Log.WriteErrorMessage(LOGTAG, "rsync", ex, "Error during Dispose", null);
++            }
++        }
++
++        /// <summary>
++        /// Gets a file from the remote backend and writes it to the specified stream.
++        /// This method retries the operation with a delay if it fails.
++        /// </summary>
++        /// <param name="remotename">The name of the remote file to get.</param>
++        /// <param name="stream">The stream to write the file to.</param>
++        /// <param name="token">A cancellation token to cancel the operation.</param>
++        /// <returns>A task representing the asynchronous get operation.</returns>
++        public Task GetAsync(string remotename, Stream stream, CancellationToken token)
++        {
++            return RetryWithDelay(
++                $"Get {remotename}",
++                async () =>
++                {
++                    await _streamingBackend!.GetAsync(remotename, stream, token).ConfigureAwait(false);
++                    _anyDownloaded = true;
++                },
++                stream,
++                true,
++                token
++            );
++        }
++
++        /// <summary>
++        /// Instantiates the backend if it has not been instantiated yet.
++        /// If the backend is already instantiated, it simply returns.
++        /// If the maximum number of retries has been reached, it throws an InvalidOperationException.
++        /// This method is called internally to ensure that the backend is ready for operations.
++        /// </summary>
++        /// <exception cref="InvalidOperationException">If the maximum number of instantiations has been reached.</exception>
++        private void Instantiate()
++        {
++            if (_backend != null)
++            {
++                // If we already have a backend, we can just return.
++                return;
++            }
++
++            if (_instantiations < _maxRetries)
++            {
++                _backend = Duplicati.Library.DynamicLoader.BackendLoader.GetBackend(_backendUrl, _options);
++                _streamingBackend = _backend as IStreamingBackend;
++                if (_streamingBackend == null)
++                {
++                    _backend.Dispose();
++                    _backend = null;
++                    throw new InvalidOperationException("Backend does not support streaming operations.");
++                }
++                _instantiations++;
++            }
++            else
++            {
++                throw new InvalidOperationException("Maximum number of backend instantiations reached.");
++            }
++        }
++
++        /// <summary>
++        /// Lists the files in the remote backend asynchronously.
++        /// </summary>
++        /// <param name="token">A cancellation token to cancel the operation.</param>
++        /// <returns>An asynchronous enumerable of file entries.</returns>
++        public IAsyncEnumerable<IFileEntry> ListAsync(CancellationToken token)
++        {
++            while (true)
++            {
++                Instantiate();
++
++                try
++                {
++                    return _streamingBackend!.ListAsync(token);
++                }
++                catch (Exception ex)
++                {
++                    Duplicati.Library.Logging.Log.WriteErrorMessage(LOGTAG, "rsync", ex, "Error during operation: List", null);
++                    Dispose(); // Dispose current backend and streaming backend
++
++                    TryRecoverFromException(ex, token).Await();
++                }
++            }
++
++        }
++
++        /// <summary>
++        /// Puts a file to the remote backend from the specified stream.
++        /// </summary>
++        /// <param name="remotename">The name of the remote file to put.</param>
++        /// <param name="stream">The stream containing the file data to put.</param>
++        /// <param name="token">A cancellation token to cancel the operation.</param>
++        /// <returns>A task representing the asynchronous put operation.</returns>
++        public Task PutAsync(string remotename, Stream stream, CancellationToken token)
++        {
++            return RetryWithDelay(
++                $"Put {remotename}",
++                async () =>
++                {
++                    await _streamingBackend!.PutAsync(remotename, stream, token).ConfigureAwait(false);
++                    _anyUploaded = true;
++                },
++                stream,
++                false,
++                token
++            );
++        }
++
++        /// <summary>
++        /// Renames a file in the remote backend.
++        /// If the backend supports renaming, it uses the RenameAsync method.
++        /// If the backend does not support renaming, it downloads the file, renames it, and deletes the old one.
++        /// </summary>
++        /// <param name="oldname">The current name of the remote file.</param>
++        /// <param name="newname">The new name for the remote file.</param>
++        /// <param name="token">A cancellation token to cancel the operation.</param>
++        /// <returns>A task representing the asynchronous rename operation.</returns>
++        public Task RenameAsync(string oldname, string newname, CancellationToken token)
++        {
++            Instantiate();
++
++            return _backend switch
++            {
++                IStreamingBackend sb =>
++                    RetryWithDelay(
++                        $"Rename {oldname} to {newname}",
++                        async () =>
++                        {
++                            // Download the file, rename it, and delete the old one
++                            using var downloaded = new MemoryStream();
++                            await sb.GetAsync(oldname, downloaded, token).ConfigureAwait(false);
++                            await sb.PutAsync(newname, downloaded, token).ConfigureAwait(false);
++                            await sb.DeleteAsync(oldname, token).ConfigureAwait(false);
++                            _anyUploaded = true;
++                            _anyDownloaded = true;
++                        },
++                        null,
++                        false,
++                        token
++                    ),
++                IRenameEnabledBackend ireb =>
++                    RetryWithDelay(
++                        $"Rename {oldname} to {newname}",
++                        async () =>
++                        {
++                            await ireb.RenameAsync(oldname, newname, token).ConfigureAwait(false);
++                            _anyUploaded = true;
++                            _anyDownloaded = true;
++                        },
++                        null,
++                        false,
++                        token
++                    ),
++                _ => throw new InvalidOperationException("Backend does not support renaming."),
++            };
++        }
++
++        /// <summary>
++        /// Retries an operation with a delay if it fails.
++        /// This method will instantiate the backend if it has not been instantiated yet.
++        /// If the operation fails, it will log the error, dispose of the current backend and streaming backend,
++        /// reset the stream if specified, and attempt to recover from the exception.
++        /// If recovery is not possible, it will wait for the specified retry delay before retrying the operation.
++        /// The retry delay can be increased exponentially if specified.
++        /// </summary>
++        /// <param name="operationName">The name of the operation being retried, used for logging.</param>
++        /// <param name="action">The action to perform.</param>
++        /// <param name="stream">The stream to use for the operation. Used when resetting the stream during recovery.</param>
++        /// <param name="resetStream">Whether to reset the stream if the operation fails.</param>
++        /// <param name="token">A cancellation token to cancel the operation.</param>
++        /// <returns>A task representing the asynchronous operation.</returns>
++        private async Task RetryWithDelay(string operationName, Func<Task> action, Stream? stream, bool resetStream, CancellationToken token)
++        {
++            while (true)
++            {
++                // This will throw an exception if we've reached the max
++                // number of retries.
++                Instantiate();
++
++                try
++                {
++                    await action().ConfigureAwait(false);
++                    return; // Exit the loop if the action succeeds.
++                }
++                catch (Exception ex)
++                {
++                    Duplicati.Library.Logging.Log.WriteErrorMessage(LOGTAG, "rsync", ex, "Error during operation: {0}", operationName);
++                    Dispose(); // Dispose current backend and streaming backend.
++
++                    // Reset the stream, as it's in a potentially faulty state.
++                    stream?.Seek(0, SeekOrigin.Begin);
++                    if (resetStream)
++                        stream?.SetLength(0);
++
++                    // Try to see if we can recover from the error.
++                    await TryRecoverFromException(ex, token).ConfigureAwait(false);
++                }
++            }
++        }
++
++        /// <summary>
++        /// Attempts to create a folder in the remote backend.
++        /// </summary>
++        /// <param name="token">A cancellation token to cancel the operation.</param>
++        /// <returns>A task that represents the asynchronous operation. The task result is true if the folder was created successfully, false otherwise.</returns>
++        private async Task<bool> TryCreateFolder(CancellationToken token)
++        {
++            try
++            {
++                Instantiate();
++
++                // Attempt to create the folder
++                await _backend!.CreateFolderAsync(token).ConfigureAwait(false);
++
++                return true; // Folder creation succeeded
++            }
++            catch (Exception ex)
++            {
++                Dispose();
++
++                Duplicati.Library.Logging.Log.WriteErrorMessage(LOGTAG, "rsync", ex, "Failed to create folder", null);
++
++                return false; // Folder creation failed
++            }
++        }
++
++        /// <summary>
++        /// Attempts to recover from an exception that occurred during a backend operation.
++        /// This method checks for specific types of exceptions, such as DNS resolution failures or folder missing exceptions.
++        /// If a DNS failure is detected, it attempts to refresh the DNS name by re-instantiating the backend and resolving DNS names.
++        /// If the exception is a folder missing exception and auto-creation of folders is enabled, it attempts to create the folder.
++        /// If recovery is not possible, it waits for the specified retry delay.
++        /// The retry delay will be doubled if exponential backoff is enabled.
++        /// </summary>
++        /// <param name="ex">The exception that occurred during the operation.</param>
++        /// <param name="token">A cancellation token to cancel the operation.</param>
++        /// <returns>A task representing the asynchronous recovery operation.</returns>
++        private async Task TryRecoverFromException(Exception ex, CancellationToken token)
++        {
++            // Copied from Duplicati.Library.Main.Backend.BackendManager.Handler.
++
++            // Refresh DNS name if we fail to connect in order to prevent issues with incorrect DNS entries.
++            var dnsFailure = ExceptionExtensions.FlattenException(ex)
++            .Any(x =>
++                (x is System.Net.WebException wex && wex.Status == System.Net.WebExceptionStatus.NameResolutionFailure)
++                ||
++                (x is System.Net.Sockets.SocketException sockEx && sockEx.SocketErrorCode == System.Net.Sockets.SocketError.HostNotFound)
++            );
++
++            if (dnsFailure)
++            {
++                try
++                {
++                    Instantiate();
++
++                    foreach (var name in await _backend!.GetDNSNamesAsync(token).ConfigureAwait(false) ?? [])
++                        if (!string.IsNullOrWhiteSpace(name))
++                            System.Net.Dns.GetHostEntry(name);
++                }
++                catch { }
++            }
++
++            var recovered = false;
++
++            // Check if this was a folder missing exception and we are allowed to autocreate folders
++            if (!(_anyDownloaded || _anyUploaded) && autoCreateFolders && ExceptionExtensions.FlattenException(ex).Any(x => x is FolderMissingException))
++            {
++                if (await TryCreateFolder(token).ConfigureAwait(false))
++                    recovered = true;
++            }
++
++            // Finally, if we did not recover, wait the specified delay before retrying.
++            if (!recovered && _retryDelay > 0)
++            {
++                if (retryWithExponentialBackoff)
++                    _retryDelay <<= 1; // Double the delay for exponential backoff
++
++                await Task.Delay(_retryDelay, token).ConfigureAwait(false);
++            }
++        }
++
++    }
++}
+diff --git a/Tools/RemoteSynchronization/Program.cs b/Tools/RemoteSynchronization/Program.cs
+index c713e1443a..d73ccf5190 100644
+--- a/Tools/RemoteSynchronization/Program.cs
++++ b/Tools/RemoteSynchronization/Program.cs
+@@ -49,6 +49,10 @@ private sealed record Config
+             string Dst,
+ 
+             // Options
++            bool AutoCreateFolders,
++            int BackendRetries,
++            int BackendRetryDelay,
++            bool BackendRetryWithExponentialBackoff,
+             bool Confirm,
+             bool DryRun,
+             List<string> DstOptions,
+@@ -107,6 +111,10 @@ destination will be verified before being overwritten (if they seemingly match).
+                 arg_src,
+                 arg_dst,
+ 
++                new Option<bool>(aliases: ["--auto-create-folders"], description: "Automatically create folders in the destination backend if they do not exist", getDefaultValue: () => true),
++                new Option<int>(aliases: ["--backend-retries"], description: "Number of times to recreate a backend on backend errors", getDefaultValue: () => 3) { Arity = ArgumentArity.ExactlyOne },
++                new Option<int>(aliases: ["--backend-retry-delay"], description: "Delay in milliseconds between backend retries", getDefaultValue: () => 1000) { Arity = ArgumentArity.ExactlyOne },
++                new Option<bool>(aliases: ["--backend-retry-with-exponential-backoff"], description: "Use exponential backoff for backend retries, multiplying the delay by two for each failure.", getDefaultValue: () => true),
+                 new Option<bool>(aliases: ["--confirm", "--yes", "-y"], description: "Automatically confirm the operation", getDefaultValue: () => false),
+                 new Option<bool>(aliases: ["--dry-run", "-d"], description: "Do not actually write or delete files. If not set here, the global options will be checked", getDefaultValue: () => false),
+                 OptionWithMultipleTokens(aliases: ["--dst-options"], description: "Options for the destination backend. Each option is a key-value pair separated by an equals sign, e.g. --dst-options key1=value1 key2=value2 [default: empty]", getDefaultValue: () => []),
+@@ -123,24 +131,23 @@ destination will be verified before being overwritten (if they seemingly match).
+                 new Option<bool>(aliases: ["--verify-get-after-put"], description: "Verify the files after uploading them to ensure that they were uploaded correctly", getDefaultValue: () => false),
+             };
+ 
+-            root_cmd.Handler = CommandHandler.Create((string backend_src, string backend_dst, Config config) =>
++            root_cmd.Handler = CommandHandler.Create((string backend_src, string backend_dst, Config config, CancellationToken token) =>
+             {
+                 var config_with_args = config with { Dst = backend_dst, Src = backend_src };
+ 
+-                return Run(config_with_args);
++                return Run(config_with_args, token);
+             });
+ 
+-            return await root_cmd.InvokeAsync(args);
++            return await root_cmd.InvokeAsync(args).ConfigureAwait(false);
+         }
+ 
+         /// <summary>
+         /// The main logic of the tool.
+         /// </summary>
+-        /// <param name="src">The connection string for the source backend.</param>
+-        /// <param name="dst">The connection string for the destination backend.</param>
+-        /// <param name="options">Various options for the tool</param>
++        /// <param name="config">The parsed configuration for the tool.</param>
++        /// <param name="token">The cancellation token to use for the asynchronous operations.</param>
+         /// <returns>The return code for the main entry; 0 on success.</returns>
+-        private static async Task<int> Run(Config config)
++        private static async Task<int> Run(Config config, CancellationToken token)
+         {
+             // Unpack and parse the multi token options
+             var global_options = ParseOptions(config.GlobalOptions);
+@@ -182,27 +189,15 @@ private static async Task<int> Run(Config config)
+             // Check if we only had to parse the arguments
+             if (config.ParseArgumentsOnly)
+             {
+-                Duplicati.Library.Logging.Log.WriteInformationMessage(LOGTAG, "rsync", "Arguments parsed successfully; exiting.");
++                Duplicati.Library.Logging.Log.WriteInformationMessage(LOGTAG, "rsync", "Arguments parsed successfully; {0}; exiting.", config);
+                 return 0;
+             }
+ 
+-            // Load the backends
+-            static Exception throw_message(string target)
+-            {
+-                var message = $"The {target} backend does not support streaming operations.";
+-                var ex = new Exception(message);
+-                Duplicati.Library.Logging.Log.WriteErrorMessage(LOGTAG, "rsync", ex, message);
+-                return ex;
+-            }
+-
+-            using var b1 = Duplicati.Library.DynamicLoader.BackendLoader.GetBackend(config.Src, src_opts);
+-            var b1s = b1 as IStreamingBackend ?? throw throw_message("source");
+-
+-            using var b2 = Duplicati.Library.DynamicLoader.BackendLoader.GetBackend(config.Dst, dst_opts);
+-            var b2s = b2 as IStreamingBackend ?? throw throw_message("destination");
++            using var b1m = new LightWeightBackendManager(config.Src, src_opts, config.BackendRetries, config.BackendRetryDelay, config.BackendRetryWithExponentialBackoff);
++            using var b2m = new LightWeightBackendManager(config.Dst, dst_opts, config.BackendRetries, config.BackendRetryDelay, config.BackendRetryWithExponentialBackoff);
+ 
+             // Prepare the operations
+-            var (to_copy, to_delete, to_verify) = await PrepareFileLists(b1s, b2s, config, CancellationToken.None);
++            var (to_copy, to_delete, to_verify) = await PrepareFileLists(b1m, b2m, config, token).ConfigureAwait(false);
+ 
+             // Verify the files if requested. If the files are not verified, they will be deleted and copied again.
+             long verified = 0, failed_verify = 0;
+@@ -220,7 +215,7 @@ static Exception throw_message(string target)
+                     }
+                 }
+ 
+-                var not_verified = await VerifyAsync(b1s, b2s, to_verify, config);
++                var not_verified = await VerifyAsync(b1m, b2m, to_verify, config, token).ConfigureAwait(false);
+                 failed_verify = not_verified.Count();
+                 verified = to_verify.Count() - failed_verify;
+ 
+@@ -237,7 +232,7 @@ static Exception throw_message(string target)
+             Duplicati.Library.Logging.Log.WriteInformationMessage(LOGTAG, "rsync",
+                 "The remote synchronization plan is to {0} {1} files from {2}, then copy {3} files from {4} to {2}.",
+                 config.Retention ? "rename" : "delete",
+-                to_delete.Count(), b2s.DisplayName, to_copy.Count(), b1s.DisplayName);
++                to_delete.Count(), b2m.DisplayName, to_copy.Count(), b1m.DisplayName);
+ 
+             // As this is a potentially destructive operation, ask for confirmation
+             if (!config.Confirm)
+@@ -261,21 +256,21 @@ static Exception throw_message(string target)
+             long renamed = 0, deleted = 0;
+             if (config.Retention)
+             {
+-                renamed = await RenameAsync(b2, to_delete, config);
++                renamed = await RenameAsync(b2m, to_delete, config, token).ConfigureAwait(false);
+                 Duplicati.Library.Logging.Log.WriteInformationMessage(LOGTAG, "rsync",
+-                    "Renamed {0} files in {1}", renamed, b2s.DisplayName);
++                    "Renamed {0} files in {1}", renamed, b2m.DisplayName);
+             }
+             else
+             {
+-                deleted = await DeleteAsync(b2s, to_delete, config);
++                deleted = await DeleteAsync(b2m, to_delete, config, token).ConfigureAwait(false);
+                 Duplicati.Library.Logging.Log.WriteInformationMessage(LOGTAG, "rsync",
+-                    "Deleted {0} files from {1}", deleted, b2s.DisplayName);
++                    "Deleted {0} files from {1}", deleted, b2m.DisplayName);
+             }
+ 
+             // Copy the files
+-            var (copied, copy_errors) = await CopyAsync(b1s, b2s, to_copy, config);
++            var (copied, copy_errors) = await CopyAsync(b1m, b2m, to_copy, config, token).ConfigureAwait(false);
+             Duplicati.Library.Logging.Log.WriteInformationMessage(LOGTAG, "rsync",
+-                "Copied {0} files from {1} to {2}", copied, b1s, b2s);
++                "Copied {0} files from {1} to {2}", copied, b1m.DisplayName, b2m.DisplayName);
+ 
+             // If there are still errors, retry a few times
+             if (copy_errors.Any())
+@@ -289,10 +284,10 @@ static Exception throw_message(string target)
+                         config.Retry, copy_errors.Count());
+                     for (int i = 0; i < config.Retry; i++)
+                     {
+-                        await Task.Delay(5000); // Wait 5 seconds before retrying
+-                        (copied, copy_errors) = await CopyAsync(b1s, b2s, copy_errors, config);
++                        await Task.Delay(5000).ConfigureAwait(false); // Wait 5 seconds before retrying
++                        (copied, copy_errors) = await CopyAsync(b1m, b2m, copy_errors, config, token).ConfigureAwait(false);
+                         Duplicati.Library.Logging.Log.WriteInformationMessage(LOGTAG, "rsync",
+-                            "Copied {0} files from {1} to {2}", copied, b1s, b2s);
++                            "Copied {0} files from {1} to {2}", copied, b1m.DisplayName, b2m.DisplayName);
+                         if (!copy_errors.Any())
+                             break;
+                     }
+@@ -310,20 +305,20 @@ static Exception throw_message(string target)
+             if (verified > 0)
+                 Duplicati.Library.Logging.Log.WriteInformationMessage(LOGTAG, "rsync",
+                     "Verified {0} files in {1} that didn't need to be copied",
+-                    verified, b2s.DisplayName);
++                    verified, b2m.DisplayName);
+             if (failed_verify > 0)
+                 Duplicati.Library.Logging.Log.WriteInformationMessage(LOGTAG, "rsync",
+                     "Failed to verify {0} files in {1}, which were then attempted to be copied",
+-                    failed_verify, b2s.DisplayName);
++                    failed_verify, b2m.DisplayName);
+             if (copied > 0)
+                 Duplicati.Library.Logging.Log.WriteInformationMessage(LOGTAG, "rsync",
+-                    "Copied {0} files from {1} to {2}", copied, b1s.DisplayName, b2s.DisplayName);
++                    "Copied {0} files from {1} to {2}", copied, b1m.DisplayName, b2m.DisplayName);
+             if (deleted > 0)
+                 Duplicati.Library.Logging.Log.WriteInformationMessage(LOGTAG, "rsync",
+-                    "Deleted {0} files from {1}", deleted, b2s.DisplayName);
++                    "Deleted {0} files from {1}", deleted, b2m.DisplayName);
+             if (renamed > 0)
+                 Duplicati.Library.Logging.Log.WriteInformationMessage(LOGTAG, "rsync",
+-                    "Renamed {0} files in {1}", renamed, b2s.DisplayName);
++                    "Renamed {0} files in {1}", renamed, b2m.DisplayName);
+ 
+             Duplicati.Library.Logging.Log.WriteInformationMessage(LOGTAG, "rsync",
+                 "Remote synchronization completed successfully");
+@@ -345,8 +340,9 @@ static Exception throw_message(string target)
+         /// <param name="b_dst">The destination backend.</param>
+         /// <param name="files">The files that will be copied.</param>
+         /// <param name="config">The parsed configuration for the tool.</param>
++        /// <param name="token">The cancellation token to use for the asynchronous operations.</param>
+         /// <returns>A tuple holding the number of succesful copies and a List of the files that failed.</returns>
+-        private static async Task<(long, IEnumerable<IFileEntry>)> CopyAsync(IStreamingBackend b_src, IStreamingBackend b_dst, IEnumerable<IFileEntry> files, Config config)
++        private static async Task<(long, IEnumerable<IFileEntry>)> CopyAsync(LightWeightBackendManager b_src, LightWeightBackendManager b_dst, IEnumerable<IFileEntry> files, Config config, CancellationToken token)
+         {
+             long successful_copies = 0;
+             List<IFileEntry> errors = [];
+@@ -369,7 +365,7 @@ static Exception throw_message(string target)
+                 try
+                 {
+                     sw_get_src.Start();
+-                    await b_src.GetAsync(f.Name, s_src, CancellationToken.None);
++                    await b_src.GetAsync(f.Name, s_src, token).ConfigureAwait(false);
+                     s_src.Position = 0;
+                     sw_get_src.Stop();
+                     if (config.DryRun)
+@@ -382,7 +378,7 @@ static Exception throw_message(string target)
+                     else
+                     {
+                         sw_put_dst.Start();
+-                        await b_dst.PutAsync(f.Name, s_src, CancellationToken.None);
++                        await b_dst.PutAsync(f.Name, s_src, token).ConfigureAwait(false);
+                         s_src.Position = 0;
+                         sw_put_dst.Stop();
+                         if (config.VerifyGetAfterPut)
+@@ -397,7 +393,7 @@ static Exception throw_message(string target)
+                             using var s_dst = Duplicati.Library.Utility.TempFileStream.Create();
+ 
+                             sw_get_dst.Start();
+-                            await b_dst.GetAsync(f.Name, s_dst, CancellationToken.None);
++                            await b_dst.GetAsync(f.Name, s_dst, token).ConfigureAwait(false);
+                             s_dst.Position = 0;
+                             sw_get_dst.Stop();
+ 
+@@ -411,7 +407,7 @@ static Exception throw_message(string target)
+                             using var hasher = HashFactory.CreateHasher("SHA256");
+                             var dsthash = Convert.ToBase64String(hasher.ComputeHash(s_dst));
+ 
+-                            if (await srchashtask != dsthash)
++                            if (await srchashtask.ConfigureAwait(false) != dsthash)
+                             {
+                                 err_string = (err_string is null ? "" : err_string + " ") + "The contents of the files do not match.";
+                             }
+@@ -463,8 +459,9 @@ static Exception throw_message(string target)
+         /// <param name="b">The backend to delete the files from.</param>
+         /// <param name="files">The files to delete.</param>
+         /// <param name="config">The parsed configuration for the tool.</param>
++        /// <param name="token">The cancellation token to use for the asynchronous operations.</param>
+         /// <returns>The number of successful deletions.</returns>
+-        private static async Task<long> DeleteAsync(IStreamingBackend b, IEnumerable<IFileEntry> files, Config config)
++        private static async Task<long> DeleteAsync(LightWeightBackendManager b, IEnumerable<IFileEntry> files, Config config, CancellationToken token)
+         {
+             long successful_deletes = 0;
+             long i = 0, n = files.Count();
+@@ -489,7 +486,7 @@ private static async Task<long> DeleteAsync(IStreamingBackend b, IEnumerable<IFi
+                     }
+                     else
+                     {
+-                        await b.DeleteAsync(f.Name, CancellationToken.None);
++                        await b.DeleteAsync(f.Name, token).ConfigureAwait(false);
+                     }
+                     successful_deletes++;
+                 }
+@@ -556,19 +553,20 @@ private static Dictionary<string, string> ParseOptions(IEnumerable<string> optio
+         /// The files to delete are the files that are found in the destination but not found in the source.
+         /// The files to verify are the files that are found in both the source and the destination, and that have the same size and modification date.
+         /// </summary>
+-        /// <param name="b_src">The source backend.</param>
+-        /// <param name="b_dst">The destination backend.</param>
++        /// <param name="b_src">The source lightweight backend manager.</param>
++        /// <param name="b_dst">The destination lightweight backend manager.</param>
+         /// <param name="config">The parsed configuration for the tool.</param>
++        /// <param name="token">The cancellation token to use for the asynchronous operations.</param>
+         /// <returns>A tuple of Lists each holding the files to copy, delete and verify.</returns>
+-        private static async Task<(IEnumerable<IFileEntry>, IEnumerable<IFileEntry>, IEnumerable<IFileEntry>)> PrepareFileLists(IStreamingBackend b_src, IStreamingBackend b_dst, Config config, CancellationToken cancelToken)
++        private static async Task<(IEnumerable<IFileEntry>, IEnumerable<IFileEntry>, IEnumerable<IFileEntry>)> PrepareFileLists(LightWeightBackendManager b_src, LightWeightBackendManager b_dst, Config config, CancellationToken token)
+         {
+             IEnumerable<IFileEntry> files_src, files_dst;
+ 
+             using (new Duplicati.Library.Logging.Timer(LOGTAG, "rsync", "Prepare | List source"))
+-                files_src = await b_src.ListAsync(cancelToken).ToListAsync(cancelToken).ConfigureAwait(false);
++                files_src = await b_src.ListAsync(token).ToListAsync(token).ConfigureAwait(false);
+ 
+             using (new Duplicati.Library.Logging.Timer(LOGTAG, "rsync", "Prepare | List destination"))
+-                files_dst = await b_dst.ListAsync(cancelToken).ToListAsync(cancelToken).ConfigureAwait(false);
++                files_dst = await b_dst.ListAsync(token).ToListAsync(token).ConfigureAwait(false);
+ 
+             // Shortcut for force
+             if (config.Force)
+@@ -642,158 +640,80 @@ private static Dictionary<string, string> ParseOptions(IEnumerable<string> optio
+         /// Renames the files in a backend.
+         /// The renaming is done by deleting the file and re-uploading it with a new name.
+         /// </summary>
+-        /// <param name="b">The backend to rename the files in.</param>
++        /// <param name="bm">The lightweight backend manager to issue rename operations to.</param>
+         /// <param name="files">The files to rename.</param>
+         /// <param name="config">The parsed configuration for the tool.</param>
++        /// <param name="token">The cancellation token to use for the asynchronous operations.</param>
+         /// <returns>The number of successful renames.</returns>
+-        private static async Task<long> RenameAsync(IBackend b, IEnumerable<IFileEntry> files, Config config)
++        private static async Task<long> RenameAsync(LightWeightBackendManager bm, IEnumerable<IFileEntry> files, Config config, CancellationToken token)
+         {
+             long successful_renames = 0;
+             string prefix = $"{System.DateTime.UtcNow:yyyyMMddHHmmss}.old";
+             using var downloaded = new MemoryStream();
+             long i = 0, n = files.Count();
+ 
+-            switch (b)
+-            {
+-                case IStreamingBackend sb:
+-                    {
+-                        var sw_get_src = new System.Diagnostics.Stopwatch();
+-                        var sw_put_dst = new System.Diagnostics.Stopwatch();
+-                        var sw_del_src = new System.Diagnostics.Stopwatch();
+-
+-                        foreach (var f in files)
+-                        {
+-                            if (config.Progress)
+-                                Console.Write($"\rRenaming: {i}/{n}");
+-
+-                            Duplicati.Library.Logging.Log.WriteVerboseMessage(LOGTAG, "rsync",
+-                                "Renaming {0} to {1}.{0} by deleting and re-uploading {2} bytes to {3}",
+-                                f.Name, prefix,
+-                                Duplicati.Library.Utility.Utility.FormatSizeString(downloaded.Length),
+-                                sb.DisplayName);
+-
+-                            try
+-                            {
+-                                sw_get_src.Start();
+-                                await sb.GetAsync(f.Name, downloaded, CancellationToken.None);
+-                                sw_get_src.Stop();
+-
+-                                if (config.DryRun)
+-                                {
+-                                    Duplicati.Library.Logging.Log.WriteDryrunMessage(LOGTAG, "rsync",
+-                                        "Would rename {0} to {1}.{0} by deleting and re-uploading {2} bytes to {3}",
+-                                        f.Name, prefix,
+-                                        Duplicati.Library.Utility.Utility.FormatSizeString(downloaded.Length),
+-                                        sb.DisplayName);
+-                                }
+-                                else
+-                                {
+-                                    sw_put_dst.Start();
+-                                    await sb.PutAsync($"{prefix}.{f.Name}", downloaded, CancellationToken.None);
+-                                    sw_put_dst.Stop();
+-                                    sw_del_src.Start();
+-                                    await sb.DeleteAsync(f.Name, CancellationToken.None);
+-                                    sw_del_src.Stop();
+-                                }
+-                                successful_renames++;
+-                            }
+-                            catch (Exception e)
+-                            {
+-                                Duplicati.Library.Logging.Log.WriteErrorMessage(LOGTAG, "rsync", e,
+-                                    "Error renaming {0}: {1}", f.Name, e.Message);
+-                            }
+-                            finally
+-                            {
+-                                // Reset the stream
+-                                downloaded.SetLength(0);
+-
+-                                // Stop any running timers
+-                                sw_get_src.Stop();
+-                                sw_put_dst.Stop();
+-                                sw_del_src.Stop();
+-                            }
+-
+-                            i++;
+-                        }
++            var sw = new System.Diagnostics.Stopwatch();
+ 
+-                        Duplicati.Library.Logging.Log.WriteProfilingMessage(LOGTAG, "rsync",
+-                            "Rename | Get source: {0} ms, Put destination: {1} ms, Delete source: {2} ms",
+-                            TimeSpan.FromMilliseconds(sw_get_src.ElapsedMilliseconds),
+-                            TimeSpan.FromMilliseconds(sw_put_dst.ElapsedMilliseconds),
+-                            TimeSpan.FromMilliseconds(sw_del_src.ElapsedMilliseconds));
++            foreach (var f in files)
++            {
++                if (config.Progress)
++                    Console.Write($"\rRenaming: {i}/{n}");
+ 
+-                        if (config.Progress)
+-                            Console.WriteLine($"\rRenaming: {n}/{n}");
++                Duplicati.Library.Logging.Log.WriteVerboseMessage(LOGTAG, "rsync",
++                    "Renaming {0} to {1}.{0} by calling Rename on {2}",
++                    f.Name, prefix, bm.DisplayName);
+ 
+-                        return successful_renames;
++                try
++                {
++                    if (config.DryRun)
++                    {
++                        Duplicati.Library.Logging.Log.WriteDryrunMessage(LOGTAG, "rsync",
++                            "Would rename {0} to {1}.{0} by calling Rename on {2}",
++                            f.Name, prefix, bm.DisplayName);
+                     }
+-                case IRenameEnabledBackend rb:
++                    else
+                     {
+-                        var sw = new System.Diagnostics.Stopwatch();
+-
+-                        foreach (var f in files)
+-                        {
+-                            if (config.Progress)
+-                                Console.Write($"\rRenaming: {i}/{n}");
+-
+-                            Duplicati.Library.Logging.Log.WriteVerboseMessage(LOGTAG, "rsync",
+-                                "Renaming {0} to {1}.{0} by calling Rename on {2}",
+-                                f.Name, prefix, rb.DisplayName);
+-
+-                            try
+-                            {
+-                                if (config.DryRun)
+-                                {
+-                                    Duplicati.Library.Logging.Log.WriteDryrunMessage(LOGTAG, "rsync",
+-                                        "Would rename {0} to {1}.{0} by calling Rename on {2}",
+-                                        f.Name, prefix, rb.DisplayName);
+-                                }
+-                                else
+-                                {
+-                                    sw.Start();
+-                                    await rb.RenameAsync(f.Name, $"{prefix}.{f.Name}", CancellationToken.None);
+-                                    sw.Stop();
+-                                }
+-                                successful_renames++;
+-                            }
+-                            catch (Exception e)
+-                            {
+-                                Duplicati.Library.Logging.Log.WriteErrorMessage(LOGTAG, "rsync", e,
+-                                    "Error renaming {0}: {1}", f.Name, e.Message);
+-                            }
+-                            finally
+-                            {
+-                                // Ensure the timer is stopped
+-                                sw.Stop();
+-                            }
++                        sw.Start();
++                        await bm.RenameAsync(f.Name, $"{prefix}.{f.Name}", token).ConfigureAwait(false);
++                        sw.Stop();
++                    }
++                    successful_renames++;
++                }
++                catch (Exception e)
++                {
++                    Duplicati.Library.Logging.Log.WriteErrorMessage(LOGTAG, "rsync", e,
++                        "Error renaming {0}: {1}", f.Name, e.Message);
++                }
++                finally
++                {
++                    // Ensure the timer is stopped
++                    sw.Stop();
++                }
+ 
+-                            i++;
+-                        }
++                i++;
++            }
+ 
+-                        Duplicati.Library.Logging.Log.WriteProfilingMessage(LOGTAG, "rsync",
+-                            "Rename: {0} ms",
+-                            TimeSpan.FromMilliseconds(sw.ElapsedMilliseconds));
++            Duplicati.Library.Logging.Log.WriteProfilingMessage(LOGTAG, "rsync",
++                "Rename: {0} ms",
++                TimeSpan.FromMilliseconds(sw.ElapsedMilliseconds));
+ 
+-                        if (config.Progress)
+-                            Console.WriteLine($"\rRenaming: {n}/{n}");
++            if (config.Progress)
++                Console.WriteLine($"\rRenaming: {n}/{n}");
+ 
+-                        return successful_renames;
+-                    }
+-                default:
+-                    throw new NotSupportedException("The backend does not support renaming");
+-            }
++            return successful_renames;
+         }
+ 
+         /// <summary>
+         /// Verifies the files in the destination backend.
+         /// The verification is done by downloading the files from the destination backend and comparing them to the source files.
+         /// </summary>
+-        /// <param name="b_src">The source backend.</param>
+-        /// <param name="b_dst">The destination backend.</param>
++        /// <param name="b_src">The source lightweight backend manager.</param>
++        /// <param name="b_dst">The destination lightweight backend manager.</param>
+         /// <param name="files">The files to verify.</param>
+         /// <param name="config">The parsed configuration for the tool.</param>
++        /// <param name="token">The cancellation token to use for the asynchronous operations.</param>
+         /// <returns>A list of the files that failed verification.</returns>
+-        private static async Task<IEnumerable<IFileEntry>> VerifyAsync(IStreamingBackend b_src, IStreamingBackend b_dst, IEnumerable<IFileEntry> files, Config config)
++        private static async Task<IEnumerable<IFileEntry>> VerifyAsync(LightWeightBackendManager b_src, LightWeightBackendManager b_dst, IEnumerable<IFileEntry> files, Config config, CancellationToken token)
+         {
+             var errors = new List<IFileEntry>();
+             using var s_src = new MemoryStream();
+@@ -817,9 +737,9 @@ private static async Task<IEnumerable<IFileEntry>> VerifyAsync(IStreamingBackend
+                 {
+                     // Get both files
+                     sw_get.Start();
+-                    var fs = b_src.GetAsync(f.Name, s_src, CancellationToken.None);
+-                    var ds = b_dst.GetAsync(f.Name, s_dst, CancellationToken.None);
+-                    await Task.WhenAll(fs, ds);
++                    var fs = b_src.GetAsync(f.Name, s_src, token);
++                    var ds = b_dst.GetAsync(f.Name, s_dst, token);
++                    await Task.WhenAll(fs, ds).ConfigureAwait(false);
+                     sw_get.Stop();
+ 
+                     // Compare the contents

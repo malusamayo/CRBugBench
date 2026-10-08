@@ -1,0 +1,460 @@
+commit 8b36ab521d6fd6d6f36048e839eddf1906eafba0
+Author: Henning Baldersheim <balder@yahoo-inc.com>
+Date:   Mon Aug 3 21:14:33 2020 +0000
+
+    When allowing weakly consistent get you might try to access attributes that are not yet fully populated.
+    Now we prevent accessing uninitialized memory by guarding each attribute by checking its current commited docid limit.
+    If not we just clear the field.
+    Also avoid doing an inefficient Field -> string -> Field lookup.
+
+diff --git a/searchcore/src/vespa/searchcore/proton/attribute/document_field_populator.cpp b/searchcore/src/vespa/searchcore/proton/attribute/document_field_populator.cpp
+index b530cffed4f..e0243934fd6 100644
+--- a/searchcore/src/vespa/searchcore/proton/attribute/document_field_populator.cpp
++++ b/searchcore/src/vespa/searchcore/proton/attribute/document_field_populator.cpp
+@@ -47,7 +47,7 @@ DocumentFieldPopulator::~DocumentFieldPopulator()
+ void
+ DocumentFieldPopulator::handleExisting(uint32_t lid, const std::shared_ptr<Document> &doc)
+ {
+-    DocumentFieldRetriever::populate(lid, *doc, _fieldName, *_attr, false);
++    DocumentFieldRetriever::populate(lid, *doc, doc->getField(_fieldName), *_attr, false);
+     ++_documentsPopulated;
+ }
+ 
+diff --git a/searchcore/src/vespa/searchcore/proton/attribute/document_field_populator.h b/searchcore/src/vespa/searchcore/proton/attribute/document_field_populator.h
+index 29975b286e6..625b7869735 100644
+--- a/searchcore/src/vespa/searchcore/proton/attribute/document_field_populator.h
++++ b/searchcore/src/vespa/searchcore/proton/attribute/document_field_populator.h
+@@ -14,24 +14,23 @@ class DocumentFieldPopulator : public IReprocessingRewriter
+ {
+ private:
+     using AttributeVectorSP = std::shared_ptr<search::AttributeVector>;
+-    vespalib::string _fieldName;
++    vespalib::string  _fieldName;
+     AttributeVectorSP _attr;
+-    vespalib::string _subDbName;
+-    int64_t _documentsPopulated;
++    vespalib::string  _subDbName;
++    int64_t           _documentsPopulated;
+ 
+ public:
+     DocumentFieldPopulator(const vespalib::string &fieldName,
+                            AttributeVectorSP attr,
+                            const vespalib::string &subDbName);
+ 
+-    ~DocumentFieldPopulator();
++    ~DocumentFieldPopulator() override;
+ 
+     const search::AttributeVector &getAttribute() const {
+         return *_attr;
+     }
+ 
+-    // Implements IReprocessingRewriter
+-    virtual void handleExisting(uint32_t lid, const std::shared_ptr<document::Document> &doc) override;
++    void handleExisting(uint32_t lid, const std::shared_ptr<document::Document> &doc) override;
+ };
+ 
+ } // namespace proton
+diff --git a/searchcore/src/vespa/searchcore/proton/attribute/document_field_retriever.cpp b/searchcore/src/vespa/searchcore/proton/attribute/document_field_retriever.cpp
+index e30667039f0..d1cb5cca3df 100644
+--- a/searchcore/src/vespa/searchcore/proton/attribute/document_field_retriever.cpp
++++ b/searchcore/src/vespa/searchcore/proton/attribute/document_field_retriever.cpp
+@@ -35,7 +35,7 @@ template <typename T>
+ void
+ setValue(DocumentIdT lid,
+          Document &doc,
+-         const vespalib::string &fieldName,
++         const document::Field & field,
+          const IAttributeVector &attr)
+ {
+     switch (attr.getCollectionType()) {
+@@ -44,9 +44,9 @@ setValue(DocumentIdT lid,
+         if ( ! attr.isUndefined(lid) ) {
+             AttributeContent<T> content;
+             content.fill(attr, lid);
+-            doc.set(fieldName, content[0]);
++            doc.set(field, content[0]);
+         } else {
+-            doc.remove(fieldName);
++            doc.remove(field);
+         }
+         break;
+     }
+@@ -54,35 +54,33 @@ setValue(DocumentIdT lid,
+     {
+         AttributeContent<T> content;
+         content.fill(attr, lid);
+-        Field f = doc.getField(fieldName);
+         if (content.size() == 0) {
+-            doc.remove(f);
++            doc.remove(field);
+             break;
+         }
+-        FieldValue::UP fv = f.getDataType().createFieldValue();
++        FieldValue::UP fv = field.getDataType().createFieldValue();
+         if (fv.get() && fv->getClass().id() != ArrayFieldValue::classId) {
+-            throw IllegalStateException("Field " + fieldName + " does not contain an array.", VESPA_STRLOC);
++            throw IllegalStateException("Field " + field.getName() + " does not contain an array.", VESPA_STRLOC);
+         }
+         ArrayFieldValue &array = static_cast<ArrayFieldValue &>(*fv.get());
+         array.resize(content.size());
+         for (uint32_t j(0); j < content.size(); ++j) {
+             array[j] = content[j];
+         }
+-        doc.setValue(f, *fv);
++        doc.setValue(field, *fv);
+         break;
+     }
+     case CollectionType::WSET:
+     {
+         AttributeContent<WeightedType<T> > content;
+         content.fill(attr, lid);
+-        Field f = doc.getField(fieldName);
+         if (content.size() == 0) {
+-            doc.remove(f);
++            doc.remove(field);
+             break;
+         }
+-        FieldValue::UP fv = f.getDataType().createFieldValue();
++        FieldValue::UP fv = field.getDataType().createFieldValue();
+         if (fv.get() && fv->getClass().id() != WeightedSetFieldValue::classId) {
+-            throw IllegalStateException("Field " + fieldName + " does not contain a wset.", VESPA_STRLOC);
++            throw IllegalStateException("Field " + field.getName() + " does not contain a wset.", VESPA_STRLOC);
+         }
+         WeightedSetFieldValue & wset(static_cast<WeightedSetFieldValue &>(*fv.get()));
+         wset.resize(content.size());
+@@ -91,7 +89,7 @@ setValue(DocumentIdT lid,
+             *it->first = content[j].getValue();
+             *it->second = content[j].getWeight();
+         }
+-        doc.setValue(f, *fv);
++        doc.setValue(field, *fv);
+         break;
+     }
+     default:
+@@ -102,17 +100,17 @@ setValue(DocumentIdT lid,
+ 
+ void
+ setTensorValue(DocumentIdT lid, Document &doc,
+-               const vespalib::string &fieldName,
++               const document::Field &field,
+                const IAttributeVector &attr)
+ {
+     const auto &tensorAttribute = static_cast<const TensorAttribute &>(attr);
+     auto tensor = tensorAttribute.getTensor(lid);
+     if (tensor) {
+-        auto tensorField = doc.getField(fieldName).createValue(); 
++        auto tensorField = field.createValue();
+         dynamic_cast<TensorFieldValue &>(*tensorField) = std::move(tensor);
+-        doc.setValue(fieldName, *tensorField);
++        doc.setValue(field, *tensorField);
+     } else {
+-        doc.remove(fieldName);
++        doc.remove(field);
+     }
+ }
+ 
+@@ -121,7 +119,7 @@ setTensorValue(DocumentIdT lid, Document &doc,
+ void
+ DocumentFieldRetriever::populate(DocumentIdT lid,
+                                  Document &doc,
+-                                 const vespalib::string &fieldName,
++                                 const document::Field & field,
+                                  const IAttributeVector &attr,
+                                  bool isIndexField)
+ {
+@@ -133,11 +131,11 @@ DocumentFieldRetriever::populate(DocumentIdT lid,
+     case BasicType::INT16:
+     case BasicType::INT32:
+     case BasicType::INT64:
+-        setValue<IAttributeVector::largeint_t>(lid, doc, fieldName, attr);
++        setValue<IAttributeVector::largeint_t>(lid, doc, field, attr);
+         break;
+     case BasicType::FLOAT:
+     case BasicType::DOUBLE:
+-        setValue<double>(lid, doc, fieldName, attr);
++        setValue<double>(lid, doc, field, attr);
+         break;
+     case BasicType::STRING:
+         // If it is a stringfield we also need to check if
+@@ -146,13 +144,13 @@ DocumentFieldRetriever::populate(DocumentIdT lid,
+         if (isIndexField) {
+             break;
+         }
+-        setValue<const char *>(lid, doc, fieldName, attr);
++        setValue<const char *>(lid, doc, field, attr);
+         break;
+     case BasicType::PREDICATE:
+         // Predicate attribute doesn't store documents, it only indexes them.
+         break;
+     case BasicType::TENSOR:
+-        setTensorValue(lid, doc, fieldName, attr);
++        setTensorValue(lid, doc, field, attr);
+         break;
+     case BasicType::REFERENCE:
+         // Reference attribute doesn't store full document id.
+diff --git a/searchcore/src/vespa/searchcore/proton/attribute/document_field_retriever.h b/searchcore/src/vespa/searchcore/proton/attribute/document_field_retriever.h
+index f6640eb17e1..b1973c62527 100644
+--- a/searchcore/src/vespa/searchcore/proton/attribute/document_field_retriever.h
++++ b/searchcore/src/vespa/searchcore/proton/attribute/document_field_retriever.h
+@@ -15,7 +15,7 @@ struct DocumentFieldRetriever
+ {
+     static void populate(search::DocumentIdT lid,
+                          document::Document &doc,
+-                         const vespalib::string &fieldName,
++                         const document::Field &field,
+                          const search::attribute::IAttributeVector &attr,
+                          bool isIndexField);
+ };
+diff --git a/searchcore/src/vespa/searchcore/proton/server/CMakeLists.txt b/searchcore/src/vespa/searchcore/proton/server/CMakeLists.txt
+index 9a9b1901c28..bfcd613ed0a 100644
+--- a/searchcore/src/vespa/searchcore/proton/server/CMakeLists.txt
++++ b/searchcore/src/vespa/searchcore/proton/server/CMakeLists.txt
+@@ -38,6 +38,7 @@ vespa_add_library(searchcore_server STATIC
+     emptysearchview.cpp
+     executor_thread_service.cpp
+     executorthreadingservice.cpp
++    fast_access_document_retriever.cpp
+     fast_access_doc_subdb.cpp
+     fast_access_doc_subdb_configurer.cpp
+     fast_access_feed_view.cpp
+diff --git a/searchcore/src/vespa/searchcore/proton/server/documentretriever.cpp b/searchcore/src/vespa/searchcore/proton/server/documentretriever.cpp
+index abfc840fc7e..09550bd74dd 100644
+--- a/searchcore/src/vespa/searchcore/proton/server/documentretriever.cpp
++++ b/searchcore/src/vespa/searchcore/proton/server/documentretriever.cpp
+@@ -74,12 +74,14 @@ DocumentRetriever
+             const vespalib::string &name = field->getName();
+             AttributeGuard::UP attr = attr_manager.getAttribute(name);
+             if (attr && attr->valid()) {
+-                _attributeFields.emplace_back(name);
++                _attributeFields.emplace_back(field);
+             }
+         }
+     }
+ }
+ 
++DocumentRetriever::~DocumentRetriever() = default;
++
+ namespace {
+ 
+ FieldValue::UP positionFromZcurve(int64_t zcurve) {
+@@ -169,9 +171,13 @@ void DocumentRetriever::visitDocuments(const LidVector & lids, search::IDocument
+ 
+ void DocumentRetriever::populate(DocumentIdT lid, Document & doc) const
+ {
+-    for (const auto &field : _attributeFields) {
+-        AttributeGuard::UP attr = _attr_manager.getAttribute(field);
+-        DocumentFieldRetriever::populate(lid, doc, field, **attr, _schema.isIndexField(field));
++    for (const document::Field * field : _attributeFields) {
++        AttributeGuard::UP attr = _attr_manager.getAttribute(field->getName());
++        if (lid < (*attr)->getCommittedDocIdLimit()) {
++            DocumentFieldRetriever::populate(lid, doc, *field, **attr, _schema.isIndexField(field->getName()));
++        } else {
++            doc.remove(*field);
++        }
+     }
+     fillInPositionFields(doc, lid, _possiblePositionFields, _attr_manager);
+ }
+diff --git a/searchcore/src/vespa/searchcore/proton/server/documentretriever.h b/searchcore/src/vespa/searchcore/proton/server/documentretriever.h
+index b51516b2fb9..71603124b7b 100644
+--- a/searchcore/src/vespa/searchcore/proton/server/documentretriever.h
++++ b/searchcore/src/vespa/searchcore/proton/server/documentretriever.h
+@@ -16,13 +16,14 @@ namespace proton {
+ class DocumentRetriever : public DocumentRetrieverBase {
+ public:
+     typedef std::vector<std::pair<const document::Field *, vespalib::string>> PositionFields;
+-    using AttributeFields = std::vector<std::string>;
++    using AttributeFields = std::vector<const document::Field *>;
+     DocumentRetriever(const DocTypeName &docTypeName,
+                       const document::DocumentTypeRepo &repo,
+                       const search::index::Schema &schema,
+                       const IDocumentMetaStoreContext &meta_store,
+                       const search::IAttributeManager &attr_manager,
+                       const search::IDocumentStore &doc_store);
++    ~DocumentRetriever() override;
+ 
+     document::Document::UP getDocument(search::DocumentIdT lid) const override;
+     void visitDocuments(const LidVector & lids, search::IDocumentVisitor & visitor, ReadConsistency) const override;
+diff --git a/searchcore/src/vespa/searchcore/proton/server/fast_access_document_retriever.cpp b/searchcore/src/vespa/searchcore/proton/server/fast_access_document_retriever.cpp
+new file mode 100644
+index 00000000000..077c9c30646
+--- /dev/null
++++ b/searchcore/src/vespa/searchcore/proton/server/fast_access_document_retriever.cpp
+@@ -0,0 +1,20 @@
++// Copyright Verizon Media. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
++
++#include "fast_access_document_retriever.h"
++
++namespace proton {
++
++FastAccessDocumentRetriever::FastAccessDocumentRetriever(FastAccessFeedView::SP feedView, IAttributeManager::SP attrMgr)
++    : DocumentRetriever(feedView->getPersistentParams()._docTypeName,
++                        *feedView->getDocumentTypeRepo(),
++                        *feedView->getSchema(),
++                        *feedView->getDocumentMetaStore(),
++                        *attrMgr,
++                        feedView->getDocumentStore()),
++      _feedView(std::move(feedView)),
++      _attrMgr(std::move(attrMgr))
++{ }
++
++FastAccessDocumentRetriever::~FastAccessDocumentRetriever() = default;
++
++}
+diff --git a/searchcore/src/vespa/searchcore/proton/server/fast_access_document_retriever.h b/searchcore/src/vespa/searchcore/proton/server/fast_access_document_retriever.h
+index 93576b7dcdf..766fd4bd4a8 100644
+--- a/searchcore/src/vespa/searchcore/proton/server/fast_access_document_retriever.h
++++ b/searchcore/src/vespa/searchcore/proton/server/fast_access_document_retriever.h
+@@ -4,7 +4,6 @@
+ #include "documentretriever.h"
+ #include "fast_access_feed_view.h"
+ #include <vespa/searchcore/proton/attribute/i_attribute_manager.h>
+-#include <vespa/searchcore/proton/docsummary/isummarymanager.h>
+ 
+ namespace proton {
+ 
+@@ -21,16 +20,8 @@ private:
+     IAttributeManager::SP    _attrMgr;
+ 
+ public:
+-    FastAccessDocumentRetriever(const FastAccessFeedView::SP &feedView, const IAttributeManager::SP &attrMgr)
+-        : DocumentRetriever(feedView->getPersistentParams()._docTypeName,
+-                            *feedView->getDocumentTypeRepo(),
+-                            *feedView->getSchema(),
+-                            *feedView->getDocumentMetaStore(),
+-                            *attrMgr,
+-                            feedView->getDocumentStore()),
+-          _feedView(feedView),
+-          _attrMgr(attrMgr)
+-    { }
++    FastAccessDocumentRetriever(FastAccessFeedView::SP feedView, IAttributeManager::SP attrMgr);
++    ~FastAccessDocumentRetriever() override;
+     uint32_t getDocIdLimit() const override { return _feedView->getDocIdLimit().get(); }
+ };
+ 
+diff --git a/searchcore/src/vespa/searchcore/proton/server/fast_access_feed_view.h b/searchcore/src/vespa/searchcore/proton/server/fast_access_feed_view.h
+index 3af97b4ecb9..ed36266d74f 100644
+--- a/searchcore/src/vespa/searchcore/proton/server/fast_access_feed_view.h
++++ b/searchcore/src/vespa/searchcore/proton/server/fast_access_feed_view.h
+@@ -5,8 +5,6 @@
+ #include "storeonlyfeedview.h"
+ #include <vespa/searchcore/proton/attribute/i_attribute_writer.h>
+ #include <vespa/searchcore/proton/common/docid_limit.h>
+-#include <vespa/searchlib/query/base.h>
+-#include <vespa/document/fieldvalue/document.h>
+ 
+ namespace proton {
+ 
+@@ -39,7 +37,7 @@ private:
+     const IAttributeWriter::SP _attributeWriter;
+     DocIdLimit                 &_docIdLimit;
+ 
+-    void putAttributes(SerialNum serialNum, search::DocumentIdT lid, const document::Document &doc,
++    void putAttributes(SerialNum serialNum, search::DocumentIdT lid, const Document &doc,
+                        bool immediateCommit, OnPutDoneType onWriteDone) override;
+ 
+     void updateAttributes(SerialNum serialNum, search::DocumentIdT lid, const document::DocumentUpdate &upd,
+diff --git a/searchcore/src/vespa/searchcore/proton/server/minimal_document_retriever.cpp b/searchcore/src/vespa/searchcore/proton/server/minimal_document_retriever.cpp
+index c2cf1f1e141..e9b855e724f 100644
+--- a/searchcore/src/vespa/searchcore/proton/server/minimal_document_retriever.cpp
++++ b/searchcore/src/vespa/searchcore/proton/server/minimal_document_retriever.cpp
+@@ -21,11 +21,15 @@ MinimalDocumentRetriever::MinimalDocumentRetriever(
+       _doc_store(doc_store) {
+ }
+ 
+-Document::UP MinimalDocumentRetriever::getDocument(DocumentIdT lid) const {
++MinimalDocumentRetriever::~MinimalDocumentRetriever() = default;
++
++Document::UP
++MinimalDocumentRetriever::getDocument(DocumentIdT lid) const {
+     return _doc_store.read(lid, *_repo);
+ }
+ 
+-void MinimalDocumentRetriever::visitDocuments(const LidVector & lids, search::IDocumentVisitor & visitor, ReadConsistency) const {
++void
++MinimalDocumentRetriever::visitDocuments(const LidVector & lids, search::IDocumentVisitor & visitor, ReadConsistency) const {
+     _doc_store.visit(lids, getDocumentTypeRepo(), visitor);
+ }
+ 
+diff --git a/searchcore/src/vespa/searchcore/proton/server/minimal_document_retriever.h b/searchcore/src/vespa/searchcore/proton/server/minimal_document_retriever.h
+index 7d8b2ef26bb..193803e6e06 100644
+--- a/searchcore/src/vespa/searchcore/proton/server/minimal_document_retriever.h
++++ b/searchcore/src/vespa/searchcore/proton/server/minimal_document_retriever.h
+@@ -25,6 +25,7 @@ public:
+                              const IDocumentMetaStoreContext &meta_store,
+                              const search::IDocumentStore &doc_store,
+                              bool hasFields);
++    ~MinimalDocumentRetriever() override;
+ 
+     document::Document::UP getDocument(search::DocumentIdT lid) const override;
+     void visitDocuments(const LidVector & lids, search::IDocumentVisitor & visitor, ReadConsistency) const override;
+diff --git a/searchcore/src/vespa/searchcore/proton/server/searchable_feed_view.cpp b/searchcore/src/vespa/searchcore/proton/server/searchable_feed_view.cpp
+index e0d873152cd..479d5230379 100644
+--- a/searchcore/src/vespa/searchcore/proton/server/searchable_feed_view.cpp
++++ b/searchcore/src/vespa/searchcore/proton/server/searchable_feed_view.cpp
+@@ -7,6 +7,7 @@
+ #include <vespa/searchcore/proton/documentmetastore/ilidreusedelayer.h>
+ #include <vespa/searchcore/proton/feedoperation/compact_lid_space_operation.h>
+ #include <vespa/vespalib/util/isequencedtaskexecutor.h>
++#include <vespa/document/fieldvalue/document.h>
+ 
+ #include <vespa/log/log.h>
+ LOG_SETUP(".proton.server.searchable_feed_view");
+@@ -58,7 +59,7 @@ SearchableFeedView::sync()
+ }
+ 
+ void
+-SearchableFeedView::putIndexedFields(SerialNum serialNum, search::DocumentIdT lid, const Document::SP &newDoc,
++SearchableFeedView::putIndexedFields(SerialNum serialNum, search::DocumentIdT lid, const DocumentSP &newDoc,
+                                      bool immediateCommit, OnOperationDoneType onWriteDone)
+ {
+     if (!hasIndexedFields()) {
+@@ -86,7 +87,7 @@ SearchableFeedView::performIndexPut(SerialNum serialNum, search::DocumentIdT lid
+ }
+ 
+ void
+-SearchableFeedView::performIndexPut(SerialNum serialNum, search::DocumentIdT lid, const Document::SP &doc,
++SearchableFeedView::performIndexPut(SerialNum serialNum, search::DocumentIdT lid, const DocumentSP &doc,
+                                     bool immediateCommit, OnOperationDoneType onWriteDone)
+ {
+     performIndexPut(serialNum, lid, *doc, immediateCommit, onWriteDone);
+diff --git a/searchcore/src/vespa/searchcore/proton/server/searchable_feed_view.h b/searchcore/src/vespa/searchcore/proton/server/searchable_feed_view.h
+index 84de5d8c853..80ec0b9f347 100644
+--- a/searchcore/src/vespa/searchcore/proton/server/searchable_feed_view.h
++++ b/searchcore/src/vespa/searchcore/proton/server/searchable_feed_view.h
+@@ -34,10 +34,10 @@ private:
+ 
+     bool hasIndexedFields() const { return _hasIndexedFields; }
+ 
+-    void performIndexPut(SerialNum serialNum, search::DocumentIdT lid, const document::Document &doc,
++    void performIndexPut(SerialNum serialNum, search::DocumentIdT lid, const Document &doc,
+                          bool immediateCommit, OnOperationDoneType onWriteDone);
+ 
+-    void performIndexPut(SerialNum serialNum, search::DocumentIdT lid, const document::Document::SP &doc,
++    void performIndexPut(SerialNum serialNum, search::DocumentIdT lid, const DocumentSP &doc,
+                          bool immediateCommit, OnOperationDoneType onWriteDone);
+     void performIndexPut(SerialNum serialNum, search::DocumentIdT lid, FutureDoc doc,
+                          bool immediateCommit, OnOperationDoneType onWriteDone);
+@@ -55,7 +55,7 @@ private:
+     void performSync();
+     void heartBeatIndexedFields(SerialNum serialNum) override;
+ 
+-    void putIndexedFields(SerialNum serialNum, search::DocumentIdT lid, const document::Document::SP &newDoc,
++    void putIndexedFields(SerialNum serialNum, search::DocumentIdT lid, const DocumentSP &newDoc,
+                           bool immediateCommit, OnOperationDoneType onWriteDone) override;
+ 
+     void updateIndexedFields(SerialNum serialNum, search::DocumentIdT lid, FutureDoc newDoc,
+diff --git a/searchcore/src/vespa/searchcore/proton/test/dummy_document_store.h b/searchcore/src/vespa/searchcore/proton/test/dummy_document_store.h
+index 152320f684e..acc0cdb111d 100644
+--- a/searchcore/src/vespa/searchcore/proton/test/dummy_document_store.h
++++ b/searchcore/src/vespa/searchcore/proton/test/dummy_document_store.h
+@@ -17,8 +17,8 @@ struct DummyDocumentStore : public search::IDocumentStore
+         : _baseDir(baseDir)
+     {}
+     ~DummyDocumentStore() {}
+-    document::Document::UP read(search::DocumentIdT, const document::DocumentTypeRepo &) const override {
+-        return document::Document::UP();
++    DocumentUP read(search::DocumentIdT, const document::DocumentTypeRepo &) const override {
++        return DocumentUP();
+     }
+     void write(uint64_t, search::DocumentIdT, const document::Document &) override {}
+     void write(uint64_t, search::DocumentIdT, const vespalib::nbostream &) override {}

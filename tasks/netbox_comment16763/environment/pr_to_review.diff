@@ -1,0 +1,573 @@
+diff --git a/netbox/core/plugins.py b/netbox/core/plugins.py
+new file mode 100644
+index 00000000000..e633001f561
+--- /dev/null
++++ b/netbox/core/plugins.py
+@@ -0,0 +1,141 @@
++import importlib
++import importlib.util
++import datetime
++import requests
++
++from dataclasses import dataclass, field
++from django.conf import settings
++from django.core.cache import cache
++from django.utils.translation import gettext_lazy as _
++from utilities.datetime import datetime_from_timestamp
++
++
++@dataclass
++class PluginVersion:
++    date: datetime.datetime = None
++    version: str = ''
++    netbox_min_version: str = ''
++    netbox_max_version: str = ''
++    has_model: bool = False
++    is_certified: bool = False
++    is_feature: bool = False
++    is_integration: bool = False
++    is_netboxlabs_supported: bool = False
++
++
++@dataclass
++class Plugin:
++    slug: str = ''
++    config_name: str = ''
++    name: str = ''
++    title_long: str = ''
++    tag_line: str = ''
++    description_short: str = ''
++    author: str = ''
++    homepage_url: str = ''
++    license_type: str = ''
++    created: datetime.datetime = None
++    updated: datetime.datetime = None
++    is_local: bool = False
++    is_installed: bool = False
++    is_certified: bool = False
++    is_community: bool = False
++    versions: list[PluginVersion] = field(default_factory=list)
++
++
++def get_local_plugins():
++    plugins = {}
++    for plugin_name in settings.PLUGINS:
++        plugin = importlib.import_module(plugin_name)
++        plugin_config: PluginConfig = plugin.config
++
++        plugin_module = "{}.{}".format(plugin_config.__module__, plugin_config.__name__)  # type: ignore
++        plugins[plugin_config.name] = Plugin(
++            slug=plugin_config.name,
++            name=plugin_config.verbose_name,
++            tag_line=plugin_config.description,
++            description_short=plugin_config.description,
++            author=plugin_config.author or _('Unknown Author'),
++            is_local=True,
++            is_installed=True,
++            is_certified=False,
++            is_community=False,
++        )
++
++    return plugins
++
++
++def get_catalog_plugins():
++    session = requests.Session()
++    plugins = {}
++
++    def get_pages():
++        # TODO: pagintation is curently broken in API
++        payload = {'page': '1', 'per_page': '50'}
++        first_page = session.get(settings.PLUGIN_CATALOG_URL, params=payload).json()
++        yield first_page
++        num_pages = first_page['metadata']['pagination']['last_page']
++
++        for page in range(2, num_pages + 1):
++            payload['page'] = page
++            next_page = session.get(settings.PLUGIN_CATALOG_URL, params=payload).json()
++            yield next_page
++
++    for page in get_pages():
++        for data in page['data']:
++
++            versions = []
++            for version in data['release_recent_history']:
++                versions.append(
++                    PluginVersion(
++                        date=datetime_from_timestamp(version['date']),
++                        version=version['version'],
++                        netbox_min_version=version['netbox_min_version'],
++                        netbox_max_version=version['netbox_max_version'],
++                        has_model=version['has_model'],
++                        is_certified=version['is_certified'],
++                        is_feature=version['is_feature'],
++                        is_integration=version['is_integration'],
++                        is_netboxlabs_supported=version['is_netboxlabs_supported'],
++                    )
++                )
++            versions = sorted(versions, key=lambda x: x.date, reverse=True)
++
++            plugins[data['slug']] = Plugin(
++                slug=data['slug'],
++                config_name=data['config_name'],
++                name=data['title_short'],
++                title_long=data['title_long'],
++                tag_line=data['tag_line'],
++                description_short=data['description_short'],
++                author=data['author']['name'] or _('Unknown Author'),
++                homepage_url=data['homepage_url'],
++                license_type=data['license_type'],
++                created=datetime_from_timestamp(data['created_at']),
++                updated=datetime_from_timestamp(data['updated_at']),
++                is_local=False,
++                is_installed=False,
++                is_certified=data['release_latest']['is_certified'],
++                is_community=not data['release_latest']['is_certified'],
++                versions=versions,
++            )
++
++    return plugins
++
++
++def get_plugins():
++    local_plugins = get_local_plugins()
++    catalog_plugins = cache.get('plugins-catalog-feed')
++    if not catalog_plugins:
++        catalog_plugins = get_catalog_plugins()
++        cache.set('plugins-catalog-feed', catalog_plugins, 3600)
++
++    plugins = catalog_plugins
++    for k, v in local_plugins.items():
++        if k in plugins:
++            plugins[k].is_local = True
++            plugins[k].is_installed = True
++        else:
++            plugins[k] = v
++
++    return plugins
+diff --git a/netbox/core/tables/plugins.py b/netbox/core/tables/plugins.py
+index 21e90cd6b46..6236386078b 100644
+--- a/netbox/core/tables/plugins.py
++++ b/netbox/core/tables/plugins.py
+@@ -1,39 +1,75 @@
+ import django_tables2 as tables
+ from django.utils.translation import gettext_lazy as _
+-from netbox.tables import BaseTable
++
++from netbox.tables import BaseTable, columns
+ 
+ __all__ = (
+-    'PluginTable',
++    'CatalogPluginTable',
++    'PluginVersionTable',
+ )
+ 
+ 
+-class PluginTable(BaseTable):
+-    name = tables.Column(
+-        accessor=tables.A('verbose_name'),
+-        verbose_name=_('Name')
+-    )
++class PluginVersionTable(BaseTable):
+     version = tables.Column(
+         verbose_name=_('Version')
+     )
+-    package = tables.Column(
+-        accessor=tables.A('name'),
+-        verbose_name=_('Package')
++    last_updated = columns.DateTimeColumn(
++        accessor=tables.A('date'),
++        timespec='minutes',
++        verbose_name=_('Last Updated')
++    )
++    min_version = tables.Column(
++        accessor=tables.A('netbox_min_version'),
++        verbose_name=_('Minimum NetBox Version')
++    )
++    max_version = tables.Column(
++        accessor=tables.A('netbox_max_version'),
++        verbose_name=_('Maximum NetBox Version')
++    )
++
++    class Meta(BaseTable.Meta):
++        empty_text = _('No plugin data found')
++        fields = (
++            'version', 'last_updated', 'min_version', 'max_version',
++        )
++        default_columns = (
++            'version', 'last_updated', 'min_version', 'max_version',
++        )
++        orderable = False
++
++
++class CatalogPluginTable(BaseTable):
++    name = tables.Column(
++        linkify=('core:plugin', [tables.A('slug')]),
++        verbose_name=_('Name')
+     )
+     author = tables.Column(
+         verbose_name=_('Author')
+     )
+-    author_email = tables.Column(
+-        verbose_name=_('Author Email')
++    is_local = columns.BooleanColumn(
++        verbose_name=_('Local')
++    )
++    is_installed = columns.BooleanColumn(
++        verbose_name=_('Installed')
++    )
++    is_certified = columns.BooleanColumn(
++        verbose_name=_('Certified')
++    )
++    created = columns.DateTimeColumn(
++        verbose_name=_('Published')
+     )
+-    description = tables.Column(
+-        verbose_name=_('Description')
++    updated = columns.DateTimeColumn(
++        verbose_name=_('Updated')
+     )
+ 
+     class Meta(BaseTable.Meta):
+-        empty_text = _('No plugins found')
++        empty_text = _('No plugin data found')
+         fields = (
+-            'name', 'version', 'package', 'author', 'author_email', 'description',
++            'name', 'author', 'is_local', 'is_installed', 'is_certified', 'created', 'updated',
+         )
+         default_columns = (
+-            'name', 'version', 'package', 'description',
++            'name', 'author', 'is_local', 'is_installed', 'is_certified', 'created', 'updated',
+         )
++        # List installed plugins first, then certified plugins, then
++        # everything else (with each tranche ordered alphabetically)
++        order_by = ('-is_installed', '-is_certified', 'name')
+diff --git a/netbox/core/urls.py b/netbox/core/urls.py
+index 58e96d735bb..fd6ec89962a 100644
+--- a/netbox/core/urls.py
++++ b/netbox/core/urls.py
+@@ -49,4 +49,8 @@
+ 
+     # System
+     path('system/', views.SystemView.as_view(), name='system'),
++
++    # Plugins
++    path('plugins/', views.PluginListView.as_view(), name='plugin_list'),
++    path('plugins/<str:name>/', views.PluginView.as_view(), name='plugin'),
+ )
+diff --git a/netbox/core/views.py b/netbox/core/views.py
+index 50840158570..761a83dafe7 100644
+--- a/netbox/core/views.py
++++ b/netbox/core/views.py
+@@ -2,7 +2,6 @@
+ import platform
+ 
+ from django import __version__ as DJANGO_VERSION
+-from django.apps import apps
+ from django.conf import settings
+ from django.contrib import messages
+ from django.contrib.auth.mixins import UserPassesTestMixin
+@@ -36,6 +35,8 @@
+ from utilities.views import ContentTypePermissionRequiredMixin, GetRelatedModelsMixin, register_model_view
+ from . import filtersets, forms, tables
+ from .models import *
++from .plugins import get_plugins
++from .tables import CatalogPluginTable, PluginVersionTable
+ 
+ 
+ #
+@@ -581,7 +582,7 @@ def get(self, request, key):
+ 
+ 
+ #
+-# Plugins
++# System
+ #
+ 
+ class SystemView(UserPassesTestMixin, View):
+@@ -614,12 +615,6 @@ def get(self, request):
+             'rq_worker_count': Worker.count(get_connection('default')),
+         }
+ 
+-        # Plugins
+-        plugins = [
+-            # Look up app config by package name
+-            apps.get_app_config(plugin.rsplit('.', 1)[-1]) for plugin in settings.PLUGINS
+-        ]
+-
+         # Configuration
+         try:
+             config = ConfigRevision.objects.get(pk=cache.get('config_version'))
+@@ -631,9 +626,6 @@ def get(self, request):
+         if 'export' in request.GET:
+             data = {
+                 **stats,
+-                'plugins': {
+-                    plugin.name: plugin.version for plugin in plugins
+-                },
+                 'config': {
+                     k: config.data[k] for k in sorted(config.data)
+                 },
+@@ -642,11 +634,56 @@ def get(self, request):
+             response['Content-Disposition'] = 'attachment; filename="netbox.json"'
+             return response
+ 
+-        plugins_table = tables.PluginTable(plugins, orderable=False)
+-        plugins_table.configure(request)
+-
+         return render(request, 'core/system.html', {
+             'stats': stats,
+-            'plugins_table': plugins_table,
+             'config': config,
+         })
++
++
++#
++# Plugins
++#
++
++class PluginListView(UserPassesTestMixin, View):
++
++    def test_func(self):
++        return self.request.user.is_staff
++
++    def get(self, request):
++        q = request.GET.get('q', None)
++
++        plugins = get_plugins().values()
++        if q:
++            plugins = [obj for obj in plugins if q.casefold() in obj.name.casefold()]
++
++        table = CatalogPluginTable(plugins, user=request.user)
++        table.configure(request)
++
++        # If this is an HTMX request, return only the rendered table HTML
++        if htmx_partial(request):
++            return render(request, 'htmx/table.html', {
++                'table': table,
++            })
++
++        return render(request, 'core/plugin_list.html', {
++            'table': table,
++        })
++
++
++class PluginView(UserPassesTestMixin, View):
++
++    def test_func(self):
++        return self.request.user.is_staff
++
++    def get(self, request, name):
++
++        plugins = get_plugins()
++        plugin = plugins[name]
++
++        table = PluginVersionTable(plugin.versions, user=request.user)
++        table.configure(request)
++
++        return render(request, 'core/plugin.html', {
++            'plugin': plugin,
++            'table': table,
++        })
+diff --git a/netbox/netbox/navigation/menu.py b/netbox/netbox/navigation/menu.py
+index b96465c3573..3ba5b7078e4 100644
+--- a/netbox/netbox/navigation/menu.py
++++ b/netbox/netbox/navigation/menu.py
+@@ -435,6 +435,11 @@
+                     link_text=_('System'),
+                     auth_required=True
+                 ),
++                MenuItem(
++                    link='core:plugin_list',
++                    link_text=_('Plugins'),
++                    auth_required=True
++                ),
+                 MenuItem(
+                     link='core:configrevision_list',
+                     link_text=_('Configuration History'),
+diff --git a/netbox/netbox/settings.py b/netbox/netbox/settings.py
+index 64fb24f0947..b2ce3eacd24 100644
+--- a/netbox/netbox/settings.py
++++ b/netbox/netbox/settings.py
+@@ -769,6 +769,8 @@ def _setting(name, default=None):
+ # Plugins
+ #
+ 
++PLUGIN_CATALOG_URL = 'https://api.netbox.oss.netboxlabs.com/v1/plugins'
++
+ # Register any configured plugins
+ for plugin_name in PLUGINS:
+     try:
+diff --git a/netbox/templates/core/plugin.html b/netbox/templates/core/plugin.html
+new file mode 100644
+index 00000000000..020326b7d15
+--- /dev/null
++++ b/netbox/templates/core/plugin.html
+@@ -0,0 +1,97 @@
++{% extends 'generic/object.html' %}
++{% load helpers %}
++{% load form_helpers %}
++{% load i18n %}
++
++{% block title %}{{ plugin.name }}{% endblock %}
++
++{% block object_identifier %}
++{% endblock object_identifier %}
++
++{% block breadcrumbs %}
++  <li class="breadcrumb-item"><a href="{% url 'core:plugin_list' %}">{% trans "Plugins" %}</a></li>
++{% endblock breadcrumbs %}
++
++{% block subtitle %}
++  <div class="text-secondary fs-5">
++    {{ plugin.tag_line }}
++    <a href="{{ plugin.homepage.url }}" target="_blank">Learn more <i class="mdi mdi-launch"></i></a><br />
++    <strong>License:</strong> {{ plugin.license_type }}
++  </div>
++{% endblock subtitle %}
++
++{% block controls %}
++<div class="text-secondary">
++From
++</div>
++{{ plugin.author }}
++{% endblock %}
++
++{% block tabs %}
++  <ul class="nav nav-tabs" role="tablist">
++    <li class="nav-item" role="presentation">
++      <a class="nav-link active" id="overview-tab" data-bs-toggle="tab" data-bs-target="#overview" type="button" role="tab" aria-controls="edit-form" aria-selected="true">
++        {% trans "Overview" %}
++      </a>
++    </li>
++    {% if not plugin.is_local %}
++      <li class="nav-item" role="presentation">
++        <button class="nav-link" id="version-history-tab" data-bs-toggle="tab" data-bs-target="#version-history" type="button" role="tab" aria-controls="object-list" aria-selected="false">
++          {% trans "Version history" %}
++        </button>
++      </li>
++      {% if plugin.is_community %}
++        <li class="nav-item" role="presentation">
++          <button class="nav-link" id="install-tab" data-bs-toggle="tab" data-bs-target="#install" type="button" role="tab" aria-controls="object-list" aria-selected="false">
++            {% trans "Install" %}
++          </button>
++        </li>
++      {% endif %}
++    {% endif %}
++  </ul>
++
++{% endblock tabs %}
++
++{% block content %}
++
++  <div class="tab-pane show active" id="overview" role="tabpanel" aria-labelledby="overview-tab">
++    {{ plugin.description_short|markdown }}
++  </div>
++  {% if not plugin.is_local %}
++    <div class="tab-pane" id="version-history" role="tabpanel" aria-labelledby="version-history-tab">
++      <div class="card">
++
++        <div class="htmx-container table-responsive" id="object_list">
++          {% include 'htmx/table.html' %}
++        </div>
++      </div>
++    </div>
++    {% if plugin.is_community %}
++      <div class="tab-pane" id="install" role="tabpanel" aria-labelledby="install-tab">
++        <p>You can install this plugin from the command line with PyPi.</p>
++        <p>The following commands may be helpful; always refer to <a href="{{ plugin.homepage_url }}" target="_blank">the plugin's own documentation <i class="mdi mdi-launch"></i></a> and the <a href="https://netboxlabs.com/docs/netbox/en/stable/plugins/installation/" target="_blank">Installing a Plugin unit <i class="mdi mdi-launch"></i></a> of the NetBox documentation.</p>
++        <p>1. Enter the NetBox virtual environment and install the plugin package:</p>
++
++        <pre class="block"><code>
++source /opt/netbox/venv/bin/activate
++pip install {{ plugin.slug }}
++    </code></pre>
++    <p>2. In /opt/netbox/netbox/netbox/configuration.py, add the plugin to the PLUGINS list:</p>
++    <pre class="block"><code>
++PLUGINS=［
++    "{{ plugin.config_name }}",
++]
++        </code></pre>
++        <p>3. Still from the NetBox virtual environment, run database migrations and collect static files:</p>
++        <pre class="block"><code>
++    python3 /opt/netbox/netbox/netbox/manage.py migrate
++    python3 /opt/netbox/netbox/netbox/manage.py collectstatic
++        </code></pre>
++        <p>4. Restart the NetBox services to complete the plugin installation:</p>
++        <pre class="block"><code>
++    sudo systemctl restart netbox netbox-rq
++        </code></pre>
++      </div>
++    {% endif %}
++  {% endif %}
++{% endblock content %}
+diff --git a/netbox/templates/core/plugin_list.html b/netbox/templates/core/plugin_list.html
+new file mode 100644
+index 00000000000..01a776b2c1d
+--- /dev/null
++++ b/netbox/templates/core/plugin_list.html
+@@ -0,0 +1,43 @@
++{% extends 'generic/object_list.html' %}
++{% load buttons %}
++{% load helpers %}
++{% load i18n %}
++{% load render_table from django_tables2 %}
++
++{% block title %}{% trans "Plugins" %}{% endblock %}
++
++{% block controls %}
++{% endblock controls %}
++
++{% block tabs %}
++  <ul class="nav nav-tabs px-3">
++    <li class="nav-item" role="presentation">
++      <a class="nav-link active" role="tab">{% trans "Plugins" %}</a>
++    </li>
++  </ul>
++{% endblock tabs %}
++
++{% block content %}
++  <div class="tab-pane show active" id="object-list" role="tabpanel" aria-labelledby="object-list-tab">
++    <p>{% trans "NetBox plugins enable you to document and model new kinds of resources, connect automations, add workflows, and much more." %}</p>
++
++    <div class="row mb-3" id="results">
++      <div class="col-auto d-print-none">
++        <div class="input-group input-group-flat me-2 quicksearch" hx-disinherit="hx-select hx-swap">
++          <input type="search" results="5" name="q" id="quicksearch" class="form-control" placeholder="{% trans "Quick search" %}"
++              hx-get="{{ request.full_path }}" hx-target="#object_list" hx-trigger="keyup changed delay:500ms, search"/>
++          <span class="input-group-text py-1">
++            <a href="#" id="quicksearch_clear" class="invisible text-secondary"><i class="mdi mdi-close-circle"></i></a>
++          </span>
++        </div>
++      </div>
++    </div>
++
++    <div class="card">
++      <div class="htmx-container table-responsive" id="object_list">
++        {% include 'htmx/table.html' %}
++      </div>
++    </div>
++
++  </div>
++{% endblock content %}
+diff --git a/netbox/templates/core/system.html b/netbox/templates/core/system.html
+index 6f88643a0e4..5a7088e96eb 100644
+--- a/netbox/templates/core/system.html
++++ b/netbox/templates/core/system.html
+@@ -78,16 +78,6 @@ <h5 class="card-header">{% trans "System Status" %}</h5>
+     </div>
+   </div>
+ 
+-  {# Plugins #}
+-  <div class="row mb-3">
+-    <div class="col col-md-12">
+-      <div class="card">
+-        <h5 class="card-header">{% trans "Plugins" %}</h5>
+-        {% render_table plugins_table %}
+-      </div>
+-    </div>
+-  </div>
+-
+   {# Configuration #}
+   <div class="row mb-3">
+     <div class="col col-md-12">

@@ -1,0 +1,295 @@
+diff --git a/src/platform/macos.mm b/src/platform/macos.mm
+index 92ee5170b98..ed77d188a54 100644
+--- a/src/platform/macos.mm
++++ b/src/platform/macos.mm
+@@ -4,6 +4,10 @@
+ #include <Security/Authorization.h>
+ #include <Security/AuthorizationTags.h>
+ 
++#include <CoreGraphics/CoreGraphics.h>
++#include <vector>
++#include <map>
++
+ extern "C" bool CanUseNewApiForScreenCaptureCheck() {
+     #ifdef NO_InputMonitoringAuthStatus
+     return false;
+@@ -292,3 +296,118 @@ static bool setDisplayToMode(CGDirectDisplayID display, CGDisplayModeRef mode) {
+     CFRelease(allModes);
+     return ret;
+ }
++
++static CFMachPortRef g_eventTap = NULL;
++static CFRunLoopSourceRef g_runLoopSource = NULL;
++static std::map<CGDirectDisplayID, std::vector<CGGammaValue>> g_originalGammas;
++
++// The event source user data value used by enigo library for injected events.
++// This allows us to distinguish remote input (which should be allowed) from local physical input.
++static const int64_t ENIGO_INPUT_EXTRA_VALUE = 100;
++
++CGEventRef MyEventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon) {
++    (void)proxy;
++    (void)type;
++    (void)refcon;
++    // Allow events explicitly injected by enigo (remote input), identified via custom user data.
++    int64_t userData = CGEventGetIntegerValueField(event, kCGEventSourceUserData);
++    if (userData == ENIGO_INPUT_EXTRA_VALUE) {
++        return event;
++    }
++    // Block local physical HID input.
++    if (CGEventGetIntegerValueField(event, kCGEventSourceStateID) == kCGEventSourceStateHIDSystemState) {
++        return NULL;
++    }
++    return event;
++}
++
++extern "C" bool MacSetPrivacyMode(bool on) {
++    if (on) {
++        // 1. Input Blocking
++        if (!g_eventTap) {
++            CGEventMask eventMask = (1 << kCGEventKeyDown) | (1 << kCGEventKeyUp) |
++                                    (1 << kCGEventLeftMouseDown) | (1 << kCGEventLeftMouseUp) |
++                                    (1 << kCGEventRightMouseDown) | (1 << kCGEventRightMouseUp) |
++                                    (1 << kCGEventMouseMoved) | (1 << kCGEventScrollWheel);
++            
++            g_eventTap = CGEventTapCreate(kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
++                                          eventMask, MyEventTapCallback, NULL);
++            if (g_eventTap) {
++                g_runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, g_eventTap, 0);
++                CFRunLoopAddSource(CFRunLoopGetMain(), g_runLoopSource, kCFRunLoopCommonModes);
++                CGEventTapEnable(g_eventTap, true);
++            } else {
++                NSLog(@"MacSetPrivacyMode: Failed to create CGEventTap; input blocking not enabled.");
++                return false;
++            }
++        }
++
++        // 2. Gamma Blackout
++        uint32_t count = 0;
++        CGGetOnlineDisplayList(0, NULL, &count);
++        std::vector<CGDirectDisplayID> displays(count);
++        CGGetOnlineDisplayList(count, displays.data(), &count);
++
++        for (uint32_t i = 0; i < count; i++) {
++            CGDirectDisplayID d = displays[i];
++            
++            // Save original if not saved
++            if (g_originalGammas.find(d) == g_originalGammas.end()) {
++                 uint32_t capacity = CGDisplayGammaTableCapacity(d);
++                 if (capacity > 0) {
++                     std::vector<CGGammaValue> red(capacity), green(capacity), blue(capacity);
++                     uint32_t sampleCount = 0;
++                     if (CGGetDisplayTransferByTable(d, capacity, red.data(), green.data(), blue.data(), &sampleCount) == kCGErrorSuccess) {
++                         std::vector<CGGammaValue> all;
++                         all.insert(all.end(), red.begin(), red.begin() + sampleCount);
++                         all.insert(all.end(), green.begin(), green.begin() + sampleCount);
++                         all.insert(all.end(), blue.begin(), blue.begin() + sampleCount);
++                         g_originalGammas[d] = all;
++                     }
++                 }
++            }
++
++            // Set to black only if we have saved original gamma for this display
++            if (g_originalGammas.find(d) != g_originalGammas.end()) {
++                uint32_t capacity = CGDisplayGammaTableCapacity(d);
++                if (capacity > 0) {
++                    std::vector<CGGammaValue> zeros(capacity, 0.0f);
++                    CGError error = CGSetDisplayTransferByTable(d, capacity, zeros.data(), zeros.data(), zeros.data());
++                    if (error != kCGErrorSuccess) {
++                        NSLog(@"MacSetPrivacyMode: Failed to set gamma table to black for display %u (error %d)", (unsigned)d, error);
++                    }
++                }
++            }
++        }
++        return true;
++
++    } else {
++        // Restore
++        // 1. Input
++        if (g_eventTap) {
++            CGEventTapEnable(g_eventTap, false);
++            CFRunLoopRemoveSource(CFRunLoopGetMain(), g_runLoopSource, kCFRunLoopCommonModes);
++            CFRelease(g_runLoopSource);
++            CFRelease(g_eventTap);
++            g_eventTap = NULL;
++            g_runLoopSource = NULL;
++        }
++
++        // 2. Gamma
++        for (auto const& [d, gamma] : g_originalGammas) {
++             uint32_t sampleCount = gamma.size() / 3;
++             if (sampleCount > 0) {
++                 const CGGammaValue* red = gamma.data();
++                 const CGGammaValue* green = red + sampleCount;
++                 const CGGammaValue* blue = green + sampleCount;
++                 CGError error = CGSetDisplayTransferByTable(d, sampleCount, red, green, blue);
++                 if (error != kCGErrorSuccess) {
++                     NSLog(@"Failed to restore gamma table for display %u (error %d), attempting system reset", (unsigned)d, error);
++                     CGDisplayRestoreColorSyncSettings();
++                 }
++             }
++        }
++        g_originalGammas.clear();
++        return true;
++    }
++}
+diff --git a/src/privacy_mode.rs b/src/privacy_mode.rs
+index adfe252949f..86684dce25a 100644
+--- a/src/privacy_mode.rs
++++ b/src/privacy_mode.rs
+@@ -23,6 +23,9 @@ pub mod win_mag;
+ #[cfg(windows)]
+ pub mod win_topmost_window;
+ 
++#[cfg(target_os = "macos")]
++pub mod macos;
++
+ #[cfg(windows)]
+ mod win_virtual_display;
+ #[cfg(windows)]
+@@ -105,7 +108,14 @@ lazy_static::lazy_static! {
+         }
+         #[cfg(not(windows))]
+         {
+-            "".to_owned()
++            #[cfg(target_os = "macos")]
++            {
++                macos::PRIVACY_MODE_IMPL.to_owned()
++            }
++            #[cfg(not(target_os = "macos"))]
++            {
++                "".to_owned()
++            }
+         }
+     };
+ 
+@@ -127,7 +137,13 @@ pub type PrivacyModeCreator = fn(impl_key: &str) -> Box<dyn PrivacyMode>;
+ lazy_static::lazy_static! {
+     static ref PRIVACY_MODE_CREATOR: Arc<Mutex<HashMap<&'static str, PrivacyModeCreator>>> = {
+         #[cfg(not(windows))]
+-        let map: HashMap<&'static str, PrivacyModeCreator> = HashMap::new();
++        let mut map: HashMap<&'static str, PrivacyModeCreator> = HashMap::new();
++        #[cfg(target_os = "macos")]
++        {
++            map.insert(macos::PRIVACY_MODE_IMPL, |impl_key: &str| {
++                Box::new(macos::PrivacyModeImpl::new(impl_key))
++            });
++        }
+         #[cfg(windows)]
+         let mut map: HashMap<&'static str, PrivacyModeCreator> = HashMap::new();
+         #[cfg(windows)]
+@@ -333,7 +349,11 @@ pub fn get_supported_privacy_mode_impl() -> Vec<(&'static str, &'static str)> {
+ 
+         vec_impls
+     }
+-    #[cfg(not(target_os = "windows"))]
++    #[cfg(target_os = "macos")]
++    {
++        vec![(macos::PRIVACY_MODE_IMPL, "privacy_mode_impl_macos_tip")]
++    }
++    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+     {
+         Vec::new()
+     }
+diff --git a/src/privacy_mode/macos.rs b/src/privacy_mode/macos.rs
+new file mode 100644
+index 00000000000..6c5735edfee
+--- /dev/null
++++ b/src/privacy_mode/macos.rs
+@@ -0,0 +1,70 @@
++use super::{PrivacyMode, PrivacyModeState};
++use hbb_common::ResultType;
++
++extern "C" {
++    fn MacSetPrivacyMode(on: bool) -> bool;
++}
++
++pub const PRIVACY_MODE_IMPL: &str = "privacy_mode_impl_macos";
++
++pub struct PrivacyModeImpl {
++    impl_key: String,
++    conn_id: i32,
++}
++
++impl PrivacyModeImpl {
++    pub fn new(impl_key: &str) -> Self {
++        Self {
++            impl_key: impl_key.to_owned(),
++            conn_id: 0,
++        }
++    }
++}
++
++impl PrivacyMode for PrivacyModeImpl {
++    fn is_async_privacy_mode(&self) -> bool {
++        false
++    }
++
++    fn init(&self) -> ResultType<()> {
++        Ok(())
++    }
++
++    fn clear(&mut self) {
++        unsafe {
++            MacSetPrivacyMode(false);
++        }
++    }
++
++    fn turn_on_privacy(&mut self, conn_id: i32) -> ResultType<bool> {
++        self.conn_id = conn_id;
++        unsafe {
++            MacSetPrivacyMode(true);
++        }
++        Ok(true)
++    }
++
++    fn turn_off_privacy(&mut self, _conn_id: i32, _state: Option<PrivacyModeState>) -> ResultType<()> {
++        unsafe {
++            MacSetPrivacyMode(false);
++        }
++        self.conn_id = 0;
++        Ok(())
++    }
++
++    fn pre_conn_id(&self) -> i32 {
++        self.conn_id
++    }
++
++    fn get_impl_key(&self) -> &str {
++        &self.impl_key
++    }
++}
++
++impl Drop for PrivacyModeImpl {
++    fn drop(&mut self) {
++        unsafe {
++            MacSetPrivacyMode(false);
++        }
++    }
++}
+diff --git a/src/server/connection.rs b/src/server/connection.rs
+index d2837345940..c4d7bd3abd0 100644
+--- a/src/server/connection.rs
++++ b/src/server/connection.rs
+@@ -1418,7 +1418,7 @@ impl Connection {
+             pi.platform = "Android".into();
+         }
+         #[cfg(all(target_os = "macos", not(feature = "unix-file-copy-paste")))]
+-        let platform_additions = serde_json::Map::new();
++        let mut platform_additions = serde_json::Map::new();
+         #[cfg(any(
+             target_os = "windows",
+             target_os = "linux",
+@@ -1451,6 +1451,13 @@ impl Connection {
+                 json!(privacy_mode::get_supported_privacy_mode_impl()),
+             );
+         }
++        #[cfg(target_os = "macos")]
++        {
++            platform_additions.insert(
++                "supported_privacy_mode_impl".into(),
++                json!(privacy_mode::get_supported_privacy_mode_impl()),
++            );
++        }
+ 
+         #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
+         {

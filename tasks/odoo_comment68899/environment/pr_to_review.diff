@@ -1,0 +1,732 @@
+diff --git a/addons/project/__manifest__.py b/addons/project/__manifest__.py
+index c8908e7316309..487830c494980 100644
+--- a/addons/project/__manifest__.py
++++ b/addons/project/__manifest__.py
+@@ -29,6 +29,8 @@
+         'views/analytic_views.xml',
+         'views/digest_views.xml',
+         'views/rating_views.xml',
++        'views/project_update_views.xml',
++        'views/project_update_templates.xml',
+         'views/project_views.xml',
+         'views/res_partner_views.xml',
+         'views/res_config_settings_views.xml',
+@@ -37,6 +39,7 @@
+         'data/ir_cron_data.xml',
+         'data/mail_data.xml',
+         'data/mail_template_data.xml',
++        'data/project_data.xml',
+         'wizard/project_delete_wizard_views.xml',
+         'wizard/project_task_type_delete_views.xml',
+     ],
+@@ -55,11 +58,13 @@
+             'project/static/src/js/project_rating_reporting.js',
+             'project/static/src/js/project_name_with_subtask_count_widget.js',
+             'project/static/src/js/project_task_kanban_examples.js',
++            'project/static/src/js/widgets/*',
+             'project/static/src/js/tours/project.js',
+             'project/static/src/js/project_calendar.js',
+             'project/static/src/js/burndown_chart/*',
+             'project/static/src/scss/project_dashboard.scss',
+             'project/static/src/scss/project_form.scss',
++            'project/static/src/scss/project_widgets.scss',
+         ],
+         'web.assets_frontend': [
+             'project/static/src/scss/portal_rating.scss',
+diff --git a/addons/project/data/project_data.xml b/addons/project/data/project_data.xml
+new file mode 100644
+index 0000000000000..9614bc87d2a07
+--- /dev/null
++++ b/addons/project/data/project_data.xml
+@@ -0,0 +1,27 @@
++<?xml version="1.0" encoding="utf-8"?>
++<odoo noupdate="1">
++    <record id="project_update_status_on_track" model="project.update.status">
++        <field name="name">On Track</field>
++        <field name="sequence">0</field>
++        <field name="color">10</field>
++        <field name="default">True</field>
++    </record>
++    <record id="project_update_status_at_risk" model="project.update.status">
++        <field name="name">At Risk</field>
++        <field name="sequence">10</field>
++        <field name="color">2</field>
++        <field name="default">False</field>
++    </record>
++    <record id="project_update_status_off_track" model="project.update.status">
++        <field name="name">Off Track</field>
++        <field name="sequence">20</field>
++        <field name="color">1</field>
++        <field name="default">False</field>
++    </record>
++    <record id="project_update_status_on_hold" model="project.update.status">
++        <field name="name">On Hold</field>
++        <field name="sequence">30</field>
++        <field name="color">4</field>
++        <field name="default">False</field>
++    </record>
++</odoo>
+diff --git a/addons/project/models/__init__.py b/addons/project/models/__init__.py
+index ff2853f7df76e..417cdc426225b 100644
+--- a/addons/project/models/__init__.py
++++ b/addons/project/models/__init__.py
+@@ -4,6 +4,7 @@
+ from . import analytic_account
+ from . import project_task_recurrence
+ from . import project
++from . import project_update
+ from . import res_config_settings
+ from . import res_partner
+ from . import digest
+diff --git a/addons/project/models/project.py b/addons/project/models/project.py
+index 988d70842f62f..b8537b4a4a756 100644
+--- a/addons/project/models/project.py
++++ b/addons/project/models/project.py
+@@ -6,7 +6,7 @@
+ from datetime import timedelta, datetime
+ from random import randint
+ 
+-from odoo import api, fields, models, tools, SUPERUSER_ID, _
++from odoo import api, Command, fields, models, tools, SUPERUSER_ID, _
+ from odoo.exceptions import UserError, AccessError, ValidationError, RedirectWarning
+ from odoo.tools.misc import format_date, get_lang
+ from odoo.osv.expression import OR
+@@ -166,6 +166,10 @@ def _inverse_is_favorite(self):
+     def _get_default_favorite_user_ids(self):
+         return [(6, 0, [self.env.uid])]
+ 
++    def _get_default_update_states(self):
++        default_states = ['project_update_status_on_track', 'project_update_status_on_hold', 'project_update_status_off_track', 'project_update_status_at_risk']
++        return [Command.link(id) for id in map(lambda s: self.env.ref('project.' + s, raise_if_not_found=False).id, default_states)]
++
+     name = fields.Char("Name", index=True, required=True, tracking=True)
+     description = fields.Html()
+     active = fields.Boolean(default=True,
+@@ -247,6 +251,15 @@ def _get_default_favorite_user_ids(self):
+         ('quarterly', 'Quarterly'),
+         ('yearly', 'Yearly')], 'Rating Frequency', required=True, default='monthly')
+ 
++    update_status_ids = fields.Many2many('project.update.status', 'project_update_status_rel', 'project_id', 'update_status_id', string='Allowed Project States',
++                                         default=_get_default_update_states)
++    update_ids = fields.One2many('project.update', 'project_id')
++    last_update_id = fields.Many2one('project.update', string='Last Update', compute='_compute_last_update')
++    last_update_color = fields.Integer(compute='_compute_last_update')
++    last_update_status_id = fields.Many2one('project.update.status', compute='_compute_last_update')
++    milestone_ids = fields.One2many('project.milestone', 'project_id')
++    milestone_count = fields.Integer(compute='_compute_milestone_count')
++
+     _sql_constraints = [
+         ('project_date_greater', 'check(date >= date_start)', 'Error! Project start date must be before project end date.')
+     ]
+@@ -299,6 +312,26 @@ def _compute_rating_request_deadline(self):
+         for project in self:
+             project.rating_request_deadline = fields.datetime.now() + timedelta(days=periods.get(project.rating_status_period, 0))
+ 
++    @api.depends('update_ids')
++    def _compute_last_update(self):
++        # I didn't find a way to achieve it in a single query
++        for project in self:
++            project.last_update_id = self.env['project.update'].search([
++                ("project_id", "=", project.id)
++            ], limit=1)
++            if project.last_update_id:
++                project.last_update_status_id = project.last_update_id.status_id
++            else:
++                project.last_update_status_id = self.env['project.update.status'].search([('project_ids', '=', project.id)], limit=1)
++            project.last_update_color = project.last_update_status_id.color
++
++    @api.depends('milestone_ids')
++    def _compute_milestone_count(self):
++        read_group = self.env['project.milestone'].read_group([('project_id', 'in', self.ids)], ['project_id'], ['project_id'])
++        mapped_count = {group['project_id'][0]: group['project_id_count'] for group in read_group}
++        for project in self:
++            project.milestone_count = mapped_count.get(project.id, 0)
++
+     @api.model
+     def _map_tasks_default_valeus(self, task, project):
+         """ get the default value for the copied task on project duplication """
+diff --git a/addons/project/models/project_update.py b/addons/project/models/project_update.py
+new file mode 100644
+index 0000000000000..15db1de3de36d
+--- /dev/null
++++ b/addons/project/models/project_update.py
+@@ -0,0 +1,234 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from datetime import timedelta
++from dateutil.relativedelta import relativedelta
++
++from odoo import api, fields, models
++
++class ProjectUpdateStatus(models.Model):
++    _name = 'project.update.status'
++    _description = 'Project Update Status'
++    _order = 'default desc, sequence, id'
++
++    def _get_default_project_ids(self):
++        default_project_id = self.env.context.get('default_project_id')
++        return [default_project_id] if default_project_id else None
++
++    name = fields.Char()
++    color = fields.Integer()
++    default = fields.Boolean()
++    sequence = fields.Integer()
++    project_ids = fields.Many2many('project.project', 'project_update_status_rel', 'update_status_id', 'project_id', string='Projects',
++                                   default=_get_default_project_ids)
++
++class ProjectUpdate(models.Model):
++    _name = 'project.update'
++    _description = 'Project Update'
++    _order = 'create_date desc'
++    _inherit = ['mail.thread.cc', 'mail.activity.mixin']
++
++    def _get_default_project_id(self):
++        return self.env.context.get('default_project_id') or self.env.context.get('active_id')
++
++    def _get_default_status(self):
++        project_id = self.env.context.get('default_project_id') or self.env.context.get('active_id')
++        if not project_id:
++            return False
++        return self.env['project.update.status'].search([('project_ids', '=', project_id)], limit=1)
++
++    def _get_default_description(self):
++        project_id = self.env.context.get('default_project_id') or self.env.context.get('active_id')
++        if not project_id:
++            return False
++        return self._build_description(project_id)
++
++    name = fields.Char("Title", required=True)
++    status_id = fields.Many2one("project.update.status", copy=False, default=_get_default_status, required=True)
++    color = fields.Integer(related="status_id.color")
++    progress = fields.Integer()
++    progress_percentage = fields.Float(compute="_compute_progress_percentage")
++    user_id = fields.Many2one('res.users', string="Author", required=True, default=lambda self: self.env.user)
++    description = fields.Html(default=_get_default_description)
++    date = fields.Date(default=fields.Date.context_today)
++    project_id = fields.Many2one("project.project", required=True, default=_get_default_project_id)
++
++    def _compute_progress_percentage(self):
++        for u in self:
++            u.progress_percentage = u.progress / 100
++
++    # ----- ORM Override
++    @api.model
++    def create(self, vals):
++        update = super(ProjectUpdate, self).create(vals)
++        return update
++
++    # ---------------------------------
++    # Build default description
++    # ---------------------------------
++
++    @api.model
++    def _build_description(self, project_id):
++        template = self.env.ref('project.project_update_default_description')
++        return template._render(self._get_template_values(project_id=project_id), engine='ir.qweb')
++
++    @api.model
++    def _get_template_values(self, project_id):
++        return {
++            'tasks': self._get_tasks_values(project_id=project_id),
++            'milestones': self._get_milestone_values(project_id=project_id)
++        }
++
++    @api.model
++    def _get_tasks_values(self, project_id):
++        Task = self.env['project.task']
++        action_url = '%s/web#menu_id=%s&action=%s&active_id=%s' % (
++            self.env['ir.config_parameter'].sudo().get_param('web.base.url'),
++            self.env.ref('project.menu_projects').id,
++            self.env.ref('project.action_project_task_burndown_chart_report').id,
++            project_id
++        )
++        return {
++            'open_tasks': Task.search_count([('display_project_id', '=', project_id), ('stage_id.fold', '=', False), ('stage_id.is_closed', '=', False)]),
++            'total_tasks': Task.search_count([('display_project_id', '=', project_id)]),
++            'created_tasks': Task.search_count([('display_project_id', '=', project_id), ('create_date', '>', fields.Datetime.now() + timedelta(days=-30))]),
++            'closed_tasks': self._get_last_stage_changes(project_id=project_id),
++            'action': action_url,
++        }
++
++    @api.model
++    def _get_last_stage_changes(self, project_id):
++        query = """
++            SELECT COUNT(DISTINCT pt.id) as total_updated_tasks
++                  FROM mail_message mm
++            INNER JOIN mail_tracking_value mtv
++                    ON mm.id = mtv.mail_message_id
++            INNER JOIN ir_model_fields imf
++                    ON mtv.field = imf.id
++                   AND imf.model = 'project.task'
++                   AND imf.name = 'stage_id'
++            INNER JOIN project_task_type next_stage
++                    ON mtv.new_value_integer = next_stage.id
++            INNER JOIN project_task pt
++                    ON mm.res_id = pt.id
++                   AND pt.stage_id = next_stage.id
++                 WHERE mm.model = 'project.task'
++                   AND mm.message_type = 'notification'
++                   AND pt.display_project_id = %(project_id)s
++                   AND (next_stage.fold OR next_stage.is_closed)
++                   AND mm.date > (now() at time zone 'utc')::date - '1 month'::interval
++                   AND pt.active
++        """
++        self.env.cr.execute(
++            query,
++            {'project_id': project_id}
++        )
++        results = self.env.cr.dictfetchone()
++        return results and results['total_updated_tasks'] or 0
++
++    @api.model
++    def _get_milestone_values(self, project_id):
++        Milestone = self.env['project.milestone']
++        list_milestones = Milestone.search(
++            [('project_id', '=', project_id),
++             ('date_deadline', '<', fields.Date.context_today(self) + relativedelta(years=1))])._get_data_list()
++        updated_milestones = self._get_last_updated_milestone(project_id=project_id)
++        created_milestones = Milestone.search(
++            [('project_id', '=', project_id),
++             ('create_date', '>', fields.Datetime.now() + timedelta(days=-30))])._get_data_list()
++        return {
++            'show_section': (list_milestones or updated_milestones or created_milestones) and True or False,
++            'list': list_milestones,
++            'updated': updated_milestones,
++            'created': created_milestones,
++        }
++
++    @api.model
++    def _get_last_updated_milestone(self, project_id):
++        Milestone = self.env['project.milestone']
++        query = """
++            SELECT DISTINCT pm.id as milestone_id,
++                            FIRST_VALUE(old_value_datetime::date) OVER w_partition as old_value,
++                            pm.date_deadline as new_value
++                       FROM mail_message mm
++                 INNER JOIN mail_tracking_value mtv
++                         ON mm.id = mtv.mail_message_id
++                 INNER JOIN ir_model_fields imf
++                         ON mtv.field = imf.id
++                        AND imf.model = 'project.milestone'
++                        AND imf.name = 'date_deadline'
++                 INNER JOIN project_milestone pm
++                         ON mm.res_id = pm.id
++                      WHERE mm.model = 'project.milestone'
++                        AND mm.message_type = 'notification'
++                        AND pm.project_id = %(project_id)s
++                        AND mm.date > (now() at time zone 'utc')::date - '1 month'::interval
++                     WINDOW w_partition AS (
++                             PARTITION BY pm.id
++                             ORDER BY mm.date ASC
++                            );
++        """
++        self.env.cr.execute(
++            query,
++            {'project_id': project_id}
++        )
++        results = self.env.cr.dictfetchall()
++        milestones = []
++        # add computed fields
++        for record in results:
++            milestones.append({
++                **Milestone.browse(record['milestone_id'])._get_data(),
++                'new_value': record['new_value'],
++                'old_value': record['old_value']
++            })
++        return milestones
++
++class ProjectMilestone(models.Model):
++    _name = 'project.milestone'
++    _description = "Project Milestone"
++    _inherit = ['mail.thread']
++
++    def _get_default_project_id(self):
++        return self.env.context.get('default_project_id') or self.env.context.get('active_id')
++
++    name = fields.Char(required=True)
++    is_done = fields.Boolean(default=False)
++    date_deadline = fields.Date(tracking=True)
++    is_deadline_exceeded = fields.Boolean(compute="_compute_is_deadline_exceeded")
++    # we use a field but it may be done using the tracking...
++    reached_date = fields.Date(compute='_compute_reached_date', store=True)
++    is_date_deadline_future = fields.Boolean(compute="_compute_is_deadline_future")
++
++    project_id = fields.Many2one('project.project', required=True, default=_get_default_project_id)
++
++    @api.depends('is_done', 'date_deadline')
++    def _compute_is_deadline_exceeded(self):
++        today = fields.Date.context_today(self)
++        for ms in self:
++            ms.is_deadline_exceeded = not ms.is_done and ms.date_deadline and ms.date_deadline < today
++
++    @api.depends('is_done')
++    def _compute_reached_date(self):
++        for ms in self:
++            if ms.is_done:
++                ms.reached_date = fields.Date.context_today(self)
++
++    @api.depends('date_deadline')
++    def _compute_is_deadline_future(self):
++        for ms in self:
++            ms.is_date_deadline_future = ms.date_deadline and ms.date_deadline > fields.Date.context_today(self)
++
++    def mark_as_done(self, vals):
++        self.write(vals)
++        return self._get_data()
++
++    @api.model
++    def _get_fields_to_export(self):
++        return ['id', 'name', 'is_done', 'date_deadline', 'is_deadline_exceeded', 'reached_date', 'is_date_deadline_future']
++
++    def _get_data(self):
++        self.ensure_one()
++        return {field: self[field] for field in self._get_fields_to_export()}
++
++    def _get_data_list(self):
++        return [ms._get_data() for ms in self]
+diff --git a/addons/project/security/ir.model.access.csv b/addons/project/security/ir.model.access.csv
+index 8283f45170866..de8b04a337de1 100644
+--- a/addons/project/security/ir.model.access.csv
++++ b/addons/project/security/ir.model.access.csv
+@@ -26,3 +26,15 @@ access_project_delete_wizard,access_project_delete_wizard,model_project_delete_w
+ access_project_task_type_delete_wizard,project.task.type.delete.wizard,model_project_task_type_delete_wizard,project.group_project_manager,1,1,1,1
+ access_project_task_recurrence,project.task.recurrence,model_project_task_recurrence,project.group_project_user,1,1,1,1
+ project.access_project_task_burndown_chart_report,access_project_task_burndown_chart_report,project.model_project_task_burndown_chart_report,project.group_project_manager,1,1,1,1
++access_project_update_user,project.update.user,model_project_update,base.group_user,1,0,0,0
++access_project_update_portal,project.update.portal,model_project_update,base.group_portal,1,0,0,0
++access_project_update_project_user,project.update.project.user,model_project_update,project.group_project_user,1,1,1,0
++access_project_update_project_manager,project.update.project.manager,model_project_update,project.group_project_manager,1,1,1,1
++access_project_update_status_user,project.update.status.user,model_project_update_status,base.group_user,1,0,0,0
++access_project_update_status_portal,project.update.status.portal,model_project_update_status,base.group_portal,1,0,0,0
++access_project_update_status_project_user,project.update.status.project.user,model_project_update_status,project.group_project_user,1,0,0,0
++access_project_update_status_project_manager,project.update.status.project.manager,model_project_update_status,project.group_project_manager,1,1,1,1
++access_project_milestone_user,project.milestone.user,model_project_milestone,base.group_user,1,0,0,0
++access_project_milestone_portal,project.milestone.portal,model_project_milestone,base.group_portal,1,0,0,0
++access_project_milestone_project_user,project.milestone.project.user,model_project_milestone,project.group_project_user,1,0,0,0
++access_project_milestone_project_manager,project.milestone.project.manager,model_project_milestone,project.group_project_manager,1,1,1,1
+diff --git a/addons/project/security/project_security.xml b/addons/project/security/project_security.xml
+index 17bd279422c3b..d602b1f62c87f 100644
+--- a/addons/project/security/project_security.xml
++++ b/addons/project/security/project_security.xml
+@@ -129,5 +129,46 @@
+         <field name="groups" eval="[(4, ref('base.group_portal'))]"/>
+     </record>
+ 
++    <record model="ir.rule" id="update_comp_rule">
++        <field name="name">Project/Updates: multi-company</field>
++        <field name="model_id" ref="model_project_update"/>
++        <field name="domain_force">[('project_id.company_id', 'in', company_ids)]</field>
++    </record>
++
++    <record model="ir.rule" id="update_visibility_rule">
++        <field name="name">Project/Update: employees: follow required for follower-only projects</field>
++        <field name="model_id" ref="model_project_update"/>
++        <field name="domain_force">[
++        '|',
++            ('project_id.privacy_visibility', '!=', 'followers'),
++            '|',
++                ('project_id.message_partner_ids', 'in', [user.partner_id.id]),
++                '|',
++                    ('user_id', '=', user.id),
++                    ('project_id.user_id', '=', user.id)
++        ]</field>
++        <field name="perm_read" eval="1"/>
++        <field name="perm_write" eval="0"/>
++        <field name="perm_create" eval="0"/>
++        <field name="perm_unlink" eval="0"/>
++        <field name="groups" eval="[(4,ref('base.group_user'))]"/>
++    </record>
++
++    <record id="update_visibility_project_user" model="ir.rule">
++        <field name="name">Project updates : Project user can only write and create updates where they are project owners</field>
++        <field name="model_id" ref="project.model_project_update"/>
++        <field name="domain_force">[
++            ('project_id.user_id', '=', user.id)
++        ]</field>
++        <field name="groups" eval="[(4,ref('project.group_project_user'))]"/>
++    </record>
++
++    <record id="update_visibility_project_admin" model="ir.rule">
++        <field name="name">Project updates : Project user can see all project updates</field>
++        <field name="model_id" ref="project.model_project_update"/>
++        <field name="domain_force">[(1, '=', 1)]</field>
++        <field name="groups" eval="[(4,ref('project.group_project_manager'))]"/>
++    </record>
++
+ </data>
+ </odoo>
+diff --git a/addons/project/static/src/js/widgets/status_with_color_widget.js b/addons/project/static/src/js/widgets/status_with_color_widget.js
+new file mode 100644
+index 0000000000000..c2b0d9b158b3a
+--- /dev/null
++++ b/addons/project/static/src/js/widgets/status_with_color_widget.js
+@@ -0,0 +1,32 @@
++/** @odoo-module **/
++
++import { qweb } from 'web.core';
++import fieldRegistry from 'web.field_registry';
++import { FieldMany2One } from 'web.relational_fields';
++
++/**
++ * options :
++ * `color_field` : The field that must be use to color the bubble. It must be in the view. (from 0 to 11). Default : grey.
++ */
++export const StatusWithColor = FieldMany2One.extend({
++    _template: 'project.statusWithColor',
++
++    init: function () {
++        this._super.apply(this, arguments);
++        this.color = this.recordData[this.nodeOptions.color_field];
++    },
++
++    /**
++     * @override
++     */
++    _renderReadonly() {
++        this._super.apply(this, arguments);
++        if (this.value) {
++            this.$el.prepend(qweb.render(this._template, {
++                color: this.color,
++            }));
++        }
++    },
++});
++
++fieldRegistry.add('status_with_color', StatusWithColor);
+diff --git a/addons/project/static/src/scss/project_widgets.scss b/addons/project/static/src/scss/project_widgets.scss
+new file mode 100644
+index 0000000000000..b92426797eb77
+--- /dev/null
++++ b/addons/project/static/src/scss/project_widgets.scss
+@@ -0,0 +1,16 @@
++@mixin o-background-color {
++    @for $size from 2 through length($o-colors) {
++        // Note: the first color is supposed to be invisible so it's ignored
++        &.o_color_bubble_#{$size - 1} {
++            background-color: nth($o-colors, $size);
++        }
++    }
++}
++
++.o_status_bubble {
++    @extend .o_status;
++    margin-right: 0.5rem;
++    border-radius: 50%;
++    @include o-background-color;
++}
++
+diff --git a/addons/project/static/src/xml/project_templates.xml b/addons/project/static/src/xml/project_templates.xml
+index f30d8c95a0eaa..f5f863b3c80de 100644
+--- a/addons/project/static/src/xml/project_templates.xml
++++ b/addons/project/static/src/xml/project_templates.xml
+@@ -14,4 +14,6 @@
+             </tbody>
+         </table>
+     </t>
++    <span t-name="project.statusWithColor" t-att-class="'o_status_bubble o_color_bubble_' + (color)"></span>
++
+ </templates>
+diff --git a/addons/project/views/project_update_templates.xml b/addons/project/views/project_update_templates.xml
+new file mode 100644
+index 0000000000000..f3e2b281f5b5d
+--- /dev/null
++++ b/addons/project/views/project_update_templates.xml
+@@ -0,0 +1,85 @@
++<?xml version="1.0"?>
++<odoo>
++    <!-- Should be in data rather than views ? -->
++    <template id="project_update_default_description" name="Project Update Description">
++        <div name="tasks">
++            <h1>Tasks</h1>
++
++            <a t-att-href="tasks['action']"><t t-esc="tasks['open_tasks']"/> tasks are open</a>, out of <t t-esc="tasks['total_tasks']"/>.
++            In the last 30 days,
++            <ul>
++                <li><t t-esc="tasks['created_tasks']"/> were created</li>
++                <li><t t-esc="tasks['closed_tasks']"/> were closed (folded stage)</li>
++            </ul>
++        </div>
++
++        <hr t-if="milestones['show_section']"/>
++
++        <div name="milestone">
++            <t t-if="milestones['show_section']">
++                <h1>Milestone</h1>
++
++                <ul class="fa-ul" t-if="milestones['list']">
++                    <t t-foreach="milestones['list']" t-as="milestone" t-key="milestone['id']">
++                        <t t-set="iconClass" t-value="milestone['is_done'] and 'fa-check-square' or 'fa-square-o'"/>
++                        <li><span class="fa-li"><i t-att-class="'fa ' + iconClass"></i></span>
++                            <t t-esc="milestone['name']"/>
++                            <span t-if="milestone['is_date_deadline_future']">
++                                <font style="color: rgb(190, 190, 190);">
++                                    (due on <t t-esc="milestone['date_deadline']"/><t t-if="not milestone['is_done'] or not milestone['reached_date']">)</t>
++                                    <t t-else="">
++                                        - reached on <t t-esc="milestone['reached_date']"/>)
++                                    </t>
++                                </font>
++                            </span>
++                            <span t-else="">
++                                (due on <t t-esc="milestone['date_deadline']"/><t t-if="not milestone['is_done'] or not milestone['reached_date']">)</t>
++                                <t t-else="">
++                                    - reached on <t t-esc="milestone['reached_date']"/>)
++                                </t>
++                            </span>
++                        </li>
++                    </t>
++                </ul>
++
++                <t t-if="milestones['updated']">
++                    Over the last 30 days, the deadline of the following milestones have been updated:
++                    <ul>
++                        <t t-foreach="milestones['updated']" t-as="milestone" t-key="milestone['id']">
++                            <li>
++                                <t t-esc="milestone['name']"/>
++                                (<t t-esc="milestone['old_value']"/> => <t t-esc="milestone['new_value']"/>)
++                            </li>
++                        </t>
++                    </ul>
++                </t>
++
++                <t t-if="milestones['updated']">
++                    The following milestones have been added:
++                    <ul>
++                        <t t-foreach="milestones['created']" t-as="milestone" t-key="milestone['id']">
++                            <li>
++                                <t t-esc="milestone['name']"/>
++                                <span t-if="milestone['is_date_deadline_future']">
++                                    <font style="color: rgb(190, 190, 190);">
++                                        (due on <t t-esc="milestone['date_deadline']"/><t t-if="not milestone['is_done'] or not milestone['reached_date']">)</t>
++                                        <t t-else="">
++                                            - reached on <t t-esc="milestone['reached_date']"/>)
++                                        </t>
++                                    </font>
++                                </span>
++                                <span t-else="">
++                                    (due on <t t-esc="milestone['date_deadline']"/><t t-if="not milestone['is_done'] or not milestone['reached_date']">)</t>
++                                    <t t-else="">
++                                        - reached on <t t-esc="milestone['reached_date']"/>)
++                                    </t>
++                                </span>
++                            </li>
++                        </t>
++                    </ul>
++                </t>
++            </t>
++        </div>
++    </template>
++
++</odoo>
+diff --git a/addons/project/views/project_update_views.xml b/addons/project/views/project_update_views.xml
+new file mode 100644
+index 0000000000000..7af7808da073f
+--- /dev/null
++++ b/addons/project/views/project_update_views.xml
+@@ -0,0 +1,76 @@
++<?xml version="1.0" encoding="utf-8"?>
++<odoo>
++    <record id="project_update_view_form" model="ir.ui.view">
++        <field name="name">project.update.view.form</field>
++        <field name="model">project.update</field>
++        <field name="arch" type="xml">
++            <form string="Project Update" create="0">
++                <sheet>
++                    <div class="oe_title">
++                        <h1>
++                            <field name="name" class="o_text_overflow" placeholder="Title of the Update"/>
++                        </h1>
++                    </div>
++                    <group>
++                        <group>
++                            <field name="project_id" invisible="1"/>
++                            <field name="color" invisible="1"/>
++                            <field name="user_id" readonly="1"/>
++                            <field name="status_id" widget="status_with_color" domain="[('project_ids','=', project_id)]"
++                                   context="{'default_project_id': project_id}" options="{'no_open': 1, 'no_create': 1, 'color_field': 'color'}"/>
++                            <field name="progress" widget="progressbar" options="{'current_value': 'progress', 'max_value': '100', 'editable': true}"/>
++                        </group>
++                        <group>
++                            <field name="date"/>
++                        </group>
++                    </group>
++                    <separator class="form-divider-h"/>
++                    <field name="description"/>
++                </sheet>
++                <div class="oe_chatter">
++                    <field name="message_follower_ids" options="{'post_refresh':True}" groups="base.group_user"/>
++                    <field name="activity_ids"/>
++                    <field name="message_ids"/>
++                </div>
++            </form>
++        </field>
++    </record>
++
++    <record id="project_milestone_view_form" model="ir.ui.view">
++        <field name="name">project.milestone.view.form</field>
++        <field name="model">project.milestone</field>
++        <field name="arch" type="xml">
++            <form>
++                <sheet>
++                    <group>
++                        <group>
++                            <field name="project_id" invisible="1"/>
++                            <field name="is_done"/>
++                            <field name="name"/>
++                            <field name="date_deadline"/>
++                        </group>
++                    </group>
++                </sheet>
++            </form>
++        </field>
++    </record>
++
++    <record id="project_milestone_view_tree" model="ir.ui.view">
++        <field name="name">project.milestone.view.tree</field>
++        <field name="model">project.milestone</field>
++        <field name="arch" type="xml">
++            <tree>
++                <field name="is_done"/>
++                <field name="name"/>
++                <field name="date_deadline"/>
++            </tree>
++        </field>
++    </record>
++
++    <record id="project_milestone_all" model="ir.actions.act_window">
++        <field name="name">Project Milestone</field>
++        <field name="res_model">project.milestone</field>
++        <field name="view_mode">tree,form</field>
++        <field name="context">{'default_project_id': active_id}</field>
++    </record>
++</odoo>
+diff --git a/addons/project/views/project_views.xml b/addons/project/views/project_views.xml
+index 136f60d62713f..3c00f62b2c487 100644
+--- a/addons/project/views/project_views.xml
++++ b/addons/project/views/project_views.xml
+@@ -259,6 +259,16 @@
+                                 Burndown Chart
+                             </span>
+                         </button>
++                        <button class="oe_stat_button" name="%(project.project_milestone_all)d" type="action" icon="fa-check-square-o">
++                            <div class="o_field_widget o_stat_info">
++                                <span class="o_stat_value">
++                                    <field name="milestone_count" nolabel="1"/>
++                                </span>
++                                <span class="o_stat_text">
++                                    Milestones
++                                </span>
++                            </div>
++                        </button>
+                     </div>
+                     <widget name="web_ribbon" title="Archived" bg_color="bg-danger" attrs="{'invisible': [('active', '=', True)]}"/>
+                     <div class="oe_title">
+@@ -417,6 +427,8 @@
+                     <field name="privacy_visibility" optional="hide"/>
+                     <field name="label_tasks" optional="hide"/>
+                     <field name="company_id" optional="show"  groups="base.group_multi_company"/>
++                    <field name="last_update_color" invisible="1"/>
++                    <field name="last_update_status_id" string="Last Update" optional="show" widget="status_with_color" options="{'no_open': 1, 'color_field': 'last_update_color'}"/>
+                 </tree>
+             </field>
+         </record>

@@ -1,0 +1,216 @@
+diff --git a/OpenRA.Game/Graphics/WorldRenderer.cs b/OpenRA.Game/Graphics/WorldRenderer.cs
+index e7e476625184..e4dabc15f525 100644
+--- a/OpenRA.Game/Graphics/WorldRenderer.cs
++++ b/OpenRA.Game/Graphics/WorldRenderer.cs
+@@ -43,6 +43,8 @@ public sealed class WorldRenderer : IDisposable
+ 		readonly List<IFinalizedRenderable> preparedOverlayRenderables = new List<IFinalizedRenderable>();
+ 		readonly List<IFinalizedRenderable> preparedAnnotationRenderables = new List<IFinalizedRenderable>();
+ 
++		readonly List<IRenderable> renderablesBuffer = new List<IRenderable>();
++
+ 		bool lastDepthPreviewEnabled;
+ 
+ 		internal WorldRenderer(ModData modData, World world)
+@@ -107,78 +109,123 @@ public void ReplacePalette(string name, IPalette pal)
+ 				palettes[name].Palette = pal;
+ 		}
+ 
+-		IEnumerable<IFinalizedRenderable> GenerateRenderables()
++		// PERF: Avoid LINQ.
++		void GenerateRenderables()
+ 		{
+-			var actors = onScreenActors.Append(World.WorldActor);
++			foreach (var actor in onScreenActors)
++				foreach (var renderable in actor.Render(this))
++					renderablesBuffer.Add(renderable);
++
++			foreach (var renderable in World.WorldActor.Render(this))
++				renderablesBuffer.Add(renderable);
++
+ 			if (World.RenderPlayer != null)
+-				actors = actors.Append(World.RenderPlayer.PlayerActor);
++				foreach (var renderable in World.RenderPlayer.PlayerActor.Render(this))
++					renderablesBuffer.Add(renderable);
+ 
+-			var worldRenderables = actors.SelectMany(a => a.Render(this));
+ 			if (World.OrderGenerator != null)
+-				worldRenderables = worldRenderables.Concat(World.OrderGenerator.Render(this, World));
++				foreach (var renderable in World.OrderGenerator.Render(this, World))
++					renderablesBuffer.Add(renderable);
+ 
+ 			// Unpartitioned effects
+-			worldRenderables = worldRenderables.Concat(World.UnpartitionedEffects.SelectMany(e => e.Render(this)));
++			foreach (var e in World.UnpartitionedEffects)
++				foreach (var renderable in e.Render(this))
++					renderablesBuffer.Add(renderable);
+ 
+ 			// Partitioned, currently on-screen effects
+-			var effectRenderables = World.ScreenMap.RenderableEffectsInBox(Viewport.TopLeft, Viewport.BottomRight);
+-			worldRenderables = worldRenderables.Concat(effectRenderables.SelectMany(e => e.Render(this)));
++			foreach (var e in World.ScreenMap.RenderableEffectsInBox(Viewport.TopLeft, Viewport.BottomRight))
++				foreach (var renderable in e.Render(this))
++					renderablesBuffer.Add(renderable);
+ 
+-			worldRenderables = worldRenderables.OrderBy(RenderableScreenZPositionComparisonKey);
++			foreach (var renderable in renderablesBuffer.OrderBy(RenderableScreenZPositionComparisonKey))
++				preparedRenderables.Add(renderable.PrepareRender(this));
+ 
+-			return worldRenderables.Select(r => r.PrepareRender(this));
++			// PERF: Reuse collection to avoid allocations.
++			renderablesBuffer.Clear();
+ 		}
+ 
+-		IEnumerable<IFinalizedRenderable> GenerateOverlayRenderables()
++		// PERF: Avoid LINQ.
++		void GenerateOverlayRenderables()
+ 		{
+-			var actors = World.ActorsWithTrait<IRenderAboveShroud>()
+-				.Where(a => a.Actor.IsInWorld && !a.Actor.Disposed && (!a.Trait.SpatiallyPartitionable || onScreenActors.Contains(a.Actor)))
+-					.SelectMany(a => a.Trait.RenderAboveShroud(a.Actor, this));
++			foreach (var a in World.ActorsWithTrait<IRenderAboveShroud>())
++			{
++				if ((!a.Actor.IsInWorld || a.Actor.Disposed) && a.Trait.SpatiallyPartitionable && !onScreenActors.Contains(a.Actor))
++					continue;
+ 
+-			var selected = World.Selection.Actors.Where(a => a.IsInWorld && !a.Disposed)
+-				.SelectMany(a => a.TraitsImplementing<IRenderAboveShroudWhenSelected>()
+-					.Where(t => !t.SpatiallyPartitionable || onScreenActors.Contains(a))
+-					.SelectMany(t => t.RenderAboveShroud(a, this)));
++				foreach (var renderable in a.Trait.RenderAboveShroud(a.Actor, this))
++					preparedOverlayRenderables.Add(renderable.PrepareRender(this));
++			}
+ 
+-			var effects = World.Effects.Select(e => e as IEffectAboveShroud)
+-				.Where(e => e != null)
+-				.SelectMany(e => e.RenderAboveShroud(this));
++			foreach (var a in World.Selection.Actors)
++			{
++				if (!a.IsInWorld || a.Disposed)
++					continue;
+ 
+-			var orderGenerator = SpriteRenderable.None;
+-			if (World.OrderGenerator != null)
+-				orderGenerator = World.OrderGenerator.RenderAboveShroud(this, World);
++				foreach (var t in a.TraitsImplementing<IRenderAboveShroudWhenSelected>())
++				{
++					if (t.SpatiallyPartitionable && !onScreenActors.Contains(a))
++						continue;
++
++					foreach (var renderable in t.RenderAboveShroud(a, this))
++						preparedOverlayRenderables.Add(renderable.PrepareRender(this));
++				}
++			}
++
++			foreach (var e in World.Effects)
++			{
++				var ea = e as IEffectAboveShroud;
++				if (ea == null)
++					continue;
++
++				foreach (var renderable in ea.RenderAboveShroud(this))
++					preparedOverlayRenderables.Add(renderable.PrepareRender(this));
++			}
+ 
+-			return actors
+-				.Concat(selected)
+-				.Concat(effects)
+-				.Concat(orderGenerator)
+-				.Select(r => r.PrepareRender(this));
++			if (World.OrderGenerator != null)
++				foreach (var renderable in World.OrderGenerator.RenderAboveShroud(this, World))
++					preparedOverlayRenderables.Add(renderable.PrepareRender(this));
+ 		}
+ 
+-		IEnumerable<IFinalizedRenderable> GenerateAnnotationRenderables()
++		// PERF: Avoid LINQ.
++		void GenerateAnnotationRenderables()
+ 		{
+-			var actors = World.ActorsWithTrait<IRenderAnnotations>()
+-				.Where(a => a.Actor.IsInWorld && !a.Actor.Disposed && (!a.Trait.SpatiallyPartitionable || onScreenActors.Contains(a.Actor)))
+-				.SelectMany(a => a.Trait.RenderAnnotations(a.Actor, this));
++			foreach (var a in World.ActorsWithTrait<IRenderAnnotations>())
++			{
++				if ((!a.Actor.IsInWorld || a.Actor.Disposed) && a.Trait.SpatiallyPartitionable && !onScreenActors.Contains(a.Actor))
++					continue;
++
++				foreach (var renderAnnotation in a.Trait.RenderAnnotations(a.Actor, this))
++					preparedAnnotationRenderables.Add(renderAnnotation.PrepareRender(this));
++			}
+ 
+-			var selected = World.Selection.Actors.Where(a => a.IsInWorld && !a.Disposed)
+-				.SelectMany(a => a.TraitsImplementing<IRenderAnnotationsWhenSelected>()
+-					.Where(t => !t.SpatiallyPartitionable || onScreenActors.Contains(a))
+-					.SelectMany(t => t.RenderAnnotations(a, this)));
++			foreach (var a in World.Selection.Actors)
++			{
++				if (!a.IsInWorld || a.Disposed)
++					continue;
+ 
+-			var effects = World.Effects.Select(e => e as IEffectAnnotation)
+-				.Where(e => e != null)
+-				.SelectMany(e => e.RenderAnnotation(this));
++				foreach (var t in a.TraitsImplementing<IRenderAnnotationsWhenSelected>())
++				{
++					if (t.SpatiallyPartitionable && !onScreenActors.Contains(a))
++						continue;
+ 
+-			var orderGenerator = SpriteRenderable.None;
+-			if (World.OrderGenerator != null)
+-				orderGenerator = World.OrderGenerator.RenderAnnotations(this, World);
++					foreach (var renderAnnotation in t.RenderAnnotations(a, this))
++						preparedAnnotationRenderables.Add(renderAnnotation.PrepareRender(this));
++				}
++			}
++
++			foreach (var e in World.Effects)
++			{
++				var ea = e as IEffectAnnotation;
++				if (ea == null)
++					continue;
++
++				foreach (var renderAnnotation in ea.RenderAnnotation(this))
++					preparedAnnotationRenderables.Add(renderAnnotation.PrepareRender(this));
++			}
+ 
+-			return actors
+-				.Concat(selected)
+-				.Concat(effects)
+-				.Concat(orderGenerator)
+-				.Select(r => r.PrepareRender(this));
++			if (World.OrderGenerator != null)
++				foreach (var renderAnnotation in World.OrderGenerator.RenderAnnotations(this, World))
++					preparedAnnotationRenderables.Add(renderAnnotation.PrepareRender(this));
+ 		}
+ 
+ 		public void PrepareRenderables()
+@@ -190,9 +237,11 @@ public void PrepareRenderables()
+ 
+ 			// PERF: Reuse collection to avoid allocations.
+ 			onScreenActors.UnionWith(World.ScreenMap.RenderableActorsInBox(Viewport.TopLeft, Viewport.BottomRight));
+-			preparedRenderables.AddRange(GenerateRenderables());
+-			preparedOverlayRenderables.AddRange(GenerateOverlayRenderables());
+-			preparedAnnotationRenderables.AddRange(GenerateAnnotationRenderables());
++
++			GenerateRenderables();
++			GenerateOverlayRenderables();
++			GenerateAnnotationRenderables();
++
+ 			onScreenActors.Clear();
+ 		}
+ 
+@@ -279,9 +328,12 @@ public void DrawAnnotations()
+ 
+ 				foreach (var b in World.ScreenMap.MouseBounds(World.RenderPlayer))
+ 				{
+-					var points = b.Vertices
+-						.Select(p => Viewport.WorldToViewPx(p).ToFloat2())
+-						.ToArray();
++					var points = new float2[b.Vertices.Length];
++					for (var index = 0; index < b.Vertices.Length; index++)
++					{
++						var vertex = b.Vertices[index];
++						points[index] = Viewport.WorldToViewPx(vertex).ToFloat2();
++					}
+ 
+ 					Game.Renderer.RgbaColorRenderer.DrawPolygon(points, 1, Color.OrangeRed);
+ 				}

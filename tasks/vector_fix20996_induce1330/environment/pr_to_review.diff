@@ -1,0 +1,260 @@
+commit 0075ea61060bb57701c821eb835071f303d31d51
+Author: Kruno Tomola Fabro <krunotf@gmail.com>
+Date:   Mon Feb 10 23:37:31 2020 +0100
+
+    enhancement(config): Option to reload config on file change (#1330)
+    
+    Signed-off-by: Kruno Tomola Fabro <krunotf@gmail.com>
+    Co-Authored-By: Ana Hobden <operator@hoverbear.org>
+    Signed-off-by: binarylogic <bjohnson@binarylogic.com>
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 3574c13977..67f93042bc 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -141,9 +141,11 @@ colored = "1.9"
+ warp = "0.1.20"
+ evmap = { version = "7", features = ["bytes"] }
+ logfmt = "0.0.2"
++notify = "4.0.14"
+ 
+ [target.'cfg(unix)'.dependencies]
+ atty = "0.2"
++nix = "0.16.1"
+ 
+ [build-dependencies]
+ prost-build = "0.5.0"
+diff --git a/config/kubernetes/vector-daemonset.yaml b/config/kubernetes/vector-daemonset.yaml
+index 2b452989dc..f97d0edeb5 100644
+--- a/config/kubernetes/vector-daemonset.yaml
++++ b/config/kubernetes/vector-daemonset.yaml
+@@ -71,6 +71,7 @@ spec:
+       - name: vector
+         image: timberio/vector:latest-alpine
+         imagePullPolicy: Always
++        args: ["-w"]
+         volumeMounts:
+         - name: var-log
+           mountPath: /var/log/
+diff --git a/src/main.rs b/src/main.rs
+index ee0d3f112b..0c2c9316db 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -72,6 +72,10 @@ struct RootOpts {
+     /// Options: `auto`, `always` or `never`
+     #[structopt(long)]
+     color: Option<Color>,
++
++    /// Watch for changes in configuration file, and reload accordingly.
++    #[structopt(short, long)]
++    watch_config: bool,
+ }
+ 
+ #[derive(StructOpt, Debug)]
+@@ -240,6 +244,18 @@ fn main() {
+     config_paths.sort();
+     config_paths.dedup();
+ 
++    if opts.watch_config {
++        // Start listening for config changes immediately.
++        vector::topology::config::watcher::config_watcher(
++            config_paths.clone(),
++            vector::topology::config::watcher::CONFIG_WATCH_DELAY,
++        )
++        .unwrap_or_else(|error| {
++            error!(message = "Unable to start config watcher.", %error);
++            std::process::exit(exitcode::CONFIG);
++        });
++    }
++
+     info!(
+         message = "Loading configs.",
+         path = ?config_paths
+diff --git a/src/topology/config/mod.rs b/src/topology/config/mod.rs
+index 73053d6a69..a16169eb8b 100644
+--- a/src/topology/config/mod.rs
++++ b/src/topology/config/mod.rs
+@@ -17,6 +17,7 @@ use std::{collections::HashMap, path::PathBuf};
+ pub mod component;
+ mod validation;
+ mod vars;
++pub mod watcher;
+ 
+ #[derive(Deserialize, Serialize, Debug)]
+ #[serde(deny_unknown_fields)]
+diff --git a/src/topology/config/watcher.rs b/src/topology/config/watcher.rs
+new file mode 100644
+index 0000000000..738d6e1bd9
+--- /dev/null
++++ b/src/topology/config/watcher.rs
+@@ -0,0 +1,135 @@
++use crate::Error;
++use notify::{raw_watcher, Op, RawEvent, RecommendedWatcher, RecursiveMode, Watcher};
++use std::{
++    path::PathBuf,
++    sync::mpsc::{channel, Receiver},
++    thread,
++    time::Duration,
++};
++
++/// Per notify own documentation, it's advised to have delay of more than 30 sec,
++/// so to avoid receiving repetitions of previous events on macOS.
++///
++/// But, config and topology reload logic can handle:
++///  - Invalid config, caused either by user or by data race.
++///  - Frequent changes, caused by user/editor modifying/saving file in small chunks.
++/// so we can use smaller, more responsive delay.
++pub const CONFIG_WATCH_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
++
++const RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
++
++/// Triggers SIGHUP when file on config_path changes.
++/// Accumulates file changes until no change for given duration has occured.
++/// Has best effort guarante of detecting all file changes from the end of
++/// this function until the main thread stops.
++#[cfg(unix)]
++pub fn config_watcher(config_paths: Vec<PathBuf>, delay: Duration) -> Result<(), Error> {
++    // Create watcher now so not to miss any changes happening between
++    // returning from this function and the thread starting.
++    let mut watcher = Some(create_watcher(&config_paths)?);
++
++    info!("Watching configuration files.");
++
++    thread::spawn(move || loop {
++        if let Some((_, receiver)) = watcher.take() {
++            while let Ok(RawEvent { op: Ok(event), .. }) = receiver.recv() {
++                if event.intersects(Op::CREATE | Op::REMOVE | Op::WRITE | Op::CLOSE_WRITE) {
++                    debug!(message = "Configuration file change detected.", ?event);
++
++                    // Consume events until delay amount of time has passed since the latest event.
++                    while let Ok(..) = receiver.recv_timeout(delay) {}
++
++                    info!("Configuration file changed.");
++                    raise_sighup();
++                } else {
++                    debug!(message = "Ignoring event.", ?event)
++                }
++            }
++        }
++
++        thread::sleep(RETRY_TIMEOUT);
++
++        watcher = create_watcher(&config_paths)
++            .map_err(|error| error!(message = "Failed to create file watcher.", ?error))
++            .ok();
++
++        if watcher.is_some() {
++            // Config files could have changed while we weren't watching,
++            // so for a good measure raise SIGHUP and let reload logic
++            // determine if anything changed.
++            info!("Speculating that configuration files have changed.");
++            raise_sighup();
++        }
++    });
++
++    Ok(())
++}
++
++#[cfg(windows)]
++/// Errors on Windows.
++pub fn config_watcher(_config_paths: Vec<PathBuf>, _delay: Duration) -> Result<(), Error> {
++    Err("Reloading config on Windows isn't currently supported. Related issue https://github.com/timberio/vector/issues/938 .".into())
++}
++
++#[cfg(unix)]
++fn raise_sighup() {
++    use nix::sys::signal;
++    let _ = signal::raise(signal::Signal::SIGHUP).map_err(|error| {
++        error!(message = "Unable to reload configuration file. Restart Vector to reload it.", cause = ?error)
++    });
++}
++
++fn create_watcher(
++    config_paths: &Vec<PathBuf>,
++) -> Result<(RecommendedWatcher, Receiver<RawEvent>), Error> {
++    info!("Creating configuration file watcher.");
++    let (sender, receiver) = channel();
++    let mut watcher = raw_watcher(sender)?;
++    for path in config_paths {
++        watcher.watch(path, RecursiveMode::NonRecursive)?;
++    }
++    Ok((watcher, receiver))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::test_util::{runtime, temp_file};
++    use futures::future;
++    use futures::{Future, Stream};
++    use std::time::{Duration, Instant};
++    use std::{fs::File, io::Write};
++    use tokio::timer::Delay;
++    use tokio_signal::unix::{Signal, SIGHUP};
++
++    #[cfg(unix)]
++    #[test]
++    fn file_update() {
++        crate::test_util::trace_init();
++        let delay = Duration::from_secs(1);
++        let file_path = temp_file();
++        let mut file = File::create(&file_path).unwrap();
++
++        let _ = config_watcher(vec![file_path], delay).unwrap();
++
++        file.write_all(&[0]).unwrap();
++        std::mem::drop(file);
++
++        let mut rt = runtime();
++
++        let signal = Signal::new(SIGHUP).flatten_stream();
++        let result = rt
++            .block_on(
++                signal
++                    .into_future()
++                    .select2(Delay::new(Instant::now() + delay * 5)),
++            )
++            .ok()
++            .unwrap();
++
++        match result {
++            future::Either::A(_) => (), //OK
++            future::Either::B(_) => panic!("Test timed out"),
++        }
++    }
++}
+diff --git a/website/docs/administration/process-management.md b/website/docs/administration/process-management.md
+index 8662407744..f08253cebf 100644
+--- a/website/docs/administration/process-management.md
++++ b/website/docs/administration/process-management.md
+@@ -103,6 +103,7 @@ test
+ | `-t, --threads` | Limits the number of internal threads Vector can spawn. See the [Limiting Resources][docs.roles.agent#limiting-resources] in the [Agent role][docs.roles.agent] documentation. |
+ | `-v, --verbose` | Drops the log level to `debug`. |
+ | `-vv` | Drops the log level to `trace`, the lowest level possible. |
++| `-w, --watch-config` | Vector will watch for changes in [configuration file][docs.configuration], and reload accordingly. (Mac/Linux only) |
+ 
+ ### Daemonizing
+ 
+@@ -190,7 +191,7 @@ are:
+ ## Reloading
+ 
+ Vector can be reloaded, on the fly, to recognize any configuration changes by
+-sending the Vector process a `SIGHUP` signal:
++sending the Vector process a `SIGHUP` signal.
+ 
+ <Tabs
+   block={true}
+@@ -245,6 +246,13 @@ ps -ax vector | grep vector
+ </TabItem>
+ </Tabs>
+ 
++### Automatic Reload On Changes
++
++You can automatically reload Vector's configuration file when it changes via
++the `-w` or `--watch-config` flag upon [starting](#starting). This is
++particularly helpful in scenarios where configuration is managed for you, such
++as Kubernetes.
++
+ ### Configuration Errors
+ 
+ When Vector is reloaded it proceeds to read the new configuration file from

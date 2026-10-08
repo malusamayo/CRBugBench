@@ -1,0 +1,447 @@
+diff --git a/packages/grafana-api-clients/src/clients/rtkq/iam/v0alpha1/endpoints.gen.ts b/packages/grafana-api-clients/src/clients/rtkq/iam/v0alpha1/endpoints.gen.ts
+index e65bac8bc6590..c7a58d09187f0 100644
+--- a/packages/grafana-api-clients/src/clients/rtkq/iam/v0alpha1/endpoints.gen.ts
++++ b/packages/grafana-api-clients/src/clients/rtkq/iam/v0alpha1/endpoints.gen.ts
+@@ -175,6 +175,8 @@ const injectedRtkApi = api
+           params: {
+             query: queryArg.query,
+             title: queryArg.title,
++            uid: queryArg.uid,
++            teamId: queryArg.teamId,
+             limit: queryArg.limit,
+             offset: queryArg.offset,
+             page: queryArg.page,
+@@ -916,6 +918,10 @@ export type GetSearchTeamsApiArg = {
+   query?: string;
+   /** exact match on team name. Mutually exclusive with query. */
+   title?: string;
++  /** filter by team UIDs. Mutually exclusive with teamId. */
++  uid?: string[];
++  /** filter by legacy team IDs. Deprecated: use uid instead. Mutually exclusive with uid. */
++  teamId?: number[];
+   /** limit the number of results */
+   limit?: number;
+   /** start the query at the given offset */
+diff --git a/packages/grafana-openapi/src/apis/iam.grafana.app-v0alpha1.json b/packages/grafana-openapi/src/apis/iam.grafana.app-v0alpha1.json
+index 91f1fa6844e36..f064381e69f74 100644
+--- a/packages/grafana-openapi/src/apis/iam.grafana.app-v0alpha1.json
++++ b/packages/grafana-openapi/src/apis/iam.grafana.app-v0alpha1.json
+@@ -896,6 +896,30 @@
+               "type": "string"
+             }
+           },
++          {
++            "name": "uid",
++            "in": "query",
++            "description": "filter by team UIDs. Mutually exclusive with teamId.",
++            "schema": {
++              "type": "array",
++              "items": {
++                "type": "string"
++              }
++            }
++          },
++          {
++            "name": "teamId",
++            "in": "query",
++            "description": "filter by legacy team IDs. Deprecated: use uid instead. Mutually exclusive with uid.",
++            "deprecated": true,
++            "schema": {
++              "type": "array",
++              "items": {
++                "type": "integer",
++                "format": "int64"
++              }
++            }
++          },
+           {
+             "name": "limit",
+             "in": "query",
+diff --git a/pkg/registry/apis/iam/team/legacy_search.go b/pkg/registry/apis/iam/team/legacy_search.go
+index e83b3d9283d21..2ec24000f1755 100644
+--- a/pkg/registry/apis/iam/team/legacy_search.go
++++ b/pkg/registry/apis/iam/team/legacy_search.go
+@@ -16,6 +16,7 @@ import (
+ 	"github.com/grafana/grafana/pkg/registry/apis/iam/legacysort"
+ 	"github.com/grafana/grafana/pkg/services/team"
+ 	teamsortopts "github.com/grafana/grafana/pkg/services/team/sortopts"
++	"github.com/grafana/grafana/pkg/storage/unified/resource"
+ 	res "github.com/grafana/grafana/pkg/storage/unified/resource"
+ 	"github.com/grafana/grafana/pkg/storage/unified/resourcepb"
+ 	"github.com/grafana/grafana/pkg/storage/unified/search/builders"
+@@ -74,12 +75,20 @@ func (c *LegacyTeamSearchClient) Search(ctx context.Context, req *resourcepb.Res
+ 		return nil, err
+ 	}
+ 
++	uids := valuesFromRequirements(req.Options, res.SEARCH_FIELD_NAME)
++	teamIds, err := legacyIDsFromRequirements(req.Options)
++	if err != nil {
++		return nil, err
++	}
++
+ 	query := &team.SearchTeamsQuery{
+ 		SignedInUser: signedInUser,
+ 		Limit:        int(req.Limit),
+ 		Page:         int(req.Page),
+ 		Query:        req.Query,
+ 		Name:         title,
++		UIDs:         uids,
++		TeamIds:      teamIds,
+ 		OrgID:        signedInUser.GetOrgID(),
+ 		SortOpts:     legacysort.ConvertToSortOptions(req.SortBy, teamSortFieldMapping, teamsortopts.SortOptionsByQueryParam),
+ 	}
+@@ -180,3 +189,43 @@ func titleFromRequirements(opts *resourcepb.ListOptions) (string, error) {
+ 	}
+ 	return "", nil
+ }
++
++func valuesFromRequirements(opts *resourcepb.ListOptions, key string) []string {
++	if opts == nil {
++		return nil
++	}
++	for _, r := range opts.Fields {
++		if r != nil && r.Key == key && len(r.Values) > 0 {
++			return r.Values
++		}
++	}
++	return nil
++}
++
++func valuesFromLabels(opts *resourcepb.ListOptions, key string) []string {
++	if opts == nil {
++		return nil
++	}
++	for _, r := range opts.Labels {
++		if r != nil && r.Key == key && len(r.Values) > 0 {
++			return r.Values
++		}
++	}
++	return nil
++}
++
++func legacyIDsFromRequirements(opts *resourcepb.ListOptions) ([]int64, error) {
++	values := valuesFromLabels(opts, resource.SEARCH_FIELD_LEGACY_ID)
++	if len(values) == 0 {
++		return nil, nil
++	}
++	ids := make([]int64, 0, len(values))
++	for _, v := range values {
++		id, err := strconv.ParseInt(v, 10, 64)
++		if err != nil {
++			return nil, fmt.Errorf("invalid legacy team ID %q: %w", v, err)
++		}
++		ids = append(ids, id)
++	}
++	return ids, nil
++}
+diff --git a/pkg/registry/apis/iam/team_search.go b/pkg/registry/apis/iam/team_search.go
+index 897225b96a202..60c9b6b32f6a0 100644
+--- a/pkg/registry/apis/iam/team_search.go
++++ b/pkg/registry/apis/iam/team_search.go
+@@ -37,6 +37,8 @@ import (
+ 	"github.com/grafana/grafana/pkg/util/errhttp"
+ )
+ 
++const maxIDFilterValues = 100
++
+ // accessControlCheck maps a legacy RBAC action name to a K8s-style check.
+ // The RBAC authz server translates Group/Resource/Verb through the mapper
+ // to resolve the underlying RBAC action.
+@@ -119,6 +121,25 @@ func (s *TeamSearchHandler) GetAPIRoutes(defs map[string]common.OpenAPIDefinitio
+ 										Schema:      spec.StringProperty(),
+ 									},
+ 								},
++								{
++									ParameterProps: spec3.ParameterProps{
++										Name:        "uid",
++										In:          "query",
++										Description: "filter by team UIDs. Mutually exclusive with teamId.",
++										Required:    false,
++										Schema:      spec.ArrayProperty(spec.StringProperty()),
++									},
++								},
++								{
++									ParameterProps: spec3.ParameterProps{
++										Name:        "teamId",
++										In:          "query",
++										Description: "filter by legacy team IDs. Deprecated: use uid instead. Mutually exclusive with uid.",
++										Required:    false,
++										Deprecated:  true,
++										Schema:      spec.ArrayProperty(spec.Int64Property()),
++									},
++								},
+ 								{
+ 									ParameterProps: spec3.ParameterProps{
+ 										Name:        "limit",
+@@ -232,6 +253,7 @@ func (s *TeamSearchHandler) GetAPIRoutes(defs map[string]common.OpenAPIDefinitio
+ 	}
+ }
+ 
++// nolint:gocyclo
+ func (s *TeamSearchHandler) DoTeamSearch(w http.ResponseWriter, r *http.Request) {
+ 	ctx, span := s.tracer.Start(r.Context(), "team.search")
+ 	defer span.End()
+@@ -317,9 +339,6 @@ func (s *TeamSearchHandler) DoTeamSearch(w http.ResponseWriter, r *http.Request)
+ 			http.Error(w, "query and title parameters are mutually exclusive", http.StatusBadRequest)
+ 			return
+ 		}
+-		if searchRequest.Options.Fields == nil {
+-			searchRequest.Options.Fields = make([]*resourcepb.Requirement, 0, 1)
+-		}
+ 		searchRequest.Options.Fields = append(searchRequest.Options.Fields, &resourcepb.Requirement{
+ 			Key:      resource.SEARCH_FIELD_TITLE,
+ 			Operator: string(selection.Equals),
+@@ -327,6 +346,38 @@ func (s *TeamSearchHandler) DoTeamSearch(w http.ResponseWriter, r *http.Request)
+ 		})
+ 	}
+ 
++	uids := queryParams["uid"]
++	teamIds := queryParams["teamId"]
++	if len(uids) > 0 && len(teamIds) > 0 {
++		http.Error(w, "uid and teamId parameters are mutually exclusive", http.StatusBadRequest)
++		return
++	}
++	if len(uids) > maxIDFilterValues {
++		http.Error(w, fmt.Sprintf("uid parameter exceeds maximum of %d values", maxIDFilterValues), http.StatusBadRequest)
++		return
++	}
++	if len(teamIds) > maxIDFilterValues {
++		http.Error(w, fmt.Sprintf("teamId parameter exceeds maximum of %d values", maxIDFilterValues), http.StatusBadRequest)
++		return
++	}
++
++	// Team UIDs in the legacy store maps to the name field in the unified store.
++	if len(uids) > 0 {
++		searchRequest.Options.Fields = append(searchRequest.Options.Fields, &resourcepb.Requirement{
++			Key:      resource.SEARCH_FIELD_NAME,
++			Operator: string(selection.In),
++			Values:   uids,
++		})
++	}
++
++	if len(teamIds) > 0 {
++		searchRequest.Options.Labels = append(searchRequest.Options.Labels, &resourcepb.Requirement{
++			Key:      resource.SEARCH_FIELD_LEGACY_ID,
++			Operator: string(selection.In),
++			Values:   teamIds,
++		})
++	}
++
+ 	result, err := s.client.Search(ctx, searchRequest)
+ 	if err != nil {
+ 		errhttp.Write(ctx, err, w)
+diff --git a/pkg/tests/apis/iam/team_search_integration_test.go b/pkg/tests/apis/iam/team_search_integration_test.go
+index 958742a5ad8b3..8bbef66b4b201 100644
+--- a/pkg/tests/apis/iam/team_search_integration_test.go
++++ b/pkg/tests/apis/iam/team_search_integration_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"fmt"
+ 	"net/http"
+ 	"net/url"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/require"
+@@ -42,12 +43,12 @@ func TestIntegrationTeamSearch(t *testing.T) {
+ 					featuremgmt.FlagKubernetesTeamsApi,
+ 				},
+ 			})
+-			doTeamSearchTests(t, helper)
++			doTeamSearchTests(t, helper, mode)
+ 		})
+ 	}
+ }
+ 
+-func doTeamSearchTests(t *testing.T, helper *apis.K8sTestHelper) {
++func doTeamSearchTests(t *testing.T, helper *apis.K8sTestHelper, mode rest.DualWriterMode) {
+ 	ctx := context.Background()
+ 	namespace := helper.Namespacer(helper.Org1.Admin.Identity.GetOrgID())
+ 
+@@ -269,6 +270,152 @@ func doTeamSearchTests(t *testing.T, helper *apis.K8sTestHelper) {
+ 		require.NotNil(t, response)
+ 		require.Equal(t, http.StatusBadRequest, response.Response.StatusCode)
+ 	})
++
++	t.Run("should filter teams by UID", func(t *testing.T) {
++		path := fmt.Sprintf("/apis/iam.grafana.app/v0alpha1/namespaces/%s/searchTeams?uid=%s", namespace, team1.GetName())
++		var result iamv0alpha1.GetSearchTeamsResponse
++
++		response := apis.DoRequest(helper, apis.RequestParams{
++			User:   helper.Org1.Admin,
++			Method: http.MethodGet,
++			Path:   path,
++		}, &result)
++
++		require.NotNil(t, response)
++		require.Equal(t, http.StatusOK, response.Response.StatusCode)
++		require.NotNil(t, response.Result)
++		require.Len(t, result.Hits, 1, "should return exactly 1 hit by UID")
++		require.Equal(t, team1.GetName(), result.Hits[0].Name)
++	})
++
++	t.Run("should filter teams by multiple UIDs", func(t *testing.T) {
++		path := fmt.Sprintf("/apis/iam.grafana.app/v0alpha1/namespaces/%s/searchTeams?uid=%s&uid=%s", namespace, team1.GetName(), team2.GetName())
++		var result iamv0alpha1.GetSearchTeamsResponse
++
++		response := apis.DoRequest(helper, apis.RequestParams{
++			User:   helper.Org1.Admin,
++			Method: http.MethodGet,
++			Path:   path,
++		}, &result)
++
++		require.NotNil(t, response)
++		require.Equal(t, http.StatusOK, response.Response.StatusCode)
++		require.NotNil(t, response.Result)
++		require.Len(t, result.Hits, 2, "should return both teams by UIDs")
++	})
++
++	t.Run("should filter teams by legacy team ID", func(t *testing.T) {
++		if mode == rest.Mode5 {
++			t.Skip("legacy team IDs are not available in unified-only mode")
++		}
++		team1LegacyID := team1.GetLabels()["grafana.app/deprecatedInternalID"]
++		require.NotEmpty(t, team1LegacyID, "team1 should have a legacy ID label")
++
++		path := fmt.Sprintf("/apis/iam.grafana.app/v0alpha1/namespaces/%s/searchTeams?teamId=%s", namespace, team1LegacyID)
++		var result iamv0alpha1.GetSearchTeamsResponse
++
++		response := apis.DoRequest(helper, apis.RequestParams{
++			User:   helper.Org1.Admin,
++			Method: http.MethodGet,
++			Path:   path,
++		}, &result)
++
++		require.NotNil(t, response)
++		require.Equal(t, http.StatusOK, response.Response.StatusCode)
++		require.NotNil(t, response.Result)
++		require.Len(t, result.Hits, 1, "should return exactly 1 hit by legacy ID")
++		require.Equal(t, team1.GetName(), result.Hits[0].Name)
++	})
++
++	t.Run("should filter teams by multiple legacy team IDs", func(t *testing.T) {
++		if mode == rest.Mode5 {
++			t.Skip("legacy team IDs are not available in unified-only mode")
++		}
++		team1LegacyID := team1.GetLabels()["grafana.app/deprecatedInternalID"]
++		require.NotEmpty(t, team1LegacyID, "team1 should have a legacy ID label")
++		team2LegacyID := team2.GetLabels()["grafana.app/deprecatedInternalID"]
++		require.NotEmpty(t, team2LegacyID, "team2 should have a legacy ID label")
++
++		path := fmt.Sprintf("/apis/iam.grafana.app/v0alpha1/namespaces/%s/searchTeams?teamId=%s&teamId=%s", namespace, team1LegacyID, team2LegacyID)
++		var result iamv0alpha1.GetSearchTeamsResponse
++
++		response := apis.DoRequest(helper, apis.RequestParams{
++			User:   helper.Org1.Admin,
++			Method: http.MethodGet,
++			Path:   path,
++		}, &result)
++
++		require.NotNil(t, response)
++		require.Equal(t, http.StatusOK, response.Response.StatusCode)
++		require.NotNil(t, response.Result)
++		require.Len(t, result.Hits, 2, "should return both teams by legacy IDs")
++	})
++
++	t.Run("should return no results for non-existent UID", func(t *testing.T) {
++		path := fmt.Sprintf("/apis/iam.grafana.app/v0alpha1/namespaces/%s/searchTeams?uid=nonexistent-uid", namespace)
++		var result iamv0alpha1.GetSearchTeamsResponse
++
++		response := apis.DoRequest(helper, apis.RequestParams{
++			User:   helper.Org1.Admin,
++			Method: http.MethodGet,
++			Path:   path,
++		}, &result)
++
++		require.NotNil(t, response)
++		require.Equal(t, http.StatusOK, response.Response.StatusCode)
++		require.NotNil(t, response.Result)
++		require.Len(t, result.Hits, 0, "should return 0 hits for non-existent UID")
++	})
++
++	t.Run("should return error when both uid and teamId are provided", func(t *testing.T) {
++		path := fmt.Sprintf("/apis/iam.grafana.app/v0alpha1/namespaces/%s/searchTeams?uid=%s&teamId=1", namespace, team1.GetName())
++		var result iamv0alpha1.GetSearchTeamsResponse
++
++		response := apis.DoRequest(helper, apis.RequestParams{
++			User:   helper.Org1.Admin,
++			Method: http.MethodGet,
++			Path:   path,
++		}, &result)
++
++		require.NotNil(t, response)
++		require.Equal(t, http.StatusBadRequest, response.Response.StatusCode)
++	})
++
++	t.Run("should return error when uid count exceeds maximum", func(t *testing.T) {
++		params := make([]string, 101)
++		for i := range params {
++			params[i] = fmt.Sprintf("uid=uid-%d", i)
++		}
++		path := fmt.Sprintf("/apis/iam.grafana.app/v0alpha1/namespaces/%s/searchTeams?%s", namespace, strings.Join(params, "&"))
++		var result iamv0alpha1.GetSearchTeamsResponse
++
++		response := apis.DoRequest(helper, apis.RequestParams{
++			User:   helper.Org1.Admin,
++			Method: http.MethodGet,
++			Path:   path,
++		}, &result)
++
++		require.NotNil(t, response)
++		require.Equal(t, http.StatusBadRequest, response.Response.StatusCode)
++	})
++
++	t.Run("should return error when teamId count exceeds maximum", func(t *testing.T) {
++		params := make([]string, 101)
++		for i := range params {
++			params[i] = fmt.Sprintf("teamId=%d", i+1)
++		}
++		path := fmt.Sprintf("/apis/iam.grafana.app/v0alpha1/namespaces/%s/searchTeams?%s", namespace, strings.Join(params, "&"))
++		var result iamv0alpha1.GetSearchTeamsResponse
++
++		response := apis.DoRequest(helper, apis.RequestParams{
++			User:   helper.Org1.Admin,
++			Method: http.MethodGet,
++			Path:   path,
++		}, &result)
++
++		require.NotNil(t, response)
++		require.Equal(t, http.StatusBadRequest, response.Response.StatusCode)
++	})
+ }
+ 
+ func TestIntegrationTeamSearch_MemberCount(t *testing.T) {
+diff --git a/pkg/tests/apis/openapi_snapshots/iam.grafana.app-v0alpha1.json b/pkg/tests/apis/openapi_snapshots/iam.grafana.app-v0alpha1.json
+index e1a32a2bb16b5..c2598cbfe40a2 100644
+--- a/pkg/tests/apis/openapi_snapshots/iam.grafana.app-v0alpha1.json
++++ b/pkg/tests/apis/openapi_snapshots/iam.grafana.app-v0alpha1.json
+@@ -968,6 +968,30 @@
+               "type": "string"
+             }
+           },
++          {
++            "name": "uid",
++            "in": "query",
++            "description": "filter by team UIDs. Mutually exclusive with teamId.",
++            "schema": {
++              "type": "array",
++              "items": {
++                "type": "string"
++              }
++            }
++          },
++          {
++            "name": "teamId",
++            "in": "query",
++            "description": "filter by legacy team IDs. Deprecated: use uid instead. Mutually exclusive with uid.",
++            "deprecated": true,
++            "schema": {
++              "type": "array",
++              "items": {
++                "type": "integer",
++                "format": "int64"
++              }
++            }
++          },
+           {
+             "name": "limit",
+             "in": "query",
