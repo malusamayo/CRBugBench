@@ -1,7 +1,7 @@
 # CRBugBench
 
-We rebuilt CRBugBench from descriptions in the paper: (When) Should a Software Factory be Lights-off?
-Benchmarking Code Review Agents on Bug Detection.
+We rebuilt CRBugBench from descriptions in the paper: [(When) Should a Software Factory be Lights-off?
+Benchmarking Code Review Agents on Bug Detection]().
 
 This contains 995 [Harbor](https://github.com/harbor-framework/harbor)-format code-review tasks,
 mined from 98 open-source GitHub repositories: 500 on the fix track and 495 on the comment track. 
