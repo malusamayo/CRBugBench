@@ -63,7 +63,7 @@ def select(
         and (not repositories or task["repo"] in repositories)
         and (not task_ids or task["task_id"] in task_ids)
     ]
-    if sample:
+    if sample is not None:
         chosen = stratified_sample(chosen, sample, seed)
     return [task["task_id"] for task in chosen]
 
